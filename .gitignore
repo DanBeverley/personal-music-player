@@ -1,0 +1,88 @@
+# Monorepo Global Ignores
+
+# Flutter / Dart
+app/.dart_tool/
+app/build/
+app/android/.gradle/
+app/android/app/build/
+app/android/local.properties
+app/ios/.symlinks/
+app/ios/Pods/
+app/.pub-cache/
+app/.pub/
+app/.packages
+app/.flutter-plugins
+app/.flutter-plugins-dependencies
+app/android.keystore
+app/macos/Flutter/ephemeral/
+app/linux/flutter/ephemeral/
+app/windows/flutter/ephemeral/
+app/web/
+
+# Python / FastAPI
+ingestion/python_proxy/venv/
+ingestion/python_proxy/.venv/
+ingestion/python_proxy/__pycache__/
+ingestion/python_proxy/.pytest_cache/
+ml_research/venv/
+ml_research/.venv/
+ml_research/__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Native C++ / Rust
+core_native/build/
+core_native/build_*/
+core_native/out/
+core_native/bin/
+# Rust
+**/target/
+**/target_*/
+# Note explicitly preserving libauralis.so
+*.o
+*.obj
+*.a
+*.lib
+
+# Downloads Storage
+app/assets/downloads/
+ingestion/python_proxy/downloads/
+ingestion/python_proxy/ffmpeg.exe
+ingestion/python_proxy/ffplay.exe
+ingestion/python_proxy/ffprobe.exe
+ingestion/python_proxy/ffmpeg.zip
+
+# IDE & OS
+.idea/
+.vscode/
+*.swp
+*.DS_Store
+Thumbs.db
+
+# Flutter Generated Plugin Registrants
+app/android/app/src/main/java/io/flutter/plugins/GeneratedPluginRegistrant.java
+app/ios/Runner/GeneratedPluginRegistrant.*
+app/macos/Flutter/GeneratedPluginRegistrant.swift
+app/windows/flutter/generated_plugin_registrant.cc
+app/linux/flutter/generated_plugin_registrant.cc
+app/lib/generated_plugin_registrant.dart
+
+# iOS and macOS Xcode Configs
+app/ios/Flutter/Generated.xcconfig
+app/ios/Flutter/flutter_export_environment.sh
+app/macos/Flutter/Flutter-*.xcconfig
+*.xcworkspace/
+*.xcuserdatad/
+*.xcshareddata/
+
+# Flutter Platform Boilerplate & Native Assets
+app/android/app/src/main/res/drawable*/
+app/android/app/src/main/res/mipmap*/
+app/android/app/src/main/res/values*/
+app/android/app/src/main/jniLibs/
+app/ios/Runner/Assets.xcassets/
+app/ios/Runner/Base.lproj/
+app/macos/Runner/Assets.xcassets/
+app/macos/Runner/Base.lproj/
+

@@ -86,3 +86,8 @@ app/ios/Runner/Base.lproj/
 app/macos/Runner/Assets.xcassets/
 app/macos/Runner/Base.lproj/
 
+
+# IDE, OS & Local Analysis Logs
+app/analyze*.txt
+app/logcat_dump*.txt
+

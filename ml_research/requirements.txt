@@ -1,0 +1,4 @@
+librosa==0.10.1
+torch==2.0.1
+onnxruntime==1.15.1
+numpy==1.25.2

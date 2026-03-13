@@ -112,6 +112,18 @@ AURALIS_EXPORT void auralis_seek(uint32_t position_ms) {
     ma_sound_seek_to_pcm_frame(&current_sound, target_frame);
 }
 
+AURALIS_EXPORT uint32_t auralis_get_position() {
+    if (!sound_loaded) return 0;
+    
+    uint32_t sample_rate;
+    ma_sound_get_data_format(&current_sound, NULL, NULL, &sample_rate, NULL, 0);
+    if (sample_rate == 0) return 0;
+    
+    ma_uint64 cursor;
+    ma_sound_get_cursor_in_pcm_frames(&current_sound, &cursor);
+    return (uint32_t)((cursor * 1000) / sample_rate);
+}
+
 AURALIS_EXPORT void auralis_set_loop(bool enable, uint32_t start_ms, uint32_t end_ms) {
     if (!sound_loaded) return;
     

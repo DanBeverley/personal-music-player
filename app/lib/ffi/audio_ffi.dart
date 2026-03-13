@@ -18,6 +18,9 @@ typedef AuralisPauseDartType = void Function();
 typedef AuralisSeekCType = ffi.Void Function(ffi.Uint32 positionMs);
 typedef AuralisSeekDartType = void Function(int positionMs);
 
+typedef AuralisGetPositionCType = ffi.Uint32 Function();
+typedef AuralisGetPositionDartType = int Function();
+
 typedef AuralisSetLoopCType = ffi.Void Function(
     ffi.Bool enable, ffi.Uint32 startMs, ffi.Uint32 endMs);
 typedef AuralisSetLoopDartType = void Function(
@@ -30,6 +33,7 @@ class AudioEngineFFI {
   late AuralisPlayDartType play;
   late AuralisPauseDartType pause;
   late AuralisSeekDartType seek;
+  late AuralisGetPositionDartType getPosition;
   late AuralisSetLoopDartType setLoop;
 
   AudioEngineFFI() {
@@ -49,6 +53,8 @@ class AudioEngineFFI {
           'auralis_pause');
       seek = _lib.lookupFunction<AuralisSeekCType, AuralisSeekDartType>(
           'auralis_seek');
+      getPosition = _lib.lookupFunction<AuralisGetPositionCType, AuralisGetPositionDartType>(
+          'auralis_get_position');
       setLoop =
           _lib.lookupFunction<AuralisSetLoopCType, AuralisSetLoopDartType>(
               'auralis_set_loop');
@@ -59,8 +65,9 @@ class AudioEngineFFI {
       loadFile = (ptr) => true;
       play = () {};
       pause = () {};
-      seek = (ms) {};
-      setLoop = (e, s, end) {};
+      seek = (pos) {};
+      getPosition = () => 0;
+      setLoop = (enable, start, end) {};
     }
   }
 }

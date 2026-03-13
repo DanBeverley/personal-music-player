@@ -23,6 +23,7 @@ AURALIS_EXPORT void auralis_play();
 AURALIS_EXPORT void auralis_pause();
 AURALIS_EXPORT void auralis_stop();
 AURALIS_EXPORT void auralis_seek(uint32_t position_ms);
+AURALIS_EXPORT uint32_t auralis_get_position();
 AURALIS_EXPORT void auralis_set_loop(bool enable, uint32_t start_ms, uint32_t end_ms);
 
 // --- DSP Effects ---

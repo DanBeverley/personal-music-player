@@ -7,6 +7,27 @@ import os
 import time
 import json
 from ytmusicapi import YTMusic
+import re
+
+def extract_thumbnail(data):
+    if not data: return None
+    thumbs = data.get("thumbnails") or data.get("thumbnail")
+    if isinstance(thumbs, list) and len(thumbs) > 0:
+        return thumbs[-1].get("url")
+    elif isinstance(thumbs, dict):
+        return thumbs.get("url")
+    return None
+
+def extract_artist(data):
+    if not data: return "Unknown Artist"
+    artists = data.get("artists") or []
+    if artists and isinstance(artists, list):
+        return ", ".join([a.get("name", "") for a in artists])
+    author = data.get("author")
+    if author:
+        return author.get("name") if isinstance(author, dict) else str(author)
+    uploader = data.get("uploader")
+    return uploader if uploader else "Unknown Artist"
 
 app = FastAPI(title="Auralis Proxy & Recommendation Engine")
 
@@ -64,8 +85,8 @@ def get_track_details(req: DownloadRequest):
                 "id": track["videoId"],
                 "title": track.get("title"),
                 "duration": track.get("length") or track.get("duration_seconds") or 0,
-                "thumbnail": track.get("thumbnails", [{}])[-1].get("url") if track.get("thumbnails") else None,
-                "channel": ", ".join([a.get("name", "") for a in track.get("artists", [])]) if track.get("artists") else ""
+                "thumbnail": extract_thumbnail(track),
+                "channel": extract_artist(track)
             })
 
         return {
@@ -73,7 +94,7 @@ def get_track_details(req: DownloadRequest):
             "video_id": video_id,
             "title": watch.get("videoDetails", {}).get("title"),
             "author": artist,
-            "thumbnail": watch.get("videoDetails", {}).get("thumbnail", {}).get("thumbnails", [{}])[-1].get("url"),
+            "thumbnail": extract_thumbnail(watch.get("videoDetails", {})),
             "duration": watch.get("videoDetails", {}).get("lengthSeconds"),
             "release_date": release_date,
             "album": album, # ytmusic.get_song doesn't easily provide album, leaving blank for now
@@ -89,21 +110,18 @@ def search_youtube(req: SearchRequest):
         results = []
         
         # Check if the query is a direct YouTube URL
-        if "youtube.com/watch?v=" in query or "youtu.be/" in query:
-            if "watch?v=" in query:
-                video_id = query.split("watch?v=")[1].split("&")[0]
-            else:
-                video_id = query.split("youtu.be/")[1].split("?")[0]
-            
+        url_match = re.search(r"(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/shorts\/)([a-zA-Z0-9_-]{11})", query)
+        if url_match:
+            video_id = url_match.group(1)
             try:
                 watch = ytmusic.get_watch_playlist(videoId=video_id)
                 vd = watch.get("videoDetails", {})
                 results.append({
                     "id": video_id,
-                    "title": vd.get("title"),
+                    "title": vd.get("title") or "Unknown URL Track",
                     "duration": vd.get("lengthSeconds") or 0,
-                    "thumbnail": vd.get("thumbnail", {}).get("thumbnails", [{}])[-1].get("url") if vd.get("thumbnail") else None,
-                    "channel": vd.get("author")
+                    "thumbnail": extract_thumbnail(vd),
+                    "channel": extract_artist(vd)
                 })
                 return {"status": "success", "results": results}
             except Exception:
@@ -115,8 +133,8 @@ def search_youtube(req: SearchRequest):
                 "id": entry.get("videoId"),
                 "title": entry.get("title"),
                 "duration": entry.get("duration_seconds") or 0,
-                "thumbnail": entry.get("thumbnails", [{}])[-1].get("url") if entry.get("thumbnails") else None,
-                "channel": ", ".join([a.get("name", "") for a in entry.get("artists", [])])
+                "thumbnail": extract_thumbnail(entry),
+                "channel": extract_artist(entry)
             })
         return {"status": "success", "results": results}
     except Exception as e:
@@ -152,8 +170,8 @@ def get_recommendations(req: SearchRequest):
                     "id": track["videoId"],
                     "title": track.get("title"),
                     "duration": track.get("length") or track.get("duration_seconds") or 0,
-                    "thumbnail": (track.get("thumbnails") or track.get("thumbnail") or [{}])[-1].get("url"),
-                    "channel": ", ".join([a.get("name", "") for a in track.get("artists", [])]) if track.get("artists") else ""
+                    "thumbnail": extract_thumbnail(track),
+                    "channel": extract_artist(track)
                 })
                 if len(results) >= req.limit:
                     break
@@ -173,8 +191,8 @@ def get_recommendations(req: SearchRequest):
                         "id": item["videoId"],
                         "title": item.get("title"),
                         "duration": 0, # Home feed doesn't always show seconds, we default to 0
-                        "thumbnail": (item.get("thumbnails") or item.get("thumbnail") or [{}])[-1].get("url"),
-                        "channel": ", ".join([a.get("name", "") for a in item.get("artists", [])]) if item.get("artists") else "YT Music Mix"
+                        "thumbnail": extract_thumbnail(item),
+                        "channel": extract_artist(item)
                     })
                 # Cap the home screen items to keep it clean natively 
                 if len(results) >= req.limit + 10:
@@ -336,6 +354,18 @@ def stream_audio(video_id: str):
     
     return FileResponse(file_path, media_type="audio/mpeg", filename=f"{video_id}.mp3")
 
+@app.get("/direct_url/{video_id}")
+def direct_stream_url(video_id: str):
+    ydl_opts = {'format': 'bestaudio/best', 'quiet': True, 'no_warnings': True}
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        try:
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+            return {"status": "success", "url": info['url']}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8010)
+    port = int(os.environ.get("PORT", 8010))
+    print(f"Starting Auralis Proxy Server on port {port}...")
+    uvicorn.run(app, host="0.0.0.0", port=port)

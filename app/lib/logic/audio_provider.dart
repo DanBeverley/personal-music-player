@@ -9,6 +9,7 @@ import '../ffi/audio_ffi.dart';
 import '../ffi/ingestion_ffi.dart';
 import 'package:ffi/ffi.dart';
 import 'package:audio_service/audio_service.dart';
+import 'package:just_audio/just_audio.dart';
 
 late AudioHandler globalAudioHandler;
 
@@ -118,6 +119,7 @@ class PlayerState {
   final int filesize;
   final int currentPosition;
   final String? artist;
+  final String? videoId;
 
   PlayerState({
     this.isPlaying = false,
@@ -129,6 +131,7 @@ class PlayerState {
     this.filesize = 0,
     this.currentPosition = 0,
     this.artist,
+    this.videoId,
   });
 
   PlayerState copyWith(
@@ -140,7 +143,8 @@ class PlayerState {
       int? duration,
       int? filesize,
       int? currentPosition,
-      String? artist}) {
+      String? artist,
+      String? videoId}) {
     return PlayerState(
       isPlaying: isPlaying ?? this.isPlaying,
       isLooping: isLooping ?? this.isLooping,
@@ -151,6 +155,7 @@ class PlayerState {
       filesize: filesize ?? this.filesize,
       currentPosition: currentPosition ?? this.currentPosition,
       artist: artist ?? this.artist,
+      videoId: videoId ?? this.videoId,
     );
   }
 }
@@ -159,6 +164,8 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
   final AudioEngineFFI audioEngine;
   final IngestionEngineFFI ingestionEngine;
   Timer? _playbackTimer;
+  final streamPlayer = AudioPlayer();
+  bool _activeStream = false;
 
   AudioPlayerNotifier(this.audioEngine, this.ingestionEngine)
       : super(PlayerState()) {
@@ -174,8 +181,16 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
 
   @override
   set state(PlayerState value) {
+    bool shouldBroadcast = super.state.isPlaying != value.isPlaying ||
+        super.state.currentTrackName != value.currentTrackName ||
+        super.state.isDownloading != value.isDownloading ||
+        (super.state.currentPosition - value.currentPosition).abs() > 1;
+
     super.state = value;
-    _broadcastState();
+    
+    if (shouldBroadcast) {
+      _broadcastState();
+    }
   }
 
   void _broadcastState() {
@@ -218,6 +233,8 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
   }
 
   void loadLocalFile(String path, String trackName) {
+    _activeStream = false;
+    streamPlayer.stop();
     final pathPtr = path.toNativeUtf8();
     audioEngine.loadFile(pathPtr);
     malloc.free(pathPtr);
@@ -226,12 +243,15 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       currentTrackName: trackName,
       thumbnail: null,
       artist: null,
+      videoId: null,
       duration: 0,
       currentPosition: 0,
     );
   }
 
   void loadLocalWithMeta(String path, Map<String, dynamic> meta) {
+    _activeStream = false;
+    streamPlayer.stop();
     final pathPtr = path.toNativeUtf8();
     audioEngine.loadFile(pathPtr);
     malloc.free(pathPtr);
@@ -242,6 +262,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       duration: _parseInt(meta['duration']),
       filesize: _parseInt(meta['filesize']),
       artist: meta['author'] ?? meta['artist'],
+      videoId: meta['video_id'] ?? meta['id'],
       currentPosition: 0,
     );
     HistoryManager.addHistory(meta['video_id']);
@@ -292,8 +313,15 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
 
       final file = File(outPath);
       final sink = file.openWrite();
-      await streamRes.stream.pipe(sink);
+      
+      await for (var chunk in streamRes.stream) {
+        sink.add(chunk);
+      }
       await sink.close();
+
+      loadLocalWithMeta(outPath, meta);
+      state = state.copyWith(isDownloading: false);
+      play();
 
       try {
         final jsonPath = outPath.replaceAll('.mp3', '.json');
@@ -301,11 +329,6 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       } catch (e) {
         // Ignore json save errors
       }
-
-      // print("Proxy Stream Success! Loading into Miniaudio.");
-      loadLocalWithMeta(outPath, meta);
-      state = state.copyWith(isDownloading: false);
-      play();
     } catch (e) {
       // print("Proxy Download Failed: $e");
       state = state.copyWith(
@@ -320,13 +343,104 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     }
   }
 
+  Future<void> downloadYoutubeBackground(String videoId, String outPath, String titleStr) async {
+    try {
+      const proxyUrl = 'http://10.0.2.2:8010';
+      final res = await http.post(Uri.parse('$proxyUrl/download'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({"video_id": videoId, "title": titleStr}));
+
+      if (res.statusCode != 200) {
+        throw Exception("Proxy Refused Connection or Failed to DL");
+      }
+
+      final meta = jsonDecode(res.body);
+      HistoryManager.addHistory(videoId);
+
+      final req = http.Request('GET', Uri.parse('$proxyUrl/stream/$videoId'));
+      final streamRes = await http.Client().send(req);
+
+      if (streamRes.statusCode != 200) {
+        throw Exception("Stream Error: ${streamRes.statusCode}");
+      }
+
+      final file = File(outPath);
+      final sink = file.openWrite();
+      
+      await for (var chunk in streamRes.stream) {
+        sink.add(chunk);
+      }
+      await sink.close();
+
+      try {
+        final jsonPath = outPath.replaceAll('.mp3', '.json');
+        await File(jsonPath).writeAsString(jsonEncode(meta));
+      } catch (e) {
+        // Ignored
+      }
+    } catch (e) {
+      try {
+        final f = File(outPath);
+        if (f.existsSync()) f.deleteSync();
+        final jf = File(outPath.replaceAll('.mp3', '.json'));
+        if (jf.existsSync()) jf.deleteSync();
+      } catch (_) {}
+    }
+  }
+
+  void streamYoutube(String videoId, Map<String, dynamic> fallbackMeta) async {
+    _activeStream = true;
+    audioEngine.pause();
+    await streamPlayer.stop();
+
+    state = state.copyWith(
+        isDownloading: true,
+        currentTrackName: fallbackMeta['title'] ?? 'Connecting Stream...',
+        thumbnail: fallbackMeta['thumbnail'],
+        artist: fallbackMeta['channel'] ?? fallbackMeta['author'],
+        videoId: videoId,
+        duration: 0,
+        currentPosition: 0);
+
+    try {
+      const proxyUrl = 'http://10.0.2.2:8010';
+      final res = await http.get(Uri.parse('$proxyUrl/direct_url/$videoId')).timeout(const Duration(seconds: 15));
+      
+      if (res.statusCode == 200) {
+        final data = jsonDecode(res.body);
+        final directUrl = data['url'];
+        
+        await streamPlayer.setUrl(directUrl);
+        final dur = streamPlayer.duration?.inSeconds ?? _parseInt(fallbackMeta['duration']);
+        
+        state = state.copyWith(
+            currentTrackName: fallbackMeta['title'],
+            duration: dur > 0 ? dur : _parseInt(fallbackMeta['duration']),
+            isDownloading: false);
+            
+        HistoryManager.addHistory(videoId);
+        play();
+      } else {
+        throw Exception("Stream Error: ${res.statusCode}");
+      }
+    } catch (e) {
+      state = state.copyWith(isDownloading: false, currentTrackName: 'Stream failed: $e');
+    }
+  }
+
   void _startTimer() {
     _playbackTimer?.cancel();
-    _playbackTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+    _playbackTimer = Timer.periodic(const Duration(milliseconds: 200), (timer) {
       if (state.duration == 0 || state.currentPosition < state.duration) {
-        state = state.copyWith(currentPosition: state.currentPosition + 1);
+        int pos = _activeStream 
+            ? streamPlayer.position.inSeconds 
+            : audioEngine.getPosition() ~/ 1000;
+        state = state.copyWith(currentPosition: pos);
       } else {
         if (state.isLooping) {
+          if (_activeStream) {
+             streamPlayer.seek(Duration.zero);
+          }
           state = state.copyWith(currentPosition: 0);
         } else {
           pause();
@@ -336,26 +450,41 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
   }
 
   void play() {
-    audioEngine.play();
+    if (_activeStream) {
+      streamPlayer.play();
+    } else {
+      audioEngine.play();
+    }
     state = state.copyWith(isPlaying: true);
     _startTimer();
   }
 
   void pause() {
-    audioEngine.pause();
+    if (_activeStream) {
+      streamPlayer.pause();
+    } else {
+      audioEngine.pause();
+    }
     state = state.copyWith(isPlaying: false);
     _playbackTimer?.cancel();
   }
 
   void seek(int seconds) {
-    audioEngine.seek(seconds * 1000); // Send MS to C++
+    if (_activeStream) {
+      streamPlayer.seek(Duration(seconds: seconds));
+    } else {
+      audioEngine.seek(seconds * 1000); // Send MS to C++
+    }
     state = state.copyWith(currentPosition: seconds);
   }
 
   void toggleLoop(int startMs, int endMs) {
-    // print("Toggle Loop called");
     final newState = !state.isLooping;
-    audioEngine.setLoop(newState, startMs, endMs);
+    if (_activeStream) {
+       streamPlayer.setLoopMode(newState ? LoopMode.one : LoopMode.off);
+    } else {
+       audioEngine.setLoop(newState, startMs, endMs);
+    }
     state = state.copyWith(isLooping: newState);
   }
 }
@@ -455,9 +584,6 @@ final recommendationProvider =
     StateNotifierProvider<RecommendationNotifier, List<dynamic>>((ref) {
   final notifier = RecommendationNotifier();
   HistoryManager.getLatestSeed().then((seed) {
-    notifier.loadRecommendations(seed);
-  });
-  HistoryManager.seedStream.listen((seed) {
     notifier.loadRecommendations(seed);
   });
   return notifier;

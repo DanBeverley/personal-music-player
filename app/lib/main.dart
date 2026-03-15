@@ -724,7 +724,7 @@ class _PlaylistDetailScreenState extends ConsumerState<PlaylistDetailScreen> {
     if (q.isEmpty) return;
     setState(() => _isSearching = true);
     try {
-      final res = await http.post(Uri.parse('http://10.0.2.2:8010/search'), headers: {'Content-Type': 'application/json'}, body: jsonEncode({"query": q}));
+      final res = await http.post(Uri.parse('https://danbeverley-auralis-proxy.hf.space/search'), headers: {'Content-Type': 'application/json'}, body: jsonEncode({"query": q}));
       if (res.statusCode == 200) {
         setState(() => _searchResults = jsonDecode(res.body)['results'] ?? []);
       }

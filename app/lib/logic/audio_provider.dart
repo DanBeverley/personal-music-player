@@ -281,7 +281,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
 
     try {
       // 1. Ask the Proxy Server to fetch the Video and extract metadata
-      const proxyUrl = 'http://10.0.2.2:8010';
+      const proxyUrl = 'https://danbeverley-auralis-proxy.hf.space';
       final titleStr = outPath.split('/').last.replaceAll('.mp3', '');
       final res = await http.post(Uri.parse('$proxyUrl/download'),
           headers: {'Content-Type': 'application/json'},
@@ -345,7 +345,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
 
   Future<void> downloadYoutubeBackground(String videoId, String outPath, String titleStr) async {
     try {
-      const proxyUrl = 'http://10.0.2.2:8010';
+      const proxyUrl = 'https://danbeverley-auralis-proxy.hf.space';
       final res = await http.post(Uri.parse('$proxyUrl/download'),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({"video_id": videoId, "title": titleStr}));
@@ -403,7 +403,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         currentPosition: 0);
 
     try {
-      const proxyUrl = 'http://10.0.2.2:8010';
+      const proxyUrl = 'https://danbeverley-auralis-proxy.hf.space';
       final res = await http.get(Uri.parse('$proxyUrl/direct_url/$videoId')).timeout(const Duration(seconds: 15));
       
       if (res.statusCode == 200) {
@@ -508,7 +508,7 @@ class SearchNotifier extends StateNotifier<List<dynamic>> {
     state = [];
     try {
       final res = await http
-          .post(Uri.parse('http://10.0.2.2:8010/search'),
+          .post(Uri.parse('https://danbeverley-auralis-proxy.hf.space/search'),
               headers: {'Content-Type': 'application/json'},
               body: jsonEncode({"query": query, "limit": 10}))
           .timeout(const Duration(seconds: 10));
@@ -542,7 +542,7 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
           ? {"query": "", "limit": 15, "seed_id": seedId}
           : {"query": "Trending Hit Songs", "limit": 15};
       final res = await http
-          .post(Uri.parse('http://10.0.2.2:8010/recommend'),
+          .post(Uri.parse('https://danbeverley-auralis-proxy.hf.space/recommend'),
               headers: {'Content-Type': 'application/json'},
               body: jsonEncode(body))
           .timeout(const Duration(seconds: 10));
@@ -561,7 +561,7 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
     if (isPaginating) return;
     isPaginating = true;
     try {
-      final res = await http.post(Uri.parse('http://10.0.2.2:8010/recommend'),
+      final res = await http.post(Uri.parse('https://danbeverley-auralis-proxy.hf.space/recommend'),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({"query": "", "limit": 10, "seed_id": seedId}));
       if (res.statusCode == 200) {
@@ -599,7 +599,7 @@ class SuggestNotifier extends StateNotifier<List<String>> {
     }
     try {
       final res = await http
-          .post(Uri.parse('http://10.0.2.2:8010/suggest'),
+          .post(Uri.parse('https://danbeverley-auralis-proxy.hf.space/suggest'),
               headers: {'Content-Type': 'application/json'},
               body: jsonEncode({"query": query, "limit": 5}))
           .timeout(const Duration(seconds: 10));
@@ -626,7 +626,7 @@ class TrackDetailsNotifier extends StateNotifier<Map<String, dynamic>?> {
     state = null; // show loading
     try {
       final res = await http.post(
-          Uri.parse('http://10.0.2.2:8010/track_details'),
+          Uri.parse('https://danbeverley-auralis-proxy.hf.space/track_details'),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({"video_id": videoId}));
       if (res.statusCode == 200) {

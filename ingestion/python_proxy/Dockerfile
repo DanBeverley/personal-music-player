@@ -7,16 +7,14 @@ RUN apt-get update && \
 
 WORKDIR /app
 
-# Install Python requirements
+# Ensure correct permissions
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy all the proxy code
 COPY . .
 
-# Railway provides the PORT environment variable dynamically
-ENV PORT=8080
+# Cloud Providers inject dynamic PORT values
+ENV PORT=8000
 EXPOSE $PORT
 
-# Start the uvicorn server
 CMD uvicorn server:app --host 0.0.0.0 --port $PORT

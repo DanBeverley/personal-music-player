@@ -1,4 +1,6 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
+import requests
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -353,6 +355,31 @@ def stream_audio(video_id: str):
         raise HTTPException(status_code=404, detail="File not found. Please download first.")
     
     return FileResponse(file_path, media_type="audio/mpeg", filename=f"{video_id}.mp3")
+
+
+@app.get("/proxy_stream/{video_id}")
+def proxy_stream(video_id: str, request: Request):
+    ydl_opts = {'format': 'bestaudio/best', 'quiet': True, 'no_warnings': True}
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+            url = info['url']
+        headers = {}
+        if "range" in request.headers:
+            headers["range"] = request.headers["range"]
+        req = requests.get(url, headers=headers, stream=True)
+        resp_headers = {}
+        for k, v in req.headers.items():
+            if k.lower() in ['content-type', 'content-length', 'content-range', 'accept-ranges']:
+                resp_headers[k] = v
+        return StreamingResponse(
+            req.iter_content(chunk_size=1024*64), 
+            status_code=req.status_code, 
+            headers=resp_headers,
+            media_type=req.headers.get("content-type", "audio/webm")
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/direct_url/{video_id}")
 def direct_stream_url(video_id: str):

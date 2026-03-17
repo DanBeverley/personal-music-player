@@ -1202,9 +1202,9 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
                             : audioNotifier.play();
                       },
                       child: Container(
-                        decoration: BoxDecoration(
-                            shape: BoxShape.circle, 
-                            color: _surfaceGreyAlt,
+                        decoration: const BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: _surfaceGreyAlt,
                         ),
                         padding: const EdgeInsets.all(20),
                         child: playerState.isDownloading 

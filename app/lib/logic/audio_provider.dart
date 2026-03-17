@@ -188,7 +188,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
   final streamPlayer = AudioPlayer();
   bool _activeStream = false;
   final Map<String, ResolvedStreamSource> _streamCache = {};
-  final Set<String> _warmingIds = <String>{};
+  final Map<String, Future<ResolvedStreamSource>> _pendingStreamLookups = {};
 
   AudioPlayerNotifier(this.audioEngine) : super(PlayerState()) {
     audioEngine.pause(); // Kill ghost audio surviving hot restarts
@@ -256,9 +256,35 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
 
   Uri _proxyUri(String path) => Uri.parse('$proxyBaseUrl$path');
 
-  Future<ResolvedStreamSource> _resolveStreamSource(String videoId) async {
+  ResolvedStreamSource? _freshStreamSource(String videoId) {
     final cached = _streamCache[videoId];
     if (cached != null && cached.isFresh) {
+      return cached;
+    }
+    return null;
+  }
+
+  ResolvedStreamSource? _cacheStreamSource(
+    String videoId,
+    Map<String, dynamic> payload,
+  ) {
+    final directUrl = payload['url']?.toString();
+    if (directUrl == null || directUrl.isEmpty) {
+      return null;
+    }
+
+    final source = ResolvedStreamSource(
+      url: directUrl,
+      headers: _parseHeaders(payload['headers']),
+      fetchedAt: DateTime.now(),
+    );
+    _streamCache[videoId] = source;
+    return source;
+  }
+
+  Future<ResolvedStreamSource> _fetchStreamSource(String videoId) async {
+    final cached = _freshStreamSource(videoId);
+    if (cached != null) {
       return cached;
     }
 
@@ -271,33 +297,94 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     }
 
     final data = jsonDecode(res.body) as Map<String, dynamic>;
-    final directUrl = data['url']?.toString();
-    if (directUrl == null || directUrl.isEmpty) {
+    final source = _cacheStreamSource(videoId, data);
+    if (source == null) {
       throw Exception('Proxy returned an empty stream URL');
     }
 
-    final source = ResolvedStreamSource(
-      url: directUrl,
-      headers: _parseHeaders(data['headers']),
-      fetchedAt: DateTime.now(),
-    );
-    _streamCache[videoId] = source;
     return source;
+  }
+
+  Future<ResolvedStreamSource> _resolveStreamSource(String videoId) {
+    final cached = _freshStreamSource(videoId);
+    if (cached != null) {
+      return Future<ResolvedStreamSource>.value(cached);
+    }
+
+    final pending = _pendingStreamLookups[videoId];
+    if (pending != null) {
+      return pending;
+    }
+
+    final lookup = _fetchStreamSource(videoId);
+    _pendingStreamLookups[videoId] = lookup;
+    lookup.whenComplete(() {
+      if (identical(_pendingStreamLookups[videoId], lookup)) {
+        _pendingStreamLookups.remove(videoId);
+      }
+    });
+    return lookup;
   }
 
   Future<void> prewarmStream(String? videoId) async {
     if (videoId == null || videoId.isEmpty) return;
-    final cached = _streamCache[videoId];
-    if (cached != null && cached.isFresh) return;
-    if (_warmingIds.contains(videoId)) return;
-
-    _warmingIds.add(videoId);
     try {
       await _resolveStreamSource(videoId);
     } catch (_) {
       // Prewarm should stay silent. Playback will surface real errors later.
-    } finally {
-      _warmingIds.remove(videoId);
+    }
+  }
+
+  Future<void> prewarmStreams(Iterable<String?> videoIds) async {
+    final idsToWarm = <String>[];
+    final seen = <String>{};
+
+    for (final rawId in videoIds) {
+      final videoId = rawId?.toString();
+      if (videoId == null || videoId.isEmpty || !seen.add(videoId)) {
+        continue;
+      }
+      if (_freshStreamSource(videoId) != null ||
+          _pendingStreamLookups.containsKey(videoId)) {
+        continue;
+      }
+      idsToWarm.add(videoId);
+      if (idsToWarm.length >= 6) {
+        break;
+      }
+    }
+
+    if (idsToWarm.isEmpty) return;
+
+    try {
+      final res = await appHttpClient
+          .post(
+            _proxyUri('/warm_streams'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({'video_ids': idsToWarm}),
+          )
+          .timeout(const Duration(seconds: 18));
+
+      if (res.statusCode != 200) {
+        throw Exception('Warm stream lookup failed: ${res.statusCode}');
+      }
+
+      final data = jsonDecode(res.body) as Map<String, dynamic>;
+      final streams = data['streams'];
+      if (streams is! Map) return;
+
+      streams.forEach((key, dynamic value) {
+        if (value is Map) {
+          _cacheStreamSource(
+            key.toString(),
+            Map<String, dynamic>.from(value),
+          );
+        }
+      });
+    } catch (_) {
+      for (final id in idsToWarm.take(2)) {
+        unawaited(prewarmStream(id));
+      }
     }
   }
 
@@ -655,8 +742,18 @@ final audioPlayerProvider =
 
 // Search & Recommendation State Management
 class SearchNotifier extends StateNotifier<List<dynamic>> {
-  SearchNotifier() : super([]);
+  final Ref ref;
+
+  SearchNotifier(this.ref) : super([]);
   bool isLoading = false;
+
+  void _primeSearchResults(List<dynamic> tracks) {
+    unawaited(
+      ref.read(audioPlayerProvider.notifier).prewarmStreams(
+            tracks.map((track) => track['id'] ?? track['videoId']),
+          ),
+    );
+  }
 
   Future<void> search(String query) async {
     isLoading = true;
@@ -669,6 +766,7 @@ class SearchNotifier extends StateNotifier<List<dynamic>> {
           .timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
         state = jsonDecode(res.body)['results'];
+        _primeSearchResults(state);
       }
     } catch (e) {
       // print("Search failed: $e");
@@ -681,13 +779,23 @@ class SearchNotifier extends StateNotifier<List<dynamic>> {
 
 final searchProvider =
     StateNotifierProvider<SearchNotifier, List<dynamic>>((ref) {
-  return SearchNotifier();
+  return SearchNotifier(ref);
 });
 
 class RecommendationNotifier extends StateNotifier<List<dynamic>> {
-  RecommendationNotifier() : super([]);
+  final Ref ref;
+
+  RecommendationNotifier(this.ref) : super([]);
   bool isLoading = true;
   bool isPaginating = false;
+
+  void _primeRecommendationResults(List<dynamic> tracks) {
+    unawaited(
+      ref.read(audioPlayerProvider.notifier).prewarmStreams(
+            tracks.map((track) => track['id'] ?? track['videoId']),
+          ),
+    );
+  }
 
   Future<void> loadRecommendations([String? seedId]) async {
     isLoading = true;
@@ -703,6 +811,7 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
           .timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
         state = jsonDecode(res.body)['recommendations'];
+        _primeRecommendationResults(state);
       }
     } catch (e) {
       // print("Recommendations failed: $e");
@@ -726,6 +835,7 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
         final uniqueNew =
             newRecs.where((t) => !existingIds.contains(t['id'])).toList();
         state = [...state, ...uniqueNew];
+        _primeRecommendationResults(uniqueNew);
       }
     } catch (e) {
       // print("Load more failed: $e");
@@ -737,7 +847,7 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
 
 final recommendationProvider =
     StateNotifierProvider<RecommendationNotifier, List<dynamic>>((ref) {
-  final notifier = RecommendationNotifier();
+  final notifier = RecommendationNotifier(ref);
   HistoryManager.getLatestSeed().then((seed) {
     notifier.loadRecommendations(seed);
   });
@@ -789,6 +899,15 @@ class TrackDetailsNotifier extends StateNotifier<Map<String, dynamic>?> {
           body: jsonEncode({"video_id": videoId}));
       if (res.statusCode == 200) {
         state = jsonDecode(res.body);
+        final similarTracks = (state?['similar_tracks'] as List<dynamic>?) ?? const [];
+        unawaited(
+          ref.read(audioPlayerProvider.notifier).prewarmStreams([
+                videoId,
+                ...similarTracks
+                    .take(4)
+                    .map((track) => track['id'] ?? track['videoId']),
+              ]),
+        );
       }
     } catch (e) {
       // print("Track Details failed: $e");

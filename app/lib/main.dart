@@ -210,6 +210,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   bool _isSearching = false;
   Timer? _suggestDebounce;
   final Set<String> _prewarmedTrackIds = <String>{};
+  String _lastPrimeSignature = '';
 
   @override
   void initState() {
@@ -260,13 +261,27 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   }
 
   void _primeLikelyTracks(List<dynamic> tracks) {
-    for (final track in tracks.take(3)) {
+    final idsToWarm = <String>[];
+    for (final track in tracks.take(6)) {
       final id = (track['id'] ?? track['videoId'])?.toString();
       if (id == null || id.isEmpty) continue;
       if (_prewarmedTrackIds.add(id)) {
-        unawaited(ref.read(audioPlayerProvider.notifier).prewarmStream(id));
+        idsToWarm.add(id);
       }
     }
+    if (idsToWarm.isEmpty) return;
+
+    final signature = idsToWarm.join('|');
+    if (signature == _lastPrimeSignature) return;
+    _lastPrimeSignature = signature;
+
+    unawaited(ref.read(audioPlayerProvider.notifier).prewarmStreams(idsToWarm));
+  }
+
+  void _warmTrack(String? videoId) {
+    if (videoId == null || videoId.isEmpty) return;
+    _prewarmedTrackIds.add(videoId);
+    unawaited(ref.read(audioPlayerProvider.notifier).prewarmStream(videoId));
   }
 
   Future<void> _triggerStream(dynamic track) async {
@@ -320,6 +335,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
             color: Colors.transparent,
             child: InkWell(
               borderRadius: BorderRadius.circular(16),
+              onTapDown: (_) => _warmTrack(videoId),
               onTap: () => _triggerStream(t),
               child: Padding(
                 padding: const EdgeInsets.all(12.0),
@@ -336,7 +352,11 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                     Expanded(
                       child: GestureDetector(
                         onTap: () {
-                          ref.read(trackDetailsProvider.notifier).fetchDetails(t['id']);
+                          if (videoId == null || videoId.isEmpty) return;
+                          _warmTrack(videoId);
+                          ref.read(trackDetailsProvider.notifier).fetchDetails(
+                                videoId,
+                              );
                           Navigator.push(
                               context,
                               MaterialPageRoute(
@@ -788,6 +808,20 @@ class _PlaylistDetailScreenState extends ConsumerState<PlaylistDetailScreen> {
   final _searchCtrl = TextEditingController();
   List<dynamic> _searchResults = [];
   bool _isSearching = false;
+  final Set<String> _primedPlaylistIds = <String>{};
+
+  void _primePlaylistTracks(Iterable<dynamic> tracks, {int limit = 5}) {
+    final idsToWarm = <String>[];
+    for (final track in tracks.take(limit)) {
+      final videoId = (track['id'] ?? track['videoId'])?.toString();
+      if (videoId == null || videoId.isEmpty) continue;
+      if (_primedPlaylistIds.add(videoId)) {
+        idsToWarm.add(videoId);
+      }
+    }
+    if (idsToWarm.isEmpty) return;
+    unawaited(ref.read(audioPlayerProvider.notifier).prewarmStreams(idsToWarm));
+  }
 
   Future<void> _search(String q) async {
     if (q.isEmpty) return;
@@ -795,7 +829,9 @@ class _PlaylistDetailScreenState extends ConsumerState<PlaylistDetailScreen> {
     try {
       final res = await http.post(Uri.parse('$proxyBaseUrl/search'), headers: {'Content-Type': 'application/json'}, body: jsonEncode({"query": q}));
       if (res.statusCode == 200) {
-        setState(() => _searchResults = jsonDecode(res.body)['results'] ?? []);
+        final results = jsonDecode(res.body)['results'] ?? [];
+        setState(() => _searchResults = results);
+        _primePlaylistTracks(results, limit: 4);
       }
     } catch (e) {
       // Ignored
@@ -807,6 +843,10 @@ class _PlaylistDetailScreenState extends ConsumerState<PlaylistDetailScreen> {
   Widget build(BuildContext context) {
     final playlists = ref.watch(playlistProvider);
     final playlist = playlists.firstWhere((p) => p.id == widget.playlistId, orElse: () => Playlist(id: '', name: 'Deleted Playlist', tracks: []));
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _primePlaylistTracks(playlist.tracks);
+    });
 
     return Scaffold(
       backgroundColor: Colors.black,

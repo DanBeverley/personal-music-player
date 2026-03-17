@@ -1,15 +1,19 @@
+from concurrent.futures import Future
+from threading import Lock
+from typing import List
+
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
-import requests
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-from pydantic import BaseModel
-import yt_dlp
-import os
-import time
+from fastapi.responses import FileResponse, StreamingResponse
+from pydantic import BaseModel, Field
 import json
-from ytmusicapi import YTMusic
+import os
 import re
+import time
+
+import requests
+import yt_dlp
+from ytmusicapi import YTMusic
 
 def extract_thumbnail(data):
     if not data: return None
@@ -50,6 +54,8 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 ytmusic = YTMusic()
 STREAM_INFO_TTL_SECONDS = 1800
 stream_info_cache = {}
+stream_info_inflight = {}
+stream_info_lock = Lock()
 
 class SearchRequest(BaseModel):
     query: str
@@ -60,11 +66,11 @@ class DownloadRequest(BaseModel):
     video_id: str
     title: str = ""
 
-def get_stream_info(video_id: str):
-    now = time.time()
-    cached = stream_info_cache.get(video_id)
-    if cached and cached["expires_at"] > now:
-        return cached["payload"]
+class WarmStreamRequest(BaseModel):
+    video_ids: List[str] = Field(default_factory=list)
+
+def _extract_stream_info(video_id: str):
+    url = f"https://www.youtube.com/watch?v={video_id}"
 
     ydl_opts = {
         'format': 'bestaudio[ext=m4a]/bestaudio/best',
@@ -72,27 +78,54 @@ def get_stream_info(video_id: str):
         'no_warnings': True
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(
-            f"https://www.youtube.com/watch?v={video_id}",
-            download=False
-        )
+        info = ydl.extract_info(url, download=False)
 
     headers = {}
     for key, value in (info.get("http_headers") or {}).items():
         if key and value:
             headers[str(key)] = str(value)
 
-    payload = {
+    return {
         "url": info["url"],
         "headers": headers,
         "mime_type": info.get("ext") or info.get("acodec") or "audio/mp4",
         "duration": info.get("duration") or 0,
     }
-    stream_info_cache[video_id] = {
-        "payload": payload,
-        "expires_at": now + STREAM_INFO_TTL_SECONDS,
-    }
-    return payload
+
+def get_stream_info(video_id: str):
+    now = time.time()
+    with stream_info_lock:
+        cached = stream_info_cache.get(video_id)
+        if cached and cached["expires_at"] > now:
+            return cached["payload"]
+
+        pending = stream_info_inflight.get(video_id)
+        if pending is None:
+            pending = Future()
+            stream_info_inflight[video_id] = pending
+            should_extract = True
+        else:
+            should_extract = False
+
+    if not should_extract:
+        return pending.result(timeout=25)
+
+    try:
+        payload = _extract_stream_info(video_id)
+        with stream_info_lock:
+            stream_info_cache[video_id] = {
+                "payload": payload,
+                "expires_at": now + STREAM_INFO_TTL_SECONDS,
+            }
+        pending.set_result(payload)
+        return payload
+    except Exception as exc:
+        pending.set_exception(exc)
+        raise
+    finally:
+        with stream_info_lock:
+            if stream_info_inflight.get(video_id) is pending:
+                stream_info_inflight.pop(video_id, None)
 
 @app.get("/")
 def health_check():
@@ -256,6 +289,18 @@ def get_recommendations(req: SearchRequest):
         return {"status": "success", "recommendations": results}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/warm_streams")
+def warm_streams(req: WarmStreamRequest):
+    warmed = {}
+    for video_id in req.video_ids[:6]:
+        if not video_id:
+            continue
+        try:
+            warmed[video_id] = get_stream_info(video_id)
+        except Exception:
+            continue
+    return {"status": "success", "streams": warmed}
 
 @app.post("/download")
 def download_audio(req: DownloadRequest):

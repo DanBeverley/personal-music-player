@@ -6,7 +6,6 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import '../ffi/audio_ffi.dart';
-import '../ffi/ingestion_ffi.dart';
 import 'package:ffi/ffi.dart';
 import 'package:audio_service/audio_service.dart';
 import 'package:just_audio/just_audio.dart';
@@ -14,6 +13,7 @@ import 'package:just_audio/just_audio.dart';
 late AudioHandler globalAudioHandler;
 const String proxyBaseUrl =
     String.fromEnvironment('AURALIS_PROXY_URL', defaultValue: 'http://34.172.70.149');
+final http.Client appHttpClient = http.Client();
 
 Future<void> initAudioService() async {
   globalAudioHandler = await AudioService.init(
@@ -67,6 +67,21 @@ Map<String, String> _parseHeaders(dynamic value) {
   return headers;
 }
 
+class ResolvedStreamSource {
+  final String url;
+  final Map<String, String> headers;
+  final DateTime fetchedAt;
+
+  const ResolvedStreamSource({
+    required this.url,
+    required this.headers,
+    required this.fetchedAt,
+  });
+
+  bool get isFresh =>
+      DateTime.now().difference(fetchedAt) < const Duration(minutes: 25);
+}
+
 class HistoryManager {
   static final _seedController = StreamController<String?>.broadcast();
   static Stream<String?> get seedStream => _seedController.stream;
@@ -114,11 +129,6 @@ final audioEngineProvider = Provider<AudioEngineFFI>((ref) {
   final engine = AudioEngineFFI();
   engine.initEngine();
   return engine;
-});
-
-// Provides the singleton FFI ingestion engine
-final ingestionEngineProvider = Provider<IngestionEngineFFI>((ref) {
-  return IngestionEngineFFI();
 });
 
 class PlayerState {
@@ -174,13 +184,13 @@ class PlayerState {
 
 class AudioPlayerNotifier extends StateNotifier<PlayerState> {
   final AudioEngineFFI audioEngine;
-  final IngestionEngineFFI ingestionEngine;
   Timer? _playbackTimer;
   final streamPlayer = AudioPlayer();
   bool _activeStream = false;
+  final Map<String, ResolvedStreamSource> _streamCache = {};
+  final Set<String> _warmingIds = <String>{};
 
-  AudioPlayerNotifier(this.audioEngine, this.ingestionEngine)
-      : super(PlayerState()) {
+  AudioPlayerNotifier(this.audioEngine) : super(PlayerState()) {
     audioEngine.pause(); // Kill ghost audio surviving hot restarts
 
     if (globalAudioHandler is AuralisAudioHandler) {
@@ -245,6 +255,51 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
   }
 
   Uri _proxyUri(String path) => Uri.parse('$proxyBaseUrl$path');
+
+  Future<ResolvedStreamSource> _resolveStreamSource(String videoId) async {
+    final cached = _streamCache[videoId];
+    if (cached != null && cached.isFresh) {
+      return cached;
+    }
+
+    final res = await appHttpClient
+        .get(_proxyUri('/direct_url/$videoId'))
+        .timeout(const Duration(seconds: 15));
+
+    if (res.statusCode != 200) {
+      throw Exception('Direct stream lookup failed: ${res.statusCode}');
+    }
+
+    final data = jsonDecode(res.body) as Map<String, dynamic>;
+    final directUrl = data['url']?.toString();
+    if (directUrl == null || directUrl.isEmpty) {
+      throw Exception('Proxy returned an empty stream URL');
+    }
+
+    final source = ResolvedStreamSource(
+      url: directUrl,
+      headers: _parseHeaders(data['headers']),
+      fetchedAt: DateTime.now(),
+    );
+    _streamCache[videoId] = source;
+    return source;
+  }
+
+  Future<void> prewarmStream(String? videoId) async {
+    if (videoId == null || videoId.isEmpty) return;
+    final cached = _streamCache[videoId];
+    if (cached != null && cached.isFresh) return;
+    if (_warmingIds.contains(videoId)) return;
+
+    _warmingIds.add(videoId);
+    try {
+      await _resolveStreamSource(videoId);
+    } catch (_) {
+      // Prewarm should stay silent. Playback will surface real errors later.
+    } finally {
+      _warmingIds.remove(videoId);
+    }
+  }
 
   bool _hasValidDownloadedAudio(String path) {
     try {
@@ -368,7 +423,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     try {
       // 1. Ask the Proxy Server to fetch the Video and extract metadata
       final titleStr = outPath.split('/').last.replaceAll('.mp3', '');
-      final res = await http.post(_proxyUri('/download'),
+      final res = await appHttpClient.post(_proxyUri('/download'),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({"video_id": videoId, "title": titleStr}));
 
@@ -389,7 +444,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
 
       // 2. Stream the byte data back from the proxy to the local flutter device
       final req = http.Request('GET', _proxyUri('/stream/$videoId'));
-      final streamRes = await http.Client().send(req);
+      final streamRes = await appHttpClient.send(req);
 
       if (streamRes.statusCode != 200) {
         throw Exception("Stream Error: ${streamRes.statusCode}");
@@ -434,7 +489,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
   Future<bool> downloadYoutubeBackground(
       String videoId, String outPath, String titleStr) async {
     try {
-      final res = await http.post(_proxyUri('/download'),
+      final res = await appHttpClient.post(_proxyUri('/download'),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({"video_id": videoId, "title": titleStr}));
 
@@ -446,7 +501,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       HistoryManager.addHistory(videoId);
 
       final req = http.Request('GET', _proxyUri('/stream/$videoId'));
-      final streamRes = await http.Client().send(req);
+      final streamRes = await appHttpClient.send(req);
 
       if (streamRes.statusCode != 200) {
         throw Exception("Stream Error: ${streamRes.statusCode}");
@@ -493,22 +548,11 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         currentPosition: 0);
 
     try {
-      final res = await http
-          .get(_proxyUri('/direct_url/$videoId'))
-          .timeout(const Duration(seconds: 15));
-
-      if (res.statusCode != 200) {
-        throw Exception('Direct stream lookup failed: ${res.statusCode}');
-      }
-
-      final data = jsonDecode(res.body) as Map<String, dynamic>;
-      final directUrl = data['url']?.toString();
-      if (directUrl == null || directUrl.isEmpty) {
-        throw Exception('Proxy returned an empty stream URL');
-      }
-
-      final headers = _parseHeaders(data['headers']);
-      await streamPlayer.setUrl(directUrl, headers: headers.isEmpty ? null : headers);
+      final source = await _resolveStreamSource(videoId);
+      await streamPlayer.setUrl(
+        source.url,
+        headers: source.headers.isEmpty ? null : source.headers,
+      );
       final dur = streamPlayer.duration?.inSeconds ?? _parseInt(fallbackMeta['duration']);
       
       state = state.copyWith(
@@ -543,10 +587,11 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     _playbackTimer?.cancel();
     _playbackTimer = Timer.periodic(const Duration(milliseconds: 200), (timer) {
       if (state.duration == 0 || state.currentPosition < state.duration) {
-        int pos = _activeStream 
-            ? streamPlayer.position.inSeconds 
-            : audioEngine.getPosition() ~/ 1000;
-        state = state.copyWith(currentPosition: pos);
+        final pos =
+            _activeStream ? streamPlayer.position.inSeconds : audioEngine.getPosition() ~/ 1000;
+        if (pos != state.currentPosition) {
+          state = state.copyWith(currentPosition: pos);
+        }
       } else {
         if (state.isLooping) {
           if (_activeStream) {
@@ -605,8 +650,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
 final audioPlayerProvider =
     StateNotifierProvider<AudioPlayerNotifier, PlayerState>((ref) {
   final audioE = ref.watch(audioEngineProvider);
-  final ingestionE = ref.watch(ingestionEngineProvider);
-  return AudioPlayerNotifier(audioE, ingestionE);
+  return AudioPlayerNotifier(audioE);
 });
 
 // Search & Recommendation State Management
@@ -618,7 +662,7 @@ class SearchNotifier extends StateNotifier<List<dynamic>> {
     isLoading = true;
     state = [];
     try {
-      final res = await http
+      final res = await appHttpClient
           .post(Uri.parse('$proxyBaseUrl/search'),
               headers: {'Content-Type': 'application/json'},
               body: jsonEncode({"query": query, "limit": 10}))
@@ -652,7 +696,7 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
       final body = seedId != null
           ? {"query": "", "limit": 15, "seed_id": seedId}
           : {"query": "Trending Hit Songs", "limit": 15};
-      final res = await http
+      final res = await appHttpClient
           .post(Uri.parse('$proxyBaseUrl/recommend'),
               headers: {'Content-Type': 'application/json'},
               body: jsonEncode(body))
@@ -672,7 +716,7 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
     if (isPaginating) return;
     isPaginating = true;
     try {
-      final res = await http.post(Uri.parse('$proxyBaseUrl/recommend'),
+      final res = await appHttpClient.post(Uri.parse('$proxyBaseUrl/recommend'),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({"query": "", "limit": 10, "seed_id": seedId}));
       if (res.statusCode == 200) {
@@ -709,7 +753,7 @@ class SuggestNotifier extends StateNotifier<List<String>> {
       return;
     }
     try {
-      final res = await http
+      final res = await appHttpClient
           .post(Uri.parse('$proxyBaseUrl/suggest'),
               headers: {'Content-Type': 'application/json'},
               body: jsonEncode({"query": query, "limit": 5}))
@@ -731,12 +775,15 @@ final suggestProvider =
 });
 
 class TrackDetailsNotifier extends StateNotifier<Map<String, dynamic>?> {
-  TrackDetailsNotifier() : super(null);
+  final Ref ref;
+
+  TrackDetailsNotifier(this.ref) : super(null);
 
   Future<void> fetchDetails(String videoId) async {
     state = null; // show loading
+    unawaited(ref.read(audioPlayerProvider.notifier).prewarmStream(videoId));
     try {
-      final res = await http.post(
+      final res = await appHttpClient.post(
           Uri.parse('$proxyBaseUrl/track_details'),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({"video_id": videoId}));
@@ -751,13 +798,18 @@ class TrackDetailsNotifier extends StateNotifier<Map<String, dynamic>?> {
 
 final trackDetailsProvider =
     StateNotifierProvider<TrackDetailsNotifier, Map<String, dynamic>?>((ref) {
-  return TrackDetailsNotifier();
+  return TrackDetailsNotifier(ref);
 });
 
 final libraryProvider =
-    FutureProvider.autoDispose<List<Map<String, dynamic>>>((ref) async {
+    FutureProvider<List<Map<String, dynamic>>>((ref) async {
   final dir = await getApplicationDocumentsDirectory();
-  final files = dir.listSync().where((f) => f.path.endsWith('.mp3')).toList();
+  final files = dir.listSync().where((f) => f.path.endsWith('.mp3')).toList()
+    ..sort((a, b) {
+      final aTime = a.statSync().modified;
+      final bTime = b.statSync().modified;
+      return bTime.compareTo(aTime);
+    });
   List<Map<String, dynamic>> tracks = [];
   for (var file in files) {
     if (file is File) {

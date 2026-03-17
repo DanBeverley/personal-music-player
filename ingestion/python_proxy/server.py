@@ -13,6 +13,9 @@ import re
 
 def extract_thumbnail(data):
     if not data: return None
+    video_id = data.get("videoId") or data.get("video_id") or data.get("id")
+    if video_id:
+        return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
     thumbs = data.get("thumbnails") or data.get("thumbnail")
     if isinstance(thumbs, list) and len(thumbs) > 0:
         return thumbs[-1].get("url")
@@ -45,6 +48,8 @@ app.add_middleware(
 DOWNLOAD_DIR = os.path.join(os.getcwd(), "downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 ytmusic = YTMusic()
+STREAM_INFO_TTL_SECONDS = 1800
+stream_info_cache = {}
 
 class SearchRequest(BaseModel):
     query: str
@@ -56,6 +61,11 @@ class DownloadRequest(BaseModel):
     title: str = ""
 
 def get_stream_info(video_id: str):
+    now = time.time()
+    cached = stream_info_cache.get(video_id)
+    if cached and cached["expires_at"] > now:
+        return cached["payload"]
+
     ydl_opts = {
         'format': 'bestaudio[ext=m4a]/bestaudio/best',
         'quiet': True,
@@ -72,12 +82,17 @@ def get_stream_info(video_id: str):
         if key and value:
             headers[str(key)] = str(value)
 
-    return {
+    payload = {
         "url": info["url"],
         "headers": headers,
         "mime_type": info.get("ext") or info.get("acodec") or "audio/mp4",
         "duration": info.get("duration") or 0,
     }
+    stream_info_cache[video_id] = {
+        "payload": payload,
+        "expires_at": now + STREAM_INFO_TTL_SECONDS,
+    }
+    return payload
 
 @app.get("/")
 def health_check():

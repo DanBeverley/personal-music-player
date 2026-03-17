@@ -1,14 +1,21 @@
 import 'dart:io';
 import 'dart:ui';
 import 'dart:convert';
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:path_provider/path_provider.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:http/http.dart' as http;
 import 'logic/audio_provider.dart';
-import 'logic/palette_provider.dart';
+import 'logic/download_provider.dart';
 import 'logic/playlist_provider.dart';
+import 'widgets/app_artwork.dart';
+import 'widgets/download_hud.dart';
+
+const _accentGrey = Color(0xFFB7BBC4);
+const _surfaceGrey = Color(0xFF141414);
+const _surfaceGreyAlt = Color(0xFF1B1B1B);
+const _voidBlack = Color(0xFF070707);
 
 void showGlassDialog({required BuildContext context, required String title, required Widget content, required List<Widget> actions}) {
   showGeneralDialog(
@@ -50,12 +57,19 @@ class AuralisApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Auralis Vanguard',
+      title: 'Auralis',
       theme: ThemeData(
         brightness: Brightness.dark,
-        scaffoldBackgroundColor: const Color(0xFF0A0A0A),
-        primaryColor: const Color(0xFF1DB954),
-        textTheme: GoogleFonts.interTextTheme(Theme.of(context).textTheme).apply(bodyColor: Colors.white, displayColor: Colors.white),
+        scaffoldBackgroundColor: _voidBlack,
+        primaryColor: _accentGrey,
+        colorScheme: const ColorScheme.dark(
+          primary: _accentGrey,
+          secondary: _accentGrey,
+          surface: _surfaceGrey,
+          onSurface: Colors.white,
+        ),
+        textTheme: GoogleFonts.spaceGroteskTextTheme(Theme.of(context).textTheme)
+            .apply(bodyColor: Colors.white, displayColor: Colors.white),
         appBarTheme: const AppBarTheme(
           backgroundColor: Colors.transparent,
           elevation: 0,
@@ -83,52 +97,68 @@ class _MainLayoutState extends ConsumerState<MainLayout> {
 
   @override
   Widget build(BuildContext context) {
-    final playerState = ref.watch(audioPlayerProvider);
+    final hasActiveTrack = ref.watch(
+      audioPlayerProvider.select(
+        (state) => state.currentTrackName != 'No track loaded',
+      ),
+    );
 
     return Scaffold(
-      body: Stack(
-        children: [
-          FadeIndexedStack(
-            index: _currentIndex,
-            children: _pages,
+      body: Container(
+        decoration: const BoxDecoration(
+          gradient: RadialGradient(
+            center: Alignment.topCenter,
+            radius: 1.2,
+            colors: [Color(0xFF171717), _voidBlack, Colors.black],
           ),
-          AnimatedPositioned(
-            duration: const Duration(milliseconds: 300),
-            curve: Curves.easeOutCubic,
-            bottom: playerState.currentTrackName != 'No track loaded'
-                ? 80
-                : -100, // Slides off screen when not loaded
-            left: 0,
-            right: 0,
-            child: const MiniPlayer(),
-          ),
-          Positioned(
-            bottom: 24,
-            left: 32,
-            right: 32,
-            child: ClipRRect(
-              borderRadius: BorderRadius.circular(40),
-              child: BackdropFilter(
-                filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
-                child: Container(
-                  height: 64,
-                  decoration: BoxDecoration(
-                    color: Colors.white.withValues(alpha: 0.05),
-                    borderRadius: BorderRadius.circular(40),
-                    border: Border.all(color: Colors.white.withValues(alpha: 0.1), width: 1),
-                  ),
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                    children: [
-                      _buildNavItem(Icons.auto_awesome_outlined, Icons.auto_awesome, 'Discover', 0),
-                      _buildNavItem(Icons.library_music_outlined, Icons.library_music, 'Library', 1),
-                    ],
+        ),
+        child: Stack(
+          children: [
+            FadeIndexedStack(
+              index: _currentIndex,
+              children: _pages,
+            ),
+            Positioned(
+              right: 24,
+              bottom: hasActiveTrack ? 170 : 96,
+              child: const DownloadHud(),
+            ),
+            AnimatedPositioned(
+              duration: const Duration(milliseconds: 300),
+              curve: Curves.easeOutCubic,
+              bottom: hasActiveTrack ? 88 : -100,
+              left: 0,
+              right: 0,
+              child: const MiniPlayer(),
+            ),
+            Positioned(
+              bottom: 24,
+              left: 24,
+              right: 24,
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(36),
+                child: BackdropFilter(
+                  filter: ImageFilter.blur(sigmaX: 16, sigmaY: 16),
+                  child: Container(
+                    height: 68,
+                    decoration: BoxDecoration(
+                      color: Colors.white.withValues(alpha: 0.05),
+                      borderRadius: BorderRadius.circular(36),
+                      border: Border.all(color: Colors.white.withValues(alpha: 0.08), width: 1),
+                    ),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                      children: [
+                        _buildNavItem(Icons.explore_outlined, Icons.explore, 'Listen', 0),
+                        _buildNavItem(Icons.queue_music_outlined, Icons.queue_music, 'Library', 1),
+                      ],
+                    ),
                   ),
                 ),
               ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -178,6 +208,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   final TextEditingController _urlController = TextEditingController();
   final FocusNode _searchFocusNode = FocusNode();
   bool _isSearching = false;
+  Timer? _suggestDebounce;
+  final Set<String> _prewarmedTrackIds = <String>{};
 
   @override
   void initState() {
@@ -185,8 +217,14 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     _urlController.addListener(() {
       final text = _urlController.text.trim();
       if (text.isNotEmpty && !_isSearching) {
-        ref.read(suggestProvider.notifier).fetchSuggestions(text);
+        _suggestDebounce?.cancel();
+        _suggestDebounce = Timer(const Duration(milliseconds: 280), () {
+          if (mounted) {
+            ref.read(suggestProvider.notifier).fetchSuggestions(text);
+          }
+        });
       } else if (text.isEmpty) {
+        _suggestDebounce?.cancel();
         ref.read(suggestProvider.notifier).clear();
         setState(() => _isSearching = false);
       }
@@ -195,6 +233,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
 
   @override
   void dispose() {
+    _suggestDebounce?.cancel();
     _urlController.dispose();
     _searchFocusNode.dispose();
     super.dispose();
@@ -220,15 +259,13 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     setState(() => _isSearching = false);
   }
 
-  Future<void> _triggerDownload(String videoId, String title) async {
-    final dir = await getApplicationDocumentsDirectory();
-    final cleanName = title.replaceAll(RegExp(r'[\\/:*?"<>|]'), '');
-    final outPath = '${dir.path}/$cleanName.mp3';
-    final success = await ref
-        .read(audioPlayerProvider.notifier)
-        .downloadAndLoadYoutube(videoId, outPath);
-    if (success) {
-      ref.invalidate(libraryProvider);
+  void _primeLikelyTracks(List<dynamic> tracks) {
+    for (final track in tracks.take(3)) {
+      final id = (track['id'] ?? track['videoId'])?.toString();
+      if (id == null || id.isEmpty) continue;
+      if (_prewarmedTrackIds.add(id)) {
+        unawaited(ref.read(audioPlayerProvider.notifier).prewarmStream(id));
+      }
     }
   }
 
@@ -244,7 +281,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       List<dynamic> tracks, bool isLoading, String emptyMessage) {
     if (isLoading && tracks.isEmpty) {
       return const Center(
-          child: CircularProgressIndicator(color: Color(0xFF1DB954)));
+          child: CircularProgressIndicator(color: _accentGrey));
     }
     if (tracks.isEmpty) {
       return Center(
@@ -261,20 +298,21 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
           return const Center(
               child: Padding(
                   padding: EdgeInsets.all(16.0),
-                  child: CircularProgressIndicator(color: Color(0xFF1DB954))));
+                  child: CircularProgressIndicator(color: _accentGrey)));
         }
         final t = tracks[index];
+        final videoId = (t['id'] ?? t['videoId'])?.toString();
         return Container(
-          margin: const EdgeInsets.only(bottom: 12),
+          margin: const EdgeInsets.only(bottom: 14),
           decoration: BoxDecoration(
-            color: Colors.white.withValues(alpha: 0.03),
-            borderRadius: BorderRadius.circular(16),
-            border: Border.all(color: Colors.white.withValues(alpha: 0.05), width: 1),
+            color: Colors.white.withValues(alpha: 0.025),
+            borderRadius: BorderRadius.circular(24),
+            border: Border.all(color: Colors.white.withValues(alpha: 0.06), width: 1),
             boxShadow: [
               BoxShadow(
                 color: Colors.black.withValues(alpha: 0.2),
-                blurRadius: 10,
-                offset: const Offset(0, 4),
+                blurRadius: 18,
+                offset: const Offset(0, 10),
               )
             ]
           ),
@@ -287,24 +325,12 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                 padding: const EdgeInsets.all(12.0),
                 child: Row(
                   children: [
-                    Container(
-                      decoration: BoxDecoration(
-                        borderRadius: BorderRadius.circular(12),
-                        boxShadow: [
-                          BoxShadow(
-                             color: Colors.black.withValues(alpha: 0.3),
-                             blurRadius: 8,
-                             offset: const Offset(0, 4)
-                          )
-                        ]
-                      ),
-                      child: ClipRRect(
-                        borderRadius: BorderRadius.circular(12),
-                        child: t['thumbnail'] != null
-                            ? Image.network(t['thumbnail'],
-                                width: 70, height: 70, fit: BoxFit.cover)
-                            : Container(width: 70, height: 70, color: Colors.grey[800]),
-                      ),
+                    AppArtwork(
+                      thumbnail: t['thumbnail'],
+                      videoId: videoId,
+                      width: 74,
+                      height: 74,
+                      radius: 18,
                     ),
                     const SizedBox(width: 16),
                     Expanded(
@@ -331,16 +357,46 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                         ),
                       ),
                     ),
-                    IconButton(
-                      icon: Container(
-                         padding: const EdgeInsets.all(8),
-                         decoration: BoxDecoration(
-                            color: Colors.white.withValues(alpha: 0.05),
-                            shape: BoxShape.circle
-                         ),
-                         child: const Icon(Icons.download_rounded, color: Colors.white70, size: 20)
-                      ),
-                      onPressed: () => _triggerDownload(t['id'], t['title']),
+                    Consumer(
+                      builder: (context, ref, child) {
+                        final task = videoId == null
+                            ? null
+                            : ref.watch(downloadTaskProvider(videoId));
+                        final isActive = task?.phase == DownloadPhase.active;
+                        return IconButton(
+                          icon: Container(
+                            padding: const EdgeInsets.all(8),
+                            decoration: BoxDecoration(
+                              color: Colors.white.withValues(alpha: 0.05),
+                              shape: BoxShape.circle,
+                            ),
+                            child: isActive
+                                ? SizedBox(
+                                    width: 20,
+                                    height: 20,
+                                    child: CircularProgressIndicator(
+                                      value: task!.progress > 0 ? task.progress : null,
+                                      strokeWidth: 2,
+                                      color: _accentGrey,
+                                    ),
+                                  )
+                                : Icon(
+                                    task?.phase == DownloadPhase.complete
+                                        ? Icons.check_rounded
+                                        : Icons.download_rounded,
+                                    color: Colors.white70,
+                                    size: 20,
+                                  ),
+                          ),
+                          onPressed: videoId == null
+                              ? null
+                              : () {
+                                  ref
+                                      .read(downloadCenterProvider.notifier)
+                                      .downloadTrack(t);
+                                },
+                        );
+                      },
                     ),
                   ],
                 ),
@@ -360,6 +416,12 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     final recState = ref.watch(recommendationProvider);
     final isRecLoading = ref.watch(recommendationProvider.notifier).isLoading;
     final suggestState = ref.watch(suggestProvider);
+    final visibleTracks = _isSearching ? searchState : recState;
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _primeLikelyTracks(visibleTracks);
+    });
 
     return SafeArea(
         child: NotificationListener<ScrollNotification>(
@@ -381,14 +443,25 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text(
-              'Good evening',
-              style: TextStyle(
-                  fontSize: 24,
-                  fontWeight: FontWeight.bold,
-                  color: Colors.white),
+            Text(
+              'Auralis',
+              style: GoogleFonts.spaceGrotesk(
+                fontSize: 32,
+                fontWeight: FontWeight.w700,
+                color: Colors.white,
+                letterSpacing: -1,
+              ),
             ),
-            const SizedBox(height: 32),
+            const SizedBox(height: 6),
+            Text(
+              'Pull songs straight into a quieter, cleaner library.',
+              style: TextStyle(
+                color: Colors.white.withValues(alpha: 0.62),
+                fontSize: 14,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+            const SizedBox(height: 28),
 
             TextField(
               controller: _urlController,
@@ -398,9 +471,9 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                 hintText: 'Search songs or paste URL...',
                 hintStyle: const TextStyle(color: Colors.white54),
                 filled: true,
-                fillColor: Colors.grey[900],
+                fillColor: _surfaceGrey,
                 border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(8),
+                  borderRadius: BorderRadius.circular(22),
                   borderSide: BorderSide.none,
                 ),
                 prefixIcon: _isSearching || _urlController.text.isNotEmpty
@@ -441,20 +514,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
               ),
 
             const SizedBox(height: 20),
-            Consumer(
-              builder: (context, ref, child) {
-                final playerState = ref.watch(audioPlayerProvider);
-                if (playerState.isDownloading) {
-                  return const Column(
-                    children: [
-                       LinearProgressIndicator(color: Color(0xFF1DB954)),
-                       SizedBox(height: 16),
-                    ]
-                  );
-                }
-                return const SizedBox.shrink();
-              },
-            ),
 
             // Content Area (Search vs Recommendations)
             if (_isSearching) ...[
@@ -467,7 +526,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
               _buildTrackList(
                   searchState, isSearchLoading, "No results found."),
             ] else ...[
-              const Text('Made For You',
+              const Text('Quiet picks',
                   style: TextStyle(
                       fontSize: 18,
                       fontWeight: FontWeight.bold,
@@ -612,6 +671,8 @@ class LibraryScreen extends ConsumerWidget {
                     final track = files[index];
                     final name = track['title'] ?? 'Unknown';
                     final path = track['local_path'];
+                    final videoId =
+                        (track['video_id'] ?? track['id'])?.toString();
                     return Container(
                       margin: const EdgeInsets.only(bottom: 12),
                       decoration: BoxDecoration(
@@ -647,17 +708,12 @@ class LibraryScreen extends ConsumerWidget {
                             padding: const EdgeInsets.all(12.0),
                             child: Row(
                               children: [
-                                Container(
-                                  decoration: BoxDecoration(
-                                    borderRadius: BorderRadius.circular(12),
-                                    boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.3), blurRadius: 8, offset: const Offset(0, 4))]
-                                  ),
-                                  child: ClipRRect(
-                                    borderRadius: BorderRadius.circular(12),
-                                    child: track['thumbnail'] != null
-                                        ? Image.network(track['thumbnail'], width: 70, height: 70, fit: BoxFit.cover)
-                                        : Container(width: 70, height: 70, color: Colors.grey[800], child: const Icon(Icons.music_note, color: Colors.white38)),
-                                  ),
+                                AppArtwork(
+                                  thumbnail: track['thumbnail'],
+                                  videoId: videoId,
+                                  width: 70,
+                                  height: 70,
+                                  radius: 16,
                                 ),
                                 const SizedBox(width: 16),
                                 Expanded(
@@ -767,7 +823,7 @@ class _PlaylistDetailScreenState extends ConsumerState<PlaylistDetailScreen> {
                 hintText: "Let's find something for your playlist",
                 hintStyle: const TextStyle(color: Colors.white54),
                 filled: true,
-                fillColor: Colors.grey[900],
+                fillColor: _surfaceGrey,
                 suffixIcon: IconButton(icon: const Icon(Icons.search, color: Colors.white), onPressed: () => _search(_searchCtrl.text)),
               ),
               onSubmitted: _search,
@@ -783,8 +839,15 @@ class _PlaylistDetailScreenState extends ConsumerState<PlaylistDetailScreen> {
                  itemCount: _searchResults.length,
                  itemBuilder: (context, i) {
                    final t = _searchResults[i];
+                   final videoId = (t['id'] ?? t['videoId'])?.toString();
                    return ListTile(
-                     leading: Image.network(t['thumbnail'] ?? '', width: 50, height: 50, fit: BoxFit.cover, errorBuilder: (c,e,s) => Container(width:50,height:50,color:Colors.grey[800])),
+                     leading: AppArtwork(
+                       thumbnail: t['thumbnail'],
+                       videoId: videoId,
+                       width: 50,
+                       height: 50,
+                       radius: 14,
+                     ),
                      title: Text(t['title'] ?? 'Unknown', style: const TextStyle(color: Colors.white), maxLines: 1),
                      subtitle: Text(t['channel'] ?? '', style: const TextStyle(color: Colors.white54)),
                      trailing: IconButton(
@@ -809,12 +872,19 @@ class _PlaylistDetailScreenState extends ConsumerState<PlaylistDetailScreen> {
               itemCount: playlist.tracks.length,
               itemBuilder: (context, i) {
                  final t = playlist.tracks[i];
+                 final videoId = (t['id'] ?? t['videoId'])?.toString();
                  return ListTile(
                     onTap: () {
                         ref.read(audioPlayerProvider.notifier).streamYoutube(t['id'] ?? t['videoId'], t);
                         Navigator.of(context).push(MaterialPageRoute(builder: (_) => const FullPlayerScreen()));
                     },
-                    leading: Image.network(t['thumbnail'] ?? '', width: 50, height: 50, fit: BoxFit.cover, errorBuilder: (c,e,s) => Container(width:50,height:50,color:Colors.grey[800])),
+                    leading: AppArtwork(
+                      thumbnail: t['thumbnail'],
+                      videoId: videoId,
+                      width: 50,
+                      height: 50,
+                      radius: 14,
+                    ),
                     title: Text(t['title'] ?? 'Unknown', style: const TextStyle(color: Colors.white), maxLines: 1),
                     subtitle: Text(t['channel'] ?? t['author'] ?? '', style: const TextStyle(color: Colors.white54)),
                     trailing: PopupMenuButton<String>(
@@ -844,6 +914,7 @@ class MiniPlayer extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final playerState = ref.watch(audioPlayerProvider);
     final audioNotifier = ref.read(audioPlayerProvider.notifier);
+    final videoId = playerState.videoId;
 
     return GestureDetector(
       onTap: () {
@@ -855,17 +926,17 @@ class MiniPlayer extends ConsumerWidget {
         child: BackdropFilter(
           filter: ImageFilter.blur(sigmaX: 15, sigmaY: 15),
           child: Container(
-            height: 72,
-            margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            height: 78,
+            margin: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
             decoration: BoxDecoration(
-              color: Colors.white.withValues(alpha: 0.08),
-              borderRadius: BorderRadius.circular(20),
-              border: Border.all(color: Colors.white.withValues(alpha: 0.1), width: 1),
+              color: Colors.white.withValues(alpha: 0.06),
+              borderRadius: BorderRadius.circular(24),
+              border: Border.all(color: Colors.white.withValues(alpha: 0.08), width: 1),
               boxShadow: [
                 BoxShadow(
                   color: Colors.black.withValues(alpha: 0.25),
-                  blurRadius: 20,
-                  offset: const Offset(0, 10),
+                  blurRadius: 24,
+                  offset: const Offset(0, 12),
                 )
               ]
             ),
@@ -875,32 +946,15 @@ class MiniPlayer extends ConsumerWidget {
                   child: Row(
                     children: [
                       const SizedBox(width: 8),
-                      // Thumbnail
-                      Hero(
-                        tag: 'album_art_${playerState.currentTrackName}',
-                        child: Container(
-                          decoration: BoxDecoration(
-                             borderRadius: BorderRadius.circular(12),
-                             boxShadow: [
-                               BoxShadow(color: Colors.black.withValues(alpha: 0.3), blurRadius: 4, offset: const Offset(0, 2))
-                             ]
-                          ),
-                          child: ClipRRect(
-                            borderRadius: BorderRadius.circular(12),
-                            child: playerState.thumbnail != null
-                                ? Image.network(playerState.thumbnail!,
-                                    width: 52, height: 52, fit: BoxFit.cover)
-                                : Container(
-                                    width: 52,
-                                    height: 52,
-                                    color: Colors.grey[800],
-                                    child: const Icon(Icons.music_note,
-                                        color: Colors.white54)),
-                          ),
-                        ),
+                      AppArtwork(
+                        thumbnail: playerState.thumbnail,
+                        videoId: videoId,
+                        width: 54,
+                        height: 54,
+                        radius: 16,
+                        heroTag: 'album_art_${playerState.currentTrackName}',
                       ),
                       const SizedBox(width: 14),
-                      // Text Info
                       Expanded(
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
@@ -909,7 +963,7 @@ class MiniPlayer extends ConsumerWidget {
                             Text(
                               playerState.currentTrackName,
                               style: const TextStyle(
-                                  color: Colors.white, fontWeight: FontWeight.bold, fontSize: 15),
+                                  color: Colors.white, fontWeight: FontWeight.w700, fontSize: 15),
                               overflow: TextOverflow.ellipsis,
                             ),
                             const SizedBox(height: 2),
@@ -925,20 +979,35 @@ class MiniPlayer extends ConsumerWidget {
                       GestureDetector(
                         onTap: () {
                           playerState.isPlaying
-                              ? audioNotifier.pause()
-                              : audioNotifier.play();
+                            ? audioNotifier.pause()
+                            : audioNotifier.play();
                         },
-                        child: Container(
+                        child: AnimatedContainer(
+                          duration: const Duration(milliseconds: 220),
                           margin: const EdgeInsets.only(right: 12),
                           padding: const EdgeInsets.all(10),
                           decoration: BoxDecoration(
-                             color: Colors.white.withValues(alpha: 0.1),
+                             color: playerState.isPlaying
+                                 ? Colors.white.withValues(alpha: 0.16)
+                                 : Colors.white.withValues(alpha: 0.08),
                              shape: BoxShape.circle,
                           ),
-                          child: Icon(
-                              playerState.isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
-                              color: Colors.white,
-                              size: 28),
+                          child: playerState.isDownloading
+                              ? const SizedBox(
+                                  width: 28,
+                                  height: 28,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                    color: Colors.white,
+                                  ),
+                                )
+                              : Icon(
+                                  playerState.isPlaying
+                                      ? Icons.pause_rounded
+                                      : Icons.play_arrow_rounded,
+                                  color: Colors.white,
+                                  size: 28,
+                                ),
                         ),
                       ),
                     ],
@@ -952,7 +1021,7 @@ class MiniPlayer extends ConsumerWidget {
                       value: (playerState.currentPosition / playerState.duration)
                           .clamp(0.0, 1.0),
                       backgroundColor: Colors.transparent,
-                      color: const Color(0xFF1DB954), // Vanguard Green Accent
+                      color: _accentGrey,
                       minHeight: 2,
                     ),
                   )
@@ -979,8 +1048,9 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
   Widget build(BuildContext context) {
     final playerState = ref.watch(audioPlayerProvider);
     final audioNotifier = ref.read(audioPlayerProvider.notifier);
-    final dominantColorAsync = ref.watch(dominantColorProvider);
-    final accentColor = dominantColorAsync.value ?? const Color(0xFF1DB954);
+    const accentColor = _accentGrey;
+    final artworkUrl =
+        preferredArtworkUrl(playerState.thumbnail, videoId: playerState.videoId);
 
     return Scaffold(
       extendBodyBehindAppBar: true,
@@ -990,18 +1060,18 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
           onPressed: () => Navigator.pop(context),
         ),
         title: const Text('Now Playing',
-            style: TextStyle(fontSize: 12, color: Colors.white, fontWeight: FontWeight.bold, letterSpacing: 1.5)),
+            style: TextStyle(fontSize: 11, color: Colors.white, fontWeight: FontWeight.w700, letterSpacing: 1.4)),
         centerTitle: true,
       ),
       body: Stack(
         fit: StackFit.expand,
         children: [
-          // Dynamic Blurred Background
-          if (playerState.thumbnail != null)
-            Image.network(playerState.thumbnail!, fit: BoxFit.cover),
-          if (playerState.thumbnail == null)
-            Container(color: Colors.grey[900]),
-            
+          Container(color: _voidBlack),
+          if (artworkUrl.isNotEmpty)
+            Opacity(
+              opacity: 0.16,
+              child: Image.network(artworkUrl, fit: BoxFit.cover),
+            ),
           BackdropFilter(
             filter: ImageFilter.blur(sigmaX: 60, sigmaY: 60),
             child: Container(
@@ -1010,9 +1080,9 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
                   begin: Alignment.topCenter,
                   end: Alignment.bottomCenter,
                   colors: [
-                    Colors.black.withValues(alpha: 0.3),
-                    Colors.black.withValues(alpha: 0.7),
-                    Colors.black.withValues(alpha: 0.95),
+                    Colors.black.withValues(alpha: 0.2),
+                    Colors.black.withValues(alpha: 0.74),
+                    Colors.black.withValues(alpha: 0.98),
                   ],
                 ),
               ),
@@ -1030,26 +1100,26 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
                   child: Hero(
                     tag: 'album_art_${playerState.currentTrackName}',
                     child: Container(
-                      width: MediaQuery.of(context).size.width * 0.85,
-                      height: MediaQuery.of(context).size.width * 0.85,
+                      padding: const EdgeInsets.all(14),
                       decoration: BoxDecoration(
-                        borderRadius: BorderRadius.circular(20),
+                        borderRadius: BorderRadius.circular(36),
+                        border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
+                        color: Colors.white.withValues(alpha: 0.03),
                         boxShadow: [
                           BoxShadow(
-                            color: Colors.black.withValues(alpha: 0.5),
-                            blurRadius: 40,
-                            offset: const Offset(0, 20),
+                            color: Colors.black.withValues(alpha: 0.44),
+                            blurRadius: 48,
+                            offset: const Offset(0, 26),
                           )
                         ],
-                        image: DecorationImage(
-                          image: playerState.thumbnail != null 
-                             ? NetworkImage(playerState.thumbnail!) 
-                             : const AssetImage('assets/placeholder.png') as ImageProvider,
-                          fit: BoxFit.cover,
-                        ),
                       ),
-                      child: playerState.thumbnail == null 
-                         ? const Icon(Icons.audiotrack, size: 80, color: Colors.white24) : null,
+                      child: AppArtwork(
+                        thumbnail: playerState.thumbnail,
+                        videoId: playerState.videoId,
+                        width: MediaQuery.of(context).size.width * 0.8,
+                        height: MediaQuery.of(context).size.width * 0.8,
+                        radius: 28,
+                      ),
                     ),
                   ),
                 ),
@@ -1134,7 +1204,7 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
                       child: Container(
                         decoration: BoxDecoration(
                             shape: BoxShape.circle, 
-                            color: Colors.grey[800],
+                            color: _surfaceGreyAlt,
                         ),
                         padding: const EdgeInsets.all(20),
                         child: playerState.isDownloading 
@@ -1203,6 +1273,10 @@ class TrackDetailsScreen extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final details = ref.watch(trackDetailsProvider);
     final audioNotifier = ref.read(audioPlayerProvider.notifier);
+    final videoId = (track['id'] ?? track['videoId'])?.toString();
+    final downloadTask = videoId == null
+        ? null
+        : ref.watch(downloadTaskProvider(videoId));
 
     return Scaffold(
       backgroundColor: Colors.black,
@@ -1227,13 +1301,12 @@ class TrackDetailsScreen extends ConsumerWidget {
               child: Row(
                 crossAxisAlignment: CrossAxisAlignment.end,
                 children: [
-                  ClipRRect(
-                    borderRadius: BorderRadius.circular(8),
-                    child: track['thumbnail'] != null
-                        ? Image.network(track['thumbnail'],
-                            width: 140, height: 140, fit: BoxFit.cover)
-                        : Container(
-                            width: 140, height: 140, color: Colors.grey[800]),
+                  AppArtwork(
+                    thumbnail: track['thumbnail'],
+                    videoId: videoId,
+                    width: 140,
+                    height: 140,
+                    radius: 18,
                   ),
                   const SizedBox(width: 24),
                   Expanded(
@@ -1334,21 +1407,31 @@ class TrackDetailsScreen extends ConsumerWidget {
                   const SizedBox(width: 8),
                   IconButton(
                     iconSize: 36,
-                    icon: const Icon(Icons.download_for_offline,
-                        color: Colors.white70),
-                    onPressed: () async {
-                      final dir = await getApplicationDocumentsDirectory();
-                      final cleanName = (track['title'] ?? 'Unknown Track')
-                          .replaceAll(RegExp(r'[<>:"/\\|?*]'), '_');
-                      if (!context.mounted) return;
-                      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Downloading ${track['title']} in background...'), duration: const Duration(seconds: 2)));
-                      audioNotifier.downloadYoutubeBackground(
-                          track['id'] ?? track['videoId'], '${dir.path}/$cleanName.mp3', track['title'] ?? 'Unknown Track').then((_) {
-                        if (_) {
-                          ref.invalidate(libraryProvider);
-                        }
-                      });
-                    },
+                    icon: downloadTask?.phase == DownloadPhase.active
+                        ? SizedBox(
+                            width: 34,
+                            height: 34,
+                            child: CircularProgressIndicator(
+                              value: downloadTask!.progress > 0
+                                  ? downloadTask.progress
+                                  : null,
+                              strokeWidth: 2.2,
+                              color: _accentGrey,
+                            ),
+                          )
+                        : Icon(
+                            downloadTask?.phase == DownloadPhase.complete
+                                ? Icons.check_circle_outline
+                                : Icons.download_for_offline,
+                            color: Colors.white70,
+                          ),
+                    onPressed: videoId == null
+                        ? null
+                        : () {
+                            ref
+                                .read(downloadCenterProvider.notifier)
+                                .downloadTrack(track);
+                          },
                   ),
                 ],
               ),
@@ -1393,11 +1476,13 @@ class TrackDetailsScreen extends ConsumerWidget {
                     },
                     leading: ClipRRect(
                       borderRadius: BorderRadius.circular(4),
-                      child: st['thumbnail'] != null
-                          ? Image.network(st['thumbnail'],
-                              width: 48, height: 48, fit: BoxFit.cover)
-                          : Container(
-                              width: 48, height: 48, color: Colors.grey[800]),
+                      child: AppArtwork(
+                        thumbnail: st['thumbnail'],
+                        videoId: st['id']?.toString(),
+                        width: 48,
+                        height: 48,
+                        radius: 10,
+                      ),
                     ),
                     title: Text(st['title'] ?? '',
                         style: const TextStyle(color: Colors.white),

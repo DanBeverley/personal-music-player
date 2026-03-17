@@ -14,8 +14,6 @@ dependencies:
   path_provider: ^2.1.1
   http: ^1.6.0
   audio_service: ^0.18.18
-  audio_session: ^0.2.2
-  palette_generator: ^0.3.3+7
   google_fonts: ^8.0.2
   cached_network_image: ^3.4.1
   just_audio: ^0.10.5

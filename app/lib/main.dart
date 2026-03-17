@@ -224,9 +224,12 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     final dir = await getApplicationDocumentsDirectory();
     final cleanName = title.replaceAll(RegExp(r'[\\/:*?"<>|]'), '');
     final outPath = '${dir.path}/$cleanName.mp3';
-    ref
+    final success = await ref
         .read(audioPlayerProvider.notifier)
         .downloadAndLoadYoutube(videoId, outPath);
+    if (success) {
+      ref.invalidate(libraryProvider);
+    }
   }
 
   Future<void> _triggerStream(dynamic track) async {
@@ -622,12 +625,22 @@ class LibraryScreen extends ConsumerWidget {
                         child: InkWell(
                           borderRadius: BorderRadius.circular(16),
                           onTap: () {
-                            if (track['thumbnail'] != null) {
-                              ref.read(audioPlayerProvider.notifier).loadLocalWithMeta(path, track);
-                            } else {
-                              ref.read(audioPlayerProvider.notifier).loadLocalFile(path, name);
+                            final audioNotifier =
+                                ref.read(audioPlayerProvider.notifier);
+                            final loaded = track['thumbnail'] != null
+                                ? audioNotifier.loadLocalWithMeta(path, track)
+                                : audioNotifier.loadLocalFile(path, name);
+                            if (!loaded) {
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                const SnackBar(
+                                  content: Text(
+                                      'This downloaded track could not be loaded for playback.'),
+                                  duration: Duration(seconds: 2),
+                                ),
+                              );
+                              return;
                             }
-                            ref.read(audioPlayerProvider.notifier).play();
+                            audioNotifier.play();
                             Navigator.of(context).push(MaterialPageRoute(builder: (_) => const FullPlayerScreen()));
                           },
                           child: Padding(
@@ -724,7 +737,7 @@ class _PlaylistDetailScreenState extends ConsumerState<PlaylistDetailScreen> {
     if (q.isEmpty) return;
     setState(() => _isSearching = true);
     try {
-      final res = await http.post(Uri.parse('https://danbeverley-auralis-proxy.hf.space/search'), headers: {'Content-Type': 'application/json'}, body: jsonEncode({"query": q}));
+      final res = await http.post(Uri.parse('$proxyBaseUrl/search'), headers: {'Content-Type': 'application/json'}, body: jsonEncode({"query": q}));
       if (res.statusCode == 200) {
         setState(() => _searchResults = jsonDecode(res.body)['results'] ?? []);
       }
@@ -1329,9 +1342,12 @@ class TrackDetailsScreen extends ConsumerWidget {
                           .replaceAll(RegExp(r'[<>:"/\\|?*]'), '_');
                       if (!context.mounted) return;
                       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Downloading ${track['title']} in background...'), duration: const Duration(seconds: 2)));
-                      await audioNotifier.downloadYoutubeBackground(
-                          track['id'] ?? track['videoId'], '${dir.path}/$cleanName.mp3', track['title'] ?? 'Unknown Track');
-                      ref.invalidate(libraryProvider);
+                      audioNotifier.downloadYoutubeBackground(
+                          track['id'] ?? track['videoId'], '${dir.path}/$cleanName.mp3', track['title'] ?? 'Unknown Track').then((_) {
+                        if (_) {
+                          ref.invalidate(libraryProvider);
+                        }
+                      });
                     },
                   ),
                 ],

@@ -55,6 +55,30 @@ class DownloadRequest(BaseModel):
     video_id: str
     title: str = ""
 
+def get_stream_info(video_id: str):
+    ydl_opts = {
+        'format': 'bestaudio[ext=m4a]/bestaudio/best',
+        'quiet': True,
+        'no_warnings': True
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(
+            f"https://www.youtube.com/watch?v={video_id}",
+            download=False
+        )
+
+    headers = {}
+    for key, value in (info.get("http_headers") or {}).items():
+        if key and value:
+            headers[str(key)] = str(value)
+
+    return {
+        "url": info["url"],
+        "headers": headers,
+        "mime_type": info.get("ext") or info.get("acodec") or "audio/mp4",
+        "duration": info.get("duration") or 0,
+    }
+
 @app.get("/")
 def health_check():
     return {"status": "Auralis Python Proxy is running"}
@@ -359,15 +383,12 @@ def stream_audio(video_id: str):
 
 @app.get("/proxy_stream/{video_id}")
 def proxy_stream(video_id: str, request: Request):
-    ydl_opts = {'format': 'bestaudio/best', 'quiet': True, 'no_warnings': True}
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-            url = info['url']
-        headers = {}
+        stream_info = get_stream_info(video_id)
+        headers = dict(stream_info["headers"])
         if "range" in request.headers:
             headers["range"] = request.headers["range"]
-        req = requests.get(url, headers=headers, stream=True)
+        req = requests.get(stream_info["url"], headers=headers, stream=True, timeout=30)
         resp_headers = {}
         for k, v in req.headers.items():
             if k.lower() in ['content-type', 'content-length', 'content-range', 'accept-ranges']:
@@ -376,20 +397,24 @@ def proxy_stream(video_id: str, request: Request):
             req.iter_content(chunk_size=1024*64), 
             status_code=req.status_code, 
             headers=resp_headers,
-            media_type=req.headers.get("content-type", "audio/webm")
+            media_type=req.headers.get("content-type", "audio/mp4")
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/direct_url/{video_id}")
 def direct_stream_url(video_id: str):
-    ydl_opts = {'format': 'bestaudio/best', 'quiet': True, 'no_warnings': True}
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        try:
-            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-            return {"status": "success", "url": info['url']}
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+    try:
+        stream_info = get_stream_info(video_id)
+        return {
+            "status": "success",
+            "url": stream_info["url"],
+            "headers": stream_info["headers"],
+            "mime_type": stream_info["mime_type"],
+            "duration": stream_info["duration"],
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn

@@ -12,6 +12,8 @@ import 'package:audio_service/audio_service.dart';
 import 'package:just_audio/just_audio.dart';
 
 late AudioHandler globalAudioHandler;
+const String proxyBaseUrl =
+    String.fromEnvironment('AURALIS_PROXY_URL', defaultValue: 'http://34.172.70.149');
 
 Future<void> initAudioService() async {
   globalAudioHandler = await AudioService.init(
@@ -53,6 +55,16 @@ int _parseInt(dynamic value) {
   if (value is num) return value.toInt();
   if (value is String) return int.tryParse(value) ?? 0;
   return 0;
+}
+
+Map<String, String> _parseHeaders(dynamic value) {
+  if (value is! Map) return const {};
+  final headers = <String, String>{};
+  value.forEach((key, dynamic entryValue) {
+    if (key == null || entryValue == null) return;
+    headers[key.toString()] = entryValue.toString();
+  });
+  return headers;
 }
 
 class HistoryManager {
@@ -232,12 +244,57 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     super.dispose();
   }
 
-  void loadLocalFile(String path, String trackName) {
+  Uri _proxyUri(String path) => Uri.parse('$proxyBaseUrl$path');
+
+  bool _hasValidDownloadedAudio(String path) {
+    try {
+      final file = File(path);
+      return file.existsSync() && file.lengthSync() >= 10000;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  bool _loadNativeFile(String path) {
+    final pathPtr = path.toNativeUtf8();
+    final loaded = audioEngine.loadFile(pathPtr);
+    malloc.free(pathPtr);
+    return loaded;
+  }
+
+  bool loadLocalFile(String path, String trackName) {
     _activeStream = false;
     streamPlayer.stop();
-    final pathPtr = path.toNativeUtf8();
-    audioEngine.loadFile(pathPtr);
-    malloc.free(pathPtr);
+
+    if (!_hasValidDownloadedAudio(path)) {
+      state = state.copyWith(
+        isPlaying: false,
+        isDownloading: false,
+        currentTrackName: 'Playback failed: downloaded file is invalid',
+        thumbnail: null,
+        artist: null,
+        videoId: null,
+        duration: 0,
+        currentPosition: 0,
+      );
+      return false;
+    }
+
+    final loaded = _loadNativeFile(path);
+    if (!loaded) {
+      state = state.copyWith(
+        isPlaying: false,
+        isDownloading: false,
+        currentTrackName: 'Playback failed: audio engine could not load file',
+        thumbnail: null,
+        artist: null,
+        videoId: null,
+        duration: 0,
+        currentPosition: 0,
+      );
+      return false;
+    }
+
     state = state.copyWith(
       isPlaying: false,
       currentTrackName: trackName,
@@ -247,14 +304,42 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       duration: 0,
       currentPosition: 0,
     );
+    return true;
   }
 
-  void loadLocalWithMeta(String path, Map<String, dynamic> meta) {
+  bool loadLocalWithMeta(String path, Map<String, dynamic> meta) {
     _activeStream = false;
     streamPlayer.stop();
-    final pathPtr = path.toNativeUtf8();
-    audioEngine.loadFile(pathPtr);
-    malloc.free(pathPtr);
+
+    if (!_hasValidDownloadedAudio(path)) {
+      state = state.copyWith(
+        isPlaying: false,
+        isDownloading: false,
+        currentTrackName: 'Playback failed: downloaded file is invalid',
+        thumbnail: meta['thumbnail'],
+        artist: meta['author'] ?? meta['artist'],
+        videoId: meta['video_id'] ?? meta['id'],
+        duration: _parseInt(meta['duration']),
+        currentPosition: 0,
+      );
+      return false;
+    }
+
+    final loaded = _loadNativeFile(path);
+    if (!loaded) {
+      state = state.copyWith(
+        isPlaying: false,
+        isDownloading: false,
+        currentTrackName: 'Playback failed: audio engine could not load file',
+        thumbnail: meta['thumbnail'],
+        artist: meta['author'] ?? meta['artist'],
+        videoId: meta['video_id'] ?? meta['id'],
+        duration: _parseInt(meta['duration']),
+        currentPosition: 0,
+      );
+      return false;
+    }
+
     state = state.copyWith(
       isPlaying: false,
       currentTrackName: meta['title'] ?? 'Unknown Track',
@@ -265,10 +350,11 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       videoId: meta['video_id'] ?? meta['id'],
       currentPosition: 0,
     );
-    HistoryManager.addHistory(meta['video_id']);
+    HistoryManager.addHistory(meta['video_id'] ?? meta['id']);
+    return true;
   }
 
-  void downloadAndLoadYoutube(String videoId, String outPath) async {
+  Future<bool> downloadAndLoadYoutube(String videoId, String outPath) async {
     state = state.copyWith(
         isDownloading: true,
         currentTrackName: 'Initializing Proxy Connection...',
@@ -281,9 +367,8 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
 
     try {
       // 1. Ask the Proxy Server to fetch the Video and extract metadata
-      const proxyUrl = 'https://danbeverley-auralis-proxy.hf.space';
       final titleStr = outPath.split('/').last.replaceAll('.mp3', '');
-      final res = await http.post(Uri.parse('$proxyUrl/download'),
+      final res = await http.post(_proxyUri('/download'),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({"video_id": videoId, "title": titleStr}));
 
@@ -303,8 +388,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       HistoryManager.addHistory(videoId);
 
       // 2. Stream the byte data back from the proxy to the local flutter device
-      // print("Streaming bytes from proxy into $outPath...");
-      final req = http.Request('GET', Uri.parse('$proxyUrl/stream/$videoId'));
+      final req = http.Request('GET', _proxyUri('/stream/$videoId'));
       final streamRes = await http.Client().send(req);
 
       if (streamRes.statusCode != 200) {
@@ -313,24 +397,27 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
 
       final file = File(outPath);
       final sink = file.openWrite();
-      
+
       await for (var chunk in streamRes.stream) {
         sink.add(chunk);
       }
       await sink.close();
 
-      loadLocalWithMeta(outPath, meta);
+      if (!_hasValidDownloadedAudio(outPath)) {
+        throw Exception('Downloaded file is empty or corrupted');
+      }
+
+      final jsonPath = outPath.replaceAll('.mp3', '.json');
+      await File(jsonPath).writeAsString(jsonEncode(meta));
+
+      final loaded = loadLocalWithMeta(outPath, meta);
+      if (!loaded) {
+        throw Exception('Downloaded file saved, but the player could not load it');
+      }
       state = state.copyWith(isDownloading: false);
       play();
-
-      try {
-        final jsonPath = outPath.replaceAll('.mp3', '.json');
-        await File(jsonPath).writeAsString(jsonEncode(meta));
-      } catch (e) {
-        // Ignore json save errors
-      }
+      return true;
     } catch (e) {
-      // print("Proxy Download Failed: $e");
       state = state.copyWith(
           isDownloading: false, currentTrackName: 'Download failed: $e');
 
@@ -340,13 +427,14 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         final jf = File(outPath.replaceAll('.mp3', '.json'));
         if (jf.existsSync()) jf.deleteSync();
       } catch (_) {}
+      return false;
     }
   }
 
-  Future<void> downloadYoutubeBackground(String videoId, String outPath, String titleStr) async {
+  Future<bool> downloadYoutubeBackground(
+      String videoId, String outPath, String titleStr) async {
     try {
-      const proxyUrl = 'https://danbeverley-auralis-proxy.hf.space';
-      final res = await http.post(Uri.parse('$proxyUrl/download'),
+      final res = await http.post(_proxyUri('/download'),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({"video_id": videoId, "title": titleStr}));
 
@@ -357,7 +445,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       final meta = jsonDecode(res.body);
       HistoryManager.addHistory(videoId);
 
-      final req = http.Request('GET', Uri.parse('$proxyUrl/stream/$videoId'));
+      final req = http.Request('GET', _proxyUri('/stream/$videoId'));
       final streamRes = await http.Client().send(req);
 
       if (streamRes.statusCode != 200) {
@@ -372,12 +460,13 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       }
       await sink.close();
 
-      try {
-        final jsonPath = outPath.replaceAll('.mp3', '.json');
-        await File(jsonPath).writeAsString(jsonEncode(meta));
-      } catch (e) {
-        // Ignored
+      if (!_hasValidDownloadedAudio(outPath)) {
+        throw Exception('Downloaded file is empty or corrupted');
       }
+
+      final jsonPath = outPath.replaceAll('.mp3', '.json');
+      await File(jsonPath).writeAsString(jsonEncode(meta));
+      return true;
     } catch (e) {
       try {
         final f = File(outPath);
@@ -385,6 +474,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         final jf = File(outPath.replaceAll('.mp3', '.json'));
         if (jf.existsSync()) jf.deleteSync();
       } catch (_) {}
+      return false;
     }
   }
 
@@ -403,28 +493,49 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         currentPosition: 0);
 
     try {
-      const proxyUrl = 'https://danbeverley-auralis-proxy.hf.space';
-      final res = await http.get(Uri.parse('$proxyUrl/direct_url/$videoId')).timeout(const Duration(seconds: 15));
+      final res = await http
+          .get(_proxyUri('/direct_url/$videoId'))
+          .timeout(const Duration(seconds: 15));
+
+      if (res.statusCode != 200) {
+        throw Exception('Direct stream lookup failed: ${res.statusCode}');
+      }
+
+      final data = jsonDecode(res.body) as Map<String, dynamic>;
+      final directUrl = data['url']?.toString();
+      if (directUrl == null || directUrl.isEmpty) {
+        throw Exception('Proxy returned an empty stream URL');
+      }
+
+      final headers = _parseHeaders(data['headers']);
+      await streamPlayer.setUrl(directUrl, headers: headers.isEmpty ? null : headers);
+      final dur = streamPlayer.duration?.inSeconds ?? _parseInt(fallbackMeta['duration']);
       
-      if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
-        final directUrl = data['url'];
-        
-        await streamPlayer.setUrl(directUrl);
+      state = state.copyWith(
+          currentTrackName: fallbackMeta['title'],
+          duration: dur > 0 ? dur : _parseInt(fallbackMeta['duration']),
+          isDownloading: false);
+          
+      HistoryManager.addHistory(videoId);
+      play();
+    } catch (e) {
+      try {
+        final fallbackUrl = '$proxyBaseUrl/proxy_stream/$videoId';
+        await streamPlayer.setUrl(fallbackUrl);
         final dur = streamPlayer.duration?.inSeconds ?? _parseInt(fallbackMeta['duration']);
-        
+
         state = state.copyWith(
             currentTrackName: fallbackMeta['title'],
             duration: dur > 0 ? dur : _parseInt(fallbackMeta['duration']),
             isDownloading: false);
-            
+
         HistoryManager.addHistory(videoId);
         play();
-      } else {
-        throw Exception("Stream Error: ${res.statusCode}");
+      } catch (fallbackError) {
+        state = state.copyWith(
+            isDownloading: false,
+            currentTrackName: 'Stream failed: $fallbackError');
       }
-    } catch (e) {
-      state = state.copyWith(isDownloading: false, currentTrackName: 'Stream failed: $e');
     }
   }
 
@@ -508,7 +619,7 @@ class SearchNotifier extends StateNotifier<List<dynamic>> {
     state = [];
     try {
       final res = await http
-          .post(Uri.parse('https://danbeverley-auralis-proxy.hf.space/search'),
+          .post(Uri.parse('$proxyBaseUrl/search'),
               headers: {'Content-Type': 'application/json'},
               body: jsonEncode({"query": query, "limit": 10}))
           .timeout(const Duration(seconds: 10));
@@ -542,7 +653,7 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
           ? {"query": "", "limit": 15, "seed_id": seedId}
           : {"query": "Trending Hit Songs", "limit": 15};
       final res = await http
-          .post(Uri.parse('https://danbeverley-auralis-proxy.hf.space/recommend'),
+          .post(Uri.parse('$proxyBaseUrl/recommend'),
               headers: {'Content-Type': 'application/json'},
               body: jsonEncode(body))
           .timeout(const Duration(seconds: 10));
@@ -561,7 +672,7 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
     if (isPaginating) return;
     isPaginating = true;
     try {
-      final res = await http.post(Uri.parse('https://danbeverley-auralis-proxy.hf.space/recommend'),
+      final res = await http.post(Uri.parse('$proxyBaseUrl/recommend'),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({"query": "", "limit": 10, "seed_id": seedId}));
       if (res.statusCode == 200) {
@@ -599,7 +710,7 @@ class SuggestNotifier extends StateNotifier<List<String>> {
     }
     try {
       final res = await http
-          .post(Uri.parse('https://danbeverley-auralis-proxy.hf.space/suggest'),
+          .post(Uri.parse('$proxyBaseUrl/suggest'),
               headers: {'Content-Type': 'application/json'},
               body: jsonEncode({"query": query, "limit": 5}))
           .timeout(const Duration(seconds: 10));
@@ -626,7 +737,7 @@ class TrackDetailsNotifier extends StateNotifier<Map<String, dynamic>?> {
     state = null; // show loading
     try {
       final res = await http.post(
-          Uri.parse('https://danbeverley-auralis-proxy.hf.space/track_details'),
+          Uri.parse('$proxyBaseUrl/track_details'),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({"video_id": videoId}));
       if (res.statusCode == 200) {

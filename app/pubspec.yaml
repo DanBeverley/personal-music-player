@@ -17,11 +17,22 @@ dependencies:
   google_fonts: ^8.0.2
   cached_network_image: ^3.4.1
   just_audio: ^0.10.5
+  image_picker: ^1.1.2
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^3.0.0
+  flutter_launcher_icons: ^0.14.3
 
 flutter:
   uses-material-design: true
+  assets:
+    - assets/branding/ebb_app_icon.png
+    - assets/branding/ebb_intro_mark.png
+    - assets/branding/ebb_intro_icon.png
+
+flutter_launcher_icons:
+  android: true
+  ios: true
+  image_path: assets/branding/ebb_app_icon.png

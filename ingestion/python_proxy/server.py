@@ -1,4 +1,4 @@
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from threading import Lock
 from typing import List
 
@@ -38,6 +38,97 @@ def extract_artist(data):
     uploader = data.get("uploader")
     return uploader if uploader else "Unknown Artist"
 
+def extract_album_info(data):
+    if not data:
+        return None
+
+    album = data.get("album")
+    if isinstance(album, dict):
+        title = album.get("name") or album.get("title")
+        album_id = album.get("id") or album.get("browseId")
+        if title:
+            return {"id": album_id, "title": title}
+    elif isinstance(album, str) and album.strip():
+        return {"id": None, "title": album.strip()}
+
+    albums = data.get("albums")
+    if isinstance(albums, list) and albums:
+        first = albums[0]
+        if isinstance(first, dict):
+            title = first.get("name") or first.get("title")
+            album_id = first.get("id") or first.get("browseId")
+            if title:
+                return {"id": album_id, "title": title}
+        elif isinstance(first, str) and first.strip():
+            return {"id": None, "title": first.strip()}
+    return None
+
+def normalize_album_results(raw_results):
+    albums = []
+    seen = set()
+    for entry in raw_results or []:
+        result_type = (entry.get("resultType") or entry.get("type") or "").lower()
+        browse_id = entry.get("browseId") or entry.get("id")
+        if result_type and result_type != "album":
+            continue
+        if not browse_id or browse_id in seen:
+            continue
+        seen.add(browse_id)
+        albums.append({
+            "id": browse_id,
+            "title": entry.get("title"),
+            "artist": extract_artist(entry),
+            "thumbnail": extract_thumbnail(entry),
+            "year": entry.get("year") or "",
+            "track_count": entry.get("trackCount") or entry.get("track_count") or 0,
+        })
+    return albums
+
+def lookup_album_for_song(video_id: str, title: str, artist: str):
+    candidates = []
+    try:
+        raw_results = ytmusic.search(f"{title} {artist}".strip(), filter="songs", limit=6)
+    except Exception:
+        raw_results = []
+
+    for entry in raw_results:
+        album_info = extract_album_info(entry)
+        if not album_info or not album_info.get("title"):
+            continue
+        score = 0
+        if entry.get("videoId") == video_id:
+            score += 4
+        if title and entry.get("title", "").strip().lower() == title.strip().lower():
+            score += 2
+        entry_artist = extract_artist(entry)
+        if artist and entry_artist and artist.strip().lower() in entry_artist.strip().lower():
+            score += 2
+        if album_info.get("id"):
+            score += 1
+        candidates.append((score, album_info))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+def parse_duration_seconds(value):
+    if value is None:
+        return 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if text.isdigit():
+            return int(text)
+        parts = [int(part) for part in text.split(":") if part.isdigit()]
+        if len(parts) == 2:
+            return parts[0] * 60 + parts[1]
+        if len(parts) == 3:
+            return parts[0] * 3600 + parts[1] * 60 + parts[2]
+    return 0
+
 app = FastAPI(title="Auralis Proxy & Recommendation Engine")
 
 # Allow Flutter emulator to connect
@@ -56,6 +147,7 @@ STREAM_INFO_TTL_SECONDS = 1800
 stream_info_cache = {}
 stream_info_inflight = {}
 stream_info_lock = Lock()
+stream_warm_executor = ThreadPoolExecutor(max_workers=6)
 
 class SearchRequest(BaseModel):
     query: str
@@ -127,6 +219,22 @@ def get_stream_info(video_id: str):
             if stream_info_inflight.get(video_id) is pending:
                 stream_info_inflight.pop(video_id, None)
 
+def _warm_stream_safely(video_id: str):
+    try:
+        get_stream_info(video_id)
+    except Exception:
+        return
+
+def queue_stream_warmup(video_ids: List[str], limit: int = 10):
+    seen = set()
+    for video_id in video_ids:
+        if not video_id or video_id in seen:
+            continue
+        seen.add(video_id)
+        stream_warm_executor.submit(_warm_stream_safely, video_id)
+        if len(seen) >= limit:
+            break
+
 @app.get("/")
 def health_check():
     return {"status": "Auralis Python Proxy is running"}
@@ -138,7 +246,8 @@ def get_track_details(req: DownloadRequest):
         
         release_date = ""
         artist = ""
-        album = ""
+        album_title = ""
+        album_id = None
         
         try:
             song = ytmusic.get_song(video_id)
@@ -146,10 +255,23 @@ def get_track_details(req: DownloadRequest):
                 release_date = song["microformat"]["microformatDataRenderer"].get("publishDate", "")
             vd = song.get("videoDetails", {})
             artist = vd.get("author", "")
+            song_album = extract_album_info(song) or extract_album_info(vd)
+            if song_album:
+                album_title = song_album.get("title") or ""
+                album_id = song_album.get("id")
         except Exception:
             pass
             
         watch = ytmusic.get_watch_playlist(videoId=video_id)
+        video_details = watch.get("videoDetails", {})
+        track_title = video_details.get("title") or ""
+        if not artist:
+            artist = extract_artist(video_details)
+        if not album_title:
+            looked_up_album = lookup_album_for_song(video_id, track_title, artist)
+            if looked_up_album:
+                album_title = looked_up_album.get("title") or ""
+                album_id = looked_up_album.get("id")
         
         similar_tracks = []
         for track in watch.get("tracks", []):
@@ -160,19 +282,87 @@ def get_track_details(req: DownloadRequest):
                 "title": track.get("title"),
                 "duration": track.get("length") or track.get("duration_seconds") or 0,
                 "thumbnail": extract_thumbnail(track),
-                "channel": extract_artist(track)
+                "channel": extract_artist(track),
+                "album": (extract_album_info(track) or {}).get("title"),
+                "album_id": (extract_album_info(track) or {}).get("id"),
             })
+        queue_stream_warmup([video_id, *[track["id"] for track in similar_tracks]])
 
         return {
             "status": "success",
             "video_id": video_id,
-            "title": watch.get("videoDetails", {}).get("title"),
+            "title": track_title,
             "author": artist,
-            "thumbnail": extract_thumbnail(watch.get("videoDetails", {})),
-            "duration": watch.get("videoDetails", {}).get("lengthSeconds"),
+            "thumbnail": extract_thumbnail(video_details),
+            "duration": video_details.get("lengthSeconds"),
             "release_date": release_date,
-            "album": album, # ytmusic.get_song doesn't easily provide album, leaving blank for now
+            "album": album_title,
+            "album_title": album_title,
+            "album_id": album_id,
+            "lyrics_available": bool(watch.get("lyrics")),
             "similar_tracks": similar_tracks
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/lyrics/{video_id}")
+def get_track_lyrics(video_id: str):
+    try:
+        watch = ytmusic.get_watch_playlist(videoId=video_id)
+        lyrics_browse_id = watch.get("lyrics")
+        if not lyrics_browse_id:
+            return {
+                "status": "success",
+                "video_id": video_id,
+                "has_lyrics": False,
+                "has_timestamps": False,
+                "source": None,
+                "lines": [],
+            }
+
+        lyrics_payload = ytmusic.get_lyrics(lyrics_browse_id, timestamps=True)
+        if not lyrics_payload:
+            return {
+                "status": "success",
+                "video_id": video_id,
+                "has_lyrics": False,
+                "has_timestamps": False,
+                "source": None,
+                "lines": [],
+            }
+
+        lines = []
+        if lyrics_payload.get("hasTimestamps"):
+            for index, line in enumerate(lyrics_payload.get("lyrics", [])):
+                text = getattr(line, "text", "").strip()
+                if not text:
+                    continue
+                lines.append({
+                    "index": index,
+                    "text": text,
+                    "start_time_ms": getattr(line, "start_time", None),
+                    "end_time_ms": getattr(line, "end_time", None),
+                })
+        else:
+            raw_text = (lyrics_payload.get("lyrics") or "").splitlines()
+            for index, line in enumerate(raw_text):
+                text = line.strip()
+                if not text:
+                    continue
+                lines.append({
+                    "index": index,
+                    "text": text,
+                    "start_time_ms": None,
+                    "end_time_ms": None,
+                })
+
+        return {
+            "status": "success",
+            "video_id": video_id,
+            "has_lyrics": bool(lines),
+            "has_timestamps": bool(lyrics_payload.get("hasTimestamps")),
+            "source": lyrics_payload.get("source"),
+            "lines": lines,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -197,20 +387,78 @@ def search_youtube(req: SearchRequest):
                     "thumbnail": extract_thumbnail(vd),
                     "channel": extract_artist(vd)
                 })
+                queue_stream_warmup([video_id], limit=1)
                 return {"status": "success", "results": results}
             except Exception:
                 pass # Fallback to normal search if extraction fails
 
         raw_results = ytmusic.search(query, filter="songs", limit=req.limit)
         for entry in raw_results:
+            album_info = extract_album_info(entry) or {}
             results.append({
                 "id": entry.get("videoId"),
                 "title": entry.get("title"),
                 "duration": entry.get("duration_seconds") or 0,
                 "thumbnail": extract_thumbnail(entry),
-                "channel": extract_artist(entry)
+                "channel": extract_artist(entry),
+                "album": album_info.get("title"),
+                "album_id": album_info.get("id"),
             })
+        queue_stream_warmup([entry.get("id") or entry.get("videoId") for entry in results])
         return {"status": "success", "results": results}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/search_albums")
+def search_albums(req: SearchRequest):
+    try:
+        raw_results = ytmusic.search(req.query, filter="albums", limit=req.limit)
+        albums = normalize_album_results(raw_results)
+        if not albums:
+            fallback_results = ytmusic.search(req.query, limit=max(req.limit * 3, 12))
+            albums = normalize_album_results(fallback_results)
+        return {"status": "success", "albums": albums}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/album/{album_id}")
+def get_album_details(album_id: str):
+    try:
+        album = ytmusic.get_album(album_id)
+        album_thumbnail = extract_thumbnail(album)
+        album_artist = extract_artist(album)
+        tracks = []
+
+        for entry in album.get("tracks", []):
+            video_id = entry.get("videoId")
+            if not video_id:
+                continue
+            tracks.append({
+                "id": video_id,
+                "title": entry.get("title"),
+                "duration": parse_duration_seconds(
+                    entry.get("duration_seconds")
+                    or entry.get("duration")
+                    or entry.get("length")
+                ),
+                "thumbnail": extract_thumbnail(entry) or album_thumbnail,
+                "channel": extract_artist(entry) or album_artist,
+                "album": album.get("title"),
+                "album_title": album.get("title"),
+                "album_id": album_id,
+            })
+
+        queue_stream_warmup([track["id"] for track in tracks], limit=8)
+        return {
+            "status": "success",
+            "id": album_id,
+            "title": album.get("title"),
+            "artist": album_artist,
+            "thumbnail": album_thumbnail,
+            "year": album.get("year") or "",
+            "track_count": len(tracks),
+            "tracks": tracks,
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -249,6 +497,7 @@ def get_recommendations(req: SearchRequest):
                 })
                 if len(results) >= req.limit:
                     break
+            queue_stream_warmup([track.get("id") for track in results])
             return {"status": "success", "recommendations": results}
             
         try:
@@ -286,6 +535,7 @@ def get_recommendations(req: SearchRequest):
                     "channel": ", ".join([a.get("name", "") for a in entry.get("artists", [])])
                 })
 
+        queue_stream_warmup([track.get("id") for track in results])
         return {"status": "success", "recommendations": results}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -293,13 +543,21 @@ def get_recommendations(req: SearchRequest):
 @app.post("/warm_streams")
 def warm_streams(req: WarmStreamRequest):
     warmed = {}
-    for video_id in req.video_ids[:6]:
-        if not video_id:
-            continue
-        try:
-            warmed[video_id] = get_stream_info(video_id)
-        except Exception:
-            continue
+    video_ids = [video_id for video_id in req.video_ids[:10] if video_id]
+    if not video_ids:
+        return {"status": "success", "streams": warmed}
+
+    max_workers = min(6, len(video_ids))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {
+            executor.submit(get_stream_info, video_id): video_id
+            for video_id in video_ids
+        }
+        for future, video_id in future_map.items():
+            try:
+                warmed[video_id] = future.result(timeout=25)
+            except Exception:
+                continue
     return {"status": "success", "streams": warmed}
 
 @app.post("/download")
@@ -404,34 +662,6 @@ def download_audio(req: DownloadRequest):
             pass
         return meta
 
-@app.post("/track_details")
-def get_track_details(req: DownloadRequest):
-    try:
-        watch = ytmusic.get_watch_playlist(videoId=req.video_id)
-        if not watch or "tracks" not in watch or len(watch["tracks"]) == 0:
-            return {"artist": "Unknown", "release_date": "", "similar_tracks": []}
-            
-        main_track = watch["tracks"][0]
-        artist = ", ".join([a.get("name", "") for a in main_track.get("artists", [])]) if main_track.get("artists") else "Unknown"
-        
-        similar_tracks = []
-        for t in watch["tracks"][1:20]: # limit to 20 similar tracks
-            if "videoId" in t and t["videoId"]:
-                similar_tracks.append({
-                    "id": t["videoId"],
-                    "title": t.get("title", ""),
-                    "artist": ", ".join([a.get("name", "") for a in t.get("artists", [])]) if t.get("artists") else "",
-                    "thumbnail": (t.get("thumbnails") or t.get("thumbnail") or [{}])[-1].get("url") if (t.get("thumbnails") or t.get("thumbnail")) else None
-                })
-                
-        return {
-            "artist": artist,
-            "release_date": "", 
-            "similar_tracks": similar_tracks
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
 @app.get("/stream/{video_id}")
 def stream_audio(video_id: str):
     file_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.mp3")
@@ -478,6 +708,6 @@ def direct_stream_url(video_id: str):
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8010))
+    port = int(os.environ.get("PORT", 8000))
     print(f"Starting Auralis Proxy Server on port {port}...")
     uvicorn.run(app, host="0.0.0.0", port=port)

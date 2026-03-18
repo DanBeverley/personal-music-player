@@ -660,7 +660,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         continue;
       }
       idsToWarm.add(videoId);
-      if (idsToWarm.length >= 12) {
+      if (idsToWarm.length >= 18) {
         break;
       }
     }
@@ -693,7 +693,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         }
       });
     } catch (_) {
-      for (final id in idsToWarm.take(2)) {
+      for (final id in idsToWarm.take(4)) {
         unawaited(prewarmStream(id));
       }
     }

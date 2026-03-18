@@ -143,11 +143,11 @@ app.add_middleware(
 DOWNLOAD_DIR = os.path.join(os.getcwd(), "downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 ytmusic = YTMusic()
-STREAM_INFO_TTL_SECONDS = 1800
+STREAM_INFO_TTL_SECONDS = 21600
 stream_info_cache = {}
 stream_info_inflight = {}
 stream_info_lock = Lock()
-stream_warm_executor = ThreadPoolExecutor(max_workers=6)
+stream_warm_executor = ThreadPoolExecutor(max_workers=10)
 
 class SearchRequest(BaseModel):
     query: str
@@ -225,7 +225,7 @@ def _warm_stream_safely(video_id: str):
     except Exception:
         return
 
-def queue_stream_warmup(video_ids: List[str], limit: int = 10):
+def queue_stream_warmup(video_ids: List[str], limit: int = 18):
     seen = set()
     for video_id in video_ids:
         if not video_id or video_id in seen:
@@ -543,11 +543,11 @@ def get_recommendations(req: SearchRequest):
 @app.post("/warm_streams")
 def warm_streams(req: WarmStreamRequest):
     warmed = {}
-    video_ids = [video_id for video_id in req.video_ids[:10] if video_id]
+    video_ids = [video_id for video_id in req.video_ids[:18] if video_id]
     if not video_ids:
         return {"status": "success", "streams": warmed}
 
-    max_workers = min(6, len(video_ids))
+    max_workers = min(10, len(video_ids))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_map = {
             executor.submit(get_stream_info, video_id): video_id

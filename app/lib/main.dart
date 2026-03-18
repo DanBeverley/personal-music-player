@@ -2,6 +2,7 @@ import 'dart:io';
 import 'dart:ui';
 import 'dart:convert';
 import 'dart:async';
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -26,6 +27,27 @@ const List<Color> _playlistCoverPalette = <Color>[
   Color(0xFF5B4D4A),
   Color(0xFF46515C),
   Color(0xFF5C5664),
+];
+const List<String> _quipOpeners = <String>[
+  'Today\'s sonic forecast',
+  'Current music goblin memo',
+  'Breaking genre news',
+  'The headphone council reports',
+  'Fresh dispatch from the aux cord tribunal',
+];
+const List<String> _quipMiddles = <String>[
+  'your queue is one impulsive click away from becoming a legal issue',
+  'someone out there is still defending their 47-minute bagpipe ambient cut',
+  'the algorithm briefly achieved sentience and immediately asked for one more chorus',
+  'your taste is giving “I know a shortcut” right before getting lost in a concept album',
+  'a bassline just kicked the door open and demanded better transitions',
+];
+const List<String> _quipClosers = <String>[
+  'Proceed with swagger.',
+  'Use responsibly near the skip button.',
+  'No moderators were consulted.',
+  'Respectfully: play it too loud.',
+  'The aux has never been safer.',
 ];
 
 void showGlassDialog({required BuildContext context, required String title, required Widget content, required List<Widget> actions}) {
@@ -917,10 +939,12 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   Timer? _suggestDebounce;
   final Set<String> _prewarmedTrackIds = <String>{};
   String _lastPrimeSignature = '';
+  late final String _heroQuip;
 
   @override
   void initState() {
     super.initState();
+    _heroQuip = _buildHeroQuip();
     _urlController.addListener(() {
       final text = _urlController.text.trim();
       if (text.isNotEmpty && !_isSearching) {
@@ -986,9 +1010,19 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   bool get hasActiveSearch =>
       _isSearching || _urlController.text.trim().isNotEmpty;
 
+  String _buildHeroQuip() {
+    final seed = DateTime.now().microsecondsSinceEpoch ^
+        (_urlController.hashCode << 3) ^
+        DateTime.now().second;
+    final rng = math.Random(seed);
+    return '${_quipOpeners[rng.nextInt(_quipOpeners.length)]}: '
+        '${_quipMiddles[rng.nextInt(_quipMiddles.length)]}. '
+        '${_quipClosers[rng.nextInt(_quipClosers.length)]}';
+  }
+
   void _primeLikelyTracks(List<dynamic> tracks) {
     final idsToWarm = <String>[];
-    for (final track in tracks.take(10)) {
+    for (final track in tracks.take(16)) {
       final id = (track['id'] ?? track['videoId'])?.toString();
       if (id == null || id.isEmpty) continue;
       if (_prewarmedTrackIds.add(id)) {
@@ -1392,6 +1426,49 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                 color: Colors.white.withValues(alpha: 0.62),
                 fontSize: 14,
                 fontWeight: FontWeight.w500,
+              ),
+            ),
+            const SizedBox(height: 16),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+              decoration: BoxDecoration(
+                color: Colors.white.withValues(alpha: 0.03),
+                borderRadius: BorderRadius.circular(20),
+                border: Border.all(
+                  color: Colors.white.withValues(alpha: 0.06),
+                ),
+              ),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Container(
+                    margin: const EdgeInsets.only(top: 2),
+                    width: 28,
+                    height: 28,
+                    decoration: BoxDecoration(
+                      color: Colors.white.withValues(alpha: 0.06),
+                      borderRadius: BorderRadius.circular(999),
+                    ),
+                    child: Icon(
+                      Icons.graphic_eq_rounded,
+                      size: 16,
+                      color: Colors.white.withValues(alpha: 0.74),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      _heroQuip,
+                      style: TextStyle(
+                        color: Colors.white.withValues(alpha: 0.72),
+                        fontSize: 13,
+                        fontWeight: FontWeight.w500,
+                        height: 1.45,
+                      ),
+                    ),
+                  ),
+                ],
               ),
             ),
             const SizedBox(height: 28),
@@ -2097,8 +2174,9 @@ class FullPlayerScreen extends ConsumerStatefulWidget {
 }
 
 class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
-  static const double _queueCollapsedSize = 0.078;
-  static const double _queueExpandedSize = 0.84;
+  static const double _queueInitialSize = 0.72;
+  static const double _queueMinSize = 0.44;
+  static const double _queueExpandedSize = 0.92;
 
   double? _dragValue;
   late final PageController _pageController;
@@ -2109,6 +2187,7 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
   Timer? _queueSearchDebounce;
   List<Map<String, dynamic>> _queueSearchResults = const [];
   bool _isQueueSearchLoading = false;
+  bool _isQueueSheetOpen = false;
   int _queueSearchRequestVersion = 0;
   String? _lastLyricsVideoId;
   int _activePage = 0;
@@ -2137,7 +2216,7 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
   void _openLyricsPanel() {
     if (!_pageController.hasClients) return;
     _lastSyncedLyricIndex = -1;
-    _closeQueueSheet();
+    _dismissQueueSheetIfOpen();
     _pageController.nextPage(
       duration: const Duration(milliseconds: 340),
       curve: Curves.easeOutCubic,
@@ -2152,21 +2231,52 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
     );
   }
 
-  void _openQueueSheet() {
-    if (!_queueSheetController.isAttached) return;
-    _queueSheetController.animateTo(
-      _queueExpandedSize,
-      duration: const Duration(milliseconds: 340),
-      curve: Curves.easeOutCubic,
-    );
+  void _dismissQueueSheetIfOpen() {
+    if (!_isQueueSheetOpen) return;
+    Navigator.of(context).maybePop();
   }
 
-  void _closeQueueSheet() {
-    if (!_queueSheetController.isAttached) return;
-    _queueSheetController.animateTo(
-      _queueCollapsedSize,
-      duration: const Duration(milliseconds: 300),
-      curve: Curves.easeOutCubic,
+  void _openQueueSheet() {
+    if (_isQueueSheetOpen || !mounted) return;
+    _clearQueueSearch();
+    setState(() => _isQueueSheetOpen = true);
+    unawaited(
+      showModalBottomSheet<void>(
+        context: context,
+        isScrollControlled: true,
+        useSafeArea: false,
+        backgroundColor: Colors.transparent,
+        barrierColor: Colors.black.withValues(alpha: 0.28),
+        builder: (sheetContext) {
+          return Consumer(
+            builder: (context, ref, _) {
+              final queueState = ref.watch(playbackQueueProvider);
+              final queueNotifier = ref.read(playbackQueueProvider.notifier);
+              return DraggableScrollableSheet(
+                controller: _queueSheetController,
+                initialChildSize: _queueInitialSize,
+                minChildSize: _queueMinSize,
+                maxChildSize: _queueExpandedSize,
+                expand: false,
+                snap: true,
+                snapSizes: const [_queueMinSize, _queueExpandedSize],
+                builder: (context, scrollController) => _buildQueueSheet(
+                  context,
+                  queueState,
+                  queueNotifier,
+                  scrollController,
+                  onDismiss: () => Navigator.of(sheetContext).pop(),
+                ),
+              );
+            },
+          );
+        },
+      ).whenComplete(() {
+        _clearQueueSearch();
+        if (mounted) {
+          setState(() => _isQueueSheetOpen = false);
+        }
+      }),
     );
   }
 
@@ -2512,6 +2622,7 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
     PlaybackQueueState queueState,
     PlaybackQueueNotifier queueNotifier,
     ScrollController scrollController,
+    {required VoidCallback onDismiss}
   ) {
     final queueTitle = queueState.mode == PlaybackQueueMode.playlist
         ? (queueState.playlistName?.isNotEmpty == true
@@ -2520,7 +2631,7 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
         : 'Autoplay Queue';
     final header = GestureDetector(
       behavior: HitTestBehavior.opaque,
-      onTap: _closeQueueSheet,
+      onTap: onDismiss,
       child: Container(
         padding: const EdgeInsets.fromLTRB(22, 14, 22, 14),
         decoration: BoxDecoration(
@@ -2563,64 +2674,6 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
                     ),
                   ),
                 ],
-              ],
-            ),
-          ],
-        ),
-      ),
-    );
-    final compactHeader = GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTap: _openQueueSheet,
-      child: Container(
-        padding: const EdgeInsets.fromLTRB(18, 10, 18, 12),
-        decoration: BoxDecoration(
-          color: Colors.black.withValues(alpha: 0.96),
-          borderRadius: const BorderRadius.vertical(top: Radius.circular(32)),
-          border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withValues(alpha: 0.28),
-              blurRadius: 24,
-              offset: const Offset(0, -6),
-            ),
-          ],
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Container(
-              width: 42,
-              height: 4,
-              decoration: BoxDecoration(
-                color: Colors.white.withValues(alpha: 0.18),
-                borderRadius: BorderRadius.circular(999),
-              ),
-            ),
-            const SizedBox(height: 10),
-            Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    queueTitle,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 15,
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
-                ),
-                if (queueState.mode == PlaybackQueueMode.radio)
-                  Text(
-                    'Auto',
-                    style: TextStyle(
-                      color: Colors.white.withValues(alpha: 0.42),
-                      fontSize: 11,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
               ],
             ),
           ],
@@ -2959,72 +3012,58 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
       }
     }
 
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        if (constraints.maxHeight < 140) {
-          return ListView(
-            controller: scrollController,
-            physics: const BouncingScrollPhysics(
-              parent: AlwaysScrollableScrollPhysics(),
-            ),
-            padding: EdgeInsets.zero,
-            children: [compactHeader],
-          );
-        }
-        return Container(
-          decoration: BoxDecoration(
-            color: Colors.black.withValues(alpha: 0.92),
-            borderRadius: const BorderRadius.vertical(top: Radius.circular(32)),
-            border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
-            boxShadow: [
-              BoxShadow(
-                color: Colors.black.withValues(alpha: 0.38),
-                blurRadius: 28,
-                offset: const Offset(0, -8),
-              ),
-            ],
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.92),
+        borderRadius: const BorderRadius.vertical(top: Radius.circular(32)),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.38),
+            blurRadius: 28,
+            offset: const Offset(0, -8),
           ),
-          child: Column(
-            children: [
-              header,
-              Expanded(
-                child: queueState.mode == PlaybackQueueMode.none
-                    ? const Center(
-                        child: Padding(
-                          padding: EdgeInsets.symmetric(horizontal: 28),
-                          child: Text(
-                            'Start a song from search, recommendations, or a playlist and the live queue will appear here.',
-                            textAlign: TextAlign.center,
-                            style: TextStyle(
-                              color: Colors.white54,
-                              fontSize: 15,
-                              height: 1.45,
-                            ),
-                          ),
-                        ),
-                      )
-                    : NotificationListener<ScrollNotification>(
-                        onNotification: (notification) {
-                          if (notification.metrics.pixels >=
-                              notification.metrics.maxScrollExtent - 180) {
-                            unawaited(queueNotifier.loadMore());
-                          }
-                          return false;
-                        },
-                        child: ListView(
-                          controller: scrollController,
-                          physics: const BouncingScrollPhysics(
-                            parent: AlwaysScrollableScrollPhysics(),
-                          ),
-                          padding: const EdgeInsets.fromLTRB(16, 8, 16, 140),
-                          children: queueChildren,
+        ],
+      ),
+      child: Column(
+        children: [
+          header,
+          Expanded(
+            child: queueState.mode == PlaybackQueueMode.none
+                ? const Center(
+                    child: Padding(
+                      padding: EdgeInsets.symmetric(horizontal: 28),
+                      child: Text(
+                        'Start a song from search, recommendations, or a playlist and the live queue will appear here.',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          color: Colors.white54,
+                          fontSize: 15,
+                          height: 1.45,
                         ),
                       ),
-              ),
-            ],
+                    ),
+                  )
+                : NotificationListener<ScrollNotification>(
+                    onNotification: (notification) {
+                      if (notification.metrics.pixels >=
+                          notification.metrics.maxScrollExtent - 180) {
+                        unawaited(queueNotifier.loadMore());
+                      }
+                      return false;
+                    },
+                    child: ListView(
+                      controller: scrollController,
+                      physics: const BouncingScrollPhysics(
+                        parent: AlwaysScrollableScrollPhysics(),
+                      ),
+                      padding: const EdgeInsets.fromLTRB(16, 8, 16, 140),
+                      children: queueChildren,
+                    ),
+                  ),
           ),
-        );
-      },
+        ],
+      ),
     );
   }
 
@@ -3238,7 +3277,7 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
               physics: const BouncingScrollPhysics(
                 parent: AlwaysScrollableScrollPhysics(),
               ),
-              padding: const EdgeInsets.fromLTRB(28, 18, 28, 132),
+              padding: const EdgeInsets.fromLTRB(28, 18, 28, 72),
               child: ConstrainedBox(
                 constraints: BoxConstraints(minHeight: constraints.maxHeight),
                 child: Column(
@@ -3554,7 +3593,6 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
     final audioNotifier = ref.read(audioPlayerProvider.notifier);
     final lyricsState = ref.watch(lyricsProvider);
     final queueState = ref.watch(playbackQueueProvider);
-    final queueNotifier = ref.read(playbackQueueProvider.notifier);
     _ensureLyricsLoaded(playerState.videoId);
 
     return Scaffold(
@@ -3629,7 +3667,7 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
               setState(() => _activePage = index);
               if (index == 1) {
                 _lastSyncedLyricIndex = -1;
-                _closeQueueSheet();
+                _dismissQueueSheetIfOpen();
               }
             },
             children: [
@@ -3654,23 +3692,6 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
               onTap: _activePage == 0 ? _openLyricsPanel : _closeLyricsPanel,
             ),
           ),
-          if (_activePage == 0)
-            Positioned.fill(
-              child: DraggableScrollableSheet(
-                controller: _queueSheetController,
-                initialChildSize: _queueCollapsedSize,
-                minChildSize: _queueCollapsedSize,
-                maxChildSize: _queueExpandedSize,
-                snap: true,
-                snapSizes: const [_queueCollapsedSize, _queueExpandedSize],
-                builder: (context, scrollController) => _buildQueueSheet(
-                  context,
-                  queueState,
-                  queueNotifier,
-                  scrollController,
-                ),
-              ),
-            ),
         ],
       ),
     );

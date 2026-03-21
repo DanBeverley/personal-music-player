@@ -18,6 +18,8 @@ dependencies:
   cached_network_image: ^3.4.1
   just_audio: ^0.10.5
   image_picker: ^1.1.2
+  supabase_flutter: ^2.12.0
+  permission_handler: ^12.0.1
 
 dev_dependencies:
   flutter_test:

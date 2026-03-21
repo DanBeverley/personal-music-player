@@ -5,9 +5,9 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:http/http.dart' as http;
-import 'package:path_provider/path_provider.dart';
 
 import 'audio_provider.dart';
+import 'auth_provider.dart';
 
 enum DownloadPhase { active, complete, failed }
 
@@ -97,6 +97,10 @@ class DownloadCenterNotifier extends StateNotifier<DownloadCenterState> {
 
   DownloadCenterNotifier(this.ref) : super(const DownloadCenterState());
 
+  void resetForScopeChange() {
+    state = const DownloadCenterState();
+  }
+
   void _upsert(DownloadTask task) {
     final next = [
       task,
@@ -136,7 +140,7 @@ class DownloadCenterNotifier extends StateNotifier<DownloadCenterState> {
     );
     _upsert(task);
 
-    final dir = await getApplicationDocumentsDirectory();
+    final dir = await getScopedDownloadsDirectory();
     final outPath = '${dir.path}/${_cleanFilename(title)}.mp3';
 
     try {
@@ -154,6 +158,7 @@ class DownloadCenterNotifier extends StateNotifier<DownloadCenterState> {
       if (meta['thumbnail'] == null && thumbnail != null) {
         meta['thumbnail'] = thumbnail;
       }
+      meta['owner_id'] = currentAuthenticatedUserId ?? 'guest';
 
       final client = http.Client();
       try {
@@ -193,6 +198,17 @@ class DownloadCenterNotifier extends StateNotifier<DownloadCenterState> {
 
       final jsonPath = outPath.replaceAll('.mp3', '.json');
       await File(jsonPath).writeAsString(jsonEncode(meta));
+      unawaited(
+        upsertCloudLibraryTrack({
+          ...meta,
+          'id': videoId,
+          'videoId': videoId,
+          if (meta['title'] == null) 'title': title,
+          if (meta['author'] == null && subtitle != null) 'author': subtitle,
+          if (meta['thumbnail'] == null && thumbnail != null)
+            'thumbnail': thumbnail,
+        }),
+      );
       ref.invalidate(libraryProvider);
 
       _upsert(task.copyWith(
@@ -233,7 +249,12 @@ class DownloadCenterNotifier extends StateNotifier<DownloadCenterState> {
 
 final downloadCenterProvider =
     StateNotifierProvider<DownloadCenterNotifier, DownloadCenterState>((ref) {
-  return DownloadCenterNotifier(ref);
+  final notifier = DownloadCenterNotifier(ref);
+  ref.listen<String>(
+    authProvider.select((state) => state.storageScopeId),
+    (_, __) => notifier.resetForScopeChange(),
+  );
+  return notifier;
 });
 
 final downloadTaskProvider =

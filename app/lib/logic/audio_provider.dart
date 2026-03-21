@@ -1,7 +1,7 @@
 // ignore_for_file: experimental_member_use
 
+import 'dart:ui' as ui;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:path_provider/path_provider.dart';
 import 'dart:io';
 import 'dart:convert';
 import 'dart:async';
@@ -9,6 +9,7 @@ import 'dart:math';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import '../ffi/audio_ffi.dart';
+import 'auth_provider.dart';
 import 'playlist_provider.dart';
 import 'package:audio_service/audio_service.dart';
 import 'package:just_audio/just_audio.dart';
@@ -27,7 +28,7 @@ Future<void> initAudioService() async {
   globalAudioHandler = await AudioService.init(
     builder: () => AuralisAudioHandler(),
     config: const AudioServiceConfig(
-      androidNotificationChannelId: 'com.example.app.channel.audio',
+      androidNotificationChannelId: 'com.danbeverley.ebb.channel.audio',
       androidNotificationChannelName: 'EBB Audio Playback',
       androidNotificationOngoing: true,
       androidStopForegroundOnPause: true,
@@ -41,6 +42,8 @@ class AuralisAudioHandler extends BaseAudioHandler
   Function()? onPause;
   Function(Duration)? onSeek;
   Future<void> Function()? onStop;
+  Future<void> Function()? onSkipToNext;
+  Future<void> Function()? onSkipToPrevious;
 
   @override
   Future<void> play() async => onPlay?.call();
@@ -50,6 +53,10 @@ class AuralisAudioHandler extends BaseAudioHandler
   Future<void> seek(Duration position) async => onSeek?.call(position);
   @override
   Future<void> stop() async => await onStop?.call();
+  @override
+  Future<void> skipToNext() async => await onSkipToNext?.call();
+  @override
+  Future<void> skipToPrevious() async => await onSkipToPrevious?.call();
 
   void broadcastState(PlaybackState state) {
     playbackState.add(state);
@@ -120,6 +127,130 @@ Map<String, dynamic> copyTrackWithHidden(
   };
 }
 
+Map<String, dynamic> _cloudTrackPayload(dynamic rawTrack) {
+  final track = normalizeTrack(rawTrack);
+  final trackId = extractTrackId(track);
+  return {
+    if (trackId != null) 'id': trackId,
+    if (trackId != null) 'videoId': trackId,
+    if (track['title'] != null) 'title': track['title'],
+    if (track['author'] != null) 'author': track['author'],
+    if (track['channel'] != null) 'channel': track['channel'],
+    if (track['artist'] != null) 'artist': track['artist'],
+    if (track['thumbnail'] != null) 'thumbnail': track['thumbnail'],
+    'duration': _parseInt(track['duration']),
+    if (track['album'] != null) 'album': track['album'],
+    if (track['album_id'] != null) 'album_id': track['album_id'],
+  };
+}
+
+Future<void> upsertCloudLibraryTrack(dynamic rawTrack) async {
+  final client = supabaseClientOrNull;
+  final userId = currentAuthenticatedUserId;
+  if (client == null || userId == null || userId.isEmpty) return;
+  final payload = _cloudTrackPayload(rawTrack);
+  final trackId = extractTrackId(payload);
+  if (trackId == null || trackId.isEmpty) return;
+  try {
+    await client.from('library_tracks').upsert(
+      {
+        'user_id': userId,
+        'track_id': trackId,
+        'track_data': payload,
+        'updated_at': DateTime.now().toUtc().toIso8601String(),
+      },
+      onConflict: 'user_id,track_id',
+    );
+  } catch (error) {
+    debugPrint('Cloud library sync failed: $error');
+  }
+}
+
+Future<void> removeCloudLibraryTrack(String? trackId) async {
+  final client = supabaseClientOrNull;
+  final userId = currentAuthenticatedUserId;
+  if (client == null ||
+      userId == null ||
+      userId.isEmpty ||
+      trackId == null ||
+      trackId.isEmpty) {
+    return;
+  }
+  try {
+    await client
+        .from('library_tracks')
+        .delete()
+        .eq('user_id', userId)
+        .eq('track_id', trackId);
+  } catch (error) {
+    debugPrint('Cloud library delete failed: $error');
+  }
+}
+
+Future<void> recordCloudSearchEvent(
+  String query, {
+  required int resultCount,
+}) async {
+  final client = supabaseClientOrNull;
+  final userId = currentAuthenticatedUserId;
+  final trimmedQuery = query.trim();
+  if (client == null ||
+      userId == null ||
+      userId.isEmpty ||
+      trimmedQuery.isEmpty) {
+    return;
+  }
+  try {
+    await client.from('search_events').insert({
+      'user_id': userId,
+      'query': trimmedQuery,
+      'result_count': resultCount,
+    });
+  } catch (error) {
+    debugPrint('Cloud search event write failed: $error');
+  }
+}
+
+Future<List<String>> getRecentCloudSearchQueries({int limit = 8}) async {
+  final client = supabaseClientOrNull;
+  final userId = currentAuthenticatedUserId;
+  if (client == null || userId == null || userId.isEmpty) {
+    return const [];
+  }
+
+  try {
+    final rows = await client
+        .from('search_events')
+        .select('query,result_count,created_at')
+        .eq('user_id', userId)
+        .order('created_at', ascending: false)
+        .limit(limit * 4);
+    if (rows.isEmpty) return const [];
+
+    final weighted = <String, double>{};
+    for (var index = 0; index < rows.length; index++) {
+      final query = rows[index]['query']?.toString().trim();
+      if (query == null || query.isEmpty) continue;
+      final normalized = query.toLowerCase();
+      final resultCount = _parseInt(rows[index]['result_count']);
+      final recencyWeight = (rows.length - index).toDouble();
+      final resultWeight = resultCount > 0 ? 1.0 : 0.35;
+      weighted.update(
+        normalized,
+        (value) => value + recencyWeight + resultWeight,
+        ifAbsent: () => recencyWeight + resultWeight,
+      );
+    }
+
+    final ranked = weighted.entries.toList()
+      ..sort((a, b) => b.value.compareTo(a.value));
+    return ranked.take(limit).map((entry) => entry.key).toList(growable: false);
+  } catch (error) {
+    debugPrint('Cloud search query lookup failed: $error');
+    return const [];
+  }
+}
+
 class ResolvedStreamSource {
   final String url;
   final Map<String, String> headers;
@@ -186,8 +317,22 @@ class HistoryManager {
   static Stream<String?> get seedStream => _seedController.stream;
 
   static Future<File> get _file async {
-    final dir = await getApplicationDocumentsDirectory();
-    return File('${dir.path}/history.json');
+    return getScopedDataFile('history.json');
+  }
+
+  static Future<void> _recordCloudPlayEvent(String videoId) async {
+    final client = supabaseClientOrNull;
+    final userId = currentAuthenticatedUserId;
+    if (client == null || userId == null || userId.isEmpty) return;
+    try {
+      await client.from('play_events').insert({
+        'user_id': userId,
+        'track_id': videoId,
+        'event_type': 'play',
+      });
+    } catch (e) {
+      debugPrint("Cloud history write error: $e");
+    }
   }
 
   static Future<void> addHistory(String? videoId) async {
@@ -203,6 +348,7 @@ class HistoryManager {
       if (history.length > 50) history = history.sublist(0, 50);
       await f.writeAsString(jsonEncode(history));
       _seedController.add(videoId);
+      unawaited(_recordCloudPlayEvent(videoId));
     } catch (e) {
       debugPrint("History Write Error: $e");
     }
@@ -216,17 +362,116 @@ class HistoryManager {
             List<String>.from(jsonDecode(await f.readAsString()));
         if (history.isNotEmpty) return history.first;
       }
+
+      final client = supabaseClientOrNull;
+      final userId = currentAuthenticatedUserId;
+      if (client != null && userId != null && userId.isNotEmpty) {
+        final rows = await client
+            .from('play_events')
+            .select('track_id')
+            .eq('user_id', userId)
+            .eq('event_type', 'play')
+            .order('created_at', ascending: false)
+            .limit(1);
+        if (rows.isNotEmpty) {
+          return rows.first['track_id']?.toString();
+        }
+      }
     } catch (e) {
       debugPrint("History Read Error: $e");
     }
     return null;
+  }
+
+  static Future<String?> getRecommendationSeed() async {
+    try {
+      final client = supabaseClientOrNull;
+      final userId = currentAuthenticatedUserId;
+      if (client != null && userId != null && userId.isNotEmpty) {
+        final rows = await client
+            .from('play_events')
+            .select('track_id')
+            .eq('user_id', userId)
+            .eq('event_type', 'play')
+            .order('created_at', ascending: false)
+            .limit(40);
+        if (rows.isNotEmpty) {
+          final scores = <String, double>{};
+          for (var index = 0; index < rows.length; index++) {
+            final trackId = rows[index]['track_id']?.toString();
+            if (trackId == null || trackId.isEmpty) continue;
+            final recencyWeight = (rows.length - index).toDouble();
+            scores.update(
+              trackId,
+              (value) => value + recencyWeight,
+              ifAbsent: () => recencyWeight,
+            );
+          }
+          if (scores.isNotEmpty) {
+            final ranked = scores.entries.toList()
+              ..sort((a, b) => b.value.compareTo(a.value));
+            return ranked.first.key;
+          }
+        }
+      }
+    } catch (error) {
+      debugPrint('Recommendation seed lookup failed: $error');
+    }
+    return getLatestSeed();
+  }
+
+  static Future<List<String>> getRecentSeeds({int limit = 8}) async {
+    final ordered = <String>[];
+    final seen = <String>{};
+
+    void addTrackId(String? trackId) {
+      if (trackId == null || trackId.isEmpty || !seen.add(trackId)) return;
+      ordered.add(trackId);
+    }
+
+    try {
+      final f = await _file;
+      if (f.existsSync()) {
+        final history = List<String>.from(jsonDecode(await f.readAsString()));
+        for (final trackId in history) {
+          addTrackId(trackId);
+          if (ordered.length >= limit) {
+            return ordered;
+          }
+        }
+      }
+
+      final client = supabaseClientOrNull;
+      final userId = currentAuthenticatedUserId;
+      if (client != null && userId != null && userId.isNotEmpty) {
+        final rows = await client
+            .from('play_events')
+            .select('track_id')
+            .eq('user_id', userId)
+            .eq('event_type', 'play')
+            .order('created_at', ascending: false)
+            .limit(limit * 3);
+        for (final row in rows) {
+          addTrackId(row['track_id']?.toString());
+          if (ordered.length >= limit) {
+            break;
+          }
+        }
+      }
+    } catch (error) {
+      debugPrint('Recent seed lookup failed: $error');
+    }
+
+    return ordered;
   }
 }
 
 // Provides the singleton FFI audio engine
 final audioEngineProvider = Provider<AudioEngineFFI>((ref) {
   final engine = AudioEngineFFI();
-  engine.initEngine();
+  if (engine.isAvailable) {
+    engine.initEngine();
+  }
   return engine;
 });
 
@@ -242,6 +487,7 @@ class PlayerState {
   final int currentPositionMs;
   final String? artist;
   final String? videoId;
+  final int sleepTimerRemainingSeconds;
 
   PlayerState({
     this.isPlaying = false,
@@ -255,6 +501,7 @@ class PlayerState {
     this.currentPositionMs = 0,
     this.artist,
     this.videoId,
+    this.sleepTimerRemainingSeconds = 0,
   });
 
   PlayerState copyWith(
@@ -268,7 +515,8 @@ class PlayerState {
       int? currentPosition,
       int? currentPositionMs,
       String? artist,
-      String? videoId}) {
+      String? videoId,
+      int? sleepTimerRemainingSeconds}) {
     final nextCurrentPosition = currentPosition ?? this.currentPosition;
     return PlayerState(
       isPlaying: isPlaying ?? this.isPlaying,
@@ -285,6 +533,8 @@ class PlayerState {
               : this.currentPositionMs),
       artist: artist ?? this.artist,
       videoId: videoId ?? this.videoId,
+      sleepTimerRemainingSeconds:
+          sleepTimerRemainingSeconds ?? this.sleepTimerRemainingSeconds,
     );
   }
 }
@@ -294,23 +544,44 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
   Future<void> Function()? onTrackCompleted;
   Future<void> Function(String? videoId)? onTrackChanged;
   Timer? _playbackTimer;
-  final streamPlayer = AudioPlayer();
+  final streamPlayer = AudioPlayer(useLazyPreparation: false);
+  final List<AudioPlayer> _prefetchPlayers = List<AudioPlayer>.generate(
+    2,
+    (_) => AudioPlayer(
+      handleInterruptions: false,
+      androidApplyAudioAttributes: false,
+      handleAudioSessionActivation: false,
+      useLazyPreparation: false,
+    ),
+  );
   bool _activeStream = false;
   final Map<String, ResolvedStreamSource> _streamCache = {};
   final Map<String, Future<ResolvedStreamSource>> _pendingStreamLookups = {};
   StreamSubscription<Duration>? _streamPositionSub;
   StreamSubscription<Duration?>? _streamDurationSub;
   StreamSubscription<dynamic>? _streamPlaybackSub;
+  StreamSubscription<int?>? _streamCurrentIndexSub;
   Future<void> _streamCommandQueue = Future<void>.value();
   LockCachingAudioSource? _cachedStreamAudioSource;
   String? _cachedStreamVideoId;
   int _streamLoadVersion = 0;
   bool _desiredStreamPlaying = false;
   String? _completedTrackIdNotified;
+  bool _streamTransitionInProgress = false;
+  bool _managedQueueActive = false;
+  List<Map<String, dynamic>> _managedQueueTracks = const [];
+  final List<String?> _prefetchedTrackIds = <String?>[null, null];
+  int _latencySummaryProbeCounter = 0;
+  Timer? _sleepTimer;
+  DateTime? _sleepTimerEndsAt;
+  final Map<String, Future<void>> _fullPrefetchTasks = {};
 
   AudioPlayerNotifier(this.audioEngine) : super(PlayerState()) {
     audioEngine.pause(); // Kill ghost audio surviving hot restarts
     _bindStreamPlayer();
+    for (final player in _prefetchPlayers) {
+      unawaited(player.setVolume(0));
+    }
 
     if (globalAudioHandler is AuralisAudioHandler) {
       final handler = globalAudioHandler as AuralisAudioHandler;
@@ -342,6 +613,13 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
   }
 
   void _notifyTrackCompletedIfNeeded() {
+    if (_streamTransitionInProgress) return;
+    if (_managedQueueActive) {
+      final currentIndex = streamPlayer.currentIndex ?? 0;
+      if (currentIndex >= 0 && currentIndex < _managedQueueTracks.length - 1) {
+        return;
+      }
+    }
     final videoId = state.videoId;
     if (videoId == null || videoId.isEmpty) return;
     if (_completedTrackIdNotified == videoId) return;
@@ -373,7 +651,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     ));
 
     handler.broadcastMediaItem(MediaItem(
-      id: 'current_track',
+      id: state.videoId ?? 'current_track',
       album: state.artist ?? 'EBB',
       title: state.currentTrackName,
       artist: state.artist ?? 'Unknown Artist',
@@ -403,6 +681,17 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       if (seconds > 0 && seconds != state.duration) {
         state = state.copyWith(duration: seconds);
       }
+    });
+
+    _streamCurrentIndexSub = streamPlayer.currentIndexStream.listen((index) {
+      if (!_activeStream || !_managedQueueActive) return;
+      if (index == null || index < 0 || index >= _managedQueueTracks.length) {
+        return;
+      }
+      _applyManagedTrackMetadata(index, resetPosition: true);
+      final currentTrackId = extractTrackId(_managedQueueTracks[index]);
+      HistoryManager.addHistory(currentTrackId);
+      unawaited(_refreshManagedQueueWarmup());
     });
 
     _streamPositionSub = streamPlayer.positionStream.listen((position) {
@@ -455,7 +744,11 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
               )
               .toInt(),
         );
-        if (isCompleted) {
+        final shouldNotifyCompletion = isCompleted &&
+            !_streamTransitionInProgress &&
+            (!_managedQueueActive || !streamPlayer.hasNext);
+
+        if (shouldNotifyCompletion) {
           _notifyTrackCompletedIfNeeded();
         } else {
           _completedTrackIdNotified = null;
@@ -489,10 +782,49 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
   Future<void> _clearOldCachedStream(LockCachingAudioSource? oldSource) async {
     if (oldSource == null) return;
     try {
+      final cacheFile = await oldSource.cacheFile;
+      if (cacheFile.path.contains('${Platform.pathSeparator}stream_cache${Platform.pathSeparator}')) {
+        return;
+      }
       await oldSource.clearCache();
     } catch (_) {
       // Cache eviction should stay silent.
     }
+  }
+
+  void _updateSleepTimerState() {
+    if (_sleepTimerEndsAt == null) {
+      if (state.sleepTimerRemainingSeconds != 0) {
+        state = state.copyWith(sleepTimerRemainingSeconds: 0);
+      }
+      return;
+    }
+    final remaining =
+        _sleepTimerEndsAt!.difference(DateTime.now()).inSeconds.clamp(0, 86400);
+    if (remaining != state.sleepTimerRemainingSeconds) {
+      state = state.copyWith(sleepTimerRemainingSeconds: remaining);
+    }
+    if (remaining <= 0) {
+      _sleepTimer?.cancel();
+      _sleepTimer = null;
+      _sleepTimerEndsAt = null;
+      unawaited(stopPlayback());
+    }
+  }
+
+  Future<void> setSleepTimer(Duration? duration) async {
+    _sleepTimer?.cancel();
+    _sleepTimer = null;
+    if (duration == null || duration <= Duration.zero) {
+      _sleepTimerEndsAt = null;
+      state = state.copyWith(sleepTimerRemainingSeconds: 0);
+      return;
+    }
+    _sleepTimerEndsAt = DateTime.now().add(duration);
+    _updateSleepTimerState();
+    _sleepTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      _updateSleepTimerState();
+    });
   }
 
   Future<void> _setStreamSource(
@@ -500,9 +832,10 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     ResolvedStreamSource source,
   ) async {
     final previousSource = _cachedStreamAudioSource;
-    final nextSource = LockCachingAudioSource(
-      Uri.parse(source.url),
-      headers: source.headers.isEmpty ? null : source.headers,
+    final nextSource = await _buildCachingSourceForVideoId(
+      videoId,
+      headers: source.headers,
+      urlOverride: source.url,
     );
 
     _cachedStreamAudioSource = nextSource;
@@ -557,10 +890,15 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
   @override
   void dispose() {
     _playbackTimer?.cancel();
+    _sleepTimer?.cancel();
     _streamPositionSub?.cancel();
     _streamDurationSub?.cancel();
     _streamPlaybackSub?.cancel();
+    _streamCurrentIndexSub?.cancel();
     unawaited(stopPlayback(resetState: false));
+    for (final player in _prefetchPlayers) {
+      unawaited(player.dispose());
+    }
     unawaited(streamPlayer.dispose());
     super.dispose();
   }
@@ -575,23 +913,597 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     return null;
   }
 
-  ResolvedStreamSource? _cacheStreamSource(
-    String videoId,
-    Map<String, dynamic> payload,
-  ) {
-    final directUrl = payload['url']?.toString();
-    if (directUrl == null || directUrl.isEmpty) {
-      return null;
-    }
-
-    final source = ResolvedStreamSource(
-      url: directUrl,
-      headers: _parseHeaders(payload['headers']),
-      fetchedAt: DateTime.now(),
+  ResolvedStreamSource _buildProxyStreamSource(
+    String videoId, {
+    DateTime? fetchedAt,
+  }) {
+    return ResolvedStreamSource(
+      url: _proxyUri('/proxy_stream/$videoId').toString(),
+      headers: const {},
+      fetchedAt: fetchedAt ?? DateTime.now(),
     );
+  }
+
+  ResolvedStreamSource _markPreparedStream(
+    String videoId, {
+    DateTime? fetchedAt,
+  }) {
+    final source = _buildProxyStreamSource(videoId, fetchedAt: fetchedAt);
     _streamCache[videoId] = source;
     return source;
   }
+
+  String? _trackArtist(dynamic rawTrack) {
+    if (rawTrack is! Map) return null;
+    return rawTrack['channel']?.toString() ??
+        rawTrack['author']?.toString() ??
+        rawTrack['artist']?.toString();
+  }
+
+  String _sanitizeCacheKey(String value) {
+    return value.replaceAll(RegExp(r'[^A-Za-z0-9_\-]'), '_');
+  }
+
+  Future<Directory> _streamCacheDirectory() async {
+    final userDir = await getScopedUserDirectory();
+    final cacheDir = Directory('${userDir.path}/stream_cache');
+    if (!cacheDir.existsSync()) {
+      cacheDir.createSync(recursive: true);
+    }
+    return cacheDir;
+  }
+
+  Future<File> _cacheFileForVideoId(String videoId) async {
+    final cacheDir = await _streamCacheDirectory();
+    return File('${cacheDir.path}/${_sanitizeCacheKey(videoId)}.audio');
+  }
+
+  Future<File> _cacheMarkerForVideoId(String videoId) async {
+    final cacheFile = await _cacheFileForVideoId(videoId);
+    return File('${cacheFile.path}.done');
+  }
+
+  Future<LockCachingAudioSource> _buildCachingSourceForVideoId(
+    String videoId, {
+    Map<String, String>? headers,
+    String? urlOverride,
+    dynamic tag,
+  }) async {
+    final cacheFile = await _cacheFileForVideoId(videoId);
+    return LockCachingAudioSource(
+      Uri.parse(urlOverride ?? _proxyUri('/proxy_stream/$videoId').toString()),
+      headers: headers == null || headers.isEmpty ? null : headers,
+      cacheFile: cacheFile,
+      tag: tag,
+    );
+  }
+
+  Future<void> _logLatencySummaryIfDue() async {
+    _latencySummaryProbeCounter++;
+    if (_latencySummaryProbeCounter % 4 != 0) return;
+    try {
+      final response = await appHttpClient
+          .get(_proxyUri('/latency_summary'))
+          .timeout(const Duration(seconds: 8));
+      if (response.statusCode != 200) return;
+      final payload = jsonDecode(response.body) as Map<String, dynamic>;
+      final summary = payload['summary'];
+      if (summary is! Map) return;
+      debugPrint(
+        '[EBB] latency-summary '
+        'resolveAvg=${summary['avg_resolve_ms']}ms '
+        'chunkAvg=${summary['avg_chunk_ms']}ms '
+        'serverAvg=${summary['avg_server_ms']}ms '
+        'prefixAvg=${summary['avg_cached_prefix_bytes']} '
+        'resolveHit=${summary['resolve_cache_hit_rate']} '
+        'chunkHit=${summary['chunk_cache_hit_rate']}',
+      );
+    } catch (_) {
+      // Summary logging is best-effort only.
+    }
+  }
+
+  Future<void> _prepareQueueSession(
+    Iterable<String?> videoIds, {
+    String? currentVideoId,
+    bool activeQueue = false,
+    int lookahead = 8,
+  }) async {
+    final idsToWarm = <String>[];
+    final seen = <String>{};
+    for (final rawId in videoIds) {
+      final videoId = rawId?.toString();
+      if (videoId == null || videoId.isEmpty || !seen.add(videoId)) {
+        continue;
+      }
+      idsToWarm.add(videoId);
+      if (idsToWarm.length >= lookahead) {
+        break;
+      }
+    }
+    if (idsToWarm.isEmpty) return;
+
+    try {
+      final res = await appHttpClient
+          .post(
+            _proxyUri('/prepare_session'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'video_ids': idsToWarm,
+              'current_video_id': currentVideoId,
+              'active_queue': activeQueue,
+              'lookahead': lookahead,
+            }),
+          )
+          .timeout(const Duration(seconds: 18));
+
+      if (res.statusCode != 200) {
+        throw Exception('Prepared session failed: ${res.statusCode}');
+      }
+
+      final data = jsonDecode(res.body) as Map<String, dynamic>;
+      final prepared = data['prepared'] ?? data['streams'];
+      if (prepared is Map) {
+        prepared.forEach((key, dynamic value) {
+          _markPreparedStream(key.toString());
+          if (value is Map) {
+            debugPrint(
+              '[EBB] prepared ${key.toString()} '
+              'resolveMs=${value['resolve_ms']} '
+              'chunkMs=${value['chunk_ms']} '
+              'targetBytes=${value['target_chunk_bytes']} '
+              'chunkBytes=${value['cached_prefix_bytes']}',
+            );
+          }
+        });
+      }
+      if (activeQueue) {
+        unawaited(_logLatencySummaryIfDue());
+      }
+    } catch (_) {
+      final fallbackCount = idsToWarm.length < 4 ? idsToWarm.length : 4;
+      for (final id in idsToWarm.take(fallbackCount)) {
+        unawaited(prewarmStream(id));
+      }
+    }
+  }
+
+  Future<void> _cleanupFullPrefetchCache(Set<String> keepIds) async {
+    final cacheDir = await _streamCacheDirectory();
+    if (!cacheDir.existsSync()) return;
+    final keepNames = keepIds.map(_sanitizeCacheKey).toSet();
+    for (final entity in cacheDir.listSync(followLinks: false)) {
+      if (entity is! File) continue;
+      final name = entity.uri.pathSegments.isEmpty
+          ? ''
+          : entity.uri.pathSegments.last;
+      if (name.isEmpty) continue;
+      final baseName = name.endsWith('.done')
+          ? name.substring(0, name.length - 5)
+          : name.replaceAll('.audio', '');
+      if (keepNames.contains(baseName)) continue;
+      try {
+        entity.deleteSync();
+      } catch (_) {}
+    }
+  }
+
+  Future<void> _prefetchTrackToTempStorage(String videoId) async {
+    final existing = _fullPrefetchTasks[videoId];
+    if (existing != null) {
+      return existing;
+    }
+
+    final task = () async {
+      final cacheFile = await _cacheFileForVideoId(videoId);
+      final markerFile = await _cacheMarkerForVideoId(videoId);
+      if (cacheFile.existsSync() &&
+          cacheFile.lengthSync() > 100000 &&
+          markerFile.existsSync()) {
+        return;
+      }
+
+      final tempFile = File('${cacheFile.path}.part');
+      if (tempFile.existsSync()) {
+        try {
+          tempFile.deleteSync();
+        } catch (_) {}
+      }
+
+      try {
+        final request =
+            http.Request('GET', _proxyUri('/proxy_stream/$videoId'));
+        final response = await appHttpClient.send(request);
+        if (response.statusCode != 200) {
+          throw Exception('Prefetch failed: ${response.statusCode}');
+        }
+        final sink = tempFile.openWrite();
+        await for (final chunk in response.stream) {
+          sink.add(chunk);
+        }
+        await sink.close();
+        if (cacheFile.existsSync()) {
+          try {
+            cacheFile.deleteSync();
+          } catch (_) {}
+        }
+        await tempFile.rename(cacheFile.path);
+        await markerFile.writeAsString(DateTime.now().toIso8601String());
+        debugPrint('[EBB] full-prefetched $videoId bytes=${cacheFile.lengthSync()}');
+      } catch (error) {
+        debugPrint('[EBB] full-prefetch failed for $videoId: $error');
+        if (tempFile.existsSync()) {
+          try {
+            tempFile.deleteSync();
+          } catch (_) {}
+        }
+      }
+    }();
+
+    _fullPrefetchTasks[videoId] = task;
+    await task.whenComplete(() => _fullPrefetchTasks.remove(videoId));
+  }
+
+  Future<void> prefetchFixedQueueTracks(
+    List<Map<String, dynamic>> tracks, {
+    required int currentIndex,
+    int count = 2,
+  }) async {
+    if (tracks.isEmpty || currentIndex < 0 || currentIndex >= tracks.length) {
+      return;
+    }
+
+    final keepIds = <String>{};
+    final currentTrackId = extractTrackId(tracks[currentIndex]);
+    if (currentTrackId != null && currentTrackId.isNotEmpty) {
+      keepIds.add(currentTrackId);
+    }
+
+    final targetIds = <String>[];
+    for (var i = currentIndex + 1; i < tracks.length; i++) {
+      final track = tracks[i];
+      if (isTrackHidden(track)) continue;
+      final id = extractTrackId(track);
+      if (id == null || id.isEmpty) continue;
+      targetIds.add(id);
+      keepIds.add(id);
+      if (targetIds.length >= count) break;
+    }
+
+    await _cleanupFullPrefetchCache(keepIds);
+    for (final id in targetIds) {
+      unawaited(_prefetchTrackToTempStorage(id));
+    }
+  }
+
+  Future<void> _prefetchManagedQueueAhead({int lookahead = 2}) async {
+    if (!_managedQueueActive || _managedQueueTracks.isEmpty) return;
+    final currentIndex = currentManagedQueueIndex ?? 0;
+    final targets = <Map<String, dynamic>>[];
+    for (var i = currentIndex + 1; i < _managedQueueTracks.length; i++) {
+      final track = _managedQueueTracks[i];
+      if (isTrackHidden(track)) continue;
+      targets.add(track);
+      if (targets.length >= lookahead) break;
+    }
+
+    for (var slot = 0; slot < _prefetchPlayers.length; slot++) {
+      final track = slot < targets.length ? targets[slot] : null;
+      final trackId = track == null ? null : extractTrackId(track);
+      if (_prefetchedTrackIds[slot] == trackId) {
+        continue;
+      }
+
+      if (track == null || trackId == null || trackId.isEmpty) {
+        _prefetchedTrackIds[slot] = null;
+        try {
+          await _prefetchPlayers[slot].stop();
+        } catch (_) {}
+        continue;
+      }
+
+      final localPath = track['local_path']?.toString();
+      if (localPath != null &&
+          localPath.isNotEmpty &&
+          File(localPath).existsSync()) {
+        _prefetchedTrackIds[slot] = trackId;
+        continue;
+      }
+
+      try {
+        final source = await _buildCachingSourceForVideoId(trackId, tag: track);
+        _prefetchedTrackIds[slot] = trackId;
+        await _prefetchPlayers[slot].stop();
+        await _prefetchPlayers[slot].setAudioSource(source, preload: true);
+      } catch (_) {
+        _prefetchedTrackIds[slot] = null;
+      }
+    }
+  }
+
+  Future<void> _refreshManagedQueueWarmup({int lookahead = 12}) async {
+    if (!_managedQueueActive || _managedQueueTracks.isEmpty) return;
+    final currentIndex = currentManagedQueueIndex ?? 0;
+    if (currentIndex < 0 || currentIndex >= _managedQueueTracks.length) return;
+    final ids = <String?>[];
+    for (var i = currentIndex; i < _managedQueueTracks.length; i++) {
+      final track = _managedQueueTracks[i];
+      if (i != currentIndex && isTrackHidden(track)) continue;
+      ids.add(extractTrackId(track));
+      if (ids.length >= lookahead) break;
+    }
+    await _prepareQueueSession(
+      ids,
+      currentVideoId: extractTrackId(_managedQueueTracks[currentIndex]),
+      activeQueue: true,
+      lookahead: lookahead,
+    );
+    unawaited(_prefetchManagedQueueAhead());
+  }
+
+  void _applyManagedTrackMetadata(
+    int index, {
+    bool resetPosition = false,
+  }) {
+    if (index < 0 || index >= _managedQueueTracks.length) return;
+    final track = _managedQueueTracks[index];
+    final videoId = extractTrackId(track);
+    final hintedDuration = _parseInt(track['duration']);
+    state = state.copyWith(
+      currentTrackName: track['title']?.toString() ?? state.currentTrackName,
+      thumbnail: track['thumbnail']?.toString() ?? state.thumbnail,
+      artist: _trackArtist(track) ?? state.artist,
+      videoId: videoId,
+      duration: hintedDuration > 0 ? hintedDuration : state.duration,
+      currentPosition: resetPosition ? 0 : state.currentPosition,
+      currentPositionMs: resetPosition ? 0 : state.currentPositionMs,
+    );
+  }
+
+  Future<AudioSource> _buildManagedAudioSource(
+    Map<String, dynamic> track,
+  ) async {
+    final localPath = track['local_path']?.toString();
+    if (localPath != null &&
+        localPath.isNotEmpty &&
+        File(localPath).existsSync()) {
+      return AudioSource.file(localPath, tag: track);
+    }
+
+    final videoId = extractTrackId(track);
+    if (videoId == null || videoId.isEmpty) {
+      throw Exception('Missing track id for managed queue source');
+    }
+
+    return _buildCachingSourceForVideoId(videoId, tag: track);
+  }
+
+  Future<void> configureManagedQueue(
+    List<Map<String, dynamic>> tracks, {
+    required int initialIndex,
+    bool autoplay = true,
+  }) async {
+    if (tracks.isEmpty || initialIndex < 0 || initialIndex >= tracks.length) {
+      return;
+    }
+
+    final normalizedTracks =
+        tracks.map((track) => normalizeTrack(track)).toList(growable: false);
+    final currentTrack = normalizedTracks[initialIndex];
+    final currentTrackId = extractTrackId(currentTrack);
+    final lookaheadIds = <String?>[
+      extractTrackId(currentTrack),
+      ...normalizedTracks
+          .skip(initialIndex + 1)
+          .where((track) => !isTrackHidden(track))
+          .take(8)
+          .map(extractTrackId),
+    ];
+
+    final loadVersion = ++_streamLoadVersion;
+    _desiredStreamPlaying = autoplay;
+    _activeStream = true;
+    _managedQueueActive = true;
+    _managedQueueTracks = normalizedTracks;
+    _streamTransitionInProgress = true;
+    _playbackTimer?.cancel();
+    audioEngine.pause();
+
+    state = state.copyWith(
+      isPlaying: false,
+      isDownloading: true,
+      currentTrackName:
+          currentTrack['title']?.toString() ?? 'Connecting Queue...',
+      thumbnail: currentTrack['thumbnail']?.toString(),
+      artist: _trackArtist(currentTrack),
+      videoId: null,
+      duration: 0,
+      currentPosition: 0,
+      currentPositionMs: 0,
+    );
+
+    await _prepareQueueSession(
+      lookaheadIds,
+      currentVideoId: currentTrackId,
+      activeQueue: true,
+      lookahead: 8,
+    );
+    if (loadVersion != _streamLoadVersion) return;
+
+    final sources = await Future.wait(
+      normalizedTracks.map(_buildManagedAudioSource),
+    );
+    if (loadVersion != _streamLoadVersion) return;
+
+    final previousSource = _cachedStreamAudioSource;
+    _cachedStreamAudioSource = null;
+    _cachedStreamVideoId = currentTrackId;
+
+    await _runStreamCommand(() async {
+      if (loadVersion != _streamLoadVersion) return;
+      await streamPlayer.stop();
+      await streamPlayer.setAudioSources(
+        sources,
+        initialIndex: initialIndex,
+        preload: true,
+      );
+      await streamPlayer.setLoopMode(
+        state.isLooping ? LoopMode.one : LoopMode.off,
+      );
+    });
+    if (previousSource != null) {
+      unawaited(_clearOldCachedStream(previousSource));
+    }
+    if (loadVersion != _streamLoadVersion) return;
+
+    _streamTransitionInProgress = false;
+    _applyManagedTrackMetadata(initialIndex, resetPosition: true);
+    state = state.copyWith(
+      isDownloading: false,
+      duration: streamPlayer.duration?.inSeconds ?? state.duration,
+    );
+    HistoryManager.addHistory(currentTrackId);
+    unawaited(_prefetchManagedQueueAhead());
+    if (_desiredStreamPlaying) {
+      await _resumeStreamPlayback();
+    }
+  }
+
+  Future<void> appendManagedQueueTracks(
+    List<Map<String, dynamic>> tracks,
+  ) async {
+    if (!_managedQueueActive || tracks.isEmpty) return;
+    final normalizedTracks =
+        tracks.map((track) => normalizeTrack(track)).toList(growable: false);
+    await prewarmStreams(
+      normalizedTracks.take(3).map(extractTrackId),
+    );
+    final sources = await Future.wait(
+      normalizedTracks.map(_buildManagedAudioSource),
+    );
+    await _runStreamCommand(() async {
+      await streamPlayer.addAudioSources(sources);
+    });
+    _managedQueueTracks = [..._managedQueueTracks, ...normalizedTracks];
+    unawaited(_refreshManagedQueueWarmup());
+  }
+
+  Future<void> insertManagedQueueTracks(
+    int index,
+    List<Map<String, dynamic>> tracks,
+  ) async {
+    if (!_managedQueueActive || tracks.isEmpty) return;
+    final normalizedTracks =
+        tracks.map((track) => normalizeTrack(track)).toList(growable: false);
+    final insertIndex = index.clamp(0, _managedQueueTracks.length).toInt();
+    await prewarmStreams(
+      normalizedTracks.take(3).map(extractTrackId),
+    );
+    final sources = await Future.wait(
+      normalizedTracks.map(_buildManagedAudioSource),
+    );
+    await _runStreamCommand(() async {
+      for (var offset = 0; offset < sources.length; offset++) {
+        await streamPlayer.insertAudioSource(insertIndex + offset, sources[offset]);
+      }
+    });
+    final updated = [..._managedQueueTracks];
+    updated.insertAll(insertIndex, normalizedTracks);
+    _managedQueueTracks = updated;
+    unawaited(_refreshManagedQueueWarmup());
+  }
+
+  Future<void> moveManagedQueueItem(int oldIndex, int newIndex) async {
+    if (!_managedQueueActive) return;
+    if (oldIndex < 0 ||
+        oldIndex >= _managedQueueTracks.length ||
+        newIndex < 0 ||
+        newIndex > _managedQueueTracks.length) {
+      return;
+    }
+
+    var targetIndex = newIndex;
+    if (targetIndex > oldIndex) {
+      targetIndex -= 1;
+    }
+    targetIndex = targetIndex.clamp(0, _managedQueueTracks.length - 1);
+    if (oldIndex == targetIndex) return;
+
+    await _runStreamCommand(() async {
+      await streamPlayer.moveAudioSource(oldIndex, targetIndex);
+    });
+
+    final updated = [..._managedQueueTracks];
+    updated.insert(targetIndex, updated.removeAt(oldIndex));
+    _managedQueueTracks = updated;
+    unawaited(_refreshManagedQueueWarmup());
+  }
+
+  Future<void> removeManagedQueueItem(int index) async {
+    if (!_managedQueueActive) return;
+    if (index < 0 || index >= _managedQueueTracks.length) return;
+    await _runStreamCommand(() async {
+      await streamPlayer.removeAudioSourceAt(index);
+    });
+    final updated = [..._managedQueueTracks]..removeAt(index);
+    _managedQueueTracks = updated;
+    if (_managedQueueTracks.isEmpty) {
+      _managedQueueActive = false;
+    }
+    unawaited(_refreshManagedQueueWarmup());
+  }
+
+  Future<void> playManagedQueueIndex(int index) async {
+    if (!_managedQueueActive) return;
+    if (index < 0 || index >= _managedQueueTracks.length) return;
+    _streamTransitionInProgress = true;
+    await _runStreamCommand(() async {
+      await streamPlayer.seek(Duration.zero, index: index);
+    });
+    _streamTransitionInProgress = false;
+    _applyManagedTrackMetadata(index, resetPosition: true);
+    HistoryManager.addHistory(extractTrackId(_managedQueueTracks[index]));
+    unawaited(_refreshManagedQueueWarmup());
+    await _resumeStreamPlayback();
+  }
+
+  Future<void> skipManagedQueueNext() async {
+    if (!_managedQueueActive || !streamPlayer.hasNext) return;
+    _streamTransitionInProgress = true;
+    await _runStreamCommand(() async {
+      await streamPlayer.seekToNext();
+    });
+    _streamTransitionInProgress = false;
+    unawaited(_refreshManagedQueueWarmup());
+    await _resumeStreamPlayback();
+  }
+
+  Future<void> skipManagedQueuePrevious() async {
+    if (!_managedQueueActive) return;
+    if (streamPlayer.position > const Duration(seconds: 3)) {
+      await _runStreamCommand(() async {
+        await streamPlayer.seek(Duration.zero);
+      });
+      return;
+    }
+    if (!streamPlayer.hasPrevious) {
+      await _runStreamCommand(() async {
+        await streamPlayer.seek(Duration.zero);
+      });
+      return;
+    }
+    _streamTransitionInProgress = true;
+    await _runStreamCommand(() async {
+      await streamPlayer.seekToPrevious();
+    });
+    _streamTransitionInProgress = false;
+    unawaited(_refreshManagedQueueWarmup());
+    await _resumeStreamPlayback();
+  }
+
+  bool get hasManagedQueue => _managedQueueActive;
+  int? get currentManagedQueueIndex =>
+      _managedQueueActive ? streamPlayer.currentIndex : null;
 
   Future<ResolvedStreamSource> _fetchStreamSource(String videoId) async {
     final cached = _freshStreamSource(videoId);
@@ -599,6 +1511,42 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       return cached;
     }
 
+    final stopwatch = Stopwatch()..start();
+    final res = await appHttpClient
+        .post(
+          _proxyUri('/prepare_session'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({
+            'video_ids': [videoId],
+          }),
+        )
+        .timeout(const Duration(seconds: 18));
+
+    if (res.statusCode != 200) {
+      throw Exception('Prepared stream lookup failed: ${res.statusCode}');
+    }
+
+    final data = jsonDecode(res.body) as Map<String, dynamic>;
+    final prepared = data['prepared'];
+    if (prepared is Map && prepared.containsKey(videoId)) {
+      final metrics = prepared[videoId];
+      if (metrics is Map) {
+        debugPrint(
+          '[EBB] prepared $videoId '
+          'resolveMs=${metrics['resolve_ms']} '
+          'chunkMs=${metrics['chunk_ms']} '
+          'chunkBytes=${metrics['cached_prefix_bytes']} '
+          'serverMs=${data['server_ms']}',
+        );
+      }
+    }
+    debugPrint(
+      '[EBB] prepare_session[$videoId] totalMs=${stopwatch.elapsedMilliseconds}',
+    );
+    return _markPreparedStream(videoId);
+  }
+
+  Future<ResolvedStreamSource> _fetchDirectStreamSource(String videoId) async {
     final res = await appHttpClient
         .get(_proxyUri('/direct_url/$videoId'))
         .timeout(const Duration(seconds: 15));
@@ -608,12 +1556,16 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     }
 
     final data = jsonDecode(res.body) as Map<String, dynamic>;
-    final source = _cacheStreamSource(videoId, data);
-    if (source == null) {
-      throw Exception('Proxy returned an empty stream URL');
+    final directUrl = data['url']?.toString();
+    if (directUrl == null || directUrl.isEmpty) {
+      throw Exception('Proxy returned an empty direct stream URL');
     }
 
-    return source;
+    return ResolvedStreamSource(
+      url: directUrl,
+      headers: _parseHeaders(data['headers']),
+      fetchedAt: DateTime.now(),
+    );
   }
 
   Future<ResolvedStreamSource> _resolveStreamSource(String videoId) {
@@ -647,56 +1599,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
   }
 
   Future<void> prewarmStreams(Iterable<String?> videoIds) async {
-    final idsToWarm = <String>[];
-    final seen = <String>{};
-
-    for (final rawId in videoIds) {
-      final videoId = rawId?.toString();
-      if (videoId == null || videoId.isEmpty || !seen.add(videoId)) {
-        continue;
-      }
-      if (_freshStreamSource(videoId) != null ||
-          _pendingStreamLookups.containsKey(videoId)) {
-        continue;
-      }
-      idsToWarm.add(videoId);
-      if (idsToWarm.length >= 18) {
-        break;
-      }
-    }
-
-    if (idsToWarm.isEmpty) return;
-
-    try {
-      final res = await appHttpClient
-          .post(
-            _proxyUri('/warm_streams'),
-            headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({'video_ids': idsToWarm}),
-          )
-          .timeout(const Duration(seconds: 18));
-
-      if (res.statusCode != 200) {
-        throw Exception('Warm stream lookup failed: ${res.statusCode}');
-      }
-
-      final data = jsonDecode(res.body) as Map<String, dynamic>;
-      final streams = data['streams'];
-      if (streams is! Map) return;
-
-      streams.forEach((key, dynamic value) {
-        if (value is Map) {
-          _cacheStreamSource(
-            key.toString(),
-            Map<String, dynamic>.from(value),
-          );
-        }
-      });
-    } catch (_) {
-      for (final id in idsToWarm.take(4)) {
-        unawaited(prewarmStream(id));
-      }
-    }
+    await _prepareQueueSession(videoIds, lookahead: 24);
   }
 
   bool _hasValidDownloadedAudio(String path) {
@@ -712,11 +1615,15 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     final loadVersion = ++_streamLoadVersion;
     _desiredStreamPlaying = false;
     _activeStream = true;
+    _managedQueueActive = false;
+    _managedQueueTracks = const [];
+    _streamTransitionInProgress = true;
     _playbackTimer?.cancel();
     audioEngine.pause();
 
     if (!_hasValidDownloadedAudio(path)) {
       _activeStream = false;
+      _streamTransitionInProgress = false;
       state = state.copyWith(
         isPlaying: false,
         isDownloading: false,
@@ -749,6 +1656,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         await _setLocalSource(path);
       });
       if (loadVersion != _streamLoadVersion) return false;
+      _streamTransitionInProgress = false;
       state = state.copyWith(
         isPlaying: false,
         isDownloading: false,
@@ -763,6 +1671,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       return true;
     } catch (error) {
       _activeStream = false;
+      _streamTransitionInProgress = false;
       state = state.copyWith(
         isPlaying: false,
         isDownloading: false,
@@ -782,11 +1691,15 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     final loadVersion = ++_streamLoadVersion;
     _desiredStreamPlaying = false;
     _activeStream = true;
+    _managedQueueActive = false;
+    _managedQueueTracks = const [];
+    _streamTransitionInProgress = true;
     _playbackTimer?.cancel();
     audioEngine.pause();
 
     if (!_hasValidDownloadedAudio(path)) {
       _activeStream = false;
+      _streamTransitionInProgress = false;
       state = state.copyWith(
         isPlaying: false,
         isDownloading: false,
@@ -820,6 +1733,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         await _setLocalSource(path);
       });
       if (loadVersion != _streamLoadVersion) return false;
+      _streamTransitionInProgress = false;
       state = state.copyWith(
         isPlaying: false,
         isDownloading: false,
@@ -836,6 +1750,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       return true;
     } catch (error) {
       _activeStream = false;
+      _streamTransitionInProgress = false;
       state = state.copyWith(
         isPlaying: false,
         isDownloading: false,
@@ -874,7 +1789,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
             "Proxy Refused Connection or Failed to DL: ${res.body}");
       }
 
-      final meta = jsonDecode(res.body);
+      final meta = Map<String, dynamic>.from(jsonDecode(res.body) as Map);
       state = state.copyWith(
         currentTrackName: meta['title'] ?? 'Downloading...',
         thumbnail: meta['thumbnail'],
@@ -905,7 +1820,15 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       }
 
       final jsonPath = outPath.replaceAll('.mp3', '.json');
+      meta['owner_id'] = currentAuthenticatedUserId ?? 'guest';
       await File(jsonPath).writeAsString(jsonEncode(meta));
+      unawaited(
+        upsertCloudLibraryTrack({
+          ...Map<String, dynamic>.from(meta as Map),
+          'id': videoId,
+          'videoId': videoId,
+        }),
+      );
 
       final loaded = await loadLocalWithMeta(outPath, meta);
       if (!loaded) {
@@ -939,7 +1862,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         throw Exception("Proxy Refused Connection or Failed to DL");
       }
 
-      final meta = jsonDecode(res.body);
+      final meta = Map<String, dynamic>.from(jsonDecode(res.body) as Map);
       HistoryManager.addHistory(videoId);
 
       final req = http.Request('GET', _proxyUri('/stream/$videoId'));
@@ -962,7 +1885,15 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       }
 
       final jsonPath = outPath.replaceAll('.mp3', '.json');
+      meta['owner_id'] = currentAuthenticatedUserId ?? 'guest';
       await File(jsonPath).writeAsString(jsonEncode(meta));
+      unawaited(
+        upsertCloudLibraryTrack({
+          ...Map<String, dynamic>.from(meta as Map),
+          'id': videoId,
+          'videoId': videoId,
+        }),
+      );
       return true;
     } catch (e) {
       try {
@@ -980,6 +1911,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     Map<String, dynamic> fallbackMeta,
   ) async {
     final loadVersion = ++_streamLoadVersion;
+    final totalStopwatch = Stopwatch()..start();
     _desiredStreamPlaying = true;
     if (_activeStream &&
         state.videoId == videoId &&
@@ -990,6 +1922,9 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     }
 
     _activeStream = true;
+    _managedQueueActive = false;
+    _managedQueueTracks = const [];
+    _streamTransitionInProgress = true;
     audioEngine.pause();
     _playbackTimer?.cancel();
 
@@ -998,61 +1933,72 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         currentTrackName: fallbackMeta['title'] ?? 'Connecting Stream...',
         thumbnail: fallbackMeta['thumbnail'],
         artist: fallbackMeta['channel'] ?? fallbackMeta['author'],
-        videoId: videoId,
+        videoId: null,
         duration: 0,
         currentPosition: 0);
 
     try {
-      final source = await _resolveStreamSource(videoId);
+      final cachedPrepared = _freshStreamSource(videoId);
+      final prepareStopwatch = Stopwatch()..start();
+      final source = cachedPrepared ?? await _resolveStreamSource(videoId);
+      final prepareMs = prepareStopwatch.elapsedMilliseconds;
       if (loadVersion != _streamLoadVersion) return;
+      final attachStopwatch = Stopwatch()..start();
       await _runStreamCommand(() async {
         if (loadVersion != _streamLoadVersion) return;
         await _setStreamSource(videoId, source);
       });
       if (loadVersion != _streamLoadVersion) return;
+      final attachMs = attachStopwatch.elapsedMilliseconds;
       final dur =
           streamPlayer.duration?.inSeconds ?? _parseInt(fallbackMeta['duration']);
-      
+      _streamTransitionInProgress = false;
       state = state.copyWith(
           currentTrackName: fallbackMeta['title'],
           duration: dur > 0 ? dur : _parseInt(fallbackMeta['duration']),
-          isDownloading: false);
+          isDownloading: false,
+          videoId: videoId);
           
       HistoryManager.addHistory(videoId);
       if (loadVersion == _streamLoadVersion && _desiredStreamPlaying) {
         await _resumeStreamPlayback();
       }
+      debugPrint(
+        '[EBB] stream $videoId prepared=${cachedPrepared != null} '
+        'prepareMs=$prepareMs attachMs=$attachMs totalMs=${totalStopwatch.elapsedMilliseconds}',
+      );
     } catch (e) {
       if (loadVersion != _streamLoadVersion) return;
       try {
-        final fallbackUrl = buildProxyUri('/proxy_stream/$videoId').toString();
+        final directSource = await _fetchDirectStreamSource(videoId);
         await _runStreamCommand(() async {
           if (loadVersion != _streamLoadVersion) return;
-          _cachedStreamVideoId = null;
-          final previousSource = _cachedStreamAudioSource;
-          _cachedStreamAudioSource = null;
-          await streamPlayer.stop();
-          await streamPlayer.setUrl(fallbackUrl);
-          unawaited(_clearOldCachedStream(previousSource));
+          await _setStreamSource(videoId, directSource);
         });
         if (loadVersion != _streamLoadVersion) return;
         final dur =
             streamPlayer.duration?.inSeconds ?? _parseInt(fallbackMeta['duration']);
-
+        _streamTransitionInProgress = false;
         state = state.copyWith(
             currentTrackName: fallbackMeta['title'],
             duration: dur > 0 ? dur : _parseInt(fallbackMeta['duration']),
-            isDownloading: false);
+            isDownloading: false,
+            videoId: videoId);
 
         HistoryManager.addHistory(videoId);
         if (loadVersion == _streamLoadVersion && _desiredStreamPlaying) {
           await _resumeStreamPlayback();
         }
+        debugPrint(
+          '[EBB] stream $videoId fell back to direct_url totalMs=${totalStopwatch.elapsedMilliseconds}',
+        );
       } catch (fallbackError) {
         if (loadVersion != _streamLoadVersion) return;
+        _streamTransitionInProgress = false;
         state = state.copyWith(
             isDownloading: false,
-            currentTrackName: 'Stream failed: $fallbackError');
+            currentTrackName: 'Stream failed: $fallbackError',
+            videoId: null);
       }
     }
   }
@@ -1116,11 +2062,25 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
   Future<void> stopPlayback({bool resetState = true}) async {
     _desiredStreamPlaying = false;
     _playbackTimer?.cancel();
+    _sleepTimer?.cancel();
+    _sleepTimer = null;
+    _sleepTimerEndsAt = null;
     _completedTrackIdNotified = null;
+    _streamTransitionInProgress = false;
+    _managedQueueActive = false;
+    _managedQueueTracks = const [];
+    for (var i = 0; i < _prefetchedTrackIds.length; i++) {
+      _prefetchedTrackIds[i] = null;
+    }
 
     try {
       await streamPlayer.stop();
     } catch (_) {}
+    for (final player in _prefetchPlayers) {
+      try {
+        await player.stop();
+      } catch (_) {}
+    }
     try {
       audioEngine.pause();
     } catch (_) {}
@@ -1141,6 +2101,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         isDownloading: false,
         currentPosition: 0,
         currentPositionMs: 0,
+        sleepTimerRemainingSeconds: 0,
       );
     }
     _broadcastStoppedState();
@@ -1206,6 +2167,11 @@ class SearchNotifier extends StateNotifier<List<dynamic>> {
   }
 
   Future<void> search(String query) async {
+    final normalizedQuery = query.trim();
+    if (normalizedQuery.isEmpty) {
+      clear();
+      return;
+    }
     final requestVersion = ++_requestVersion;
     isLoading = true;
     state = [...state];
@@ -1213,12 +2179,18 @@ class SearchNotifier extends StateNotifier<List<dynamic>> {
       final res = await appHttpClient
           .post(buildProxyUri('/search'),
               headers: {'Content-Type': 'application/json'},
-              body: jsonEncode({"query": query, "limit": 10}))
+              body: jsonEncode({"query": normalizedQuery, "limit": 10}))
           .timeout(const Duration(seconds: 10));
       if (requestVersion != _requestVersion) return;
       if (res.statusCode == 200) {
         state = jsonDecode(res.body)['results'];
         _primeSearchResults(state);
+        unawaited(
+          recordCloudSearchEvent(
+            normalizedQuery,
+            resultCount: state.length,
+          ),
+        );
       } else {
         state = [];
       }
@@ -1247,50 +2219,375 @@ final searchProvider =
 
 class RecommendationNotifier extends StateNotifier<List<dynamic>> {
   final Ref ref;
+  final Random _random = Random();
+  static const List<String> _tasteKeywords = <String>[
+    'rock',
+    'metal',
+    'jazz',
+    'blues',
+    'classical',
+    'orchestra',
+    'punk',
+    'indie',
+    'folk',
+    'country',
+    'ambient',
+    'chill',
+    'sad',
+    'happy',
+    'workout',
+    'gym',
+    'sleep',
+    'focus',
+    'lofi',
+    'edm',
+    'house',
+    'techno',
+    'trance',
+    'disco',
+    'pop',
+    'rap',
+    'hip hop',
+    'rnb',
+    'soul',
+    'funk',
+    'vibe',
+    'mood',
+    'party',
+    'romantic',
+    'rain',
+    'night',
+    'morning',
+    'road trip',
+    '80s',
+    '90s',
+    '2000s',
+  ];
 
   RecommendationNotifier(this.ref) : super([]);
   bool isLoading = true;
   bool isPaginating = false;
+  int _requestVersion = 0;
+  Timer? _refreshDebounce;
+  final Set<String> _prewarmedRecommendationIds = <String>{};
 
-  void _primeRecommendationResults(List<dynamic> tracks) {
-    unawaited(
-      ref.read(audioPlayerProvider.notifier).prewarmStreams(
-            tracks.map((track) => track['id'] ?? track['videoId']),
-          ),
+  bool _isRequestCurrent(int requestVersion) =>
+      mounted && requestVersion == _requestVersion;
+
+  Future<void> refreshFromSignals({bool forceRefresh = false}) async {
+    final seed = await HistoryManager.getRecommendationSeed();
+    if (!mounted) return;
+    await loadRecommendations(seed, forceRefresh);
+  }
+
+  void scheduleRefresh({bool forceRefresh = false}) {
+    _refreshDebounce?.cancel();
+    _refreshDebounce = Timer(
+      Duration(milliseconds: forceRefresh ? 180 : 120),
+      () {
+        if (!mounted) return;
+        unawaited(refreshFromSignals(forceRefresh: forceRefresh));
+      },
     );
   }
 
-  Future<void> loadRecommendations([String? seedId]) async {
+  @override
+  void dispose() {
+    _refreshDebounce?.cancel();
+    _requestVersion++;
+    super.dispose();
+  }
+
+  String _defaultTrendingQuery() {
+    final locale = ui.PlatformDispatcher.instance.locale;
+    final countryCode = locale.countryCode?.trim();
+    if (countryCode != null && countryCode.isNotEmpty) {
+      return 'Trending songs in $countryCode';
+    }
+    final languageCode = locale.languageCode.trim();
+    if (languageCode.isNotEmpty) {
+      return 'Trending $languageCode music';
+    }
+    return 'Trending hit songs';
+  }
+
+  List<dynamic> _prepareRecommendationResults(
+    List<dynamic> source, {
+    Set<String> avoidIds = const <String>{},
+    bool forceRefresh = false,
+  }) {
+    final preferred = <dynamic>[];
+    final fallback = <dynamic>[];
+    final seen = <String>{};
+    for (final track in source) {
+      final id = (track['id'] ?? track['videoId'])?.toString();
+      if (id != null && id.isNotEmpty && !seen.add(id)) {
+        continue;
+      }
+      if (forceRefresh && id != null && avoidIds.contains(id)) {
+        fallback.add(track);
+      } else {
+        preferred.add(track);
+      }
+    }
+    final combined = [...preferred, ...fallback];
+    if (forceRefresh && combined.length > 1) {
+      combined.shuffle(_random);
+    }
+    return combined.take(15).toList(growable: false);
+  }
+
+  Future<List<dynamic>> _fetchDefaultRecommendations({
+    bool forceRefresh = false,
+  }) async {
+    final queries = <String>[
+      _defaultTrendingQuery(),
+      'Trending hit songs',
+      'Top music right now',
+      'Viral music picks',
+    ];
+
+    final aggregated = <dynamic>[];
+    final seen = <String>{};
+    for (final query in queries) {
+      try {
+        final res = await appHttpClient
+            .post(
+              buildProxyUri('/search'),
+              headers: {'Content-Type': 'application/json'},
+              body: jsonEncode({"query": query, "limit": forceRefresh ? 18 : 15}),
+            )
+            .timeout(const Duration(seconds: 10));
+        if (res.statusCode != 200) continue;
+        final payload = jsonDecode(res.body) as Map<String, dynamic>;
+        final results = payload['results'] as List<dynamic>? ?? const [];
+        if (results.isNotEmpty) {
+          if (!forceRefresh) {
+            return results;
+          }
+          for (final track in results) {
+            final id = (track['id'] ?? track['videoId'])?.toString();
+            if (id != null && id.isNotEmpty && !seen.add(id)) {
+              continue;
+            }
+            aggregated.add(track);
+          }
+        }
+      } catch (_) {
+        continue;
+      }
+    }
+    if (forceRefresh && aggregated.isNotEmpty) {
+      aggregated.shuffle(_random);
+      return aggregated;
+    }
+    return const [];
+  }
+
+  void _primeRecommendationResults(List<dynamic> tracks) {
+    final ids = <String>[];
+    for (final track in tracks) {
+      final id = (track['id'] ?? track['videoId'])?.toString();
+      if (id == null || id.isEmpty || !_prewarmedRecommendationIds.add(id)) {
+        continue;
+      }
+      ids.add(id);
+      if (ids.length >= 6) {
+        break;
+      }
+    }
+    if (ids.isEmpty) return;
+    if (_prewarmedRecommendationIds.length > 160) {
+      _prewarmedRecommendationIds.removeAll(
+        _prewarmedRecommendationIds.take(_prewarmedRecommendationIds.length - 80),
+      );
+    }
+    unawaited(ref.read(audioPlayerProvider.notifier).prewarmStreams(ids));
+  }
+
+  void _bumpTasteWeight(
+    Map<String, double> weights,
+    String? value,
+    double weight,
+  ) {
+    final normalized = value?.trim().toLowerCase();
+    if (normalized == null || normalized.isEmpty) return;
+    weights.update(normalized, (current) => current + weight,
+        ifAbsent: () => weight);
+  }
+
+  String? _extractArtistHint(dynamic rawTrack) {
+    if (rawTrack is! Map) return null;
+    return rawTrack['channel']?.toString() ??
+        rawTrack['author']?.toString() ??
+        rawTrack['artist']?.toString();
+  }
+
+  String? _extractAlbumHint(dynamic rawTrack) {
+    if (rawTrack is! Map) return null;
+    return rawTrack['album']?.toString() ?? rawTrack['album_title']?.toString();
+  }
+
+  bool _looksLikeTasteQuery(String query) {
+    final normalized = query.trim().toLowerCase();
+    if (normalized.isEmpty) return false;
+    if (normalized.length > 38) return true;
+    if (normalized.contains(' mix') ||
+        normalized.contains(' playlist') ||
+        normalized.contains(' songs') ||
+        normalized.contains(' music')) {
+      return true;
+    }
+    return _tasteKeywords.any((keyword) => normalized.contains(keyword));
+  }
+
+  Future<Map<String, dynamic>> _buildRecommendationRequestBody(
+    String? seedId, {
+    required int limit,
+    Set<String> avoidIds = const <String>{},
+    bool forceRefresh = false,
+  }) async {
+    final seedIds = <String>[];
+    void addSeed(String? id) {
+      final normalized = id?.trim();
+      if (normalized == null || normalized.isEmpty) return;
+      if (!seedIds.contains(normalized)) {
+        seedIds.add(normalized);
+      }
+    }
+
+    addSeed(seedId);
+    for (final recentSeed
+        in await HistoryManager.getRecentSeeds(limit: forceRefresh ? 12 : 8)) {
+      addSeed(recentSeed);
+    }
+
+    final artistWeights = <String, double>{};
+    final queryWeights = <String, double>{};
+    final playlists = ref.read(playlistProvider);
+    final libraryTracks = ref.read(libraryProvider).valueOrNull ?? const [];
+
+    for (final playlist in playlists) {
+      _bumpTasteWeight(queryWeights, playlist.name, 1.4);
+      for (final track in playlist.tracks.take(18)) {
+        _bumpTasteWeight(artistWeights, _extractArtistHint(track), 1.4);
+        _bumpTasteWeight(queryWeights, _extractAlbumHint(track), 0.8);
+      }
+    }
+
+    for (final track in libraryTracks.take(24)) {
+      _bumpTasteWeight(artistWeights, _extractArtistHint(track), 1.2);
+      _bumpTasteWeight(queryWeights, _extractAlbumHint(track), 0.7);
+    }
+
+    final recentQueries = await getRecentCloudSearchQueries(limit: 8);
+    for (final query in recentQueries) {
+      if (_looksLikeTasteQuery(query)) {
+        _bumpTasteWeight(queryWeights, query, 1.35);
+      }
+    }
+
+    final rankedArtists = artistWeights.entries.toList()
+      ..sort((a, b) => b.value.compareTo(a.value));
+    final rankedQueries = queryWeights.entries.toList()
+      ..sort((a, b) => b.value.compareTo(a.value));
+
+    return {
+      'query': '',
+      'limit': limit,
+      if (seedIds.isNotEmpty) 'seed_id': seedIds.first,
+      'seed_ids': seedIds.take(forceRefresh ? 6 : 5).toList(growable: false),
+      'artist_hints':
+          rankedArtists.take(6).map((entry) => entry.key).toList(growable: false),
+      'taste_queries':
+          rankedQueries.take(8).map((entry) => entry.key).toList(growable: false),
+      'avoid_ids': avoidIds.take(40).toList(growable: false),
+    };
+  }
+
+  Future<void> loadRecommendations([String? seedId, bool forceRefresh = false]) async {
+    final requestVersion = ++_requestVersion;
+    final previousIds = forceRefresh
+        ? state
+            .map((track) => (track['id'] ?? track['videoId'])?.toString())
+            .whereType<String>()
+            .toSet()
+        : const <String>{};
     isLoading = true;
-    state = [];
+    if (_isRequestCurrent(requestVersion)) {
+      state = forceRefresh ? [...state] : [];
+    }
     try {
-      final body = seedId != null
-          ? {"query": "", "limit": 15, "seed_id": seedId}
-          : {"query": "Trending Hit Songs", "limit": 15};
+      if (seedId == null || seedId.isEmpty) {
+        final fallbackResults =
+            await _fetchDefaultRecommendations(forceRefresh: forceRefresh);
+        if (!_isRequestCurrent(requestVersion)) return;
+        if (fallbackResults.isNotEmpty) {
+          state = _prepareRecommendationResults(
+            fallbackResults,
+            avoidIds: previousIds,
+            forceRefresh: forceRefresh,
+          );
+          _primeRecommendationResults(state);
+          return;
+        }
+      }
+
+      final body = await _buildRecommendationRequestBody(
+        seedId,
+        limit: 15,
+        avoidIds: previousIds,
+        forceRefresh: forceRefresh,
+      );
+      if (!_isRequestCurrent(requestVersion)) return;
       final res = await appHttpClient
           .post(buildProxyUri('/recommend'),
               headers: {'Content-Type': 'application/json'},
               body: jsonEncode(body))
           .timeout(const Duration(seconds: 10));
+      if (!_isRequestCurrent(requestVersion)) return;
       if (res.statusCode == 200) {
-        state = jsonDecode(res.body)['recommendations'];
+        final fetched = jsonDecode(res.body)['recommendations'] as List<dynamic>;
+        state = _prepareRecommendationResults(
+          fetched,
+          avoidIds: previousIds,
+          forceRefresh: forceRefresh,
+        );
         _primeRecommendationResults(state);
       }
     } catch (e) {
       // print("Recommendations failed: $e");
     } finally {
-      isLoading = false;
-      state = [...state];
+      if (_isRequestCurrent(requestVersion)) {
+        isLoading = false;
+        state = [...state];
+      }
     }
   }
 
   Future<void> loadMore(String seedId) async {
     if (isPaginating) return;
+    final requestVersion = ++_requestVersion;
     isPaginating = true;
+    if (_isRequestCurrent(requestVersion)) {
+      state = [...state];
+    }
     try {
+      final effectiveSeedId = await HistoryManager.getRecommendationSeed() ?? seedId;
+      if (!_isRequestCurrent(requestVersion)) return;
+      final body = await _buildRecommendationRequestBody(
+        effectiveSeedId,
+        limit: 10,
+        avoidIds: state
+            .map((track) => (track['id'] ?? track['videoId'])?.toString())
+            .whereType<String>()
+            .toSet(),
+      );
+      if (!_isRequestCurrent(requestVersion)) return;
       final res = await appHttpClient.post(buildProxyUri('/recommend'),
           headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({"query": "", "limit": 10, "seed_id": seedId}));
+          body: jsonEncode(body));
+      if (!_isRequestCurrent(requestVersion)) return;
       if (res.statusCode == 200) {
         final newRecs =
             jsonDecode(res.body)['recommendations'] as List<dynamic>;
@@ -1303,17 +2600,30 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
     } catch (e) {
       // print("Load more failed: $e");
     } finally {
-      isPaginating = false;
+      if (_isRequestCurrent(requestVersion)) {
+        isPaginating = false;
+        state = [...state];
+      }
     }
   }
 }
 
 final recommendationProvider =
     StateNotifierProvider<RecommendationNotifier, List<dynamic>>((ref) {
+  ref.watch(authProvider.select((state) => state.storageScopeId));
+  ref.watch(storageRefreshTickProvider);
   final notifier = RecommendationNotifier(ref);
-  HistoryManager.getLatestSeed().then((seed) {
-    notifier.loadRecommendations(seed);
+  unawaited(notifier.refreshFromSignals());
+  final subscription = HistoryManager.seedStream.listen((_) {
+    notifier.scheduleRefresh();
   });
+  ref.listen<List<Playlist>>(playlistProvider, (_, __) {
+    notifier.scheduleRefresh(forceRefresh: true);
+  });
+  ref.listen<AsyncValue<List<Map<String, dynamic>>>>(libraryProvider, (_, __) {
+    notifier.scheduleRefresh(forceRefresh: true);
+  });
+  ref.onDispose(subscription.cancel);
   return notifier;
 });
 
@@ -1634,7 +2944,7 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
 
   void _primeTracks(
     Iterable<dynamic> tracks, {
-    int limit = 6,
+    int limit = 8,
   }) {
     final ids = <String>[];
     for (final track in tracks) {
@@ -1648,9 +2958,10 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
     unawaited(ref.read(audioPlayerProvider.notifier).prewarmStreams(ids));
   }
 
-  void _primeUpcomingQueue({int lookahead = 4}) {
+  void _primeUpcomingQueue({int lookahead = 10}) {
     final upcoming = <Map<String, dynamic>>[];
-    for (var i = state.currentIndex + 1; i < state.queue.length; i++) {
+    final resolvedCurrentIndex = _resolvedCurrentIndex();
+    for (var i = resolvedCurrentIndex + 1; i < state.queue.length; i++) {
       final track = state.queue[i];
       if (isTrackHidden(track)) {
         continue;
@@ -1664,8 +2975,41 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
       _primeTracks(upcoming, limit: lookahead);
     }
     if (state.recommendations.isNotEmpty) {
-      _primeTracks(state.recommendations, limit: 4);
+      _primeTracks(state.recommendations, limit: 6);
     }
+    if (state.mode == PlaybackQueueMode.playlist) {
+      unawaited(
+        ref.read(audioPlayerProvider.notifier).prefetchFixedQueueTracks(
+              state.queue,
+              currentIndex: resolvedCurrentIndex,
+              count: 2,
+            ),
+      );
+    }
+  }
+
+  int _resolvedCurrentIndex() {
+    if (state.queue.isEmpty) return 0;
+
+    final audioNotifier = ref.read(audioPlayerProvider.notifier);
+    final managedIndex = audioNotifier.currentManagedQueueIndex;
+    if (audioNotifier.hasManagedQueue &&
+        managedIndex != null &&
+        managedIndex >= 0 &&
+        managedIndex < state.queue.length) {
+      return managedIndex;
+    }
+
+    final activeTrackId = state.currentTrackId;
+    if (activeTrackId != null && activeTrackId.isNotEmpty) {
+      final matchingIndex = state.queue
+          .indexWhere((track) => extractTrackId(track) == activeTrackId);
+      if (matchingIndex >= 0) {
+        return matchingIndex;
+      }
+    }
+
+    return state.currentIndex.clamp(0, state.queue.length - 1).toInt();
   }
 
   int _nextPlayableIndex(int fromIndex) {
@@ -1704,11 +3048,19 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
     String seedId, {
     int limit = 12,
   }) async {
+    final body = await RecommendationNotifier(ref)._buildRecommendationRequestBody(
+      seedId,
+      limit: limit,
+      avoidIds: state.queue
+          .map((track) => extractTrackId(track))
+          .whereType<String>()
+          .toSet(),
+    );
     final res = await appHttpClient
         .post(
           buildProxyUri('/recommend'),
           headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({"query": "", "limit": limit, "seed_id": seedId}),
+          body: jsonEncode(body),
         )
         .timeout(const Duration(seconds: 12));
 
@@ -1735,9 +3087,10 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
       playedTrackIds: const [],
     );
 
-    await ref
-        .read(audioPlayerProvider.notifier)
-        .streamYoutube(videoId, normalizedTrack);
+    await ref.read(audioPlayerProvider.notifier).configureManagedQueue(
+          [normalizedTrack],
+          initialIndex: 0,
+        );
     _primeUpcomingQueue();
     unawaited(_appendRadioRecommendations(seedId: videoId));
   }
@@ -1772,13 +3125,16 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
         currentTrackId: videoId,
         playedTrackIds: const [],
       );
+      await audioNotifier.configureManagedQueue(
+        [localTrack],
+        initialIndex: 0,
+      );
       _primeTracks([localTrack], limit: 1);
       unawaited(_appendRadioRecommendations(seedId: videoId));
     } else {
       clearSession();
     }
 
-    await audioNotifier.play();
     return true;
   }
 
@@ -1815,9 +3171,10 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
       playlistName: playlistName,
     );
 
-    await ref
-        .read(audioPlayerProvider.notifier)
-        .streamYoutube(currentTrackId, currentTrackMap);
+    await ref.read(audioPlayerProvider.notifier).configureManagedQueue(
+          normalizedQueue,
+          initialIndex: currentIndex,
+        );
     _primeUpcomingQueue();
     unawaited(_refreshPlaylistRecommendations(currentTrackId));
   }
@@ -1846,10 +3203,10 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
     }
 
     if (playableIndexes.length > 1) {
-      playableIndexes.remove(state.currentIndex);
+      playableIndexes.remove(_resolvedCurrentIndex());
     }
     if (playableIndexes.isEmpty) {
-      playableIndexes.add(state.currentIndex.clamp(0, state.queue.length - 1));
+      playableIndexes.add(_resolvedCurrentIndex());
     }
 
     final index = playableIndexes[_random.nextInt(playableIndexes.length)];
@@ -1873,6 +3230,10 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
         currentTrackId: videoId,
         playedTrackIds: nextPlayedTrackIds,
       );
+      if (isTrackHidden(state.queue[matchingIndex])) {
+        await playNext();
+        return;
+      }
     } else {
       state = state.copyWith(
         currentTrackId: videoId,
@@ -1891,7 +3252,28 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
   Future<void> playNext() async {
     if (state.mode == PlaybackQueueMode.none) return;
 
-    final nextIndex = _nextPlayableIndex(state.currentIndex);
+    final audioNotifier = ref.read(audioPlayerProvider.notifier);
+
+    if (audioNotifier.hasManagedQueue) {
+      final resolvedCurrentIndex = _resolvedCurrentIndex();
+      final nextIndex = _nextPlayableIndex(resolvedCurrentIndex);
+      if (nextIndex >= 0) {
+        if (nextIndex == resolvedCurrentIndex + 1 &&
+            !isTrackHidden(state.queue[nextIndex])) {
+          await audioNotifier.skipManagedQueueNext();
+        } else {
+          await audioNotifier.playManagedQueueIndex(nextIndex);
+        }
+        return;
+      }
+    }
+
+    final resolvedCurrentIndex = _resolvedCurrentIndex();
+    if (resolvedCurrentIndex != state.currentIndex) {
+      state = state.copyWith(currentIndex: resolvedCurrentIndex);
+    }
+
+    final nextIndex = _nextPlayableIndex(resolvedCurrentIndex);
     if (nextIndex >= 0) {
       await playQueueIndex(nextIndex);
       return;
@@ -1899,11 +3281,24 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
 
     if (state.mode == PlaybackQueueMode.radio) {
       await _appendRadioRecommendations(seedId: state.currentTrackId);
-      final refreshedNextIndex = _nextPlayableIndex(state.currentIndex);
+      final refreshedNextIndex = _nextPlayableIndex(_resolvedCurrentIndex());
       if (refreshedNextIndex >= 0) {
         await playQueueIndex(refreshedNextIndex);
       }
     }
+  }
+
+  Future<void> playPrevious() async {
+    if (state.mode == PlaybackQueueMode.none) return;
+    final audioNotifier = ref.read(audioPlayerProvider.notifier);
+    if (audioNotifier.hasManagedQueue) {
+      await audioNotifier.skipManagedQueuePrevious();
+      return;
+    }
+
+    final resolvedCurrentIndex = _resolvedCurrentIndex();
+    final previousIndex = max(0, resolvedCurrentIndex - 1);
+    await playQueueIndex(previousIndex);
   }
 
   Future<void> playQueueIndex(int index) async {
@@ -1913,6 +3308,21 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
     if (videoId == null) return;
 
     final previousTrackId = state.currentTrackId;
+    final audioNotifier = ref.read(audioPlayerProvider.notifier);
+    if (audioNotifier.hasManagedQueue) {
+      await audioNotifier.playManagedQueueIndex(index);
+    } else {
+      final localPath = track['local_path']?.toString();
+      if (localPath != null &&
+          localPath.isNotEmpty &&
+          File(localPath).existsSync()) {
+        final loaded = await audioNotifier.loadLocalWithMeta(localPath, track);
+        if (!loaded) return;
+        await audioNotifier.play();
+      } else {
+        await audioNotifier.streamYoutube(videoId, track);
+      }
+    }
     state = state.copyWith(
       currentIndex: index,
       currentTrackId: videoId,
@@ -1920,17 +3330,6 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
           ? _withPlayedTrack(previousTrackId)
           : state.playedTrackIds,
     );
-    final localPath = track['local_path']?.toString();
-    final audioNotifier = ref.read(audioPlayerProvider.notifier);
-    if (localPath != null &&
-        localPath.isNotEmpty &&
-        File(localPath).existsSync()) {
-      final loaded = await audioNotifier.loadLocalWithMeta(localPath, track);
-      if (!loaded) return;
-      await audioNotifier.play();
-    } else {
-      await audioNotifier.streamYoutube(videoId, track);
-    }
     _primeUpcomingQueue();
   }
 
@@ -1942,12 +3341,14 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
     if (index < 0) return;
 
     final updatedQueue = [...state.queue]..removeAt(index);
+    final audioNotifier = ref.read(audioPlayerProvider.notifier);
     if (updatedQueue.isEmpty) {
       clearSession();
       return;
     }
 
-    if (index == state.currentIndex) {
+    final resolvedCurrentIndex = _resolvedCurrentIndex();
+    if (index == resolvedCurrentIndex) {
       final replacementIndex =
           index.clamp(0, updatedQueue.length - 1).toInt();
       state = state.copyWith(
@@ -1956,11 +3357,12 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
         currentTrackId: extractTrackId(updatedQueue[replacementIndex]),
         playedTrackIds: state.playedTrackIds.where((id) => id != videoId).toList(),
       );
+      unawaited(audioNotifier.removeManagedQueueItem(index));
       unawaited(playQueueIndex(replacementIndex));
       return;
     }
 
-    var nextCurrentIndex = state.currentIndex;
+    var nextCurrentIndex = resolvedCurrentIndex;
     if (index < nextCurrentIndex) {
       nextCurrentIndex -= 1;
     }
@@ -1969,6 +3371,7 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
       currentIndex: nextCurrentIndex,
       playedTrackIds: state.playedTrackIds.where((id) => id != videoId).toList(),
     );
+    unawaited(audioNotifier.removeManagedQueueItem(index));
     _primeUpcomingQueue();
   }
 
@@ -1990,12 +3393,13 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
     if (index < 0) return;
 
     final updatedQueue = [...state.queue]..removeAt(index);
+    final audioNotifier = ref.read(audioPlayerProvider.notifier);
     if (updatedQueue.isEmpty) {
       clearSession();
       return;
     }
 
-    var nextCurrentIndex = state.currentIndex;
+    var nextCurrentIndex = _resolvedCurrentIndex();
     if (index < nextCurrentIndex) {
       nextCurrentIndex -= 1;
     }
@@ -2007,10 +3411,11 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
       currentTrackId: extractTrackId(updatedQueue[nextCurrentIndex]),
       playedTrackIds: state.playedTrackIds.where((id) => id != trackId).toList(),
     );
+    unawaited(audioNotifier.removeManagedQueueItem(index));
     _primeUpcomingQueue();
   }
 
-  Future<void> enqueueTrack(dynamic track) async {
+  Future<void> enqueueTrack(dynamic track, {bool playNext = true}) async {
     final normalizedTrack = normalizeTrack(track);
     final videoId = extractTrackId(normalizedTrack);
     if (videoId == null) return;
@@ -2027,10 +3432,20 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
     final nextRecommendations = state.recommendations
         .where((entry) => extractTrackId(entry) != videoId)
         .toList(growable: false);
+    final resolvedCurrentIndex = _resolvedCurrentIndex();
+    final insertIndex = playNext
+        ? (resolvedCurrentIndex + 1).clamp(0, state.queue.length).toInt()
+        : state.queue.length;
+    final updatedQueue = [...state.queue];
+    updatedQueue.insert(insertIndex, normalizedTrack);
     state = state.copyWith(
-      queue: [...state.queue, normalizedTrack],
+      queue: updatedQueue,
       recommendations: nextRecommendations,
     );
+    unawaited(ref.read(audioPlayerProvider.notifier).insertManagedQueueTracks(
+          insertIndex,
+          [normalizedTrack],
+        ));
     _primeTracks([normalizedTrack], limit: 1);
   }
 
@@ -2055,6 +3470,12 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
       queue: updatedQueue,
       currentIndex: nextCurrentIndex < 0 ? 0 : nextCurrentIndex,
     );
+    unawaited(
+      ref.read(audioPlayerProvider.notifier).moveManagedQueueItem(
+            oldIndex,
+            normalizedNewIndex,
+          ),
+    );
 
     if (state.mode == PlaybackQueueMode.playlist && state.playlistId != null) {
       ref
@@ -2062,6 +3483,19 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
           .replaceTracks(state.playlistId!, updatedQueue);
     }
     _primeUpcomingQueue();
+  }
+
+  void reorderUpcomingQueue(int oldIndex, int newIndex) {
+    final activeIndex = _resolvedCurrentIndex();
+    final upcomingStartIndex = activeIndex + 1;
+    if (upcomingStartIndex >= state.queue.length) return;
+
+    final upcomingLength = state.queue.length - upcomingStartIndex;
+    if (oldIndex < 0 || oldIndex >= upcomingLength) return;
+
+    final actualOldIndex = upcomingStartIndex + oldIndex;
+    final actualNewIndex = upcomingStartIndex + newIndex;
+    reorderQueue(actualOldIndex, actualNewIndex);
   }
 
   Future<void> loadMore() async {
@@ -2083,7 +3517,7 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
     if (effectiveSeedId == null || effectiveSeedId.isEmpty) return;
     if (state.isLoadingQueue) return;
 
-    final remaining = state.queue.length - state.currentIndex - 1;
+    final remaining = state.queue.length - _resolvedCurrentIndex() - 1;
     if (remaining > 5) return;
 
     state = state.copyWith(isLoadingQueue: true);
@@ -2097,6 +3531,11 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
           .toList(growable: false);
       if (newTracks.isNotEmpty) {
         state = state.copyWith(queue: [...state.queue, ...newTracks]);
+        unawaited(
+          ref.read(audioPlayerProvider.notifier).appendManagedQueueTracks(
+                newTracks,
+              ),
+        );
         _primeTracks(newTracks);
       }
     } catch (_) {
@@ -2158,6 +3597,11 @@ final playbackQueueProvider =
 
   audioNotifier.onTrackCompleted = handleTrackCompleted;
   audioNotifier.onTrackChanged = handleTrackChanged;
+  if (globalAudioHandler is AuralisAudioHandler) {
+    final handler = globalAudioHandler as AuralisAudioHandler;
+    handler.onSkipToNext = notifier.playNext;
+    handler.onSkipToPrevious = notifier.playPrevious;
+  }
 
   ref.onDispose(() {
     if (identical(audioNotifier.onTrackCompleted, handleTrackCompleted)) {
@@ -2166,6 +3610,15 @@ final playbackQueueProvider =
     if (identical(audioNotifier.onTrackChanged, handleTrackChanged)) {
       audioNotifier.onTrackChanged = null;
     }
+    if (globalAudioHandler is AuralisAudioHandler) {
+      final handler = globalAudioHandler as AuralisAudioHandler;
+      if (identical(handler.onSkipToNext, notifier.playNext)) {
+        handler.onSkipToNext = null;
+      }
+      if (identical(handler.onSkipToPrevious, notifier.playPrevious)) {
+        handler.onSkipToPrevious = null;
+      }
+    }
   });
 
   return notifier;
@@ -2173,7 +3626,9 @@ final playbackQueueProvider =
 
 final libraryProvider =
     FutureProvider<List<Map<String, dynamic>>>((ref) async {
-  final dir = await getApplicationDocumentsDirectory();
+  final scopeId = ref.watch(authProvider.select((state) => state.storageScopeId));
+  ref.watch(storageRefreshTickProvider);
+  final dir = await getScopedDownloadsDirectory(scopeId);
   final files = dir.listSync().where((f) => f.path.endsWith('.mp3')).toList()
     ..sort((a, b) {
       final aTime = a.statSync().modified;

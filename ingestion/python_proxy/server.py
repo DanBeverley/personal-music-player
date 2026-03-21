@@ -1,6 +1,7 @@
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from threading import Lock
-from typing import List
+from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -129,6 +130,38 @@ def parse_duration_seconds(value):
             return parts[0] * 3600 + parts[1] * 60 + parts[2]
     return 0
 
+def normalize_recommendation_track(data):
+    if not data:
+        return None
+    video_id = data.get("videoId") or data.get("video_id") or data.get("id")
+    if not video_id:
+        return None
+    album_info = extract_album_info(data) or {}
+    return {
+        "id": video_id,
+        "title": data.get("title"),
+        "duration": parse_duration_seconds(
+            data.get("duration_seconds")
+            or data.get("lengthSeconds")
+            or data.get("length")
+            or data.get("duration")
+        ),
+        "thumbnail": extract_thumbnail(data),
+        "channel": extract_artist(data),
+        "album": album_info.get("title"),
+        "album_id": album_info.get("id"),
+    }
+
+def _normalize_text(value: Optional[str]) -> str:
+    return re.sub(r"\s+", " ", (value or "").strip().lower())
+
+def _query_tokens(query: str):
+    return [
+        token
+        for token in re.split(r"[^a-z0-9]+", _normalize_text(query))
+        if len(token) >= 3
+    ]
+
 app = FastAPI(title="Auralis Proxy & Recommendation Engine")
 
 # Allow Flutter emulator to connect
@@ -144,15 +177,26 @@ DOWNLOAD_DIR = os.path.join(os.getcwd(), "downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 ytmusic = YTMusic()
 STREAM_INFO_TTL_SECONDS = 21600
+STREAM_WARM_CHUNK_BYTES = int(os.environ.get("STREAM_WARM_CHUNK_BYTES", "786432"))
+STREAM_CHUNK_TTL_SECONDS = 1800
 stream_info_cache = {}
 stream_info_inflight = {}
 stream_info_lock = Lock()
-stream_warm_executor = ThreadPoolExecutor(max_workers=10)
+stream_chunk_cache = {}
+stream_chunk_lock = Lock()
+prepare_metrics = deque(maxlen=180)
+prepare_metrics_lock = Lock()
+stream_warm_executor = ThreadPoolExecutor(max_workers=16)
+upstream_http = requests.Session()
 
 class SearchRequest(BaseModel):
     query: str
     limit: int = 10
     seed_id: str = None
+    seed_ids: List[str] = Field(default_factory=list)
+    taste_queries: List[str] = Field(default_factory=list)
+    artist_hints: List[str] = Field(default_factory=list)
+    avoid_ids: List[str] = Field(default_factory=list)
 
 class DownloadRequest(BaseModel):
     video_id: str
@@ -160,6 +204,9 @@ class DownloadRequest(BaseModel):
 
 class WarmStreamRequest(BaseModel):
     video_ids: List[str] = Field(default_factory=list)
+    current_video_id: Optional[str] = None
+    active_queue: bool = False
+    lookahead: int = 0
 
 def _extract_stream_info(video_id: str):
     url = f"https://www.youtube.com/watch?v={video_id}"
@@ -183,6 +230,284 @@ def _extract_stream_info(video_id: str):
         "mime_type": info.get("ext") or info.get("acodec") or "audio/mp4",
         "duration": info.get("duration") or 0,
     }
+
+def _is_stream_info_cached(video_id: str):
+    now = time.time()
+    with stream_info_lock:
+        cached = stream_info_cache.get(video_id)
+        return bool(cached and cached["expires_at"] > now)
+
+def _extract_total_length(headers):
+    content_range = headers.get("content-range") or headers.get("Content-Range")
+    if content_range and "/" in content_range:
+        total = content_range.split("/")[-1].strip()
+        if total.isdigit():
+            return int(total)
+
+    content_length = headers.get("content-length") or headers.get("Content-Length")
+    if content_length and content_length.isdigit():
+        return int(content_length)
+    return None
+
+def _get_cached_stream_chunk(video_id: str, min_bytes: int = 0):
+    now = time.time()
+    with stream_chunk_lock:
+        cached = stream_chunk_cache.get(video_id)
+        if cached and cached["expires_at"] > now:
+            payload = cached["payload"]
+            if len(payload.get("bytes") or b"") >= min_bytes:
+                return payload
+            return None
+        if cached:
+            stream_chunk_cache.pop(video_id, None)
+    return None
+
+def _store_stream_chunk(video_id: str, payload):
+    with stream_chunk_lock:
+        stream_chunk_cache[video_id] = {
+            "payload": payload,
+            "expires_at": time.time() + STREAM_CHUNK_TTL_SECONDS,
+        }
+
+def _chunk_target_bytes(position: int, active_queue: bool):
+    if active_queue:
+        if position <= 0:
+            return 2097152
+        if position == 1:
+            return 1572864
+        if position == 2:
+            return 1048576
+        return STREAM_WARM_CHUNK_BYTES
+    if position <= 0:
+        return 1048576
+    if position == 1:
+        return 786432
+    return STREAM_WARM_CHUNK_BYTES
+
+def _parse_byte_range(range_header: Optional[str], total_length: Optional[int]):
+    if not range_header:
+        return None
+
+    value = range_header.strip().lower()
+    if not value.startswith("bytes="):
+        return None
+
+    spec = value.split("=", 1)[1].strip()
+    if "," in spec or "-" not in spec:
+        return None
+
+    start_text, end_text = spec.split("-", 1)
+    start_text = start_text.strip()
+    end_text = end_text.strip()
+
+    if not start_text:
+        if total_length is None or not end_text.isdigit():
+            return None
+        suffix_length = int(end_text)
+        if suffix_length <= 0:
+            return None
+        start = max(total_length - suffix_length, 0)
+        end = total_length - 1
+        return start, end
+
+    if not start_text.isdigit():
+        return None
+
+    start = int(start_text)
+    end = None
+    if end_text:
+        if not end_text.isdigit():
+            return None
+        end = int(end_text)
+
+    if total_length is not None:
+        if start >= total_length:
+            return None
+        if end is None or end >= total_length:
+            end = total_length - 1
+
+    if end is not None and end < start:
+        return None
+
+    return start, end
+
+def _record_prepare_metric(video_id: str, metrics: dict):
+    with prepare_metrics_lock:
+        prepare_metrics.append({
+            "video_id": video_id,
+            "resolve_ms": metrics.get("resolve_ms") or 0,
+            "chunk_ms": metrics.get("chunk_ms") or 0,
+            "server_ms": metrics.get("server_ms") or 0,
+            "cached_prefix_bytes": metrics.get("cached_prefix_bytes") or 0,
+            "resolve_cache_hit": bool(metrics.get("resolve_cache_hit")),
+            "chunk_cache_hit": bool(metrics.get("chunk_cache_hit")),
+            "active_queue": bool(metrics.get("active_queue")),
+            "created_at": time.time(),
+        })
+
+def _summarize_prepare_metrics():
+    with prepare_metrics_lock:
+        items = list(prepare_metrics)
+
+    if not items:
+        return {
+            "sample_count": 0,
+            "avg_resolve_ms": 0,
+            "avg_chunk_ms": 0,
+            "avg_server_ms": 0,
+            "avg_cached_prefix_bytes": 0,
+            "resolve_cache_hit_rate": 0.0,
+            "chunk_cache_hit_rate": 0.0,
+        }
+
+    count = len(items)
+    return {
+        "sample_count": count,
+        "avg_resolve_ms": int(sum(item["resolve_ms"] for item in items) / count),
+        "avg_chunk_ms": int(sum(item["chunk_ms"] for item in items) / count),
+        "avg_server_ms": int(sum(item["server_ms"] for item in items) / count),
+        "avg_cached_prefix_bytes": int(
+            sum(item["cached_prefix_bytes"] for item in items) / count
+        ),
+        "resolve_cache_hit_rate": round(
+            sum(1 for item in items if item["resolve_cache_hit"]) / count, 3
+        ),
+        "chunk_cache_hit_rate": round(
+            sum(1 for item in items if item["chunk_cache_hit"]) / count, 3
+        ),
+    }
+
+def _warm_initial_stream_chunk(video_id: str, stream_info: dict, target_bytes: int):
+    target_bytes = max(target_bytes, STREAM_WARM_CHUNK_BYTES)
+    cached = _get_cached_stream_chunk(video_id, min_bytes=target_bytes)
+    if cached is not None:
+        return cached
+
+    existing = _get_cached_stream_chunk(video_id)
+    existing_bytes = existing.get("bytes") if existing else b""
+    total_length = existing.get("total_length") if existing else None
+    if total_length is not None and len(existing_bytes) >= total_length:
+        return existing
+
+    headers = dict(stream_info["headers"])
+    start_offset = len(existing_bytes)
+    headers["range"] = f"bytes={start_offset}-{max(target_bytes - 1, start_offset)}"
+    req = upstream_http.get(
+        stream_info["url"],
+        headers=headers,
+        stream=True,
+        timeout=(5, 20),
+    )
+    try:
+        req.raise_for_status()
+        chunks = [existing_bytes] if existing_bytes else []
+        total_bytes = len(existing_bytes)
+        for chunk in req.iter_content(chunk_size=1024 * 64):
+            if not chunk:
+                continue
+            remaining = target_bytes - total_bytes
+            if remaining <= 0:
+                break
+            if len(chunk) > remaining:
+                chunk = chunk[:remaining]
+            chunks.append(chunk)
+            total_bytes += len(chunk)
+            if total_bytes >= target_bytes:
+                break
+
+        payload = {
+            "bytes": b"".join(chunks),
+            "content_type": req.headers.get(
+                "content-type",
+                stream_info.get("mime_type") or "audio/mp4",
+            ),
+            "total_length": _extract_total_length(req.headers) or total_length,
+        }
+        _store_stream_chunk(video_id, payload)
+        return payload
+    finally:
+        req.close()
+
+def _prepare_stream_track(video_id: str, target_chunk_bytes: int, active_queue: bool):
+    total_start = time.perf_counter()
+    resolve_start = time.perf_counter()
+    resolve_cache_hit = _is_stream_info_cached(video_id)
+    stream_info = get_stream_info(video_id)
+    resolve_ms = int((time.perf_counter() - resolve_start) * 1000)
+
+    chunk_cache_hit = _get_cached_stream_chunk(video_id, min_bytes=target_chunk_bytes) is not None
+    chunk_start = time.perf_counter()
+    chunk_payload = _warm_initial_stream_chunk(video_id, stream_info, target_chunk_bytes)
+    chunk_ms = int((time.perf_counter() - chunk_start) * 1000)
+
+    metrics = {
+        "prepared": True,
+        "playback_path": f"/proxy_stream/{video_id}",
+        "resolve_cache_hit": resolve_cache_hit,
+        "chunk_cache_hit": chunk_cache_hit,
+        "resolve_ms": resolve_ms,
+        "chunk_ms": chunk_ms,
+        "target_chunk_bytes": target_chunk_bytes,
+        "cached_prefix_bytes": len(chunk_payload.get("bytes") or b""),
+        "duration": stream_info.get("duration") or 0,
+        "active_queue": active_queue,
+        "server_ms": int((time.perf_counter() - total_start) * 1000),
+    }
+    _record_prepare_metric(video_id, metrics)
+    return metrics
+
+def _prepare_stream_track_safely(video_id: str, target_chunk_bytes: int, active_queue: bool):
+    try:
+        return _prepare_stream_track(video_id, target_chunk_bytes, active_queue)
+    except Exception:
+        return None
+
+def _prepare_streams(
+    video_ids: List[str],
+    limit: int = 18,
+    current_video_id: Optional[str] = None,
+    active_queue: bool = False,
+):
+    prepared = {}
+    deduped_ids = []
+    seen = set()
+    for video_id in video_ids:
+        if not video_id or video_id in seen:
+            continue
+        seen.add(video_id)
+        deduped_ids.append(video_id)
+        if len(deduped_ids) >= limit:
+            break
+
+    if not deduped_ids:
+        return prepared
+
+    if current_video_id and current_video_id in deduped_ids:
+        deduped_ids.remove(current_video_id)
+        deduped_ids.insert(0, current_video_id)
+
+    targets = {
+        video_id: _chunk_target_bytes(index, active_queue)
+        for index, video_id in enumerate(deduped_ids)
+    }
+
+    max_workers = min(12, len(deduped_ids))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {
+            executor.submit(
+                _prepare_stream_track,
+                video_id,
+                targets[video_id],
+                active_queue,
+            ): video_id
+            for video_id in deduped_ids
+        }
+        for future, video_id in future_map.items():
+            try:
+                prepared[video_id] = future.result(timeout=25)
+            except Exception:
+                continue
+    return prepared
 
 def get_stream_info(video_id: str):
     now = time.time()
@@ -220,10 +545,11 @@ def get_stream_info(video_id: str):
                 stream_info_inflight.pop(video_id, None)
 
 def _warm_stream_safely(video_id: str):
-    try:
-        get_stream_info(video_id)
-    except Exception:
-        return
+    _prepare_stream_track_safely(
+        video_id,
+        _chunk_target_bytes(4, False),
+        False,
+    )
 
 def queue_stream_warmup(video_ids: List[str], limit: int = 18):
     seen = set()
@@ -234,6 +560,33 @@ def queue_stream_warmup(video_ids: List[str], limit: int = 18):
         stream_warm_executor.submit(_warm_stream_safely, video_id)
         if len(seen) >= limit:
             break
+
+@app.post("/prepare_session")
+def prepare_session(req: WarmStreamRequest):
+    start_time = time.perf_counter()
+    limit = min(max(req.lookahead or len(req.video_ids), 1), 24)
+    prepared = _prepare_streams(
+        req.video_ids,
+        limit=limit,
+        current_video_id=req.current_video_id,
+        active_queue=req.active_queue,
+    )
+    return {
+        "status": "success",
+        "prepared": prepared,
+        "prepared_ids": list(prepared.keys()),
+        "summary": _summarize_prepare_metrics(),
+        "server_ms": int((time.perf_counter() - start_time) * 1000),
+    }
+
+@app.get("/latency_summary")
+def latency_summary():
+    return {
+        "status": "success",
+        "summary": _summarize_prepare_metrics(),
+        "stream_info_cache_size": len(stream_info_cache),
+        "stream_chunk_cache_size": len(stream_chunk_cache),
+    }
 
 @app.get("/")
 def health_check():
@@ -472,69 +825,187 @@ def get_suggestions(req: SearchRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+def _fallback_home_candidates(limit: int):
+    results = []
+    try:
+        home_feed = ytmusic.get_home(limit=limit)
+    except Exception:
+        home_feed = []
+
+    for carousel in home_feed:
+        for item in carousel.get("contents", []):
+            track = normalize_recommendation_track(item)
+            if track is None:
+                continue
+            results.append((track, 1.0))
+            if len(results) >= limit + 10:
+                return results
+
+    if len(results) < 5:
+        try:
+            backup = ytmusic.search("trending hit songs", filter="songs", limit=limit)
+        except Exception:
+            backup = []
+        for entry in backup:
+            track = normalize_recommendation_track(entry)
+            if track is None:
+                continue
+            results.append((track, 0.7))
+            if len(results) >= limit + 10:
+                break
+    return results
+
+def _rank_recommendation_candidates(
+    candidates,
+    *,
+    limit: int,
+    avoid_ids,
+    seed_ids,
+    artist_hints,
+    taste_queries,
+):
+    ranked = {}
+    blocked_ids = {item for item in avoid_ids if item}.union(
+        {item for item in seed_ids if item}
+    )
+    normalized_artist_hints = [
+        _normalize_text(item) for item in artist_hints if _normalize_text(item)
+    ]
+    query_token_groups = [
+        tokens[:4]
+        for tokens in (_query_tokens(item) for item in taste_queries)
+        if tokens
+    ]
+
+    for track, base_score in candidates:
+        track_id = track.get("id")
+        if not track_id or track_id in blocked_ids:
+            continue
+        title_text = _normalize_text(track.get("title"))
+        artist_text = _normalize_text(track.get("channel"))
+        album_text = _normalize_text(track.get("album"))
+        score = float(base_score)
+
+        for index, artist_hint in enumerate(normalized_artist_hints):
+            if artist_hint and artist_hint in artist_text:
+                score += max(3.2 - (index * 0.35), 0.8)
+
+        for index, tokens in enumerate(query_token_groups):
+            hits = sum(
+                1
+                for token in tokens
+                if token in title_text or token in artist_text or token in album_text
+            )
+            if hits:
+                score += min(hits, 2) * max(2.1 - (index * 0.18), 0.45)
+
+        existing = ranked.get(track_id)
+        if existing is None or score > existing["score"]:
+            ranked[track_id] = {
+                "track": track,
+                "score": score,
+                "artist_key": artist_text,
+            }
+
+    ordered = sorted(
+        ranked.values(),
+        key=lambda item: (item["score"], item["track"].get("title") or ""),
+        reverse=True,
+    )
+
+    results = []
+    artist_counts = {}
+    for item in ordered:
+        artist_key = item["artist_key"]
+        if artist_key:
+            artist_count = artist_counts.get(artist_key, 0)
+            if artist_count >= 2 and len(results) + 1 < limit:
+                continue
+            artist_counts[artist_key] = artist_count + 1
+        results.append(item["track"])
+        if len(results) >= limit:
+            break
+    return results
+
 @app.post("/recommend")
 def get_recommendations(req: SearchRequest):
     """
-    Fetches genuine YouTube Music recommendations.
-    If seed_id is provided (based on user's recent listening history), 
-    it generates an infinite mix of similar tracks!
+    Builds recommendations from multiple explicit taste signals instead of
+    relying on only the latest played seed.
     """
     try:
-        results = []
-        if req.seed_id and req.seed_id != "trending hit songs":
-            # Generate a radio mix based on the seed
-            mix = ytmusic.get_watch_playlist(videoId=req.seed_id, limit=req.limit + 5)
+        seed_ids = []
+        for candidate in [req.seed_id, *(req.seed_ids or [])]:
+            if candidate and candidate not in seed_ids:
+                seed_ids.append(candidate)
+
+        candidates = []
+
+        for index, seed_id in enumerate(seed_ids[:3]):
+            if not seed_id or seed_id == "trending hit songs":
+                continue
+            try:
+                mix = ytmusic.get_watch_playlist(
+                    videoId=seed_id,
+                    limit=max(req.limit, 10) + 6,
+                )
+            except Exception:
+                continue
+
+            source_weight = max(6.0 - index, 2.0)
+            collected = 0
             for track in mix.get("tracks", []):
-                # Skip the seed track itself
-                if track.get("videoId") == req.seed_id or not track.get("videoId"):
+                normalized = normalize_recommendation_track(track)
+                if normalized is None or normalized["id"] == seed_id:
                     continue
-                results.append({
-                    "id": track["videoId"],
-                    "title": track.get("title"),
-                    "duration": track.get("length") or track.get("duration_seconds") or 0,
-                    "thumbnail": extract_thumbnail(track),
-                    "channel": extract_artist(track)
-                })
-                if len(results) >= req.limit:
+                candidates.append((normalized, source_weight))
+                collected += 1
+                if collected >= max(req.limit // 2, 6):
                     break
-            queue_stream_warmup([track.get("id") for track in results])
-            return {"status": "success", "recommendations": results}
-            
-        try:
-            home_feed = ytmusic.get_home(limit=req.limit)
-        except Exception:
-            home_feed = []
-            
-        results = []
-        # Flatten the home feed carousels into a single track list
-        for carousel in home_feed:
-            for item in carousel.get("contents", []):
-                if "videoId" in item and item["videoId"]:
-                    results.append({
-                        "id": item["videoId"],
-                        "title": item.get("title"),
-                        "duration": 0, # Home feed doesn't always show seconds, we default to 0
-                        "thumbnail": extract_thumbnail(item),
-                        "channel": extract_artist(item)
-                    })
-                # Cap the home screen items to keep it clean natively 
-                if len(results) >= req.limit + 10:
-                    break
-            if len(results) >= req.limit + 10:
-                break
 
-        # Fallback if the home feed doesn't have enough direct songs (sometimes it's just playlists)
-        if len(results) < 5:
-            backup = ytmusic.search("trending hit songs", filter="songs", limit=req.limit)
-            for entry in backup:
-                results.append({
-                    "id": entry.get("videoId"),
-                    "title": entry.get("title"),
-                    "duration": entry.get("duration_seconds") or 0,
-                    "thumbnail": (entry.get("thumbnails") or entry.get("thumbnail") or [{}])[-1].get("url"),
-                    "channel": ", ".join([a.get("name", "") for a in entry.get("artists", [])])
-                })
+        if len(candidates) < max(req.limit, 10):
+            for index, artist_hint in enumerate(req.artist_hints[:3]):
+                query = (artist_hint or "").strip()
+                if not query:
+                    continue
+                try:
+                    results = ytmusic.search(f"{query} songs", filter="songs", limit=6)
+                except Exception:
+                    continue
 
+                source_weight = max(3.8 - (index * 0.3), 1.3)
+                for track in results:
+                    normalized = normalize_recommendation_track(track)
+                    if normalized is not None:
+                        candidates.append((normalized, source_weight))
+
+        if len(candidates) < max(req.limit, 10) and not seed_ids:
+            for index, taste_query in enumerate(req.taste_queries[:2]):
+                query = (taste_query or "").strip()
+                if not query:
+                    continue
+                try:
+                    results = ytmusic.search(query, filter="songs", limit=5)
+                except Exception:
+                    continue
+
+                source_weight = max(2.7 - (index * 0.25), 0.9)
+                for track in results:
+                    normalized = normalize_recommendation_track(track)
+                    if normalized is not None:
+                        candidates.append((normalized, source_weight))
+
+        if len(candidates) < max(req.limit, 10):
+            candidates.extend(_fallback_home_candidates(req.limit))
+
+        results = _rank_recommendation_candidates(
+            candidates,
+            limit=req.limit,
+            avoid_ids=req.avoid_ids or [],
+            seed_ids=seed_ids,
+            artist_hints=req.artist_hints or [],
+            taste_queries=req.taste_queries or [],
+        )
         queue_stream_warmup([track.get("id") for track in results])
         return {"status": "success", "recommendations": results}
     except Exception as e:
@@ -542,23 +1013,13 @@ def get_recommendations(req: SearchRequest):
 
 @app.post("/warm_streams")
 def warm_streams(req: WarmStreamRequest):
-    warmed = {}
-    video_ids = [video_id for video_id in req.video_ids[:18] if video_id]
-    if not video_ids:
-        return {"status": "success", "streams": warmed}
-
-    max_workers = min(10, len(video_ids))
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {
-            executor.submit(get_stream_info, video_id): video_id
-            for video_id in video_ids
-        }
-        for future, video_id in future_map.items():
-            try:
-                warmed[video_id] = future.result(timeout=25)
-            except Exception:
-                continue
-    return {"status": "success", "streams": warmed}
+    prepared = _prepare_streams(
+        req.video_ids,
+        limit=18,
+        current_video_id=req.current_video_id,
+        active_queue=req.active_queue,
+    )
+    return {"status": "success", "streams": prepared}
 
 @app.post("/download")
 def download_audio(req: DownloadRequest):
@@ -675,17 +1136,110 @@ def stream_audio(video_id: str):
 def proxy_stream(video_id: str, request: Request):
     try:
         stream_info = get_stream_info(video_id)
+        cached_chunk = _get_cached_stream_chunk(video_id)
+        range_header = request.headers.get("range")
+
+        if cached_chunk:
+            cached_bytes = cached_chunk.get("bytes") or b""
+            content_type = cached_chunk.get("content_type") or stream_info.get("mime_type") or "audio/mp4"
+            total_length = cached_chunk.get("total_length")
+            parsed_range = _parse_byte_range(range_header, total_length)
+
+            if not range_header or parsed_range is not None:
+                start = parsed_range[0] if parsed_range else 0
+                end = parsed_range[1] if parsed_range else None
+
+                if start < len(cached_bytes):
+                    cached_end = len(cached_bytes) - 1
+                    requested_end = end if end is not None else cached_end
+                    slice_end = min(cached_end, requested_end)
+                    cached_slice = cached_bytes[start:slice_end + 1]
+
+                    def generate_cached_then_upstream():
+                        if cached_slice:
+                            yield cached_slice
+
+                        upstream_start = len(cached_bytes)
+                        if upstream_start <= start:
+                            upstream_start = start
+
+                        if end is not None and upstream_start > end:
+                            return
+
+                        if total_length is not None and upstream_start >= total_length:
+                            return
+
+                        upstream_headers = dict(stream_info["headers"])
+                        if end is None:
+                            upstream_headers["range"] = f"bytes={upstream_start}-"
+                        else:
+                            upstream_headers["range"] = f"bytes={upstream_start}-{end}"
+
+                        req = upstream_http.get(
+                            stream_info["url"],
+                            headers=upstream_headers,
+                            stream=True,
+                            timeout=(5, 30),
+                        )
+                        try:
+                            req.raise_for_status()
+                            for chunk in req.iter_content(chunk_size=1024 * 64):
+                                if chunk:
+                                    yield chunk
+                        finally:
+                            req.close()
+
+                    resp_headers = {"Accept-Ranges": "bytes"}
+                    status_code = 206 if range_header else 200
+                    if total_length is not None:
+                        response_end = end if end is not None else total_length - 1
+                        if status_code == 206:
+                            resp_headers["Content-Range"] = (
+                                f"bytes {start}-{response_end}/{total_length}"
+                            )
+                            resp_headers["Content-Length"] = str(
+                                max(response_end - start + 1, 0)
+                            )
+                        else:
+                            resp_headers["Content-Length"] = str(total_length)
+                    elif status_code == 206 and end is not None:
+                        resp_headers["Content-Length"] = str(
+                            max(end - start + 1, 0)
+                        )
+
+                    return StreamingResponse(
+                        generate_cached_then_upstream(),
+                        status_code=status_code,
+                        headers=resp_headers,
+                        media_type=content_type,
+                    )
+
         headers = dict(stream_info["headers"])
-        if "range" in request.headers:
-            headers["range"] = request.headers["range"]
-        req = requests.get(stream_info["url"], headers=headers, stream=True, timeout=30)
+        if range_header:
+            headers["range"] = range_header
+
+        req = upstream_http.get(
+            stream_info["url"],
+            headers=headers,
+            stream=True,
+            timeout=(5, 30),
+        )
+
+        def generate_upstream():
+            try:
+                for chunk in req.iter_content(chunk_size=1024 * 64):
+                    if chunk:
+                        yield chunk
+            finally:
+                req.close()
+
         resp_headers = {}
         for k, v in req.headers.items():
             if k.lower() in ['content-type', 'content-length', 'content-range', 'accept-ranges']:
                 resp_headers[k] = v
         return StreamingResponse(
-            req.iter_content(chunk_size=1024*64), 
-            status_code=req.status_code, 
+            generate_upstream(),
+            status_code=req.status_code,
             headers=resp_headers,
             media_type=req.headers.get("content-type", "audio/mp4")
         )

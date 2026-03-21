@@ -35,6 +35,8 @@ class AudioEngineFFI {
   late AuralisSeekDartType seek;
   late AuralisGetPositionDartType getPosition;
   late AuralisSetLoopDartType setLoop;
+  bool isAvailable = false;
+  String? unavailableReason;
 
   AudioEngineFFI() {
     try {
@@ -58,9 +60,12 @@ class AudioEngineFFI {
       setLoop =
           _lib.lookupFunction<AuralisSetLoopCType, AuralisSetLoopDartType>(
               'auralis_set_loop');
+      isAvailable = true;
     } catch (e) {
+      unavailableReason = e.toString();
       debugPrint(
-          'FFI LOAD ERROR: Native library not found. Falling back to empty mocks! Error: $e');
+          'FFI UNAVAILABLE: Native engine symbols do not match the packaged libauralis.so. '
+          'Falling back to safe no-op mocks. Error: $e');
       initEngine = () => true;
       loadFile = (ptr) => true;
       play = () {};

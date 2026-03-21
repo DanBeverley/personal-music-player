@@ -198,17 +198,15 @@ class DownloadCenterNotifier extends StateNotifier<DownloadCenterState> {
 
       final jsonPath = outPath.replaceAll('.mp3', '.json');
       await File(jsonPath).writeAsString(jsonEncode(meta));
-      unawaited(
-        upsertCloudLibraryTrack({
-          ...meta,
-          'id': videoId,
-          'videoId': videoId,
-          if (meta['title'] == null) 'title': title,
-          if (meta['author'] == null && subtitle != null) 'author': subtitle,
-          if (meta['thumbnail'] == null && thumbnail != null)
-            'thumbnail': thumbnail,
-        }),
-      );
+      await upsertCloudLibraryTrack({
+        ...meta,
+        'id': videoId,
+        'videoId': videoId,
+        if (meta['title'] == null) 'title': title,
+        if (meta['author'] == null && subtitle != null) 'author': subtitle,
+        if (meta['thumbnail'] == null && thumbnail != null)
+          'thumbnail': thumbnail,
+      });
       ref.invalidate(libraryProvider);
 
       _upsert(task.copyWith(

@@ -85,6 +85,102 @@ def normalize_album_results(raw_results):
         })
     return albums
 
+def _normalize_song_result(entry):
+    if not entry:
+        return None
+    video_id = entry.get("videoId") or entry.get("video_id") or entry.get("id")
+    if not video_id:
+        return None
+    album_info = extract_album_info(entry) or {}
+    return {
+        "id": video_id,
+        "title": entry.get("title"),
+        "duration": parse_duration_seconds(
+            entry.get("duration_seconds")
+            or entry.get("lengthSeconds")
+            or entry.get("length")
+            or entry.get("duration")
+        ),
+        "thumbnail": extract_thumbnail(entry),
+        "channel": extract_artist(entry),
+        "album": album_info.get("title"),
+        "album_id": album_info.get("id"),
+    }
+
+def _ytmusic_song_search(query: str, limit: int):
+    results = []
+    seen = set()
+
+    def add_entry(entry):
+        normalized = _normalize_song_result(entry)
+        if not normalized:
+            return
+        track_id = normalized["id"]
+        if not track_id or track_id in seen:
+            return
+        seen.add(track_id)
+        results.append(normalized)
+
+    try:
+        raw_results = ytmusic.search(query, filter="songs", limit=limit)
+    except Exception:
+        raw_results = []
+
+    for entry in raw_results:
+        add_entry(entry)
+        if len(results) >= limit:
+            return results
+
+    if len(results) < limit:
+        try:
+            fallback_results = ytmusic.search(query, limit=max(limit * 3, 12))
+        except Exception:
+            fallback_results = []
+
+        for entry in fallback_results:
+            result_type = (entry.get("resultType") or entry.get("type") or "").lower()
+            if result_type and result_type not in {"song", "video"}:
+                continue
+            add_entry(entry)
+            if len(results) >= limit:
+                break
+
+    return results
+
+def _ytdlp_song_search(query: str, limit: int):
+    url = f"ytsearch{limit}:{query}"
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'extract_flat': True,
+        'skip_download': True,
+    }
+    results = []
+    seen = set()
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception:
+        return results
+
+    for entry in info.get("entries", []) or []:
+        video_id = entry.get("id") or entry.get("url")
+        if not video_id or video_id in seen:
+            continue
+        seen.add(video_id)
+        results.append({
+            "id": video_id,
+            "title": entry.get("title"),
+            "duration": parse_duration_seconds(entry.get("duration")),
+            "thumbnail": extract_thumbnail(entry),
+            "channel": extract_artist(entry),
+            "album": None,
+            "album_id": None,
+        })
+        if len(results) >= limit:
+            break
+    return results
+
 def lookup_album_for_song(video_id: str, title: str, artist: str):
     candidates = []
     try:
@@ -179,14 +275,19 @@ ytmusic = YTMusic()
 STREAM_INFO_TTL_SECONDS = 21600
 STREAM_WARM_CHUNK_BYTES = int(os.environ.get("STREAM_WARM_CHUNK_BYTES", "786432"))
 STREAM_CHUNK_TTL_SECONDS = 1800
+STREAM_WARM_WORKERS = int(os.environ.get("STREAM_WARM_WORKERS", "8"))
+PREPARE_SESSION_WORKERS = int(os.environ.get("PREPARE_SESSION_WORKERS", "4"))
+PREPARE_SESSION_MAX_LOOKAHEAD = int(os.environ.get("PREPARE_SESSION_MAX_LOOKAHEAD", "18"))
 stream_info_cache = {}
 stream_info_inflight = {}
 stream_info_lock = Lock()
 stream_chunk_cache = {}
 stream_chunk_lock = Lock()
+stream_chunk_inflight = {}
+stream_chunk_inflight_lock = Lock()
 prepare_metrics = deque(maxlen=180)
 prepare_metrics_lock = Lock()
-stream_warm_executor = ThreadPoolExecutor(max_workers=16)
+stream_warm_executor = ThreadPoolExecutor(max_workers=STREAM_WARM_WORKERS)
 upstream_http = requests.Session()
 
 class SearchRequest(BaseModel):
@@ -379,54 +480,81 @@ def _summarize_prepare_metrics():
 
 def _warm_initial_stream_chunk(video_id: str, stream_info: dict, target_bytes: int):
     target_bytes = max(target_bytes, STREAM_WARM_CHUNK_BYTES)
-    cached = _get_cached_stream_chunk(video_id, min_bytes=target_bytes)
-    if cached is not None:
-        return cached
+    while True:
+        cached = _get_cached_stream_chunk(video_id, min_bytes=target_bytes)
+        if cached is not None:
+            return cached
 
-    existing = _get_cached_stream_chunk(video_id)
-    existing_bytes = existing.get("bytes") if existing else b""
-    total_length = existing.get("total_length") if existing else None
-    if total_length is not None and len(existing_bytes) >= total_length:
-        return existing
+        with stream_chunk_inflight_lock:
+            pending = stream_chunk_inflight.get(video_id)
+            if pending is None:
+                pending = Future()
+                stream_chunk_inflight[video_id] = pending
+                should_fetch = True
+            else:
+                should_fetch = False
 
-    headers = dict(stream_info["headers"])
-    start_offset = len(existing_bytes)
-    headers["range"] = f"bytes={start_offset}-{max(target_bytes - 1, start_offset)}"
-    req = upstream_http.get(
-        stream_info["url"],
-        headers=headers,
-        stream=True,
-        timeout=(5, 20),
-    )
-    try:
-        req.raise_for_status()
-        chunks = [existing_bytes] if existing_bytes else []
-        total_bytes = len(existing_bytes)
-        for chunk in req.iter_content(chunk_size=1024 * 64):
-            if not chunk:
-                continue
-            remaining = target_bytes - total_bytes
-            if remaining <= 0:
-                break
-            if len(chunk) > remaining:
-                chunk = chunk[:remaining]
-            chunks.append(chunk)
-            total_bytes += len(chunk)
-            if total_bytes >= target_bytes:
-                break
+        if not should_fetch:
+            try:
+                pending.result(timeout=25)
+            except Exception:
+                pass
+            continue
 
-        payload = {
-            "bytes": b"".join(chunks),
-            "content_type": req.headers.get(
-                "content-type",
-                stream_info.get("mime_type") or "audio/mp4",
-            ),
-            "total_length": _extract_total_length(req.headers) or total_length,
-        }
-        _store_stream_chunk(video_id, payload)
-        return payload
-    finally:
-        req.close()
+        try:
+            existing = _get_cached_stream_chunk(video_id)
+            existing_bytes = existing.get("bytes") if existing else b""
+            total_length = existing.get("total_length") if existing else None
+            if total_length is not None and len(existing_bytes) >= total_length:
+                pending.set_result(existing)
+                return existing
+
+            headers = dict(stream_info["headers"])
+            start_offset = len(existing_bytes)
+            headers["range"] = f"bytes={start_offset}-{max(target_bytes - 1, start_offset)}"
+            req = upstream_http.get(
+                stream_info["url"],
+                headers=headers,
+                stream=True,
+                timeout=(5, 20),
+            )
+            try:
+                req.raise_for_status()
+                chunks = [existing_bytes] if existing_bytes else []
+                total_bytes = len(existing_bytes)
+                for chunk in req.iter_content(chunk_size=1024 * 64):
+                    if not chunk:
+                        continue
+                    remaining = target_bytes - total_bytes
+                    if remaining <= 0:
+                        break
+                    if len(chunk) > remaining:
+                        chunk = chunk[:remaining]
+                    chunks.append(chunk)
+                    total_bytes += len(chunk)
+                    if total_bytes >= target_bytes:
+                        break
+
+                payload = {
+                    "bytes": b"".join(chunks),
+                    "content_type": req.headers.get(
+                        "content-type",
+                        stream_info.get("mime_type") or "audio/mp4",
+                    ),
+                    "total_length": _extract_total_length(req.headers) or total_length,
+                }
+                _store_stream_chunk(video_id, payload)
+                pending.set_result(payload)
+                return payload
+            finally:
+                req.close()
+        except Exception as exc:
+            pending.set_exception(exc)
+            raise
+        finally:
+            with stream_chunk_inflight_lock:
+                if stream_chunk_inflight.get(video_id) is pending:
+                    stream_chunk_inflight.pop(video_id, None)
 
 def _prepare_stream_track(video_id: str, target_chunk_bytes: int, active_queue: bool):
     total_start = time.perf_counter()
@@ -491,7 +619,7 @@ def _prepare_streams(
         for index, video_id in enumerate(deduped_ids)
     }
 
-    max_workers = min(12, len(deduped_ids))
+    max_workers = min(PREPARE_SESSION_WORKERS, len(deduped_ids))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_map = {
             executor.submit(
@@ -564,7 +692,7 @@ def queue_stream_warmup(video_ids: List[str], limit: int = 18):
 @app.post("/prepare_session")
 def prepare_session(req: WarmStreamRequest):
     start_time = time.perf_counter()
-    limit = min(max(req.lookahead or len(req.video_ids), 1), 24)
+    limit = min(max(req.lookahead or len(req.video_ids), 1), PREPARE_SESSION_MAX_LOOKAHEAD)
     prepared = _prepare_streams(
         req.video_ids,
         limit=limit,
@@ -639,8 +767,6 @@ def get_track_details(req: DownloadRequest):
                 "album": (extract_album_info(track) or {}).get("title"),
                 "album_id": (extract_album_info(track) or {}).get("id"),
             })
-        queue_stream_warmup([video_id, *[track["id"] for track in similar_tracks]])
-
         return {
             "status": "success",
             "video_id": video_id,
@@ -722,45 +848,32 @@ def get_track_lyrics(video_id: str):
 
 @app.post("/search")
 def search_youtube(req: SearchRequest):
-    try:
-        query = req.query
-        results = []
-        
-        # Check if the query is a direct YouTube URL
-        url_match = re.search(r"(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/shorts\/)([a-zA-Z0-9_-]{11})", query)
-        if url_match:
-            video_id = url_match.group(1)
-            try:
-                watch = ytmusic.get_watch_playlist(videoId=video_id)
-                vd = watch.get("videoDetails", {})
-                results.append({
-                    "id": video_id,
-                    "title": vd.get("title") or "Unknown URL Track",
-                    "duration": vd.get("lengthSeconds") or 0,
-                    "thumbnail": extract_thumbnail(vd),
-                    "channel": extract_artist(vd)
-                })
-                queue_stream_warmup([video_id], limit=1)
-                return {"status": "success", "results": results}
-            except Exception:
-                pass # Fallback to normal search if extraction fails
+    query = req.query
+    results = []
 
-        raw_results = ytmusic.search(query, filter="songs", limit=req.limit)
-        for entry in raw_results:
-            album_info = extract_album_info(entry) or {}
+    # Check if the query is a direct YouTube URL
+    url_match = re.search(r"(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/shorts\/)([a-zA-Z0-9_-]{11})", query)
+    if url_match:
+        video_id = url_match.group(1)
+        try:
+            watch = ytmusic.get_watch_playlist(videoId=video_id)
+            vd = watch.get("videoDetails", {})
             results.append({
-                "id": entry.get("videoId"),
-                "title": entry.get("title"),
-                "duration": entry.get("duration_seconds") or 0,
-                "thumbnail": extract_thumbnail(entry),
-                "channel": extract_artist(entry),
-                "album": album_info.get("title"),
-                "album_id": album_info.get("id"),
+                "id": video_id,
+                "title": vd.get("title") or "Unknown URL Track",
+                "duration": vd.get("lengthSeconds") or 0,
+                "thumbnail": extract_thumbnail(vd),
+                "channel": extract_artist(vd)
             })
-        queue_stream_warmup([entry.get("id") or entry.get("videoId") for entry in results])
-        return {"status": "success", "results": results}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+            return {"status": "success", "results": results}
+        except Exception:
+            pass # Fallback to normal search if extraction fails
+
+    results = _ytmusic_song_search(query, req.limit)
+    if not results:
+        results = _ytdlp_song_search(query, req.limit)
+
+    return {"status": "success", "results": results}
 
 @app.post("/search_albums")
 def search_albums(req: SearchRequest):
@@ -768,11 +881,14 @@ def search_albums(req: SearchRequest):
         raw_results = ytmusic.search(req.query, filter="albums", limit=req.limit)
         albums = normalize_album_results(raw_results)
         if not albums:
-            fallback_results = ytmusic.search(req.query, limit=max(req.limit * 3, 12))
+            try:
+                fallback_results = ytmusic.search(req.query, limit=max(req.limit * 3, 12))
+            except Exception:
+                fallback_results = []
             albums = normalize_album_results(fallback_results)
         return {"status": "success", "albums": albums}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return {"status": "success", "albums": []}
 
 @app.get("/album/{album_id}")
 def get_album_details(album_id: str):
@@ -801,7 +917,6 @@ def get_album_details(album_id: str):
                 "album_id": album_id,
             })
 
-        queue_stream_warmup([track["id"] for track in tracks], limit=8)
         return {
             "status": "success",
             "id": album_id,
@@ -1006,7 +1121,6 @@ def get_recommendations(req: SearchRequest):
             artist_hints=req.artist_hints or [],
             taste_queries=req.taste_queries or [],
         )
-        queue_stream_warmup([track.get("id") for track in results])
         return {"status": "success", "recommendations": results}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

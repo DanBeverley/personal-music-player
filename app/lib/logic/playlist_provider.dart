@@ -89,6 +89,7 @@ Map<String, dynamic> _normalizePlaylistTrack(dynamic rawTrack) {
 class PlaylistNotifier extends StateNotifier<List<Playlist>> {
   final Ref ref;
   String _scopeId = 'guest';
+  Future<void> _persistQueue = Future<void>.value();
 
   PlaylistNotifier(this.ref) : super(const []) {
     unawaited(reloadForCurrentScope());
@@ -261,7 +262,7 @@ class PlaylistNotifier extends StateNotifier<List<Playlist>> {
     final snapshot = [...state];
     final scopeId = _scopeId;
     final authState = ref.read(authProvider);
-    unawaited(() async {
+    _persistQueue = _persistQueue.catchError((_) {}).then((_) async {
       await _saveLocalPlaylists(snapshot, scopeId);
       if (authState.isAuthenticated) {
         try {
@@ -270,7 +271,8 @@ class PlaylistNotifier extends StateNotifier<List<Playlist>> {
           debugPrint('Playlist cloud sync failed: $error');
         }
       }
-    }());
+    });
+    unawaited(_persistQueue);
   }
 
   Playlist createPlaylist(String name) {

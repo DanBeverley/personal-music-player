@@ -18,19 +18,19 @@ import 'widgets/app_artwork.dart';
 import 'widgets/app_bottom_nav_bar.dart';
 import 'widgets/download_hud.dart';
 
-const _accentGrey = Color(0xFFB7BBC4);
-const _surfaceGrey = Color(0xFF141414);
-const _surfaceGreyAlt = Color(0xFF1B1B1B);
-const _voidBlack = Color(0xFF070707);
+const _accentGrey = Color(0xFFD0D5D8);
+const _surfaceGrey = Color(0xFF363C40);
+const _surfaceGreyAlt = Color(0xFF2C3135);
+const _voidBlack = Color(0xFF252A2D);
 const double _radiusLarge = 12;
 const double _radiusMedium = 10;
 const List<Color> _playlistCoverPalette = <Color>[
-  Color(0xFF525866),
-  Color(0xFF4A5260),
-  Color(0xFF3F4755),
-  Color(0xFF5B4D4A),
-  Color(0xFF46515C),
-  Color(0xFF5C5664),
+  Color(0xFF4A5155),
+  Color(0xFF41484C),
+  Color(0xFF383E42),
+  Color(0xFF50575C),
+  Color(0xFF444B4F),
+  Color(0xFF565D62),
 ];
 const List<String> _quipOpeners = <String>[
   'Today\'s sonic forecast',
@@ -1902,13 +1902,13 @@ class LibraryScreen extends ConsumerWidget {
               ),
             
             const SizedBox(height: 32),
-            const Text('Offline tracks', style: TextStyle(color: Colors.white, fontSize: 24, fontWeight: FontWeight.bold)),
+            const Text('Saved tracks', style: TextStyle(color: Colors.white, fontSize: 24, fontWeight: FontWeight.bold)),
             const SizedBox(height: 16),
             
             libraryAsync.when(
               data: (files) {
                 if (files.isEmpty) {
-                  return const Text('Your Offline Library is empty.', style: TextStyle(color: Colors.white54, fontSize: 16));
+                  return const Text('No saved tracks yet.', style: TextStyle(color: Colors.white54, fontSize: 16));
                 }
                 return ListView.builder(
                   shrinkWrap: true,
@@ -1917,7 +1917,8 @@ class LibraryScreen extends ConsumerWidget {
                   itemBuilder: (context, index) {
                     final track = files[index];
                     final name = track['title'] ?? 'Unknown';
-                    final path = track['local_path'];
+                    final path = track['local_path']?.toString();
+                    final hasLocalFile = path != null && path.isNotEmpty;
                     final videoId =
                         (track['video_id'] ?? track['id'])?.toString();
                     return Container(
@@ -1933,6 +1934,16 @@ class LibraryScreen extends ConsumerWidget {
                         child: InkWell(
                           borderRadius: BorderRadius.circular(16),
                           onTap: () async {
+                            if (!hasLocalFile) {
+                              await ref
+                                  .read(playbackQueueProvider.notifier)
+                                  .startRadioSession(track);
+                              if (!context.mounted) return;
+                              Navigator.of(context).push(MaterialPageRoute(
+                                  builder: (_) => const FullPlayerScreen()));
+                              return;
+                            }
+
                             final loaded = await ref
                                 .read(playbackQueueProvider.notifier)
                                 .startLocalSession(
@@ -1972,6 +1983,18 @@ class LibraryScreen extends ConsumerWidget {
                                           style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w700)),
                                       const SizedBox(height: 4),
                                       Text(track['author'] ?? track['artist'] ?? '', maxLines: 1, style: TextStyle(color: Colors.white.withValues(alpha: 0.6), fontSize: 13)),
+                                      if (!hasLocalFile)
+                                        Padding(
+                                          padding: const EdgeInsets.only(top: 4),
+                                          child: Text(
+                                            'Saved to account',
+                                            style: TextStyle(
+                                              color: Colors.white.withValues(alpha: 0.45),
+                                              fontSize: 11,
+                                              fontWeight: FontWeight.w600,
+                                            ),
+                                          ),
+                                        ),
                                     ],
                                   ),
                                 ),
@@ -1987,9 +2010,11 @@ class LibraryScreen extends ConsumerWidget {
                                       ),
                                       onPressed: () {
                                         try {
-                                          File(path).deleteSync();
-                                          final jsonPath = path.replaceAll('.mp3', '.json');
-                                          if (File(jsonPath).existsSync()) File(jsonPath).deleteSync();
+                                          if (hasLocalFile) {
+                                            File(path).deleteSync();
+                                            final jsonPath = path.replaceAll('.mp3', '.json');
+                                            if (File(jsonPath).existsSync()) File(jsonPath).deleteSync();
+                                          }
                                           unawaited(removeCloudLibraryTrack(videoId));
                                           ref.invalidate(libraryProvider);
                                         } catch (e) {
@@ -2088,7 +2113,7 @@ class _PlaylistDetailScreenState extends ConsumerState<PlaylistDetailScreen> {
     });
 
     return Scaffold(
-      backgroundColor: Colors.black,
+      backgroundColor: _voidBlack,
       appBar: AppBar(backgroundColor: Colors.transparent, title: Text(playlist.name, style: const TextStyle(color: Colors.white))),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(16),
@@ -4632,7 +4657,7 @@ class TrackDetailsScreen extends ConsumerWidget {
             .toString();
 
     return Scaffold(
-      backgroundColor: Colors.black,
+      backgroundColor: _voidBlack,
       appBar: AppBar(
         title: const Text(''),
         backgroundColor: Colors.transparent,

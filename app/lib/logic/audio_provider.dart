@@ -211,6 +211,17 @@ Future<void> recordCloudSearchEvent(
   }
 }
 
+final StreamController<String> _recommendationSignalController =
+    StreamController<String>.broadcast();
+
+Stream<String> get recommendationSignalStream =>
+    _recommendationSignalController.stream;
+
+void notifyRecommendationSignal([String reason = '']) {
+  if (_recommendationSignalController.isClosed) return;
+  _recommendationSignalController.add(reason);
+}
+
 Future<List<String>> getRecentCloudSearchQueries({int limit = 8}) async {
   final client = supabaseClientOrNull;
   final userId = currentAuthenticatedUserId;
@@ -572,6 +583,8 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
   List<Map<String, dynamic>> _managedQueueTracks = const [];
   final List<String?> _prefetchedTrackIds = <String?>[null, null];
   int _latencySummaryProbeCounter = 0;
+  final Map<String, DateTime> _recentPrepareBatches = <String, DateTime>{};
+  final Map<String, Future<void>> _pendingPrepareBatches = <String, Future<void>>{};
   Timer? _sleepTimer;
   DateTime? _sleepTimerEndsAt;
   final Map<String, Future<void>> _fullPrefetchTasks = {};
@@ -979,8 +992,9 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
   }
 
   Future<void> _logLatencySummaryIfDue() async {
+    if (!kDebugMode) return;
     _latencySummaryProbeCounter++;
-    if (_latencySummaryProbeCounter % 4 != 0) return;
+    if (_latencySummaryProbeCounter % 24 != 0) return;
     try {
       final response = await appHttpClient
           .get(_proxyUri('/latency_summary'))
@@ -1000,6 +1014,34 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       );
     } catch (_) {
       // Summary logging is best-effort only.
+    }
+  }
+
+  String _prepareBatchKey(
+    Iterable<String> ids, {
+    String? currentVideoId,
+    required bool activeQueue,
+    required int lookahead,
+  }) {
+    return [
+      activeQueue ? '1' : '0',
+      currentVideoId ?? '',
+      '$lookahead',
+      ids.join(','),
+    ].join('|');
+  }
+
+  void _prunePrepareBatchTracking() {
+    final now = DateTime.now();
+    _recentPrepareBatches.removeWhere(
+      (_, startedAt) => now.difference(startedAt) > const Duration(minutes: 2),
+    );
+    if (_recentPrepareBatches.length <= 120) return;
+    final ordered = _recentPrepareBatches.entries.toList()
+      ..sort((a, b) => a.value.compareTo(b.value));
+    final overflow = ordered.length - 80;
+    for (var i = 0; i < overflow; i++) {
+      _recentPrepareBatches.remove(ordered[i].key);
     }
   }
 
@@ -1023,13 +1065,40 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     }
     if (idsToWarm.isEmpty) return;
 
-    try {
+    final idsNeedingWarm = idsToWarm
+        .where((videoId) => _freshStreamSource(videoId) == null)
+        .toList(growable: false);
+    if (idsNeedingWarm.isEmpty) return;
+
+    final batchKey = _prepareBatchKey(
+      idsNeedingWarm,
+      currentVideoId: currentVideoId,
+      activeQueue: activeQueue,
+      lookahead: lookahead,
+    );
+
+    final pendingBatch = _pendingPrepareBatches[batchKey];
+    if (pendingBatch != null) {
+      await pendingBatch;
+      return;
+    }
+
+    final lastPreparedAt = _recentPrepareBatches[batchKey];
+    final cooldown = activeQueue
+        ? const Duration(seconds: 6)
+        : const Duration(seconds: 12);
+    if (lastPreparedAt != null &&
+        DateTime.now().difference(lastPreparedAt) < cooldown) {
+      return;
+    }
+
+    Future<void> runPrepareTask() async {
       final res = await appHttpClient
           .post(
             _proxyUri('/prepare_session'),
             headers: {'Content-Type': 'application/json'},
             body: jsonEncode({
-              'video_ids': idsToWarm,
+              'video_ids': idsNeedingWarm,
               'current_video_id': currentVideoId,
               'active_queue': activeQueue,
               'lookahead': lookahead,
@@ -1060,11 +1129,22 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       if (activeQueue) {
         unawaited(_logLatencySummaryIfDue());
       }
+      _recentPrepareBatches[batchKey] = DateTime.now();
+      _prunePrepareBatchTracking();
+    }
+
+    final pendingTask = runPrepareTask();
+    _pendingPrepareBatches[batchKey] = pendingTask;
+    try {
+      await pendingTask;
     } catch (_) {
-      final fallbackCount = idsToWarm.length < 4 ? idsToWarm.length : 4;
-      for (final id in idsToWarm.take(fallbackCount)) {
+      final fallbackCount =
+          idsNeedingWarm.length < 4 ? idsNeedingWarm.length : 4;
+      for (final id in idsNeedingWarm.take(fallbackCount)) {
         unawaited(prewarmStream(id));
       }
+    } finally {
+      _pendingPrepareBatches.remove(batchKey);
     }
   }
 
@@ -1599,7 +1679,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
   }
 
   Future<void> prewarmStreams(Iterable<String?> videoIds) async {
-    await _prepareQueueSession(videoIds, lookahead: 24);
+    await _prepareQueueSession(videoIds, lookahead: 18);
   }
 
   bool _hasValidDownloadedAudio(String path) {
@@ -2191,6 +2271,7 @@ class SearchNotifier extends StateNotifier<List<dynamic>> {
             resultCount: state.length,
           ),
         );
+        notifyRecommendationSignal(normalizedQuery);
       } else {
         state = [];
       }
@@ -2274,6 +2355,69 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
   bool _isRequestCurrent(int requestVersion) =>
       mounted && requestVersion == _requestVersion;
 
+  Future<File> _cacheFile() => getScopedDataFile('recommendations_cache.json');
+
+  Future<List<dynamic>> _loadCachedRecommendations() async {
+    try {
+      final file = await _cacheFile();
+      if (!file.existsSync()) return const [];
+      final decoded = jsonDecode(await file.readAsString());
+      if (decoded is! List) return const [];
+      return decoded
+          .whereType<Map>()
+          .map((entry) => Map<String, dynamic>.from(entry))
+          .toList(growable: false);
+    } catch (error) {
+      debugPrint('Recommendation cache load failed: $error');
+      return const [];
+    }
+  }
+
+  Future<void> _saveCachedRecommendations(List<dynamic> tracks) async {
+    try {
+      final file = await _cacheFile();
+      await file.writeAsString(jsonEncode(tracks.take(20).toList(growable: false)));
+    } catch (error) {
+      debugPrint('Recommendation cache save failed: $error');
+    }
+  }
+
+  Future<void> bootstrap() async {
+    final cached = await _loadCachedRecommendations();
+    if (!mounted) return;
+    if (cached.isNotEmpty) {
+      isLoading = false;
+      state = _prepareRecommendationResults(cached);
+      _primeRecommendationResults(state);
+      return;
+    }
+
+    final quickSeed = await HistoryManager.getLatestSeed();
+    if (!mounted) return;
+    if (quickSeed != null && quickSeed.isNotEmpty) {
+      await loadQuickRecommendations(quickSeed);
+      if (!mounted) return;
+      if (state.isNotEmpty) {
+        unawaited(refreshFromSignals());
+        return;
+      }
+    }
+
+    final fastDefault = await _fetchDefaultRecommendations();
+    if (!mounted) return;
+    if (fastDefault.isNotEmpty) {
+      final nextState = _prepareRecommendationResults(fastDefault);
+      isLoading = false;
+      state = nextState;
+      _primeRecommendationResults(nextState);
+      unawaited(_saveCachedRecommendations(nextState));
+      unawaited(refreshFromSignals());
+      return;
+    }
+
+    await refreshFromSignals();
+  }
+
   Future<void> refreshFromSignals({bool forceRefresh = false}) async {
     final seed = await HistoryManager.getRecommendationSeed();
     if (!mounted) return;
@@ -2283,7 +2427,7 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
   void scheduleRefresh({bool forceRefresh = false}) {
     _refreshDebounce?.cancel();
     _refreshDebounce = Timer(
-      Duration(milliseconds: forceRefresh ? 180 : 120),
+      Duration(milliseconds: forceRefresh ? 420 : 280),
       () {
         if (!mounted) return;
         unawaited(refreshFromSignals(forceRefresh: forceRefresh));
@@ -2343,8 +2487,6 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
     final queries = <String>[
       _defaultTrendingQuery(),
       'Trending hit songs',
-      'Top music right now',
-      'Viral music picks',
     ];
 
     final aggregated = <dynamic>[];
@@ -2355,9 +2497,9 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
             .post(
               buildProxyUri('/search'),
               headers: {'Content-Type': 'application/json'},
-              body: jsonEncode({"query": query, "limit": forceRefresh ? 18 : 15}),
+              body: jsonEncode({"query": query, "limit": forceRefresh ? 16 : 12}),
             )
-            .timeout(const Duration(seconds: 10));
+            .timeout(const Duration(seconds: 5));
         if (res.statusCode != 200) continue;
         final payload = jsonDecode(res.body) as Map<String, dynamic>;
         final results = payload['results'] as List<dynamic>? ?? const [];
@@ -2505,6 +2647,44 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
     };
   }
 
+  Future<void> loadQuickRecommendations(String seedId) async {
+    final requestVersion = ++_requestVersion;
+    isLoading = true;
+    state = [...state];
+    try {
+      final res = await appHttpClient
+          .post(
+            buildProxyUri('/recommend'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'query': '',
+              'limit': 12,
+              'seed_id': seedId,
+              'seed_ids': [seedId],
+              'artist_hints': const [],
+              'taste_queries': const [],
+              'avoid_ids': const [],
+            }),
+          )
+          .timeout(const Duration(seconds: 5));
+      if (!_isRequestCurrent(requestVersion)) return;
+      if (res.statusCode != 200) return;
+      final fetched = jsonDecode(res.body)['recommendations'] as List<dynamic>;
+      if (fetched.isEmpty) return;
+      final nextState = _prepareRecommendationResults(fetched);
+      state = nextState;
+      _primeRecommendationResults(nextState);
+      unawaited(_saveCachedRecommendations(nextState));
+    } catch (_) {
+      // Quick bootstrap is best-effort only.
+    } finally {
+      if (_isRequestCurrent(requestVersion)) {
+        isLoading = false;
+        state = [...state];
+      }
+    }
+  }
+
   Future<void> loadRecommendations([String? seedId, bool forceRefresh = false]) async {
     final requestVersion = ++_requestVersion;
     final previousIds = forceRefresh
@@ -2515,24 +2695,9 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
         : const <String>{};
     isLoading = true;
     if (_isRequestCurrent(requestVersion)) {
-      state = forceRefresh ? [...state] : [];
+      state = forceRefresh ? [...state] : [...state];
     }
     try {
-      if (seedId == null || seedId.isEmpty) {
-        final fallbackResults =
-            await _fetchDefaultRecommendations(forceRefresh: forceRefresh);
-        if (!_isRequestCurrent(requestVersion)) return;
-        if (fallbackResults.isNotEmpty) {
-          state = _prepareRecommendationResults(
-            fallbackResults,
-            avoidIds: previousIds,
-            forceRefresh: forceRefresh,
-          );
-          _primeRecommendationResults(state);
-          return;
-        }
-      }
-
       final body = await _buildRecommendationRequestBody(
         seedId,
         limit: 15,
@@ -2548,15 +2713,49 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
       if (!_isRequestCurrent(requestVersion)) return;
       if (res.statusCode == 200) {
         final fetched = jsonDecode(res.body)['recommendations'] as List<dynamic>;
-        state = _prepareRecommendationResults(
+        final nextState = _prepareRecommendationResults(
           fetched,
           avoidIds: previousIds,
           forceRefresh: forceRefresh,
         );
+        state = nextState;
         _primeRecommendationResults(state);
+        unawaited(_saveCachedRecommendations(nextState));
+        return;
+      }
+
+      if (state.isEmpty || forceRefresh) {
+        final fallbackResults =
+            await _fetchDefaultRecommendations(forceRefresh: forceRefresh);
+        if (!_isRequestCurrent(requestVersion)) return;
+        if (fallbackResults.isNotEmpty) {
+          final nextState = _prepareRecommendationResults(
+            fallbackResults,
+            avoidIds: previousIds,
+            forceRefresh: forceRefresh,
+          );
+          state = nextState;
+          _primeRecommendationResults(state);
+          unawaited(_saveCachedRecommendations(nextState));
+          return;
+        }
       }
     } catch (e) {
-      // print("Recommendations failed: $e");
+      if (state.isEmpty || forceRefresh) {
+        final fallbackResults =
+            await _fetchDefaultRecommendations(forceRefresh: forceRefresh);
+        if (!_isRequestCurrent(requestVersion)) return;
+        if (fallbackResults.isNotEmpty) {
+          final nextState = _prepareRecommendationResults(
+            fallbackResults,
+            avoidIds: previousIds,
+            forceRefresh: forceRefresh,
+          );
+          state = nextState;
+          _primeRecommendationResults(state);
+          unawaited(_saveCachedRecommendations(nextState));
+        }
+      }
     } finally {
       if (_isRequestCurrent(requestVersion)) {
         isLoading = false;
@@ -2613,17 +2812,17 @@ final recommendationProvider =
   ref.watch(authProvider.select((state) => state.storageScopeId));
   ref.watch(storageRefreshTickProvider);
   final notifier = RecommendationNotifier(ref);
-  unawaited(notifier.refreshFromSignals());
-  final subscription = HistoryManager.seedStream.listen((_) {
-    notifier.scheduleRefresh();
-  });
-  ref.listen<List<Playlist>>(playlistProvider, (_, __) {
+  unawaited(notifier.bootstrap());
+  final historySubscription = HistoryManager.seedStream.listen((_) {
     notifier.scheduleRefresh(forceRefresh: true);
   });
-  ref.listen<AsyncValue<List<Map<String, dynamic>>>>(libraryProvider, (_, __) {
+  final searchSubscription = recommendationSignalStream.listen((_) {
     notifier.scheduleRefresh(forceRefresh: true);
   });
-  ref.onDispose(subscription.cancel);
+  ref.onDispose(() {
+    historySubscription.cancel();
+    searchSubscription.cancel();
+  });
   return notifier;
 });
 
@@ -3624,10 +3823,7 @@ final playbackQueueProvider =
   return notifier;
 });
 
-final libraryProvider =
-    FutureProvider<List<Map<String, dynamic>>>((ref) async {
-  final scopeId = ref.watch(authProvider.select((state) => state.storageScopeId));
-  ref.watch(storageRefreshTickProvider);
+Future<List<Map<String, dynamic>>> _loadLocalLibraryTracks(String scopeId) async {
   final dir = await getScopedDownloadsDirectory(scopeId);
   final files = dir.listSync().where((f) => f.path.endsWith('.mp3')).toList()
     ..sort((a, b) {
@@ -3635,12 +3831,10 @@ final libraryProvider =
       final bTime = b.statSync().modified;
       return bTime.compareTo(aTime);
     });
-  List<Map<String, dynamic>> tracks = [];
-  for (var file in files) {
+
+  final tracks = <Map<String, dynamic>>[];
+  for (final file in files) {
     if (file is File) {
-      // GC: Destroy ghost files resulting from aborted connections or proxy refuses
-      // Note: Increased to 10000 bytes (10 KB) to eradicate HTML error payloads
-      // dumped by rogue port 8000 Educere hijackers. Real MP3s are > 2MB.
       try {
         if (file.lengthSync() < 10000) {
           file.deleteSync();
@@ -3653,16 +3847,97 @@ final libraryProvider =
 
     final jsonPath = file.path.replaceAll('.mp3', '.json');
     if (File(jsonPath).existsSync()) {
-      final meta = jsonDecode(File(jsonPath).readAsStringSync());
+      final meta = Map<String, dynamic>.from(
+        jsonDecode(File(jsonPath).readAsStringSync()) as Map,
+      );
       meta['local_path'] = file.path;
-      tracks.add(meta);
+      meta['is_downloaded_locally'] = true;
+      tracks.add(normalizeTrack(meta));
     } else {
       tracks.add({
         'title': file.path.split('/').last.replaceAll('.mp3', ''),
         'local_path': file.path,
         'duration': 0,
+        'is_downloaded_locally': true,
       });
     }
   }
   return tracks;
+}
+
+Future<List<Map<String, dynamic>>> _loadCloudLibraryTracks() async {
+  final client = supabaseClientOrNull;
+  final userId = currentAuthenticatedUserId;
+  if (client == null || userId == null || userId.isEmpty) {
+    return const [];
+  }
+
+  try {
+    final rows = await client
+        .from('library_tracks')
+        .select('track_id,track_data,added_at')
+        .eq('user_id', userId)
+        .order('added_at', ascending: false);
+    return (rows as List<dynamic>)
+        .map((rawRow) {
+          final row = Map<String, dynamic>.from(rawRow as Map);
+          final payload = normalizeTrack(
+            Map<String, dynamic>.from(row['track_data'] as Map),
+          );
+          final trackId = row['track_id']?.toString();
+          if (trackId != null && trackId.isNotEmpty) {
+            payload['id'] = trackId;
+            payload['videoId'] = trackId;
+          }
+          payload['is_cloud_saved'] = true;
+          return payload;
+        })
+        .toList(growable: false);
+  } catch (error) {
+    debugPrint('Cloud library load failed: $error');
+    return const [];
+  }
+}
+
+final libraryProvider = FutureProvider<List<Map<String, dynamic>>>((ref) async {
+  final authState = ref.watch(authProvider);
+  final scopeId = authState.storageScopeId;
+  ref.watch(storageRefreshTickProvider);
+
+  final localTracks = await _loadLocalLibraryTracks(scopeId);
+  if (!authState.isAuthenticated || !isSupabaseConfigured) {
+    return localTracks;
+  }
+
+  final cloudTracks = await _loadCloudLibraryTracks();
+  final localById = <String, Map<String, dynamic>>{};
+  for (final track in localTracks) {
+    final trackId = extractTrackId(track);
+    if (trackId != null && trackId.isNotEmpty) {
+      localById[trackId] = track;
+    }
+  }
+
+  final merged = <Map<String, dynamic>>[];
+  for (final cloudTrack in cloudTracks) {
+    final trackId = extractTrackId(cloudTrack);
+    final localTrack = trackId == null ? null : localById.remove(trackId);
+    merged.add({
+      ...cloudTrack,
+      if (localTrack != null) ...localTrack,
+      'is_cloud_saved': true,
+      'is_downloaded_locally': localTrack != null,
+    });
+  }
+
+  for (final localTrack in localById.values) {
+    merged.add({
+      ...localTrack,
+      'is_cloud_saved': false,
+      'is_downloaded_locally': true,
+    });
+    unawaited(upsertCloudLibraryTrack(localTrack));
+  }
+
+  return merged;
 });

@@ -278,6 +278,7 @@ STREAM_CHUNK_TTL_SECONDS = 1800
 STREAM_WARM_WORKERS = int(os.environ.get("STREAM_WARM_WORKERS", "8"))
 PREPARE_SESSION_WORKERS = int(os.environ.get("PREPARE_SESSION_WORKERS", "4"))
 PREPARE_SESSION_MAX_LOOKAHEAD = int(os.environ.get("PREPARE_SESSION_MAX_LOOKAHEAD", "18"))
+RECOMMENDATION_CACHE_TTL_SECONDS = int(os.environ.get("RECOMMENDATION_CACHE_TTL_SECONDS", "180"))
 stream_info_cache = {}
 stream_info_inflight = {}
 stream_info_lock = Lock()
@@ -287,6 +288,10 @@ stream_chunk_inflight = {}
 stream_chunk_inflight_lock = Lock()
 prepare_metrics = deque(maxlen=180)
 prepare_metrics_lock = Lock()
+recommendation_cache = {}
+recommendation_cache_lock = Lock()
+home_candidates_cache = {"expires_at": 0, "results": []}
+home_candidates_lock = Lock()
 stream_warm_executor = ThreadPoolExecutor(max_workers=STREAM_WARM_WORKERS)
 upstream_http = requests.Session()
 
@@ -941,6 +946,12 @@ def get_suggestions(req: SearchRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 def _fallback_home_candidates(limit: int):
+    now = time.time()
+    with home_candidates_lock:
+        cached = home_candidates_cache.get("results") or []
+        if home_candidates_cache.get("expires_at", 0) > now and len(cached) >= max(5, limit):
+            return cached[: limit + 10]
+
     results = []
     try:
         home_feed = ytmusic.get_home(limit=limit)
@@ -968,7 +979,41 @@ def _fallback_home_candidates(limit: int):
             results.append((track, 0.7))
             if len(results) >= limit + 10:
                 break
+
+    if results:
+        with home_candidates_lock:
+            home_candidates_cache["results"] = results[: limit + 10]
+            home_candidates_cache["expires_at"] = now + RECOMMENDATION_CACHE_TTL_SECONDS
     return results
+
+def _recommendation_cache_key(req: SearchRequest):
+    payload = {
+        "query": (req.query or "").strip().lower(),
+        "limit": int(req.limit),
+        "seed_id": (req.seed_id or "").strip(),
+        "seed_ids": [item for item in (req.seed_ids or []) if item][:6],
+        "artist_hints": [item.strip().lower() for item in (req.artist_hints or []) if item][:6],
+        "taste_queries": [item.strip().lower() for item in (req.taste_queries or []) if item][:8],
+        "avoid_ids": [item for item in (req.avoid_ids or []) if item][:40],
+    }
+    return json.dumps(payload, sort_keys=True)
+
+def _get_cached_recommendations(cache_key: str):
+    now = time.time()
+    with recommendation_cache_lock:
+        cached = recommendation_cache.get(cache_key)
+        if cached and cached["expires_at"] > now:
+            return cached["results"]
+        if cached:
+            recommendation_cache.pop(cache_key, None)
+    return None
+
+def _set_cached_recommendations(cache_key: str, results):
+    with recommendation_cache_lock:
+        recommendation_cache[cache_key] = {
+            "results": results,
+            "expires_at": time.time() + RECOMMENDATION_CACHE_TTL_SECONDS,
+        }
 
 def _rank_recommendation_candidates(
     candidates,
@@ -1049,6 +1094,11 @@ def get_recommendations(req: SearchRequest):
     relying on only the latest played seed.
     """
     try:
+        cache_key = _recommendation_cache_key(req)
+        cached_results = _get_cached_recommendations(cache_key)
+        if cached_results is not None:
+            return {"status": "success", "recommendations": cached_results}
+
         seed_ids = []
         for candidate in [req.seed_id, *(req.seed_ids or [])]:
             if candidate and candidate not in seed_ids:
@@ -1121,6 +1171,7 @@ def get_recommendations(req: SearchRequest):
             artist_hints=req.artist_hints or [],
             taste_queries=req.taste_queries or [],
         )
+        _set_cached_recommendations(cache_key, results)
         return {"status": "success", "recommendations": results}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

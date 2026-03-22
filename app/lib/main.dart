@@ -17,6 +17,7 @@ import 'logic/playlist_provider.dart';
 import 'widgets/app_artwork.dart';
 import 'widgets/app_bottom_nav_bar.dart';
 import 'widgets/download_hud.dart';
+import 'widgets/track_list_skeleton.dart';
 
 const _accentGrey = Color(0xFFD0D5D8);
 const _surfaceGrey = Color(0xFF363C40);
@@ -948,6 +949,7 @@ class _MainLayoutState extends ConsumerState<MainLayout> {
       GlobalKey<_HomeScreenState>();
 
   Widget _buildBottomArea(bool hasActiveTrack) {
+    final viewBottomInset = MediaQuery.of(context).viewPadding.bottom;
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
@@ -970,10 +972,15 @@ class _MainLayoutState extends ConsumerState<MainLayout> {
             );
           },
           child: hasActiveTrack
-              ? const Padding(
-                  key: ValueKey('mini-player'),
-                  padding: EdgeInsets.fromLTRB(18, 0, 18, 8),
-                  child: MiniPlayer(),
+              ? Padding(
+                  key: const ValueKey('mini-player'),
+                  padding: EdgeInsets.fromLTRB(
+                    18,
+                    0,
+                    18,
+                    viewBottomInset > 0 ? 10 : 8,
+                  ),
+                  child: const MiniPlayer(),
                 )
               : const SizedBox.shrink(key: ValueKey('mini-player-hidden')),
         ),
@@ -992,6 +999,7 @@ class _MainLayoutState extends ConsumerState<MainLayout> {
         (state) => state.currentTrackName != 'No track loaded',
       ),
     );
+    final viewBottomInset = MediaQuery.of(context).viewPadding.bottom;
     final pages = <Widget>[
       HomeScreen(key: _legacyHomeKey),
       const LibraryScreen(),
@@ -1025,7 +1033,9 @@ class _MainLayoutState extends ConsumerState<MainLayout> {
             ),
             Positioned(
               right: 24,
-              bottom: hasActiveTrack ? 148 : 24,
+              bottom: hasActiveTrack
+                  ? viewBottomInset + 148
+                  : viewBottomInset + 24,
               child: const DownloadHud(),
             ),
           ],
@@ -1046,7 +1056,9 @@ class HomeScreen extends ConsumerStatefulWidget {
 class _HomeScreenState extends ConsumerState<HomeScreen> {
   final TextEditingController _urlController = TextEditingController();
   final FocusNode _searchFocusNode = FocusNode();
+  final ScrollController _homeScrollController = ScrollController();
   bool _isSearching = false;
+  bool _refreshRecommendationsOnSearchExit = false;
   Timer? _suggestDebounce;
   final Set<String> _prewarmedTrackIds = <String>{};
   String _lastPrimeSignature = '';
@@ -1056,6 +1068,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   void initState() {
     super.initState();
     _heroQuip = _buildHeroQuip();
+    _homeScrollController.addListener(_handleHomeScroll);
     _urlController.addListener(() {
       final text = _urlController.text.trim();
       if (text.isNotEmpty && !_isSearching) {
@@ -1078,9 +1091,26 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   @override
   void dispose() {
     _suggestDebounce?.cancel();
+    _homeScrollController
+      ..removeListener(_handleHomeScroll)
+      ..dispose();
     _urlController.dispose();
     _searchFocusNode.dispose();
     super.dispose();
+  }
+
+  void _handleHomeScroll() {
+    if (_isSearching || !_homeScrollController.hasClients) return;
+    final notifier = ref.read(recommendationProvider.notifier);
+    if (notifier.isLoading || notifier.isPaginating) return;
+    final position = _homeScrollController.position;
+    if (position.extentAfter > 420) return;
+    final recState = ref.read(recommendationProvider);
+    if (recState.isEmpty) return;
+    final lastTrackId =
+        (recState.last['id'] ?? recState.last['videoId'])?.toString() ?? '';
+    if (lastTrackId.isEmpty) return;
+    unawaited(notifier.loadMore(lastTrackId));
   }
 
   Future<void> _performSearch(WidgetRef ref, [String? query]) async {
@@ -1099,6 +1129,9 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       ref.read(searchProvider.notifier).search(q),
       ref.read(albumSearchProvider.notifier).search(q),
     ]);
+    if (mounted) {
+      _refreshRecommendationsOnSearchExit = true;
+    }
   }
 
   void _clearSearch() {
@@ -1108,6 +1141,16 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     ref.read(searchProvider.notifier).clear();
     ref.read(albumSearchProvider.notifier).clear();
     setState(() => _isSearching = false);
+    if (_refreshRecommendationsOnSearchExit) {
+      _refreshRecommendationsOnSearchExit = false;
+      unawaited(() async {
+        final seed = await HistoryManager.getRecommendationSeed();
+        if (!mounted) return;
+        await ref
+            .read(recommendationProvider.notifier)
+            .loadRecommendations(seed, true);
+      }());
+    }
   }
 
   Future<void> _refreshContent() async {
@@ -1359,8 +1402,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     bool showTrailingLoader = false,
   }) {
     if (isLoading && tracks.isEmpty) {
-      return const Center(
-          child: CircularProgressIndicator(color: _accentGrey));
+      return const TrackListSkeleton(count: 5);
     }
     if (tracks.isEmpty) {
       return Center(
@@ -1368,16 +1410,14 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
             Text(emptyMessage, style: const TextStyle(color: Colors.white54)),
       );
     }
+    final loadingTileCount = showTrailingLoader ? 3 : 0;
     return ListView.builder(
       shrinkWrap: true,
       physics: const NeverScrollableScrollPhysics(),
-      itemCount: tracks.length + ((isLoading || showTrailingLoader) ? 1 : 0),
+      itemCount: tracks.length + loadingTileCount,
       itemBuilder: (context, index) {
         if (index >= tracks.length) {
-          return const Center(
-              child: Padding(
-                  padding: EdgeInsets.all(16.0),
-                  child: CircularProgressIndicator(color: _accentGrey)));
+          return const TrackListSkeleton(count: 1);
         }
         final t = tracks[index];
         final videoId = (t['id'] ?? t['videoId'])?.toString();
@@ -1526,27 +1566,15 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         color: _accentGrey,
         backgroundColor: _surfaceGreyAlt,
         onRefresh: _refreshContent,
-        child: NotificationListener<ScrollNotification>(
-          onNotification: (ScrollNotification scrollInfo) {
-            if (!_isSearching &&
-                !isRecLoading &&
-                scrollInfo.metrics.pixels >=
-                    scrollInfo.metrics.maxScrollExtent - 200) {
-              if (recState.isNotEmpty) {
-                final lastTrackId = recState.last['id'];
-                ref.read(recommendationProvider.notifier).loadMore(lastTrackId);
-              }
-            }
-            return false;
-          },
-          child: SingleChildScrollView(
-            physics: const BouncingScrollPhysics(
-              parent: AlwaysScrollableScrollPhysics(),
-            ),
-            padding: const EdgeInsets.all(16.0),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
+        child: SingleChildScrollView(
+          controller: _homeScrollController,
+          physics: const BouncingScrollPhysics(
+            parent: AlwaysScrollableScrollPhysics(),
+          ),
+          padding: const EdgeInsets.all(16.0),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
             Semantics(
               label: _heroQuip,
               child: TextField(
@@ -1638,6 +1666,19 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                       fontWeight: FontWeight.bold,
                       color: Colors.white)),
               const SizedBox(height: 16),
+              AnimatedSwitcher(
+                duration: const Duration(milliseconds: 220),
+                switchInCurve: Curves.easeOutCubic,
+                switchOutCurve: Curves.easeInCubic,
+                child: isRecLoading && recState.isNotEmpty
+                    ? const TrackListSkeleton(
+                        key: ValueKey('recommendation-refresh-skeleton'),
+                        count: 2,
+                      )
+                    : const SizedBox.shrink(
+                        key: ValueKey('recommendation-refresh-idle'),
+                      ),
+              ),
               _buildTrackList(
                 recState,
                 isRecLoading,
@@ -1645,9 +1686,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                 showTrailingLoader: isRecPaginating,
               ),
             ],
-                const SizedBox(height: 28),
-              ],
-            ),
+              const SizedBox(height: 28),
+            ],
           ),
         ),
       ),
@@ -3832,9 +3872,12 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
     const accentColor = _accentGrey;
     final nextUpTrack = _nextUpTrack(queueState);
     final queueNotifier = ref.read(playbackQueueProvider.notifier);
-    final bottomInset = MediaQuery.of(context).padding.bottom;
+    final mediaQuery = MediaQuery.of(context);
+    final bottomInset = mediaQuery.padding.bottom > mediaQuery.viewPadding.bottom
+        ? mediaQuery.padding.bottom
+        : mediaQuery.viewPadding.bottom;
     final artworkSize =
-        (MediaQuery.of(context).size.width * 0.76).clamp(248.0, 360.0).toDouble();
+        (mediaQuery.size.width * 0.76).clamp(248.0, 360.0).toDouble();
 
     return GestureDetector(
       behavior: HitTestBehavior.translucent,
@@ -3859,7 +3902,7 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
                 24,
                 18,
                 24,
-                math.max(156, bottomInset + 156).toDouble(),
+                math.max(196, bottomInset + 196).toDouble(),
               ),
               child: ConstrainedBox(
                 constraints: BoxConstraints(minHeight: constraints.maxHeight),
@@ -4268,7 +4311,7 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
                         ),
                       ],
                     ),
-                    SizedBox(height: bottomInset > 0 ? 16 : 8),
+                    SizedBox(height: bottomInset > 0 ? bottomInset + 12 : 18),
                   ],
                 ),
               ),

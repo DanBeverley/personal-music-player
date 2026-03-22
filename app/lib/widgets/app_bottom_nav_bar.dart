@@ -14,9 +14,12 @@ class AppBottomNavBar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final bottomInset = MediaQuery.of(context).padding.bottom;
+    final mediaQuery = MediaQuery.of(context);
+    final bottomInset = mediaQuery.padding.bottom > mediaQuery.viewPadding.bottom
+        ? mediaQuery.padding.bottom
+        : mediaQuery.viewPadding.bottom;
     return Padding(
-      padding: EdgeInsets.fromLTRB(18, 0, 18, bottomInset > 0 ? 14 : 18),
+      padding: EdgeInsets.fromLTRB(18, 0, 18, bottomInset > 0 ? bottomInset + 10 : 18),
       child: ClipRRect(
         borderRadius: BorderRadius.circular(12),
         child: BackdropFilter(

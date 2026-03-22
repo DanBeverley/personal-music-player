@@ -2349,7 +2349,6 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
   bool isLoading = true;
   bool isPaginating = false;
   int _requestVersion = 0;
-  Timer? _refreshDebounce;
   final Set<String> _prewarmedRecommendationIds = <String>{};
 
   bool _isRequestCurrent(int requestVersion) =>
@@ -2398,7 +2397,6 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
       await loadQuickRecommendations(quickSeed);
       if (!mounted) return;
       if (state.isNotEmpty) {
-        unawaited(refreshFromSignals());
         return;
       }
     }
@@ -2411,7 +2409,6 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
       state = nextState;
       _primeRecommendationResults(nextState);
       unawaited(_saveCachedRecommendations(nextState));
-      unawaited(refreshFromSignals());
       return;
     }
 
@@ -2424,20 +2421,8 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
     await loadRecommendations(seed, forceRefresh);
   }
 
-  void scheduleRefresh({bool forceRefresh = false}) {
-    _refreshDebounce?.cancel();
-    _refreshDebounce = Timer(
-      Duration(milliseconds: forceRefresh ? 420 : 280),
-      () {
-        if (!mounted) return;
-        unawaited(refreshFromSignals(forceRefresh: forceRefresh));
-      },
-    );
-  }
-
   @override
   void dispose() {
-    _refreshDebounce?.cancel();
     _requestVersion++;
     super.dispose();
   }
@@ -2484,39 +2469,66 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
   Future<List<dynamic>> _fetchDefaultRecommendations({
     bool forceRefresh = false,
   }) async {
-    final queries = <String>[
-      _defaultTrendingQuery(),
-      'Trending hit songs',
-    ];
+    try {
+      final res = await appHttpClient
+          .post(
+            buildProxyUri('/recommend'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'query': '',
+              'limit': forceRefresh ? 16 : 12,
+              'seed_ids': const [],
+              'artist_hints': const [],
+              'taste_queries': const [],
+              'avoid_ids': const [],
+            }),
+          )
+          .timeout(const Duration(seconds: 4));
+      if (res.statusCode == 200) {
+        final payload = jsonDecode(res.body) as Map<String, dynamic>;
+        final recommendations =
+            payload['recommendations'] as List<dynamic>? ?? const [];
+        if (recommendations.isNotEmpty) {
+          return forceRefresh
+              ? ([...recommendations]..shuffle(_random))
+              : recommendations;
+        }
+      }
+    } catch (_) {
+      // Fall back to the broader search bootstrap below.
+    }
 
-    final aggregated = <dynamic>[];
-    final seen = <String>{};
-    for (final query in queries) {
+    final queries = <String>[_defaultTrendingQuery(), 'Trending hit songs'];
+    final futures = queries.map((query) async {
       try {
         final res = await appHttpClient
             .post(
               buildProxyUri('/search'),
               headers: {'Content-Type': 'application/json'},
-              body: jsonEncode({"query": query, "limit": forceRefresh ? 16 : 12}),
+              body: jsonEncode({"query": query, "limit": forceRefresh ? 14 : 10}),
             )
-            .timeout(const Duration(seconds: 5));
-        if (res.statusCode != 200) continue;
+            .timeout(const Duration(seconds: 4));
+        if (res.statusCode != 200) return const <dynamic>[];
         final payload = jsonDecode(res.body) as Map<String, dynamic>;
-        final results = payload['results'] as List<dynamic>? ?? const [];
-        if (results.isNotEmpty) {
-          if (!forceRefresh) {
-            return results;
-          }
-          for (final track in results) {
-            final id = (track['id'] ?? track['videoId'])?.toString();
-            if (id != null && id.isNotEmpty && !seen.add(id)) {
-              continue;
-            }
-            aggregated.add(track);
-          }
-        }
+        return payload['results'] as List<dynamic>? ?? const <dynamic>[];
       } catch (_) {
-        continue;
+        return const <dynamic>[];
+      }
+    }).toList(growable: false);
+
+    final responses = await Future.wait(futures);
+    final aggregated = <dynamic>[];
+    final seen = <String>{};
+    for (final results in responses) {
+      for (final track in results) {
+        final id = (track['id'] ?? track['videoId'])?.toString();
+        if (id != null && id.isNotEmpty && !seen.add(id)) {
+          continue;
+        }
+        aggregated.add(track);
+      }
+      if (!forceRefresh && aggregated.isNotEmpty) {
+        return aggregated;
       }
     }
     if (forceRefresh && aggregated.isNotEmpty) {
@@ -2813,16 +2825,6 @@ final recommendationProvider =
   ref.watch(storageRefreshTickProvider);
   final notifier = RecommendationNotifier(ref);
   unawaited(notifier.bootstrap());
-  final historySubscription = HistoryManager.seedStream.listen((_) {
-    notifier.scheduleRefresh(forceRefresh: true);
-  });
-  final searchSubscription = recommendationSignalStream.listen((_) {
-    notifier.scheduleRefresh(forceRefresh: true);
-  });
-  ref.onDispose(() {
-    historySubscription.cancel();
-    searchSubscription.cancel();
-  });
   return notifier;
 });
 

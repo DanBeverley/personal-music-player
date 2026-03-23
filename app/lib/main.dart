@@ -3876,8 +3876,9 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
     final bottomInset = mediaQuery.padding.bottom > mediaQuery.viewPadding.bottom
         ? mediaQuery.padding.bottom
         : mediaQuery.viewPadding.bottom;
-    final artworkSize =
-        (mediaQuery.size.width * 0.76).clamp(248.0, 360.0).toDouble();
+    final downloadTask = playerState.videoId == null
+        ? null
+        : ref.watch(downloadTaskProvider(playerState.videoId!));
 
     return GestureDetector(
       behavior: HitTestBehavior.translucent,
@@ -3894,6 +3895,68 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
       child: SafeArea(
         child: LayoutBuilder(
           builder: (context, constraints) {
+            final compactLayout = constraints.maxHeight < 760;
+            final extraCompactLayout = constraints.maxHeight < 690;
+            final hasQueuePreview = nextUpTrack != null;
+            final queueAwareCompactLayout = compactLayout && hasQueuePreview;
+            final artworkSize = math.min(
+              mediaQuery.size.width *
+                  (queueAwareCompactLayout
+                      ? 0.52
+                      : compactLayout
+                          ? 0.62
+                          : 0.76),
+              queueAwareCompactLayout
+                  ? 244.0
+                  : compactLayout
+                      ? 296.0
+                      : 360.0,
+            ).clamp(
+                    queueAwareCompactLayout
+                        ? 164.0
+                        : extraCompactLayout
+                            ? 182.0
+                            : 214.0,
+                    360.0)
+                .toDouble();
+            final titleSize = queueAwareCompactLayout
+                ? 22.0
+                : compactLayout
+                    ? 24.0
+                    : 28.0;
+            final artistSize = queueAwareCompactLayout
+                ? 15.0
+                : compactLayout
+                    ? 16.0
+                    : 18.0;
+            final artworkGap = queueAwareCompactLayout
+                ? 16.0
+                : compactLayout
+                    ? 24.0
+                    : 40.0;
+            final cardGap = queueAwareCompactLayout ? 10.0 : compactLayout ? 14.0 : 18.0;
+            final sliderGap = queueAwareCompactLayout ? 12.0 : compactLayout ? 18.0 : 26.0;
+            final toolRowGap = queueAwareCompactLayout ? 10.0 : compactLayout ? 12.0 : 20.0;
+            final transportIconSize = queueAwareCompactLayout
+                ? 28.0
+                : compactLayout
+                    ? 30.0
+                    : 34.0;
+            final transportButtonWidth = queueAwareCompactLayout
+                ? 42.0
+                : compactLayout
+                    ? 46.0
+                    : 50.0;
+            final primaryTransportSize = queueAwareCompactLayout
+                ? 68.0
+                : compactLayout
+                    ? 74.0
+                    : 84.0;
+            final primaryTransportBox = queueAwareCompactLayout
+                ? 76.0
+                : compactLayout
+                    ? 82.0
+                    : 92.0;
             return SingleChildScrollView(
               physics: const BouncingScrollPhysics(
                 parent: AlwaysScrollableScrollPhysics(),
@@ -3902,7 +3965,8 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
                 24,
                 18,
                 24,
-                math.max(196, bottomInset + 196).toDouble(),
+                math.max(compactLayout ? 156 : 196, bottomInset + 104)
+                    .toDouble(),
               ),
               child: ConstrainedBox(
                 constraints: BoxConstraints(minHeight: constraints.maxHeight),
@@ -3939,11 +4003,11 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
                         ),
                       ),
                     ),
-                    const SizedBox(height: 40),
+                    SizedBox(height: artworkGap),
                     Text(
                       playerState.currentTrackName,
-                      style: const TextStyle(
-                        fontSize: 28,
+                      style: TextStyle(
+                        fontSize: titleSize,
                         fontWeight: FontWeight.w800,
                         color: Colors.white,
                         height: 1.2,
@@ -3955,19 +4019,19 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
                     Text(
                       playerState.artist ?? 'Artist Unknown',
                       style: TextStyle(
-                        fontSize: 18,
+                        fontSize: artistSize,
                         color: Colors.white.withValues(alpha: 0.7),
                       ),
                     ),
                     if (nextUpTrack != null) ...[
-                      const SizedBox(height: 18),
+                      SizedBox(height: cardGap),
                       GestureDetector(
                         onTap: _openQueueSheet,
                         child: Container(
                           width: double.infinity,
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 16,
-                            vertical: 14,
+                          padding: EdgeInsets.symmetric(
+                            horizontal: 14,
+                            vertical: queueAwareCompactLayout ? 10 : 14,
                           ),
                           decoration: BoxDecoration(
                             color: Colors.white.withValues(alpha: 0.04),
@@ -3985,31 +4049,45 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
                               ),
                               const SizedBox(width: 12),
                               Expanded(
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Text(
-                                      'Up next',
-                                      style: TextStyle(
-                                        color: Colors.white.withValues(alpha: 0.46),
-                                        fontSize: 11,
-                                        fontWeight: FontWeight.w700,
-                                        letterSpacing: 0.5,
+                                child: queueAwareCompactLayout
+                                    ? Text(
+                                        nextUpTrack['title'] ?? 'More like this',
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: const TextStyle(
+                                          color: Colors.white,
+                                          fontSize: 13,
+                                          fontWeight: FontWeight.w600,
+                                        ),
+                                      )
+                                    : Column(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        children: [
+                                          Text(
+                                            'Up next',
+                                            style: TextStyle(
+                                              color: Colors.white
+                                                  .withValues(alpha: 0.46),
+                                              fontSize: 11,
+                                              fontWeight: FontWeight.w700,
+                                              letterSpacing: 0.5,
+                                            ),
+                                          ),
+                                          const SizedBox(height: 4),
+                                          Text(
+                                            nextUpTrack['title'] ??
+                                                'More like this',
+                                            maxLines: 1,
+                                            overflow: TextOverflow.ellipsis,
+                                            style: const TextStyle(
+                                              color: Colors.white,
+                                              fontSize: 14,
+                                              fontWeight: FontWeight.w600,
+                                            ),
+                                          ),
+                                        ],
                                       ),
-                                    ),
-                                    const SizedBox(height: 4),
-                                    Text(
-                                      nextUpTrack['title'] ?? 'More like this',
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: const TextStyle(
-                                        color: Colors.white,
-                                        fontSize: 14,
-                                        fontWeight: FontWeight.w600,
-                                      ),
-                                    ),
-                                  ],
-                                ),
                               ),
                               Icon(
                                 Icons.keyboard_arrow_up_rounded,
@@ -4020,7 +4098,7 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
                         ),
                       ),
                     ],
-                    const SizedBox(height: 26),
+                    SizedBox(height: sliderGap),
                     SliderTheme(
                       data: SliderTheme.of(context).copyWith(
                         activeTrackColor: Colors.white,
@@ -4078,7 +4156,7 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
                         ],
                       ),
                     ),
-                    const SizedBox(height: 20),
+                    SizedBox(height: toolRowGap),
                     Row(
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
@@ -4163,6 +4241,47 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
                           visualDensity: VisualDensity.compact,
                           iconSize: 28,
                           padding: EdgeInsets.zero,
+                          tooltip: 'Download',
+                          icon: downloadTask?.phase == DownloadPhase.active
+                              ? SizedBox(
+                                  width: 24,
+                                  height: 24,
+                                  child: CircularProgressIndicator(
+                                    value: downloadTask!.progress > 0
+                                        ? downloadTask.progress
+                                        : null,
+                                    strokeWidth: 2.3,
+                                    color: accentColor,
+                                  ),
+                                )
+                              : Icon(
+                                  downloadTask?.phase == DownloadPhase.complete
+                                      ? Icons.download_done_rounded
+                                      : Icons.download_rounded,
+                                  color: downloadTask?.phase ==
+                                          DownloadPhase.complete
+                                      ? accentColor
+                                      : Colors.white.withValues(alpha: 0.5),
+                                ),
+                          onPressed: playerState.videoId == null
+                              ? null
+                              : () {
+                                  ref
+                                      .read(downloadCenterProvider.notifier)
+                                      .downloadTrack({
+                                    'id': playerState.videoId,
+                                    'videoId': playerState.videoId,
+                                    'title': playerState.currentTrackName,
+                                    'thumbnail': playerState.thumbnail,
+                                    'channel': playerState.artist,
+                                    'duration': playerState.duration,
+                                  });
+                                },
+                        ),
+                        IconButton(
+                          visualDensity: VisualDensity.compact,
+                          iconSize: 28,
+                          padding: EdgeInsets.zero,
                           icon: Icon(
                             Icons.playlist_add,
                             color: Colors.white.withValues(alpha: 0.5),
@@ -4184,16 +4303,16 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
                         ),
                       ],
                     ),
-                    const SizedBox(height: 18),
+                    SizedBox(height: compactLayout ? 12 : 18),
                     Row(
                       mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                       crossAxisAlignment: CrossAxisAlignment.center,
                       children: [
                         SizedBox(
-                          width: 50,
+                          width: transportButtonWidth,
                           child: IconButton(
                             visualDensity: VisualDensity.compact,
-                            iconSize: 34,
+                            iconSize: transportIconSize,
                             padding: EdgeInsets.zero,
                             onPressed: () {
                               unawaited(queueNotifier.playPrevious());
@@ -4205,10 +4324,10 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
                           ),
                         ),
                         SizedBox(
-                          width: 50,
+                          width: transportButtonWidth,
                           child: IconButton(
                             visualDensity: VisualDensity.compact,
-                            iconSize: 34,
+                            iconSize: transportIconSize,
                             padding: EdgeInsets.zero,
                             onPressed: () {
                               unawaited(
@@ -4224,7 +4343,7 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
                           ),
                         ),
                         SizedBox(
-                          width: 92,
+                          width: primaryTransportBox,
                           child: Center(
                             child: GestureDetector(
                               onTap: () {
@@ -4235,8 +4354,8 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
                                 );
                               },
                               child: Container(
-                                width: 84,
-                                height: 84,
+                                width: primaryTransportSize,
+                                height: primaryTransportSize,
                                 decoration: BoxDecoration(
                                   shape: BoxShape.circle,
                                   color: _surfaceGreyAlt,
@@ -4276,10 +4395,10 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
                           ),
                         ),
                         SizedBox(
-                          width: 50,
+                          width: transportButtonWidth,
                           child: IconButton(
                             visualDensity: VisualDensity.compact,
-                            iconSize: 34,
+                            iconSize: transportIconSize,
                             padding: EdgeInsets.zero,
                             onPressed: () {
                               unawaited(
@@ -4295,10 +4414,10 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
                           ),
                         ),
                         SizedBox(
-                          width: 50,
+                          width: transportButtonWidth,
                           child: IconButton(
                             visualDensity: VisualDensity.compact,
-                            iconSize: 34,
+                            iconSize: transportIconSize,
                             padding: EdgeInsets.zero,
                             onPressed: () {
                               unawaited(queueNotifier.playNext());
@@ -4311,7 +4430,7 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
                         ),
                       ],
                     ),
-                    SizedBox(height: bottomInset > 0 ? bottomInset + 12 : 18),
+                    SizedBox(height: compactLayout ? 10 : 14),
                   ],
                 ),
               ),

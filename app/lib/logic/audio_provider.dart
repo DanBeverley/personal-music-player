@@ -30,8 +30,7 @@ Future<void> initAudioService() async {
     config: const AudioServiceConfig(
       androidNotificationChannelId: 'com.danbeverley.ebb.channel.audio',
       androidNotificationChannelName: 'EBB Audio Playback',
-      androidNotificationOngoing: true,
-      androidStopForegroundOnPause: true,
+      androidStopForegroundOnPause: false,
     ),
   );
 }
@@ -64,6 +63,10 @@ class AuralisAudioHandler extends BaseAudioHandler
 
   void broadcastMediaItem(MediaItem item) {
     mediaItem.add(item);
+  }
+
+  void broadcastQueue(List<MediaItem> items) {
+    queue.add(items);
   }
 }
 
@@ -331,6 +334,27 @@ class HistoryManager {
     return getScopedDataFile('history.json');
   }
 
+  static Future<List<String>> _readLocalHistory() async {
+    final f = await _file;
+    if (!f.existsSync()) return const [];
+    try {
+      final raw = (await f.readAsString()).trim();
+      if (raw.isEmpty) return const [];
+      final decoded = jsonDecode(raw);
+      if (decoded is! List) return const [];
+      return decoded
+          .map((entry) => entry?.toString() ?? '')
+          .where((entry) => entry.isNotEmpty)
+          .toList(growable: false);
+    } catch (error) {
+      debugPrint('History cache parse failed, resetting local history: $error');
+      try {
+        await f.writeAsString('[]');
+      } catch (_) {}
+      return const [];
+    }
+  }
+
   static Future<void> _recordCloudPlayEvent(String videoId) async {
     final client = supabaseClientOrNull;
     final userId = currentAuthenticatedUserId;
@@ -350,10 +374,7 @@ class HistoryManager {
     try {
       if (videoId == null || videoId.isEmpty) return;
       final f = await _file;
-      List<String> history = [];
-      if (f.existsSync()) {
-        history = List<String>.from(jsonDecode(await f.readAsString()));
-      }
+      List<String> history = await _readLocalHistory();
       history.remove(videoId);
       history.insert(0, videoId);
       if (history.length > 50) history = history.sublist(0, 50);
@@ -367,12 +388,8 @@ class HistoryManager {
 
   static Future<String?> getLatestSeed() async {
     try {
-      final f = await _file;
-      if (f.existsSync()) {
-        List<String> history =
-            List<String>.from(jsonDecode(await f.readAsString()));
-        if (history.isNotEmpty) return history.first;
-      }
+      final history = await _readLocalHistory();
+      if (history.isNotEmpty) return history.first;
 
       final client = supabaseClientOrNull;
       final userId = currentAuthenticatedUserId;
@@ -441,14 +458,11 @@ class HistoryManager {
     }
 
     try {
-      final f = await _file;
-      if (f.existsSync()) {
-        final history = List<String>.from(jsonDecode(await f.readAsString()));
-        for (final trackId in history) {
-          addTrackId(trackId);
-          if (ordered.length >= limit) {
-            return ordered;
-          }
+      final history = await _readLocalHistory();
+      for (final trackId in history) {
+        addTrackId(trackId);
+        if (ordered.length >= limit) {
+          return ordered;
         }
       }
 
@@ -582,12 +596,15 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
   bool _managedQueueActive = false;
   List<Map<String, dynamic>> _managedQueueTracks = const [];
   final List<String?> _prefetchedTrackIds = <String?>[null, null];
+  final Set<String> _unavailableStreamTrackIds = <String>{};
+  final Map<String, String> _unavailableStreamReasons = <String, String>{};
   int _latencySummaryProbeCounter = 0;
   final Map<String, DateTime> _recentPrepareBatches = <String, DateTime>{};
   final Map<String, Future<void>> _pendingPrepareBatches = <String, Future<void>>{};
   Timer? _sleepTimer;
   DateTime? _sleepTimerEndsAt;
   final Map<String, Future<void>> _fullPrefetchTasks = {};
+  bool _streamFailureRecoveryInProgress = false;
 
   AudioPlayerNotifier(this.audioEngine) : super(PlayerState()) {
     audioEngine.pause(); // Kill ghost audio surviving hot restarts
@@ -663,14 +680,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       bufferedPosition: Duration(seconds: state.currentPosition),
     ));
 
-    handler.broadcastMediaItem(MediaItem(
-      id: state.videoId ?? 'current_track',
-      album: state.artist ?? 'EBB',
-      title: state.currentTrackName,
-      artist: state.artist ?? 'Unknown Artist',
-      duration: Duration(seconds: state.duration),
-      artUri: state.thumbnail != null ? Uri.parse(state.thumbnail!) : null,
-    ));
+    handler.broadcastMediaItem(_currentMediaItem());
   }
 
   void _broadcastStoppedState() {
@@ -684,6 +694,45 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         updatePosition: Duration.zero,
         bufferedPosition: Duration.zero,
       ),
+    );
+    handler.broadcastQueue(const []);
+  }
+
+  MediaItem _currentMediaItem() {
+    return MediaItem(
+      id: state.videoId ?? 'current_track',
+      album: state.artist ?? 'EBB',
+      title: state.currentTrackName,
+      artist: state.artist ?? 'Unknown Artist',
+      duration: Duration(seconds: state.duration),
+      artUri: state.thumbnail != null ? Uri.parse(state.thumbnail!) : null,
+    );
+  }
+
+  MediaItem _mediaItemFromTrack(Map<String, dynamic> track) {
+    final duration = _parseInt(track['duration']);
+    final thumbnail = track['thumbnail']?.toString();
+    return MediaItem(
+      id: extractTrackId(track) ?? track['title']?.toString() ?? 'track',
+      album: track['album']?.toString() ?? track['album_title']?.toString() ?? '',
+      title: track['title']?.toString() ?? 'Unknown Track',
+      artist: _trackArtist(track) ?? 'Unknown Artist',
+      duration: duration > 0 ? Duration(seconds: duration) : null,
+      artUri: thumbnail != null && thumbnail.isNotEmpty
+          ? Uri.tryParse(thumbnail)
+          : null,
+    );
+  }
+
+  void _broadcastManagedQueue() {
+    if (globalAudioHandler is! AuralisAudioHandler) return;
+    final handler = globalAudioHandler as AuralisAudioHandler;
+    if (!_managedQueueActive || _managedQueueTracks.isEmpty) {
+      handler.broadcastQueue(const []);
+      return;
+    }
+    handler.broadcastQueue(
+      _managedQueueTracks.map(_mediaItemFromTrack).toList(growable: false),
     );
   }
 
@@ -774,6 +823,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
           isDownloading: false,
           currentTrackName: 'Stream failed: $error',
         );
+        unawaited(_handleStreamFailure(error));
       },
     );
   }
@@ -888,6 +938,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
             isDownloading: false,
             currentTrackName: 'Stream failed: $error',
           );
+          unawaited(_handleStreamFailure(error));
         }),
       );
     } catch (error) {
@@ -897,6 +948,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         isDownloading: false,
         currentTrackName: 'Stream failed: $error',
       );
+      unawaited(_handleStreamFailure(error));
     }
   }
 
@@ -944,6 +996,118 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     final source = _buildProxyStreamSource(videoId, fetchedAt: fetchedAt);
     _streamCache[videoId] = source;
     return source;
+  }
+
+  bool _hasLocalFileForTrack(Map<String, dynamic> track) {
+    final localPath = track['local_path']?.toString();
+    return localPath != null &&
+        localPath.isNotEmpty &&
+        File(localPath).existsSync();
+  }
+
+  void _registerUnavailableTrack(String? videoId, [String? reason]) {
+    final normalizedId = videoId?.trim();
+    if (normalizedId == null || normalizedId.isEmpty) return;
+    _unavailableStreamTrackIds.add(normalizedId);
+    if (reason != null && reason.trim().isNotEmpty) {
+      _unavailableStreamReasons[normalizedId] = reason.trim();
+    }
+    _streamCache.remove(normalizedId);
+  }
+
+  bool _isKnownUnavailableRemoteTrack(Map<String, dynamic> track) {
+    if (_hasLocalFileForTrack(track)) return false;
+    final videoId = extractTrackId(track);
+    return videoId != null && _unavailableStreamTrackIds.contains(videoId);
+  }
+
+  Future<Map<String, dynamic>> _resolveManagedQueueSources(
+    List<Map<String, dynamic>> tracks, {
+    required int preferredInitialIndex,
+  }) async {
+    final playableTracks = <Map<String, dynamic>>[];
+    final sources = <AudioSource>[];
+    var resolvedInitialIndex = preferredInitialIndex;
+
+    for (var i = 0; i < tracks.length; i++) {
+      final track = tracks[i];
+      final videoId = extractTrackId(track);
+      if (_isKnownUnavailableRemoteTrack(track)) {
+        if (i < resolvedInitialIndex) {
+          resolvedInitialIndex -= 1;
+        }
+        continue;
+      }
+      try {
+        final source = await _buildManagedAudioSource(track);
+        playableTracks.add(track);
+        sources.add(source);
+      } catch (error) {
+        _registerUnavailableTrack(videoId, error.toString());
+        if (i < resolvedInitialIndex) {
+          resolvedInitialIndex -= 1;
+        }
+      }
+    }
+
+    if (playableTracks.isEmpty) {
+      resolvedInitialIndex = 0;
+    } else {
+      resolvedInitialIndex =
+          resolvedInitialIndex.clamp(0, playableTracks.length - 1).toInt();
+    }
+
+    return {
+      'tracks': playableTracks,
+      'sources': sources,
+      'initialIndex': resolvedInitialIndex,
+    };
+  }
+
+  Future<void> _handleStreamFailure(Object error) async {
+    if (_streamFailureRecoveryInProgress || !_activeStream) return;
+    if (!_managedQueueActive || _managedQueueTracks.isEmpty) {
+      return;
+    }
+
+    _streamFailureRecoveryInProgress = true;
+    try {
+      final failedIndex = streamPlayer.currentIndex ?? 0;
+      if (failedIndex < 0 || failedIndex >= _managedQueueTracks.length) {
+        return;
+      }
+
+      final failedTrack = _managedQueueTracks[failedIndex];
+      final failedVideoId = extractTrackId(failedTrack) ?? state.videoId;
+      _registerUnavailableTrack(failedVideoId, error.toString());
+
+      final remainingTracks = _managedQueueTracks
+          .where((track) => !_isKnownUnavailableRemoteTrack(track))
+          .toList(growable: false);
+
+      if (remainingTracks.isEmpty) {
+        await stopPlayback(resetState: false);
+        state = state.copyWith(
+          isPlaying: false,
+          isDownloading: false,
+          currentTrackName: 'Track unavailable right now',
+          videoId: failedVideoId,
+        );
+        _managedQueueActive = false;
+        _managedQueueTracks = const [];
+        _broadcastManagedQueue();
+        return;
+      }
+
+      final nextIndex = failedIndex.clamp(0, remainingTracks.length - 1).toInt();
+      await configureManagedQueue(
+        remainingTracks,
+        initialIndex: nextIndex,
+        autoplay: _desiredStreamPlaying,
+      );
+    } finally {
+      _streamFailureRecoveryInProgress = false;
+    }
   }
 
   String? _trackArtist(dynamic rawTrack) {
@@ -1112,6 +1276,15 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
 
       final data = jsonDecode(res.body) as Map<String, dynamic>;
       final prepared = data['prepared'] ?? data['streams'];
+      final failed = data['failed'];
+      if (failed is Map) {
+        failed.forEach((key, dynamic value) {
+          final failureReason = value is Map
+              ? value['message']?.toString() ?? value['code']?.toString()
+              : value?.toString();
+          _registerUnavailableTrack(key.toString(), failureReason);
+        });
+      }
       if (prepared is Map) {
         prepared.forEach((key, dynamic value) {
           _markPreparedStream(key.toString());
@@ -1354,6 +1527,12 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     if (videoId == null || videoId.isEmpty) {
       throw Exception('Missing track id for managed queue source');
     }
+    if (_unavailableStreamTrackIds.contains(videoId)) {
+      final reason = _unavailableStreamReasons[videoId];
+      throw Exception(reason == null || reason.isEmpty
+          ? 'Track unavailable for streaming'
+          : reason);
+    }
 
     return _buildCachingSourceForVideoId(videoId, tag: track);
   }
@@ -1388,6 +1567,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     _streamTransitionInProgress = true;
     _playbackTimer?.cancel();
     audioEngine.pause();
+    _broadcastManagedQueue();
 
     state = state.copyWith(
       isPlaying: false,
@@ -1410,21 +1590,40 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     );
     if (loadVersion != _streamLoadVersion) return;
 
-    final sources = await Future.wait(
-      normalizedTracks.map(_buildManagedAudioSource),
+    final resolvedQueue = await _resolveManagedQueueSources(
+      normalizedTracks,
+      preferredInitialIndex: initialIndex,
     );
+    final playableTracks =
+        List<Map<String, dynamic>>.from(resolvedQueue['tracks'] as List);
+    final sources = List<AudioSource>.from(resolvedQueue['sources'] as List);
+    final resolvedInitialIndex = (resolvedQueue['initialIndex'] as int?) ?? 0;
+    if (playableTracks.isEmpty || sources.isEmpty) {
+      _streamTransitionInProgress = false;
+      _managedQueueActive = false;
+      _managedQueueTracks = const [];
+      state = state.copyWith(
+        isPlaying: false,
+        isDownloading: false,
+        currentTrackName: 'No playable tracks available',
+        videoId: null,
+      );
+      _broadcastManagedQueue();
+      return;
+    }
     if (loadVersion != _streamLoadVersion) return;
 
     final previousSource = _cachedStreamAudioSource;
     _cachedStreamAudioSource = null;
-    _cachedStreamVideoId = currentTrackId;
+    _cachedStreamVideoId = extractTrackId(playableTracks[resolvedInitialIndex]);
+    _managedQueueTracks = playableTracks;
 
     await _runStreamCommand(() async {
       if (loadVersion != _streamLoadVersion) return;
       await streamPlayer.stop();
       await streamPlayer.setAudioSources(
         sources,
-        initialIndex: initialIndex,
+        initialIndex: resolvedInitialIndex,
         preload: true,
       );
       await streamPlayer.setLoopMode(
@@ -1437,12 +1636,12 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     if (loadVersion != _streamLoadVersion) return;
 
     _streamTransitionInProgress = false;
-    _applyManagedTrackMetadata(initialIndex, resetPosition: true);
+    _applyManagedTrackMetadata(resolvedInitialIndex, resetPosition: true);
     state = state.copyWith(
       isDownloading: false,
       duration: streamPlayer.duration?.inSeconds ?? state.duration,
     );
-    HistoryManager.addHistory(currentTrackId);
+    HistoryManager.addHistory(extractTrackId(playableTracks[resolvedInitialIndex]));
     unawaited(_prefetchManagedQueueAhead());
     if (_desiredStreamPlaying) {
       await _resumeStreamPlayback();
@@ -1458,13 +1657,21 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     await prewarmStreams(
       normalizedTracks.take(3).map(extractTrackId),
     );
-    final sources = await Future.wait(
-      normalizedTracks.map(_buildManagedAudioSource),
+    final resolvedQueue = await _resolveManagedQueueSources(
+      normalizedTracks,
+      preferredInitialIndex: 0,
     );
+    final playableTracks =
+        List<Map<String, dynamic>>.from(resolvedQueue['tracks'] as List);
+    final sources = List<AudioSource>.from(resolvedQueue['sources'] as List);
+    if (playableTracks.isEmpty || sources.isEmpty) {
+      return;
+    }
     await _runStreamCommand(() async {
       await streamPlayer.addAudioSources(sources);
     });
-    _managedQueueTracks = [..._managedQueueTracks, ...normalizedTracks];
+    _managedQueueTracks = [..._managedQueueTracks, ...playableTracks];
+    _broadcastManagedQueue();
     unawaited(_refreshManagedQueueWarmup());
   }
 
@@ -1479,17 +1686,25 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     await prewarmStreams(
       normalizedTracks.take(3).map(extractTrackId),
     );
-    final sources = await Future.wait(
-      normalizedTracks.map(_buildManagedAudioSource),
+    final resolvedQueue = await _resolveManagedQueueSources(
+      normalizedTracks,
+      preferredInitialIndex: 0,
     );
+    final playableTracks =
+        List<Map<String, dynamic>>.from(resolvedQueue['tracks'] as List);
+    final sources = List<AudioSource>.from(resolvedQueue['sources'] as List);
+    if (playableTracks.isEmpty || sources.isEmpty) {
+      return;
+    }
     await _runStreamCommand(() async {
       for (var offset = 0; offset < sources.length; offset++) {
         await streamPlayer.insertAudioSource(insertIndex + offset, sources[offset]);
       }
     });
     final updated = [..._managedQueueTracks];
-    updated.insertAll(insertIndex, normalizedTracks);
+    updated.insertAll(insertIndex, playableTracks);
     _managedQueueTracks = updated;
+    _broadcastManagedQueue();
     unawaited(_refreshManagedQueueWarmup());
   }
 
@@ -1516,6 +1731,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     final updated = [..._managedQueueTracks];
     updated.insert(targetIndex, updated.removeAt(oldIndex));
     _managedQueueTracks = updated;
+    _broadcastManagedQueue();
     unawaited(_refreshManagedQueueWarmup());
   }
 
@@ -1530,6 +1746,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     if (_managedQueueTracks.isEmpty) {
       _managedQueueActive = false;
     }
+    _broadcastManagedQueue();
     unawaited(_refreshManagedQueueWarmup());
   }
 
@@ -1608,17 +1825,28 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
 
     final data = jsonDecode(res.body) as Map<String, dynamic>;
     final prepared = data['prepared'];
-    if (prepared is Map && prepared.containsKey(videoId)) {
-      final metrics = prepared[videoId];
-      if (metrics is Map) {
-        debugPrint(
-          '[EBB] prepared $videoId '
-          'resolveMs=${metrics['resolve_ms']} '
-          'chunkMs=${metrics['chunk_ms']} '
-          'chunkBytes=${metrics['cached_prefix_bytes']} '
-          'serverMs=${data['server_ms']}',
-        );
-      }
+    final failed = data['failed'];
+    if (failed is Map && failed.containsKey(videoId)) {
+      final failure = failed[videoId];
+      final failureReason = failure is Map
+          ? failure['message']?.toString() ?? failure['code']?.toString()
+          : failure?.toString();
+      _registerUnavailableTrack(videoId, failureReason);
+      throw Exception(failureReason ?? 'Track unavailable for streaming');
+    }
+    if (prepared is! Map || !prepared.containsKey(videoId)) {
+      _registerUnavailableTrack(videoId, 'Track unavailable for streaming');
+      throw Exception('Track unavailable for streaming');
+    }
+    final metrics = prepared[videoId];
+    if (metrics is Map) {
+      debugPrint(
+        '[EBB] prepared $videoId '
+        'resolveMs=${metrics['resolve_ms']} '
+        'chunkMs=${metrics['chunk_ms']} '
+        'chunkBytes=${metrics['cached_prefix_bytes']} '
+        'serverMs=${data['server_ms']}',
+      );
     }
     debugPrint(
       '[EBB] prepare_session[$videoId] totalMs=${stopwatch.elapsedMilliseconds}',
@@ -2348,8 +2576,11 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
   RecommendationNotifier(this.ref) : super([]);
   bool isLoading = true;
   bool isPaginating = false;
+  bool _hasMorePages = true;
   int _requestVersion = 0;
   final Set<String> _prewarmedRecommendationIds = <String>{};
+
+  bool get hasMorePages => _hasMorePages;
 
   bool _isRequestCurrent(int requestVersion) =>
       mounted && requestVersion == _requestVersion;
@@ -2385,6 +2616,7 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
     final cached = await _loadCachedRecommendations();
     if (!mounted) return;
     if (cached.isNotEmpty) {
+      _hasMorePages = true;
       isLoading = false;
       state = _prepareRecommendationResults(cached);
       _primeRecommendationResults(state);
@@ -2405,6 +2637,7 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
     if (!mounted) return;
     if (fastDefault.isNotEmpty) {
       final nextState = _prepareRecommendationResults(fastDefault);
+      _hasMorePages = true;
       isLoading = false;
       state = nextState;
       _primeRecommendationResults(nextState);
@@ -2598,6 +2831,7 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
   Future<Map<String, dynamic>> _buildRecommendationRequestBody(
     String? seedId, {
     required int limit,
+    int offset = 0,
     Set<String> avoidIds = const <String>{},
     bool forceRefresh = false,
   }) async {
@@ -2649,6 +2883,7 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
     return {
       'query': '',
       'limit': limit,
+      'offset': offset,
       if (seedIds.isNotEmpty) 'seed_id': seedIds.first,
       'seed_ids': seedIds.take(forceRefresh ? 6 : 5).toList(growable: false),
       'artist_hints':
@@ -2661,6 +2896,7 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
 
   Future<void> loadQuickRecommendations(String seedId) async {
     final requestVersion = ++_requestVersion;
+    _hasMorePages = true;
     isLoading = true;
     state = [...state];
     try {
@@ -2681,9 +2917,11 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
           .timeout(const Duration(seconds: 5));
       if (!_isRequestCurrent(requestVersion)) return;
       if (res.statusCode != 200) return;
-      final fetched = jsonDecode(res.body)['recommendations'] as List<dynamic>;
+      final payload = jsonDecode(res.body) as Map<String, dynamic>;
+      final fetched = payload['recommendations'] as List<dynamic>;
       if (fetched.isEmpty) return;
       final nextState = _prepareRecommendationResults(fetched);
+      _hasMorePages = payload['has_more'] == true;
       state = nextState;
       _primeRecommendationResults(nextState);
       unawaited(_saveCachedRecommendations(nextState));
@@ -2706,6 +2944,7 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
             .toSet()
         : const <String>{};
     isLoading = true;
+    _hasMorePages = true;
     if (_isRequestCurrent(requestVersion)) {
       state = forceRefresh ? [...state] : [...state];
     }
@@ -2713,6 +2952,7 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
       final body = await _buildRecommendationRequestBody(
         seedId,
         limit: 15,
+        offset: 0,
         avoidIds: previousIds,
         forceRefresh: forceRefresh,
       );
@@ -2724,12 +2964,14 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
           .timeout(const Duration(seconds: 10));
       if (!_isRequestCurrent(requestVersion)) return;
       if (res.statusCode == 200) {
-        final fetched = jsonDecode(res.body)['recommendations'] as List<dynamic>;
+        final payload = jsonDecode(res.body) as Map<String, dynamic>;
+        final fetched = payload['recommendations'] as List<dynamic>;
         final nextState = _prepareRecommendationResults(
           fetched,
           avoidIds: previousIds,
           forceRefresh: forceRefresh,
         );
+        _hasMorePages = payload['has_more'] == true;
         state = nextState;
         _primeRecommendationResults(state);
         unawaited(_saveCachedRecommendations(nextState));
@@ -2746,6 +2988,7 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
             avoidIds: previousIds,
             forceRefresh: forceRefresh,
           );
+          _hasMorePages = fallbackResults.length >= (forceRefresh ? 16 : 12);
           state = nextState;
           _primeRecommendationResults(state);
           unawaited(_saveCachedRecommendations(nextState));
@@ -2763,6 +3006,7 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
             avoidIds: previousIds,
             forceRefresh: forceRefresh,
           );
+          _hasMorePages = fallbackResults.length >= (forceRefresh ? 16 : 12);
           state = nextState;
           _primeRecommendationResults(state);
           unawaited(_saveCachedRecommendations(nextState));
@@ -2777,7 +3021,7 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
   }
 
   Future<void> loadMore(String seedId) async {
-    if (isPaginating) return;
+    if (isPaginating || !_hasMorePages) return;
     final requestVersion = ++_requestVersion;
     isPaginating = true;
     if (_isRequestCurrent(requestVersion)) {
@@ -2786,13 +3030,16 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
     try {
       final effectiveSeedId = await HistoryManager.getRecommendationSeed() ?? seedId;
       if (!_isRequestCurrent(requestVersion)) return;
+      final existingIds = state
+          .map(extractTrackId)
+          .whereType<String>()
+          .where((id) => id.isNotEmpty)
+          .toSet();
       final body = await _buildRecommendationRequestBody(
         effectiveSeedId,
         limit: 10,
-        avoidIds: state
-            .map((track) => (track['id'] ?? track['videoId'])?.toString())
-            .whereType<String>()
-            .toSet(),
+        offset: state.length,
+        avoidIds: existingIds,
       );
       if (!_isRequestCurrent(requestVersion)) return;
       final res = await appHttpClient.post(buildProxyUri('/recommend'),
@@ -2800,11 +3047,17 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
           body: jsonEncode(body));
       if (!_isRequestCurrent(requestVersion)) return;
       if (res.statusCode == 200) {
-        final newRecs =
-            jsonDecode(res.body)['recommendations'] as List<dynamic>;
-        final existingIds = state.map((t) => t['id']).toSet();
-        final uniqueNew =
-            newRecs.where((t) => !existingIds.contains(t['id'])).toList();
+        final payload = jsonDecode(res.body) as Map<String, dynamic>;
+        final newRecs = payload['recommendations'] as List<dynamic>;
+        final uniqueNew = newRecs
+            .whereType<Map>()
+            .map((track) => normalizeTrack(track))
+            .where((track) {
+              final id = extractTrackId(track);
+              return id != null && id.isNotEmpty && !existingIds.contains(id);
+            })
+            .toList(growable: false);
+        _hasMorePages = payload['has_more'] == true;
         state = [...state, ...uniqueNew];
         _primeRecommendationResults(uniqueNew);
       }

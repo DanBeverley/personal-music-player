@@ -4,3 +4,7 @@ yt-dlp
 requests
 pydantic
 ytmusicapi
+langgraph
+langchain-core
+ddgs
+psycopg[binary]

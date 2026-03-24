@@ -14,6 +14,7 @@ import 'logic/audio_provider.dart';
 import 'logic/auth_provider.dart';
 import 'logic/download_provider.dart';
 import 'logic/playlist_provider.dart';
+import 'screens/assistant_screen.dart';
 import 'widgets/app_artwork.dart';
 import 'widgets/app_bottom_nav_bar.dart';
 import 'widgets/download_hud.dart';
@@ -1100,17 +1101,53 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   }
 
   void _handleHomeScroll() {
+    _maybeLoadMoreRecommendations();
+  }
+
+  bool _handleHomeScrollNotification(ScrollNotification notification) {
+    if (_isSearching || notification.depth != 0) return false;
+    if (notification.metrics.extentAfter > 420) return false;
+    _maybeLoadMoreRecommendations();
+    return false;
+  }
+
+  void _maybeLoadMoreRecommendations({bool force = false}) {
     if (_isSearching || !_homeScrollController.hasClients) return;
     final notifier = ref.read(recommendationProvider.notifier);
-    if (notifier.isLoading || notifier.isPaginating) return;
+    if (notifier.isLoading || notifier.isPaginating || !notifier.hasMorePages) {
+      return;
+    }
     final position = _homeScrollController.position;
-    if (position.extentAfter > 420) return;
+    if (!force && position.extentAfter > 420) return;
     final recState = ref.read(recommendationProvider);
     if (recState.isEmpty) return;
     final lastTrackId =
         (recState.last['id'] ?? recState.last['videoId'])?.toString() ?? '';
     if (lastTrackId.isEmpty) return;
     unawaited(notifier.loadMore(lastTrackId));
+  }
+
+  void _ensureRecommendationPageCanPaginate(
+    List<dynamic> recState,
+    bool isRecLoading,
+    bool isRecPaginating,
+  ) {
+    if (_isSearching || isRecLoading || isRecPaginating || recState.isEmpty) {
+      return;
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _isSearching || !_homeScrollController.hasClients) return;
+      final notifier = ref.read(recommendationProvider.notifier);
+      if (notifier.isLoading ||
+          notifier.isPaginating ||
+          !notifier.hasMorePages) {
+        return;
+      }
+      final position = _homeScrollController.position;
+      if (position.maxScrollExtent > 48) return;
+      if (recState.length >= 40) return;
+      _maybeLoadMoreRecommendations(force: true);
+    });
   }
 
   Future<void> _performSearch(WidgetRef ref, [String? query]) async {
@@ -1221,6 +1258,21 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         builder: (_) => AlbumDetailsScreen(
           albumId: albumId,
           fallbackAlbum: album,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _openAssistant() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => AssistantScreen(
+          onOpenAlbum: _openAlbum,
+          onOpenPlayer: () {
+            Navigator.of(context).push(
+              MaterialPageRoute(builder: (_) => const FullPlayerScreen()),
+            );
+          },
         ),
       ),
     );
@@ -1560,21 +1612,28 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       if (!mounted) return;
       _primeLikelyTracks(visibleTracks);
     });
+    _ensureRecommendationPageCanPaginate(
+      recState,
+      isRecLoading,
+      isRecPaginating,
+    );
 
     return SafeArea(
       child: RefreshIndicator(
         color: _accentGrey,
         backgroundColor: _surfaceGreyAlt,
         onRefresh: _refreshContent,
-        child: SingleChildScrollView(
-          controller: _homeScrollController,
-          physics: const BouncingScrollPhysics(
-            parent: AlwaysScrollableScrollPhysics(),
-          ),
-          padding: const EdgeInsets.all(16.0),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
+        child: NotificationListener<ScrollNotification>(
+          onNotification: _handleHomeScrollNotification,
+          child: SingleChildScrollView(
+            controller: _homeScrollController,
+            physics: const BouncingScrollPhysics(
+              parent: AlwaysScrollableScrollPhysics(),
+            ),
+            padding: const EdgeInsets.all(16.0),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
             Semantics(
               label: _heroQuip,
               child: TextField(
@@ -1606,6 +1665,73 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                 onSubmitted: (_) => _performSearch(ref),
               ),
             ),
+
+            if (!_isSearching) ...[
+              const SizedBox(height: 14),
+              Material(
+                color: Colors.transparent,
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(_radiusLarge),
+                  onTap: _openAssistant,
+                  child: Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(14),
+                    decoration: BoxDecoration(
+                      color: Colors.white.withValues(alpha: 0.03),
+                      borderRadius: BorderRadius.circular(_radiusLarge),
+                      border: Border.all(
+                        color: Colors.white.withValues(alpha: 0.08),
+                      ),
+                    ),
+                    child: Row(
+                      children: [
+                        Container(
+                          width: 42,
+                          height: 42,
+                          decoration: BoxDecoration(
+                            color: Colors.white.withValues(alpha: 0.06),
+                            borderRadius: BorderRadius.circular(_radiusMedium),
+                          ),
+                          child: const Icon(
+                            Icons.auto_awesome_rounded,
+                            color: Colors.white,
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              const Text(
+                                'Ask EBB',
+                                style: TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 15,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                              const SizedBox(height: 4),
+                              Text(
+                                'Describe a mood, artist, era, or playlist idea and get playable picks back.',
+                                style: TextStyle(
+                                  color: Colors.white.withValues(alpha: 0.68),
+                                  fontSize: 12,
+                                  height: 1.4,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        Icon(
+                          Icons.chevron_right_rounded,
+                          color: Colors.white.withValues(alpha: 0.6),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ],
 
             // Suggestions Dropdown
             if (suggestState.isNotEmpty && !_isSearching)
@@ -1686,8 +1812,9 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                 showTrailingLoader: isRecPaginating,
               ),
             ],
-              const SizedBox(height: 28),
-            ],
+                const SizedBox(height: 28),
+              ],
+            ),
           ),
         ),
       ),

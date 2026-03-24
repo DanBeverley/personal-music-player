@@ -840,7 +840,7 @@ class AssistantNotifier extends StateNotifier<AssistantState> {
     if (retryText.isEmpty) return;
     final trimmedMessages = state.messages.take(lastUserIndex).toList(growable: false);
     state = state.copyWith(messages: trimmedMessages, error: null);
-    await sendMessage(retryText);
+    await sendMessage(retryText, forceRefresh: true);
   }
 
   Future<void> editAndResendLastUserMessage(String updatedMessage) async {
@@ -854,10 +854,10 @@ class AssistantNotifier extends StateNotifier<AssistantState> {
     }
     final trimmedMessages = state.messages.take(lastUserIndex).toList(growable: false);
     state = state.copyWith(messages: trimmedMessages, error: null);
-    await sendMessage(trimmed);
+    await sendMessage(trimmed, forceRefresh: true);
   }
 
-  Future<void> sendMessage(String rawMessage) async {
+  Future<void> sendMessage(String rawMessage, {bool forceRefresh = false}) async {
     final message = rawMessage.trim();
     if (message.isEmpty || state.isSending) return;
 
@@ -893,6 +893,7 @@ class AssistantNotifier extends StateNotifier<AssistantState> {
         'user_scope_id': authState.storageScopeId,
         'session_id': state.currentSessionId,
         'thinking_mode': state.thinkingMode,
+        'force_refresh': forceRefresh,
         'conversation': conversationWindow
             .map((entry) => entry.toConversationJson())
             .toList(growable: false),

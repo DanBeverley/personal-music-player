@@ -1070,6 +1070,12 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     super.initState();
     _heroQuip = _buildHeroQuip();
     _homeScrollController.addListener(_handleHomeScroll);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      unawaited(
+        ref.read(recommendedArtistsProvider.notifier).loadRecommendedArtists(),
+      );
+    });
     _urlController.addListener(() {
       final text = _urlController.text.trim();
       if (text.isNotEmpty && !_isSearching) {
@@ -1084,6 +1090,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         ref.read(suggestProvider.notifier).clear();
         ref.read(searchProvider.notifier).clear();
         ref.read(albumSearchProvider.notifier).clear();
+        ref.read(artistSearchProvider.notifier).clear();
         setState(() => _isSearching = false);
       }
     });
@@ -1155,6 +1162,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     if (q.isEmpty) {
       ref.read(searchProvider.notifier).clear();
       ref.read(albumSearchProvider.notifier).clear();
+      ref.read(artistSearchProvider.notifier).clear();
       setState(() => _isSearching = false);
       return;
     }
@@ -1165,18 +1173,39 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     await Future.wait([
       ref.read(searchProvider.notifier).search(q),
       ref.read(albumSearchProvider.notifier).search(q),
+      ref.read(artistSearchProvider.notifier).search(q),
     ]);
+    final artistSeeds = ref
+        .read(artistSearchProvider)
+        .take(4)
+        .map((artist) => artist['name']?.toString() ?? '')
+        .where((name) => name.trim().isNotEmpty)
+        .toList(growable: false);
+    unawaited(
+      ref.read(recommendedArtistsProvider.notifier).loadRecommendedArtists(
+            seedArtistHints: artistSeeds,
+            seedTasteQueries: [q],
+          ),
+    );
     if (mounted) {
       _refreshRecommendationsOnSearchExit = true;
     }
   }
 
   void _clearSearch() {
+    final currentQuery = _urlController.text.trim();
+    final currentArtistSeeds = ref
+        .read(artistSearchProvider)
+        .take(4)
+        .map((artist) => artist['name']?.toString() ?? '')
+        .where((name) => name.trim().isNotEmpty)
+        .toList(growable: false);
     _urlController.clear();
     _searchFocusNode.unfocus();
     ref.read(suggestProvider.notifier).clear();
     ref.read(searchProvider.notifier).clear();
     ref.read(albumSearchProvider.notifier).clear();
+    ref.read(artistSearchProvider.notifier).clear();
     setState(() => _isSearching = false);
     if (_refreshRecommendationsOnSearchExit) {
       _refreshRecommendationsOnSearchExit = false;
@@ -1186,6 +1215,10 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         await ref
             .read(recommendationProvider.notifier)
             .loadRecommendations(seed, true);
+        await ref.read(recommendedArtistsProvider.notifier).loadRecommendedArtists(
+              seedArtistHints: currentArtistSeeds,
+              seedTasteQueries: currentQuery.isEmpty ? const [] : [currentQuery],
+            );
       }());
     }
   }
@@ -1196,7 +1229,10 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       return;
     }
     final seed = await HistoryManager.getRecommendationSeed();
-    await ref.read(recommendationProvider.notifier).loadRecommendations(seed, true);
+    await Future.wait([
+      ref.read(recommendationProvider.notifier).loadRecommendations(seed, true),
+      ref.read(recommendedArtistsProvider.notifier).loadRecommendedArtists(),
+    ]);
   }
 
   bool handleSystemBack() {
@@ -1260,6 +1296,29 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
           fallbackAlbum: album,
         ),
       ),
+    );
+  }
+
+  Future<void> _openArtist(Map<String, dynamic> artist) async {
+    final artistId = artist['id']?.toString();
+    if (artistId == null || artistId.isEmpty) return;
+    final searchQuery = _urlController.text.trim();
+    final artistName = artist['name']?.toString().trim() ?? '';
+    unawaited(ref.read(artistDetailsProvider.notifier).fetchArtist(artistId));
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => ArtistDetailsScreen(
+          artistId: artistId,
+          fallbackArtist: artist,
+        ),
+      ),
+    );
+    if (!mounted) return;
+    unawaited(
+      ref.read(recommendedArtistsProvider.notifier).loadRecommendedArtists(
+            seedArtistHints: artistName.isEmpty ? const [] : [artistName],
+            seedTasteQueries: searchQuery.isEmpty ? const [] : [searchQuery],
+          ),
     );
   }
 
@@ -1412,6 +1471,208 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
           ),
         );
       },
+    );
+  }
+
+  Widget _buildArtistRow(
+    List<Map<String, dynamic>> artists, {
+    required String title,
+    bool showTitle = true,
+    bool isLoading = false,
+  }) {
+    if (artists.isEmpty && !isLoading) {
+      return const SizedBox.shrink();
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        if (showTitle) ...[
+          Text(
+            title,
+            style: const TextStyle(
+              fontSize: 18,
+              fontWeight: FontWeight.bold,
+              color: Colors.white,
+            ),
+          ),
+          const SizedBox(height: 14),
+        ],
+        SizedBox(
+          height: 112,
+          child: isLoading && artists.isEmpty
+              ? ListView.separated(
+                  scrollDirection: Axis.horizontal,
+                  itemCount: 5,
+                  separatorBuilder: (_, __) => const SizedBox(width: 14),
+                  itemBuilder: (_, __) => Column(
+                    children: [
+                      Container(
+                        width: 68,
+                        height: 68,
+                        decoration: BoxDecoration(
+                          color: Colors.white.withValues(alpha: 0.06),
+                          shape: BoxShape.circle,
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      Container(
+                        width: 58,
+                        height: 10,
+                        decoration: BoxDecoration(
+                          color: Colors.white.withValues(alpha: 0.06),
+                          borderRadius: BorderRadius.circular(999),
+                        ),
+                      ),
+                    ],
+                  ),
+                )
+              : ListView.separated(
+                  scrollDirection: Axis.horizontal,
+                  itemCount: artists.length,
+                  separatorBuilder: (_, __) => const SizedBox(width: 14),
+                  itemBuilder: (context, index) {
+                    final artist = artists[index];
+                    return SizedBox(
+                      width: 82,
+                      child: Material(
+                        color: Colors.transparent,
+                        child: InkWell(
+                          borderRadius: BorderRadius.circular(22),
+                          onTap: () => _openArtist(artist),
+                          child: Column(
+                            children: [
+                              AppArtwork(
+                                thumbnail: artist['thumbnail'],
+                                width: 68,
+                                height: 68,
+                                radius: 999,
+                              ),
+                              const SizedBox(height: 10),
+                              Text(
+                                artist['name']?.toString() ?? 'Artist',
+                                maxLines: 2,
+                                overflow: TextOverflow.ellipsis,
+                                textAlign: TextAlign.center,
+                                style: TextStyle(
+                                  color: Colors.white.withValues(alpha: 0.88),
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.w600,
+                                  height: 1.2,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    );
+                  },
+                ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildFeaturedArtistCard(Map<String, dynamic> artist) {
+    final description = (artist['description'] ?? '').toString().trim();
+    return Container(
+      margin: const EdgeInsets.only(bottom: 16),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.03),
+        borderRadius: BorderRadius.circular(_radiusLarge),
+        border: Border.all(
+          color: Colors.white.withValues(alpha: 0.08),
+        ),
+      ),
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(_radiusLarge),
+          onTap: () => _openArtist(artist),
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Row(
+              children: [
+                AppArtwork(
+                  thumbnail: artist['thumbnail'],
+                  width: 88,
+                  height: 88,
+                  radius: 999,
+                ),
+                const SizedBox(width: 16),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 5,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.white.withValues(alpha: 0.06),
+                          borderRadius: BorderRadius.circular(999),
+                          border: Border.all(
+                            color: Colors.white.withValues(alpha: 0.08),
+                          ),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              Icons.mic_external_on_rounded,
+                              size: 12,
+                              color: Colors.white.withValues(alpha: 0.72),
+                            ),
+                            const SizedBox(width: 6),
+                            Text(
+                              'Artist',
+                              style: TextStyle(
+                                color: Colors.white.withValues(alpha: 0.74),
+                                fontSize: 11,
+                                fontWeight: FontWeight.w700,
+                                letterSpacing: 0.4,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      Text(
+                        artist['name']?.toString() ?? 'Unknown Artist',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 18,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                      if (description.isNotEmpty) ...[
+                        const SizedBox(height: 6),
+                        Text(
+                          description,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            color: Colors.white.withValues(alpha: 0.56),
+                            fontSize: 12,
+                            height: 1.35,
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+                Icon(
+                  Icons.chevron_right_rounded,
+                  color: Colors.white.withValues(alpha: 0.48),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
     );
   }
 
@@ -1588,13 +1849,24 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   Widget build(BuildContext context) {
     final searchState = ref.watch(searchProvider);
     final isSearchLoading = ref.watch(searchProvider.notifier).isLoading;
+    final artistSearchState = ref.watch(artistSearchProvider);
+    final isArtistSearchLoading =
+        ref.watch(artistSearchProvider.notifier).isLoading;
     final albumSearchState = ref.watch(albumSearchProvider);
     final isAlbumSearchLoading =
         ref.watch(albumSearchProvider.notifier).isLoading;
+    final recommendedArtists = ref.watch(recommendedArtistsProvider);
+    final isRecommendedArtistsLoading =
+        ref.watch(recommendedArtistsProvider.notifier).isLoading;
     final fallbackAlbums =
         _isSearching ? _deriveAlbumsFromTracks(searchState) : const <Map<String, dynamic>>[];
     final displayAlbums =
         albumSearchState.isNotEmpty ? albumSearchState : fallbackAlbums;
+    final featuredArtist =
+        _isSearching && artistSearchState.isNotEmpty ? artistSearchState.first : null;
+    final similarArtists = featuredArtist == null
+        ? artistSearchState
+        : artistSearchState.skip(1).toList(growable: false);
     final featuredAlbum =
         _isSearching && displayAlbums.isNotEmpty ? displayAlbums.first : null;
     final extraAlbums = featuredAlbum == null
@@ -1606,6 +1878,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     final isRecPaginating =
         ref.watch(recommendationProvider.notifier).isPaginating;
     final suggestState = ref.watch(suggestProvider);
+    final showSearchSuggestions = suggestState.isNotEmpty && !_isSearching;
     final visibleTracks = _isSearching ? searchState : recState;
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -1666,8 +1939,41 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
               ),
             ),
 
-            if (!_isSearching) ...[
-              const SizedBox(height: 14),
+            if (showSearchSuggestions)
+              Container(
+                margin: const EdgeInsets.only(top: 8),
+                decoration: BoxDecoration(
+                  color: Colors.grey[850],
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: ListView.builder(
+                  shrinkWrap: true,
+                  physics: const NeverScrollableScrollPhysics(),
+                  itemCount: suggestState.length,
+                  itemBuilder: (context, i) {
+                    return ListTile(
+                      leading: const Icon(Icons.search, color: Colors.white54),
+                      title: Text(
+                        suggestState[i],
+                        style: const TextStyle(color: Colors.white),
+                      ),
+                      onTap: () => _performSearch(ref, suggestState[i]),
+                    );
+                  },
+                ),
+              ),
+
+            if (!_isSearching && !showSearchSuggestions) ...[
+              const SizedBox(height: 18),
+              _buildArtistRow(
+                recommendedArtists,
+                title: 'Recommended artists',
+                isLoading: isRecommendedArtistsLoading,
+              ),
+            ],
+
+            if (!_isSearching && !showSearchSuggestions) ...[
+              const SizedBox(height: 8),
               Material(
                 color: Colors.transparent,
                 child: InkWell(
@@ -1733,30 +2039,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
               ),
             ],
 
-            // Suggestions Dropdown
-            if (suggestState.isNotEmpty && !_isSearching)
-              Container(
-                margin: const EdgeInsets.only(top: 4),
-                decoration: BoxDecoration(
-                  color: Colors.grey[850],
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: ListView.builder(
-                  shrinkWrap: true,
-                  physics: const NeverScrollableScrollPhysics(),
-                  itemCount: suggestState.length,
-                  itemBuilder: (context, i) {
-                    return ListTile(
-                      leading: const Icon(Icons.search, color: Colors.white54),
-                      title: Text(suggestState[i],
-                          style: const TextStyle(color: Colors.white)),
-                      onTap: () => _performSearch(ref, suggestState[i]),
-                    );
-                  },
-                ),
-              ),
-
-            const SizedBox(height: 20),
+            SizedBox(height: showSearchSuggestions ? 12 : 20),
 
             // Content Area (Search vs Recommendations)
             if (_isSearching) ...[
@@ -1766,6 +2049,23 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                       fontWeight: FontWeight.bold,
                       color: Colors.white)),
               const SizedBox(height: 16),
+              if (featuredArtist != null) ...[
+                _buildFeaturedArtistCard(featuredArtist),
+              ] else if (isArtistSearchLoading) ...[
+                _buildArtistRow(
+                  const [],
+                  title: 'Artist match',
+                  isLoading: true,
+                ),
+                const SizedBox(height: 10),
+              ],
+              if (similarArtists.isNotEmpty) ...[
+                _buildArtistRow(
+                  similarArtists,
+                  title: 'Similar artists',
+                ),
+                const SizedBox(height: 8),
+              ],
               if (featuredAlbum != null) ...[
                 _buildAlbumList([featuredAlbum], false),
                 const SizedBox(height: 10),
@@ -1858,6 +2158,18 @@ class LibraryScreen extends ConsumerWidget {
     final libraryAsync = ref.watch(libraryProvider);
     final playlists = ref.watch(playlistProvider);
     final offlineTracks = libraryAsync.valueOrNull ?? const <Map<String, dynamic>>[];
+    final downloadedOfflineTracks = offlineTracks
+        .where((track) => track['is_downloaded_locally'] == true)
+        .toList(growable: false);
+    final missingOfflineTracks = offlineTracks
+        .where(
+          (track) =>
+              track['is_cloud_saved'] == true &&
+              track['is_downloaded_locally'] != true &&
+              (extractTrackId(track)?.isNotEmpty ?? false),
+        )
+        .map((track) => Map<String, dynamic>.from(track))
+        .toList(growable: false);
     final displayName =
         authState.user?.userMetadata?['full_name']?.toString() ??
             authState.user?.userMetadata?['name']?.toString() ??
@@ -1940,7 +2252,7 @@ class LibraryScreen extends ConsumerWidget {
                             children: [
                               _LibraryStatChip(label: providerName.toUpperCase()),
                               _LibraryStatChip(label: '${playlists.length} playlists'),
-                              _LibraryStatChip(label: '${offlineTracks.length} offline'),
+                              _LibraryStatChip(label: '${downloadedOfflineTracks.length} offline'),
                             ],
                           ),
                         ],
@@ -2069,7 +2381,38 @@ class LibraryScreen extends ConsumerWidget {
               ),
             
             const SizedBox(height: 32),
-            const Text('Saved tracks', style: TextStyle(color: Colors.white, fontSize: 24, fontWeight: FontWeight.bold)),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                const Text(
+                  'Saved tracks',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 24,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                if (missingOfflineTracks.isNotEmpty)
+                  TextButton.icon(
+                    onPressed: () {
+                      unawaited(
+                        ref
+                            .read(downloadCenterProvider.notifier)
+                            .downloadTracks(missingOfflineTracks),
+                      );
+                    },
+                    icon: const Icon(
+                      Icons.download_for_offline_rounded,
+                      color: Colors.white,
+                      size: 18,
+                    ),
+                    label: Text(
+                      'Download all (${missingOfflineTracks.length})',
+                      style: const TextStyle(color: Colors.white),
+                    ),
+                  ),
+              ],
+            ),
             const SizedBox(height: 16),
             
             libraryAsync.when(
@@ -2085,7 +2428,10 @@ class LibraryScreen extends ConsumerWidget {
                     final track = files[index];
                     final name = track['title'] ?? 'Unknown';
                     final path = track['local_path']?.toString();
-                    final hasLocalFile = path != null && path.isNotEmpty;
+                    final isDownloadedLocally =
+                        track['is_downloaded_locally'] == true;
+                    final hasLocalFile =
+                        isDownloadedLocally && path != null && path.isNotEmpty;
                     final videoId =
                         (track['video_id'] ?? track['id'])?.toString();
                     return Container(
@@ -2154,7 +2500,7 @@ class LibraryScreen extends ConsumerWidget {
                                         Padding(
                                           padding: const EdgeInsets.only(top: 4),
                                           child: Text(
-                                            'Saved to account',
+                                            'Saved to account - download to listen offline',
                                             style: TextStyle(
                                               color: Colors.white.withValues(alpha: 0.45),
                                               fontSize: 11,
@@ -2165,38 +2511,107 @@ class LibraryScreen extends ConsumerWidget {
                                     ],
                                   ),
                                 ),
-                                Column(
-                                  crossAxisAlignment: CrossAxisAlignment.end,
-                                  mainAxisAlignment: MainAxisAlignment.center,
-                                  children: [
-                                    IconButton(
-                                      icon: Container(
-                                         padding: const EdgeInsets.all(6),
-                                         decoration: BoxDecoration(color: Colors.redAccent.withValues(alpha: 0.1), shape: BoxShape.circle),
-                                         child: const Icon(Icons.delete_outline_rounded, color: Colors.redAccent, size: 20)
-                                      ),
-                                      onPressed: () {
-                                        try {
-                                          if (hasLocalFile) {
-                                            File(path).deleteSync();
-                                            final jsonPath = path.replaceAll('.mp3', '.json');
-                                            if (File(jsonPath).existsSync()) File(jsonPath).deleteSync();
-                                          }
-                                          unawaited(removeCloudLibraryTrack(videoId));
-                                          ref.invalidate(libraryProvider);
-                                        } catch (e) {
-                                          // Ignored mapping
-                                        }
-                                      },
-                                    ),
-                                    if (track['filesize'] != null && track['filesize'] > 0)
-                                      Padding(
-                                        padding: const EdgeInsets.only(right: 8.0),
-                                        child: Text('${(track['filesize'] / 1024 / 1024).toStringAsFixed(1)} MB',
-                                          style: TextStyle(color: Colors.white.withValues(alpha: 0.3), fontSize: 10, fontWeight: FontWeight.w600),
+                                Consumer(
+                                  builder: (context, ref, child) {
+                                    final downloadTask = videoId == null
+                                        ? null
+                                        : ref.watch(downloadTaskProvider(videoId));
+                                    final isDownloading =
+                                        downloadTask?.phase == DownloadPhase.active;
+                                    final isDownloadedNow =
+                                        hasLocalFile ||
+                                        downloadTask?.phase == DownloadPhase.complete;
+                                    return Column(
+                                      crossAxisAlignment: CrossAxisAlignment.end,
+                                      mainAxisAlignment: MainAxisAlignment.center,
+                                      children: [
+                                        Row(
+                                          mainAxisSize: MainAxisSize.min,
+                                          children: [
+                                            if (!hasLocalFile && videoId != null)
+                                              IconButton(
+                                                icon: Container(
+                                                  padding: const EdgeInsets.all(6),
+                                                  decoration: BoxDecoration(
+                                                    color: Colors.white.withValues(alpha: 0.08),
+                                                    shape: BoxShape.circle,
+                                                  ),
+                                                  child: isDownloading
+                                                      ? SizedBox(
+                                                          width: 20,
+                                                          height: 20,
+                                                          child: CircularProgressIndicator(
+                                                            value: downloadTask!.progress > 0
+                                                                ? downloadTask.progress
+                                                                : null,
+                                                            strokeWidth: 2,
+                                                            color: _accentGrey,
+                                                          ),
+                                                        )
+                                                      : Icon(
+                                                          isDownloadedNow
+                                                              ? Icons.check_rounded
+                                                              : Icons.download_for_offline_rounded,
+                                                          color: Colors.white70,
+                                                          size: 20,
+                                                        ),
+                                                ),
+                                                onPressed: isDownloading
+                                                    ? null
+                                                    : () {
+                                                        unawaited(
+                                                          ref
+                                                              .read(downloadCenterProvider.notifier)
+                                                              .downloadTrack(track),
+                                                        );
+                                                      },
+                                              ),
+                                            IconButton(
+                                              icon: Container(
+                                                padding: const EdgeInsets.all(6),
+                                                decoration: BoxDecoration(
+                                                  color: Colors.redAccent.withValues(alpha: 0.1),
+                                                  shape: BoxShape.circle,
+                                                ),
+                                                child: const Icon(
+                                                  Icons.delete_outline_rounded,
+                                                  color: Colors.redAccent,
+                                                  size: 20,
+                                                ),
+                                              ),
+                                              onPressed: () {
+                                                try {
+                                                  if (hasLocalFile) {
+                                                    File(path).deleteSync();
+                                                    final jsonPath = path.replaceAll('.mp3', '.json');
+                                                    if (File(jsonPath).existsSync()) {
+                                                      File(jsonPath).deleteSync();
+                                                    }
+                                                  }
+                                                  unawaited(removeCloudLibraryTrack(videoId));
+                                                  ref.invalidate(libraryProvider);
+                                                } catch (e) {
+                                                  // Ignored mapping
+                                                }
+                                              },
+                                            ),
+                                          ],
                                         ),
-                                      ),
-                                  ],
+                                        if (track['filesize'] != null && track['filesize'] > 0)
+                                          Padding(
+                                            padding: const EdgeInsets.only(right: 8.0),
+                                            child: Text(
+                                              '${(track['filesize'] / 1024 / 1024).toStringAsFixed(1)} MB',
+                                              style: TextStyle(
+                                                color: Colors.white.withValues(alpha: 0.3),
+                                                fontSize: 10,
+                                                fontWeight: FontWeight.w600,
+                                              ),
+                                            ),
+                                          ),
+                                      ],
+                                    );
+                                  },
                                 ),
                               ],
                             ),
@@ -4092,14 +4507,16 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
                 24,
                 18,
                 24,
-                math.max(compactLayout ? 156 : 196, bottomInset + 104)
+                math.max(compactLayout ? 161 : 201, bottomInset + 109)
                     .toDouble(),
               ),
               child: ConstrainedBox(
                 constraints: BoxConstraints(minHeight: constraints.maxHeight),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
+                child: Transform.translate(
+                  offset: const Offset(0, -5),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
                     const SizedBox(height: 8),
                     Center(
                       child: Hero(
@@ -4150,81 +4567,112 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
                         color: Colors.white.withValues(alpha: 0.7),
                       ),
                     ),
-                    if (nextUpTrack != null) ...[
-                      SizedBox(height: cardGap),
-                      GestureDetector(
-                        onTap: _openQueueSheet,
-                        child: Container(
-                          width: double.infinity,
-                          padding: EdgeInsets.symmetric(
-                            horizontal: 14,
-                            vertical: queueAwareCompactLayout ? 10 : 14,
+                    SizedBox(height: nextUpTrack != null ? cardGap : 0),
+                    AnimatedSwitcher(
+                      duration: const Duration(milliseconds: 280),
+                      switchInCurve: Curves.easeOutCubic,
+                      switchOutCurve: Curves.easeInCubic,
+                      transitionBuilder: (child, animation) {
+                        final curved = CurvedAnimation(
+                          parent: animation,
+                          curve: Curves.easeOutCubic,
+                          reverseCurve: Curves.easeInCubic,
+                        );
+                        return FadeTransition(
+                          opacity: curved,
+                          child: SlideTransition(
+                            position: Tween<Offset>(
+                              begin: const Offset(0, 0.08),
+                              end: Offset.zero,
+                            ).animate(curved),
+                            child: child,
                           ),
-                          decoration: BoxDecoration(
-                            color: Colors.white.withValues(alpha: 0.04),
-                            borderRadius: BorderRadius.circular(_radiusLarge),
-                            border: Border.all(
-                              color: Colors.white.withValues(alpha: 0.08),
+                        );
+                      },
+                      child: nextUpTrack == null
+                          ? const SizedBox.shrink(
+                              key: ValueKey('player-next-up-empty'),
+                            )
+                          : GestureDetector(
+                              key: ValueKey(
+                                'player-next-up-${extractTrackId(nextUpTrack) ?? nextUpTrack['title'] ?? 'unknown'}',
+                              ),
+                              onTap: _openQueueSheet,
+                              child: Container(
+                                width: double.infinity,
+                                padding: EdgeInsets.symmetric(
+                                  horizontal: 14,
+                                  vertical: queueAwareCompactLayout ? 10 : 14,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: Colors.white.withValues(alpha: 0.04),
+                                  borderRadius:
+                                      BorderRadius.circular(_radiusLarge),
+                                  border: Border.all(
+                                    color: Colors.white.withValues(alpha: 0.08),
+                                  ),
+                                ),
+                                child: Row(
+                                  children: [
+                                    Icon(
+                                      Icons.queue_music_rounded,
+                                      color: Colors.white.withValues(alpha: 0.72),
+                                      size: 18,
+                                    ),
+                                    const SizedBox(width: 12),
+                                    Expanded(
+                                      child: queueAwareCompactLayout
+                                          ? Text(
+                                              nextUpTrack['title'] ??
+                                                  'More like this',
+                                              maxLines: 1,
+                                              overflow: TextOverflow.ellipsis,
+                                              style: const TextStyle(
+                                                color: Colors.white,
+                                                fontSize: 13,
+                                                fontWeight: FontWeight.w600,
+                                              ),
+                                            )
+                                          : Column(
+                                              crossAxisAlignment:
+                                                  CrossAxisAlignment.start,
+                                              children: [
+                                                Text(
+                                                  'Up next',
+                                                  style: TextStyle(
+                                                    color: Colors.white.withValues(
+                                                      alpha: 0.46,
+                                                    ),
+                                                    fontSize: 11,
+                                                    fontWeight: FontWeight.w700,
+                                                    letterSpacing: 0.5,
+                                                  ),
+                                                ),
+                                                const SizedBox(height: 4),
+                                                Text(
+                                                  nextUpTrack['title'] ??
+                                                      'More like this',
+                                                  maxLines: 1,
+                                                  overflow:
+                                                      TextOverflow.ellipsis,
+                                                  style: const TextStyle(
+                                                    color: Colors.white,
+                                                    fontSize: 14,
+                                                    fontWeight: FontWeight.w600,
+                                                  ),
+                                                ),
+                                              ],
+                                            ),
+                                    ),
+                                    Icon(
+                                      Icons.keyboard_arrow_up_rounded,
+                                      color: Colors.white.withValues(alpha: 0.56),
+                                    ),
+                                  ],
+                                ),
+                              ),
                             ),
-                          ),
-                          child: Row(
-                            children: [
-                              Icon(
-                                Icons.queue_music_rounded,
-                                color: Colors.white.withValues(alpha: 0.72),
-                                size: 18,
-                              ),
-                              const SizedBox(width: 12),
-                              Expanded(
-                                child: queueAwareCompactLayout
-                                    ? Text(
-                                        nextUpTrack['title'] ?? 'More like this',
-                                        maxLines: 1,
-                                        overflow: TextOverflow.ellipsis,
-                                        style: const TextStyle(
-                                          color: Colors.white,
-                                          fontSize: 13,
-                                          fontWeight: FontWeight.w600,
-                                        ),
-                                      )
-                                    : Column(
-                                        crossAxisAlignment:
-                                            CrossAxisAlignment.start,
-                                        children: [
-                                          Text(
-                                            'Up next',
-                                            style: TextStyle(
-                                              color: Colors.white
-                                                  .withValues(alpha: 0.46),
-                                              fontSize: 11,
-                                              fontWeight: FontWeight.w700,
-                                              letterSpacing: 0.5,
-                                            ),
-                                          ),
-                                          const SizedBox(height: 4),
-                                          Text(
-                                            nextUpTrack['title'] ??
-                                                'More like this',
-                                            maxLines: 1,
-                                            overflow: TextOverflow.ellipsis,
-                                            style: const TextStyle(
-                                              color: Colors.white,
-                                              fontSize: 14,
-                                              fontWeight: FontWeight.w600,
-                                            ),
-                                          ),
-                                        ],
-                                      ),
-                              ),
-                              Icon(
-                                Icons.keyboard_arrow_up_rounded,
-                                color: Colors.white.withValues(alpha: 0.56),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                    ],
+                    ),
                     SizedBox(height: sliderGap),
                     SliderTheme(
                       data: SliderTheme.of(context).copyWith(
@@ -4560,6 +5008,7 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
                     SizedBox(height: compactLayout ? 10 : 14),
                   ],
                 ),
+                ),
               ),
             );
           },
@@ -4630,6 +5079,474 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+class ArtistDetailsScreen extends ConsumerStatefulWidget {
+  final String artistId;
+  final Map<String, dynamic> fallbackArtist;
+
+  const ArtistDetailsScreen({
+    super.key,
+    required this.artistId,
+    required this.fallbackArtist,
+  });
+
+  @override
+  ConsumerState<ArtistDetailsScreen> createState() => _ArtistDetailsScreenState();
+}
+
+class _ArtistDetailsScreenState extends ConsumerState<ArtistDetailsScreen> {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      unawaited(
+        ref.read(artistDetailsProvider.notifier).fetchArtist(widget.artistId),
+      );
+    });
+  }
+
+  Future<void> _playArtistTracks(
+    Map<String, dynamic> artist,
+    List<dynamic> tracks, {
+    bool shuffle = false,
+  }) async {
+    if (tracks.isEmpty) return;
+    final navigator = Navigator.of(context);
+    final currentTrack = shuffle
+        ? tracks[DateTime.now().microsecondsSinceEpoch % tracks.length]
+        : tracks.first;
+    final artistName = artist['name']?.toString() ?? 'Artist Radio';
+    await ref.read(playbackQueueProvider.notifier).startPlaylistSession(
+          playlistId: 'artist:${widget.artistId}:top-songs',
+          playlistName: '$artistName Top Songs',
+          tracks: tracks,
+          currentTrack: currentTrack,
+          shuffle: shuffle,
+        );
+    if (!mounted) return;
+    navigator.push(
+      MaterialPageRoute(builder: (_) => const FullPlayerScreen()),
+    );
+  }
+
+  Future<void> _openAlbum(Map<String, dynamic> album) async {
+    final albumId = album['id']?.toString();
+    if (albumId == null || albumId.isEmpty) return;
+    unawaited(ref.read(albumDetailsProvider.notifier).fetchAlbum(albumId));
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => AlbumDetailsScreen(
+          albumId: albumId,
+          fallbackAlbum: album,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _openRelatedArtist(Map<String, dynamic> artist) async {
+    final artistId = artist['id']?.toString();
+    if (artistId == null || artistId.isEmpty) return;
+    unawaited(ref.read(artistDetailsProvider.notifier).fetchArtist(artistId));
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => ArtistDetailsScreen(
+          artistId: artistId,
+          fallbackArtist: artist,
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final artistState = ref.watch(artistDetailsProvider);
+    final loadedArtist = artistState.artist;
+    final artist =
+        loadedArtist != null && loadedArtist['id']?.toString() == widget.artistId
+            ? loadedArtist
+            : widget.fallbackArtist;
+    final topSongs =
+        (loadedArtist?['top_songs'] as List<dynamic>? ?? const <dynamic>[]);
+    final albums =
+        (loadedArtist?['albums'] as List<dynamic>? ?? const <dynamic>[]);
+    final relatedArtists =
+        (loadedArtist?['related_artists'] as List<dynamic>? ?? const <dynamic>[]);
+    final stats =
+        (loadedArtist?['stats'] as List<dynamic>? ?? const <dynamic>[])
+            .whereType<Map>()
+            .map((entry) => Map<String, dynamic>.from(entry))
+            .toList(growable: false);
+    final description = (artist['description'] ?? '').toString().trim();
+
+    return Scaffold(
+      backgroundColor: _voidBlack,
+      appBar: AppBar(
+        title: const Text('Artist'),
+      ),
+      body: SafeArea(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.fromLTRB(18, 18, 18, 24),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Center(
+                child: Container(
+                  padding: const EdgeInsets.all(14),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: 0.03),
+                    shape: BoxShape.circle,
+                    border: Border.all(
+                      color: Colors.white.withValues(alpha: 0.08),
+                    ),
+                  ),
+                  child: AppArtwork(
+                    thumbnail: artist['thumbnail'],
+                    width: 220,
+                    height: 220,
+                    radius: 999,
+                  ),
+                ),
+              ),
+              const SizedBox(height: 24),
+              Text(
+                artist['name']?.toString() ?? 'Unknown Artist',
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 28,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+              if (description.isNotEmpty) ...[
+                const SizedBox(height: 10),
+                Text(
+                  description,
+                  style: TextStyle(
+                    color: Colors.white.withValues(alpha: 0.62),
+                    fontSize: 14,
+                    height: 1.45,
+                  ),
+                ),
+              ],
+              if (stats.isNotEmpty) ...[
+                const SizedBox(height: 16),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: stats.map((stat) {
+                    final label = (stat['label'] ?? '').toString();
+                    final value = (stat['value'] ?? '').toString();
+                    return Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 8,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.white.withValues(alpha: 0.05),
+                        borderRadius: BorderRadius.circular(999),
+                        border: Border.all(
+                          color: Colors.white.withValues(alpha: 0.08),
+                        ),
+                      ),
+                      child: Text(
+                        '$label • $value',
+                        style: TextStyle(
+                          color: Colors.white.withValues(alpha: 0.82),
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    );
+                  }).toList(growable: false),
+                ),
+              ],
+              const SizedBox(height: 22),
+              Row(
+                children: [
+                  Expanded(
+                    child: FilledButton(
+                      style: FilledButton.styleFrom(
+                        backgroundColor: _surfaceGreyAlt,
+                        foregroundColor: Colors.white,
+                        padding: const EdgeInsets.symmetric(vertical: 14),
+                      ),
+                      onPressed: topSongs.isEmpty
+                          ? null
+                          : () => _playArtistTracks(artist, topSongs),
+                      child: const Text('Play top songs'),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  OutlinedButton.icon(
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: Colors.white,
+                      side: BorderSide(
+                        color: Colors.white.withValues(alpha: 0.14),
+                      ),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 14,
+                      ),
+                    ),
+                    onPressed: topSongs.isEmpty
+                        ? null
+                        : () => _playArtistTracks(
+                              artist,
+                              topSongs,
+                              shuffle: true,
+                            ),
+                    icon: const Icon(Icons.shuffle_rounded),
+                    label: const Text('Shuffle'),
+                  ),
+                ],
+              ),
+              if (albums.isNotEmpty) ...[
+                const SizedBox(height: 28),
+                const Text(
+                  'Albums',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 18,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const SizedBox(height: 16),
+                SizedBox(
+                  height: 246,
+                  child: ListView.separated(
+                    scrollDirection: Axis.horizontal,
+                    itemCount: albums.length,
+                    separatorBuilder: (_, __) => const SizedBox(width: 14),
+                    itemBuilder: (context, index) {
+                      final album = Map<String, dynamic>.from(albums[index] as Map);
+                      return SizedBox(
+                        width: 170,
+                        child: Material(
+                          color: Colors.transparent,
+                          child: InkWell(
+                            borderRadius: BorderRadius.circular(_radiusLarge),
+                            onTap: () => _openAlbum(album),
+                            child: Ink(
+                              padding: const EdgeInsets.all(12),
+                              decoration: BoxDecoration(
+                                color: Colors.white.withValues(alpha: 0.03),
+                                borderRadius:
+                                    BorderRadius.circular(_radiusLarge),
+                                border: Border.all(
+                                  color: Colors.white.withValues(alpha: 0.08),
+                                ),
+                              ),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  AppArtwork(
+                                    thumbnail: album['thumbnail'],
+                                    width: 140,
+                                    height: 140,
+                                    radius: 18,
+                                  ),
+                                  const SizedBox(height: 10),
+                                  Text(
+                                    album['title']?.toString() ?? 'Unknown Album',
+                                    maxLines: 2,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 14,
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 6),
+                                  Text(
+                                    [
+                                      if ((album['year'] ?? '')
+                                          .toString()
+                                          .isNotEmpty)
+                                        album['year'].toString(),
+                                      if ((album['track_count'] ?? 0) > 0)
+                                        '${album['track_count']} tracks',
+                                    ].join(' • '),
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                      color: Colors.white.withValues(alpha: 0.52),
+                                      fontSize: 12,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+              ],
+              const SizedBox(height: 28),
+              const Text(
+                'Top songs',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 18,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const SizedBox(height: 16),
+              if (artistState.isLoading && topSongs.isEmpty)
+                const Center(
+                  child: Padding(
+                    padding: EdgeInsets.symmetric(vertical: 32),
+                    child: CircularProgressIndicator(color: _accentGrey),
+                  ),
+                )
+              else if (topSongs.isEmpty)
+                Text(
+                  artistState.error ?? 'No top-song data available for this artist.',
+                  style: TextStyle(color: Colors.white.withValues(alpha: 0.56)),
+                )
+              else
+                ListView.builder(
+                  shrinkWrap: true,
+                  physics: const NeverScrollableScrollPhysics(),
+                  itemCount: topSongs.length,
+                  itemBuilder: (context, index) {
+                    final track = Map<String, dynamic>.from(topSongs[index] as Map);
+                    final videoId =
+                        (track['id'] ?? track['videoId'])?.toString();
+                    return Container(
+                      margin: const EdgeInsets.only(bottom: 12),
+                      decoration: BoxDecoration(
+                        color: Colors.white.withValues(alpha: 0.03),
+                        borderRadius: BorderRadius.circular(18),
+                        border: Border.all(
+                          color: Colors.white.withValues(alpha: 0.06),
+                        ),
+                      ),
+                      child: ListTile(
+                        onTap: () async {
+                          final navigator = Navigator.of(context);
+                          await ref
+                              .read(playbackQueueProvider.notifier)
+                              .startPlaylistSession(
+                                playlistId: 'artist:${widget.artistId}:top-songs',
+                                playlistName:
+                                    '${artist['name']?.toString() ?? 'Artist'} Top Songs',
+                                tracks: topSongs,
+                                currentTrack: track,
+                              );
+                          if (!mounted) return;
+                          navigator.push(
+                            MaterialPageRoute(
+                              builder: (_) => const FullPlayerScreen(),
+                            ),
+                          );
+                        },
+                        leading: AppArtwork(
+                          thumbnail: track['thumbnail'],
+                          videoId: videoId,
+                          width: 56,
+                          height: 56,
+                          radius: 14,
+                        ),
+                        title: Text(
+                          track['title'] ?? 'Unknown Track',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                        subtitle: Text(
+                          track['channel'] ??
+                              artist['name']?.toString() ??
+                              'Unknown Artist',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            color: Colors.white.withValues(alpha: 0.52),
+                            fontSize: 12,
+                          ),
+                        ),
+                        trailing: IconButton(
+                          onPressed: () => showAddToPlaylistDialog(
+                            context: context,
+                            track: track,
+                          ),
+                          icon: Icon(
+                            Icons.playlist_add_rounded,
+                            color: Colors.white.withValues(alpha: 0.68),
+                          ),
+                        ),
+                      ),
+                    );
+                  },
+                ),
+              if (relatedArtists.isNotEmpty) ...[
+                const SizedBox(height: 28),
+                const Text(
+                  'Similar artists',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 18,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const SizedBox(height: 14),
+                SizedBox(
+                  height: 112,
+                  child: ListView.separated(
+                    scrollDirection: Axis.horizontal,
+                    itemCount: relatedArtists.length,
+                    separatorBuilder: (_, __) => const SizedBox(width: 14),
+                    itemBuilder: (context, index) {
+                      final related =
+                          Map<String, dynamic>.from(relatedArtists[index] as Map);
+                      return SizedBox(
+                        width: 82,
+                        child: Material(
+                          color: Colors.transparent,
+                          child: InkWell(
+                            borderRadius: BorderRadius.circular(22),
+                            onTap: () => _openRelatedArtist(related),
+                            child: Column(
+                              children: [
+                                AppArtwork(
+                                  thumbnail: related['thumbnail'],
+                                  width: 68,
+                                  height: 68,
+                                  radius: 999,
+                                ),
+                                const SizedBox(height: 10),
+                                Text(
+                                  related['name']?.toString() ?? 'Artist',
+                                  maxLines: 2,
+                                  overflow: TextOverflow.ellipsis,
+                                  textAlign: TextAlign.center,
+                                  style: TextStyle(
+                                    color: Colors.white.withValues(alpha: 0.88),
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w600,
+                                    height: 1.2,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
       ),
     );
   }

@@ -142,6 +142,177 @@ def normalize_artist_results(raw_results):
         )
     return artists
 
+
+def _normalize_artist_song_entries(raw_results, fallback_artist: str = ""):
+    songs = []
+    seen = set()
+    for entry in raw_results or []:
+        normalized = _normalize_song_result(entry)
+        if not normalized:
+            continue
+        track_id = normalized.get("id")
+        if not track_id or track_id in seen:
+            continue
+        seen.add(track_id)
+        if fallback_artist and not (normalized.get("channel") or "").strip():
+            normalized["channel"] = fallback_artist
+        songs.append(normalized)
+    return songs
+
+
+def _normalize_artist_album_entries(raw_results, fallback_artist: str = ""):
+    albums = []
+    seen = set()
+    for entry in raw_results or []:
+        browse_id = entry.get("browseId") or entry.get("id")
+        title = entry.get("title") or entry.get("name")
+        if not browse_id or not title or browse_id in seen:
+            continue
+        seen.add(browse_id)
+        albums.append(
+            {
+                "id": browse_id,
+                "title": title,
+                "artist": extract_artist(entry) or fallback_artist,
+                "thumbnail": extract_thumbnail(entry),
+                "year": entry.get("year") or "",
+                "track_count": entry.get("trackCount") or entry.get("track_count") or 0,
+            }
+        )
+    return albums
+
+
+def _normalize_artist_stats(payload):
+    stats = []
+    for label, value in (
+        ("Monthly listeners", payload.get("monthlyListeners")),
+        ("Subscribers", payload.get("subscribers")),
+        ("Views", payload.get("views")),
+    ):
+        text = (value or "").strip()
+        if not text:
+            continue
+        stats.append({"label": label, "value": text})
+    return stats
+
+
+def _build_artist_details_payload(artist_id: str):
+    artist = ytmusic.get_artist(artist_id)
+    name = artist.get("name") or "Unknown Artist"
+    songs_section = artist.get("songs") or {}
+    album_section = artist.get("albums") or {}
+    related_section = artist.get("related") or {}
+
+    top_songs = _normalize_artist_song_entries(
+        songs_section.get("results") or [],
+        fallback_artist=name,
+    )
+
+    albums = _normalize_artist_album_entries(
+        album_section.get("results") or [],
+        fallback_artist=name,
+    )
+    album_browse_id = album_section.get("browseId")
+    album_params = album_section.get("params")
+    if album_browse_id and album_params:
+        try:
+            more_albums = ytmusic.get_artist_albums(
+                album_browse_id,
+                album_params,
+                limit=12,
+            )
+        except Exception:
+            more_albums = []
+        for album in _normalize_artist_album_entries(more_albums, fallback_artist=name):
+            album_id = album.get("id")
+            if album_id and any(existing.get("id") == album_id for existing in albums):
+                continue
+            albums.append(album)
+            if len(albums) >= 12:
+                break
+
+    related_artists = normalize_artist_results(related_section.get("results") or [])
+
+    return {
+        "status": "success",
+        "id": artist_id,
+        "name": name,
+        "description": artist.get("description") or "",
+        "thumbnail": extract_thumbnail(artist),
+        "stats": _normalize_artist_stats(artist),
+        "top_songs": top_songs[:12],
+        "albums": albums[:12],
+        "related_artists": related_artists[:12],
+    }
+
+
+def _recommended_artists_payload(req: SearchRequest):
+    weighted_queries = []
+    seen_queries = set()
+
+    def add_query(raw: Optional[str]) -> None:
+        query = (raw or "").strip()
+        normalized = _normalize_text(query)
+        if not normalized or normalized in seen_queries:
+            return
+        seen_queries.add(normalized)
+        weighted_queries.append(query)
+
+    for raw in list(req.artist_hints or []) + list(req.taste_queries or []):
+        add_query(raw)
+        if len(weighted_queries) >= 8:
+            break
+
+    if len(weighted_queries) < 4:
+        for track, _score in _fallback_home_candidates(max(req.limit or 8, 12)):
+            fallback_artist = _trim_text(
+                track.get("channel")
+                or track.get("artist")
+                or extract_artist(track)
+            )
+            if not fallback_artist:
+                continue
+            add_query(fallback_artist)
+            if len(weighted_queries) >= 8:
+                break
+
+    artists = []
+    seen_artist_ids = set()
+    seen_artist_names = set()
+    for query in weighted_queries:
+        for artist in _assistant_tool_search_artists(query, 4):
+            artist_id = (artist.get("id") or "").strip()
+            artist_name = (artist.get("name") or "").strip()
+            normalized_name = _normalize_text(artist_name)
+            if (
+                not artist_id
+                or not artist_name
+                or artist_id in seen_artist_ids
+                or normalized_name in seen_artist_names
+            ):
+                continue
+            query_text = _normalize_text(query)
+            name_text = normalized_name
+            artist["score"] = (
+                4 if query_text == name_text else
+                3 if query_text and query_text in name_text else
+                2 if any(token in name_text for token in _query_tokens(query)) else
+                1
+            )
+            seen_artist_ids.add(artist_id)
+            seen_artist_names.add(normalized_name)
+            artists.append(artist)
+
+    artists.sort(
+        key=lambda item: (
+            item.get("score", 0),
+            len(_normalize_text(item.get("name") or "")),
+        ),
+        reverse=True,
+    )
+    limit = max(1, min(req.limit or 8, 12))
+    return {"status": "success", "artists": artists[:limit]}
+
 def _normalize_song_result(entry):
     if not entry:
         return None
@@ -335,6 +506,8 @@ def _call_ollama_chat(
         "stream": False,
         "options": {"temperature": temperature},
     }
+    if OLLAMA_KEEP_ALIVE:
+        payload["keep_alive"] = OLLAMA_KEEP_ALIVE
     if schema is not None:
         payload["format"] = schema
 
@@ -469,8 +642,10 @@ OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434/api"
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "minimax-m2.7:cloud")
 OLLAMA_THINKING_MODEL = os.environ.get("OLLAMA_THINKING_MODEL", OLLAMA_MODEL).strip() or OLLAMA_MODEL
 OLLAMA_FAST_MODEL = os.environ.get("OLLAMA_FAST_MODEL", "rnj-1:8b-cloud").strip() or "rnj-1:8b-cloud"
+OLLAMA_PLANNER_MODEL = os.environ.get("OLLAMA_PLANNER_MODEL", OLLAMA_FAST_MODEL).strip() or OLLAMA_FAST_MODEL
 OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "").strip()
 OLLAMA_EMBED_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", OLLAMA_MODEL).strip()
+OLLAMA_KEEP_ALIVE = os.environ.get("OLLAMA_KEEP_ALIVE", "15m").strip()
 OLLAMA_CONNECT_TIMEOUT_SECONDS = float(os.environ.get("OLLAMA_CONNECT_TIMEOUT_SECONDS", "10"))
 OLLAMA_READ_TIMEOUT_SECONDS = float(os.environ.get("OLLAMA_READ_TIMEOUT_SECONDS", "90"))
 ASSISTANT_EMBED_BACKEND = os.environ.get("ASSISTANT_EMBED_BACKEND", "local").strip().lower()
@@ -547,6 +722,7 @@ class AssistantChatRequest(BaseModel):
     user_scope_id: str = "guest"
     session_id: Optional[str] = None
     thinking_mode: bool = True
+    force_refresh: bool = False
     conversation: List[AssistantConversationMessage] = Field(default_factory=list)
     last_assistant_tracks: List[AssistantContextTrack] = Field(default_factory=list)
     last_playlist_draft_tracks: List[AssistantContextTrack] = Field(default_factory=list)
@@ -1278,6 +1454,28 @@ def _assistant_tool_search_artists(query: str, limit: int):
         except Exception:
             fallback_results = []
         artists = normalize_artist_results(fallback_results)
+    normalized_query = _normalize_text(query)
+    tokens = _query_tokens(query)
+
+    def artist_score(item):
+        name = _normalize_text(item.get("name"))
+        if normalized_query and name == normalized_query:
+            return 5
+        if normalized_query and normalized_query in name:
+            return 4
+        if tokens and all(token in name for token in tokens):
+            return 3
+        if tokens and any(token in name for token in tokens):
+            return 2
+        return 1
+
+    artists.sort(
+        key=lambda item: (
+            artist_score(item),
+            -len(_normalize_text(item.get("name"))),
+        ),
+        reverse=True,
+    )
     return artists[:limit]
 
 
@@ -1610,6 +1808,16 @@ def _assistant_langgraph_deps(req: AssistantChatRequest):
         "initial_memory_queries": _assistant_initial_memory_queries,
         "query_memory": _assistant_query_memory,
         "merge_memory_hits": _assistant_merge_memory_hits,
+        "call_planner_structured": lambda messages, **kwargs: _call_ollama_structured(
+            messages,
+            model_override=OLLAMA_PLANNER_MODEL,
+            **kwargs,
+        ),
+        "call_response_structured": lambda messages, **kwargs: _call_ollama_structured(
+            messages,
+            model_override=selected_model,
+            **kwargs,
+        ),
         "call_structured": lambda messages, **kwargs: _call_ollama_structured(
             messages,
             model_override=selected_model,
@@ -1639,6 +1847,7 @@ def _assistant_langgraph_deps(req: AssistantChatRequest):
             model_override=selected_model,
         ),
         "model_name": selected_model,
+        "planner_model_name": OLLAMA_PLANNER_MODEL,
     }
 
 def _assistant_fallback_chat_reply(req: AssistantChatRequest, model_override=None):
@@ -2302,10 +2511,35 @@ def search_albums(req: SearchRequest):
     except Exception as e:
         return {"status": "success", "albums": []}
 
+
+@app.post("/search_artists")
+def search_artists(req: SearchRequest):
+    try:
+        artists = _assistant_tool_search_artists(req.query, max(1, min(req.limit, 12)))
+        return {"status": "success", "artists": artists}
+    except Exception:
+        return {"status": "success", "artists": []}
+
+
+@app.post("/recommended_artists")
+def recommended_artists(req: SearchRequest):
+    try:
+        return _recommended_artists_payload(req)
+    except Exception:
+        return {"status": "success", "artists": []}
+
 @app.get("/album/{album_id}")
 def get_album_details(album_id: str):
     try:
         return _build_album_details_payload(album_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/artist/{artist_id}")
+def get_artist_details(artist_id: str):
+    try:
+        return _build_artist_details_payload(artist_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

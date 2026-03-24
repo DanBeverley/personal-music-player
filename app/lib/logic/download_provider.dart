@@ -243,6 +243,12 @@ class DownloadCenterNotifier extends StateNotifier<DownloadCenterState> {
       return false;
     }
   }
+
+  Future<void> downloadTracks(Iterable<Map<String, dynamic>> tracks) async {
+    for (final track in tracks) {
+      await downloadTrack(track);
+    }
+  }
 }
 
 final downloadCenterProvider =

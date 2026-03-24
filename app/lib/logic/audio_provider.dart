@@ -19,6 +19,50 @@ const String proxyBaseUrl =
     String.fromEnvironment('AURALIS_PROXY_URL', defaultValue: 'http://34.172.70.149');
 final http.Client appHttpClient = http.Client();
 
+const List<String> _sharedTasteKeywords = <String>[
+  'rock',
+  'metal',
+  'jazz',
+  'blues',
+  'classical',
+  'orchestra',
+  'punk',
+  'indie',
+  'folk',
+  'country',
+  'ambient',
+  'chill',
+  'sad',
+  'happy',
+  'workout',
+  'gym',
+  'sleep',
+  'focus',
+  'lofi',
+  'edm',
+  'house',
+  'techno',
+  'trance',
+  'disco',
+  'pop',
+  'rap',
+  'hip hop',
+  'rnb',
+  'soul',
+  'funk',
+  'vibe',
+  'mood',
+  'party',
+  'romantic',
+  'rain',
+  'night',
+  'morning',
+  'road trip',
+  '80s',
+  '90s',
+  '2000s',
+];
+
 Uri buildProxyUri(String path) {
   final normalizedPath = path.startsWith('/') ? path : '/$path';
   return Uri.parse('$proxyBaseUrl$normalizedPath');
@@ -2529,50 +2573,6 @@ final searchProvider =
 class RecommendationNotifier extends StateNotifier<List<dynamic>> {
   final Ref ref;
   final Random _random = Random();
-  static const List<String> _tasteKeywords = <String>[
-    'rock',
-    'metal',
-    'jazz',
-    'blues',
-    'classical',
-    'orchestra',
-    'punk',
-    'indie',
-    'folk',
-    'country',
-    'ambient',
-    'chill',
-    'sad',
-    'happy',
-    'workout',
-    'gym',
-    'sleep',
-    'focus',
-    'lofi',
-    'edm',
-    'house',
-    'techno',
-    'trance',
-    'disco',
-    'pop',
-    'rap',
-    'hip hop',
-    'rnb',
-    'soul',
-    'funk',
-    'vibe',
-    'mood',
-    'party',
-    'romantic',
-    'rain',
-    'night',
-    'morning',
-    'road trip',
-    '80s',
-    '90s',
-    '2000s',
-  ];
-
   RecommendationNotifier(this.ref) : super([]);
   bool isLoading = true;
   bool isPaginating = false;
@@ -2825,7 +2825,7 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
         normalized.contains(' music')) {
       return true;
     }
-    return _tasteKeywords.any((keyword) => normalized.contains(keyword));
+    return _sharedTasteKeywords.any((keyword) => normalized.contains(keyword));
   }
 
   Future<Map<String, dynamic>> _buildRecommendationRequestBody(
@@ -3265,6 +3265,264 @@ class AlbumDetailsNotifier extends StateNotifier<AlbumDetailsState> {
 final albumDetailsProvider =
     StateNotifierProvider<AlbumDetailsNotifier, AlbumDetailsState>((ref) {
   return AlbumDetailsNotifier(ref);
+});
+
+class ArtistSearchNotifier extends StateNotifier<List<Map<String, dynamic>>> {
+  int _requestVersion = 0;
+  bool isLoading = false;
+
+  ArtistSearchNotifier() : super(const []);
+
+  Future<void> search(String query) async {
+    final trimmed = query.trim();
+    if (trimmed.isEmpty) {
+      clear();
+      return;
+    }
+    final requestVersion = ++_requestVersion;
+    isLoading = true;
+    state = [...state];
+    try {
+      final res = await appHttpClient
+          .post(
+            buildProxyUri('/search_artists'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({"query": trimmed, "limit": 8}),
+          )
+          .timeout(const Duration(seconds: 10));
+      if (requestVersion != _requestVersion) return;
+      if (res.statusCode == 200) {
+        final payload = jsonDecode(res.body) as Map<String, dynamic>;
+        final artists = (payload['artists'] as List<dynamic>? ?? const []);
+        state = artists
+            .map((artist) => Map<String, dynamic>.from(artist as Map))
+            .toList(growable: false);
+      } else {
+        state = const [];
+      }
+    } catch (_) {
+      if (requestVersion != _requestVersion) return;
+      state = const [];
+    } finally {
+      if (requestVersion == _requestVersion) {
+        isLoading = false;
+        state = [...state];
+      }
+    }
+  }
+
+  void clear() {
+    _requestVersion++;
+    isLoading = false;
+    state = const [];
+  }
+}
+
+final artistSearchProvider =
+    StateNotifierProvider<ArtistSearchNotifier, List<Map<String, dynamic>>>(
+        (ref) {
+  return ArtistSearchNotifier();
+});
+
+class RecommendedArtistsNotifier
+    extends StateNotifier<List<Map<String, dynamic>>> {
+  final Ref ref;
+  int _requestVersion = 0;
+  bool isLoading = false;
+
+  RecommendedArtistsNotifier(this.ref) : super(const []);
+
+  void _bumpWeight(Map<String, double> weights, String? value, double weight) {
+    final normalized = value?.trim().toLowerCase();
+    if (normalized == null || normalized.isEmpty) return;
+    weights.update(
+      normalized,
+      (current) => current + weight,
+      ifAbsent: () => weight,
+    );
+  }
+
+  String? _extractArtistHint(dynamic rawTrack) {
+    if (rawTrack is! Map) return null;
+    return rawTrack['channel']?.toString() ??
+        rawTrack['author']?.toString() ??
+        rawTrack['artist']?.toString();
+  }
+
+  bool _looksLikeTasteQuery(String query) {
+    final normalized = query.trim().toLowerCase();
+    if (normalized.isEmpty) return false;
+    if (normalized.length > 38) return true;
+    if (normalized.contains(' mix') ||
+        normalized.contains(' playlist') ||
+        normalized.contains(' songs') ||
+        normalized.contains(' music')) {
+      return true;
+    }
+    return _sharedTasteKeywords.any((keyword) => normalized.contains(keyword));
+  }
+
+  Future<void> bootstrap() async {
+    await loadRecommendedArtists();
+  }
+
+  Future<void> loadRecommendedArtists({
+    List<String> seedArtistHints = const [],
+    List<String> seedTasteQueries = const [],
+  }) async {
+    final requestVersion = ++_requestVersion;
+    isLoading = true;
+    state = [...state];
+    try {
+      final artistWeights = <String, double>{};
+      final queryWeights = <String, double>{};
+      final playlists = ref.read(playlistProvider);
+      final libraryTracks = ref.read(libraryProvider).valueOrNull ?? const [];
+
+      for (final artist in seedArtistHints) {
+        _bumpWeight(artistWeights, artist, 2.8);
+      }
+      for (final query in seedTasteQueries) {
+        _bumpWeight(queryWeights, query, 2.0);
+      }
+
+      for (final playlist in playlists) {
+        _bumpWeight(queryWeights, playlist.name, 1.2);
+        for (final track in playlist.tracks.take(18)) {
+          _bumpWeight(artistWeights, _extractArtistHint(track), 1.5);
+        }
+      }
+
+      for (final track in libraryTracks.take(24)) {
+        _bumpWeight(artistWeights, _extractArtistHint(track), 1.25);
+      }
+
+      final recentQueries = await getRecentCloudSearchQueries(limit: 8);
+      for (final query in recentQueries) {
+        if (_looksLikeTasteQuery(query)) {
+          _bumpWeight(queryWeights, query, 1.1);
+        }
+      }
+
+      final rankedArtists = artistWeights.entries.toList()
+        ..sort((a, b) => b.value.compareTo(a.value));
+      final rankedQueries = queryWeights.entries.toList()
+        ..sort((a, b) => b.value.compareTo(a.value));
+
+      final res = await appHttpClient
+          .post(
+            buildProxyUri('/recommended_artists'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'query': '',
+              'limit': 8,
+              'artist_hints': rankedArtists
+                  .take(8)
+                  .map((entry) => entry.key)
+                  .toList(growable: false),
+              'taste_queries': rankedQueries
+                  .take(6)
+                  .map((entry) => entry.key)
+                  .toList(growable: false),
+            }),
+          )
+          .timeout(const Duration(seconds: 10));
+      if (requestVersion != _requestVersion) return;
+      if (res.statusCode == 200) {
+        final payload = jsonDecode(res.body) as Map<String, dynamic>;
+        final artists = (payload['artists'] as List<dynamic>? ?? const []);
+        state = artists
+            .map((artist) => Map<String, dynamic>.from(artist as Map))
+            .toList(growable: false);
+      } else {
+        state = const [];
+      }
+    } catch (_) {
+      if (requestVersion != _requestVersion) return;
+      state = const [];
+    } finally {
+      if (requestVersion == _requestVersion) {
+        isLoading = false;
+        state = [...state];
+      }
+    }
+  }
+
+  void clear() {
+    _requestVersion++;
+    isLoading = false;
+    state = const [];
+  }
+}
+
+final recommendedArtistsProvider = StateNotifierProvider<
+    RecommendedArtistsNotifier, List<Map<String, dynamic>>>((ref) {
+  ref.watch(authProvider.select((state) => state.storageScopeId));
+  ref.watch(storageRefreshTickProvider);
+  final notifier = RecommendedArtistsNotifier(ref);
+  unawaited(notifier.bootstrap());
+  return notifier;
+});
+
+class ArtistDetailsState {
+  final bool isLoading;
+  final Map<String, dynamic>? artist;
+  final String? error;
+
+  const ArtistDetailsState({
+    this.isLoading = false,
+    this.artist,
+    this.error,
+  });
+}
+
+class ArtistDetailsNotifier extends StateNotifier<ArtistDetailsState> {
+  final Ref ref;
+  int _requestVersion = 0;
+
+  ArtistDetailsNotifier(this.ref) : super(const ArtistDetailsState());
+
+  Future<void> fetchArtist(String? artistId) async {
+    if (artistId == null || artistId.isEmpty) {
+      state = const ArtistDetailsState(error: 'Artist unavailable.');
+      return;
+    }
+
+    final requestVersion = ++_requestVersion;
+    state = const ArtistDetailsState(isLoading: true);
+    try {
+      final res = await appHttpClient
+          .get(buildProxyUri('/artist/$artistId'))
+          .timeout(const Duration(seconds: 14));
+      if (requestVersion != _requestVersion) return;
+      if (res.statusCode != 200) {
+        state = const ArtistDetailsState(error: 'Artist unavailable.');
+        return;
+      }
+
+      final payload = jsonDecode(res.body) as Map<String, dynamic>;
+      final topSongs = (payload['top_songs'] as List<dynamic>? ?? const []);
+      unawaited(
+        ref.read(audioPlayerProvider.notifier).prewarmStreams(
+              topSongs.take(8).map((track) => track['id'] ?? track['videoId']),
+            ),
+      );
+      state = ArtistDetailsState(artist: payload);
+    } catch (_) {
+      if (requestVersion != _requestVersion) return;
+      state = const ArtistDetailsState(error: 'Artist unavailable.');
+    }
+  }
+
+  void clear() {
+    _requestVersion++;
+    state = const ArtistDetailsState();
+  }
+}
+
+final artistDetailsProvider =
+    StateNotifierProvider<ArtistDetailsNotifier, ArtistDetailsState>((ref) {
+  return ArtistDetailsNotifier(ref);
 });
 
 class LyricsNotifier extends StateNotifier<TrackLyricsState> {

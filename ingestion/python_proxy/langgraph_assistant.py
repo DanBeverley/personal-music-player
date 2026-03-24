@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
@@ -40,6 +41,46 @@ except Exception:  # pragma: no cover - optional dependency
 
 _FAST_EVENT_PLAYLIST_CACHE: Dict[str, Dict[str, Any]] = {}
 _FAST_EVENT_PLAYLIST_CACHE_TTL_SECONDS = 600
+_WEB_SEARCH_CACHE: Dict[str, Dict[str, Any]] = {}
+_WEB_SEARCH_CACHE_TTL_SECONDS = 900
+_PAGE_HTML_CACHE: Dict[str, Dict[str, Any]] = {}
+_PAGE_TEXT_CACHE: Dict[str, Dict[str, Any]] = {}
+_PAGE_TEXT_CACHE_TTL_SECONDS = 1800
+_EVENT_NOISE_PHRASES = {
+    "skip to content",
+    "listen",
+    "search",
+    "menu",
+    "home",
+    "privacy policy",
+    "terms of use",
+    "sign in",
+    "log in",
+    "subscribe",
+    "cookie policy",
+    "open in app",
+    "read more",
+    "view all",
+    "navigation",
+}
+_SETLIST_STOP_PHRASES = {
+    "tour stats",
+    "average setlist",
+    "show note",
+    "show notes",
+    "videos",
+    "video",
+    "photos",
+    "photo",
+    "albums",
+    "album",
+    "tickets",
+    "artists covered",
+    "cover statistics",
+    "cover stats",
+    "follow setlist.fm",
+    "edit setlist",
+}
 
 
 class AssistantGraphState(TypedDict, total=False):
@@ -171,10 +212,19 @@ def _musicbrainz_artist_search(query: str, limit: int = 5) -> List[Dict[str, Any
     return results
 
 
-def _duckduckgo_search(query: str, limit: int = 5) -> List[Dict[str, Any]]:
+def _duckduckgo_search(query: str, limit: int = 5, *, force_refresh: bool = False) -> List[Dict[str, Any]]:
     query = (query or "").strip()
     if not query or DDGS is None:
         return []
+    cache_key = f"{query.lower()}::{max(1, min(limit, 8))}"
+    cached = _WEB_SEARCH_CACHE.get(cache_key)
+    now = time.time()
+    if (
+        not force_refresh
+        and cached
+        and cached.get("expires_at", 0) > now
+    ):
+        return list(cached.get("results") or [])
     try:
         with DDGS() as ddgs:
             results = ddgs.text(query, max_results=max(1, min(limit, 8)))
@@ -187,16 +237,49 @@ def _duckduckgo_search(query: str, limit: int = 5) -> List[Dict[str, Any]]:
                         "href": item.get("href"),
                     }
                 )
+            _WEB_SEARCH_CACHE[cache_key] = {
+                "results": normalized,
+                "expires_at": now + _WEB_SEARCH_CACHE_TTL_SECONDS,
+            }
             return normalized
     except Exception:
         return []
 
 
-def _search_web_context(query: str, limit: int = 5) -> List[Dict[str, Any]]:
-    return _duckduckgo_search(query, limit)
+def _fetch_event_page_html(url: str, *, force_refresh: bool = False) -> str:
+    normalized = _trim_text(url)
+    if not normalized:
+        return ""
+    cached = _PAGE_HTML_CACHE.get(normalized)
+    now = time.time()
+    if (
+        not force_refresh
+        and cached
+        and cached.get("expires_at", 0) > now
+    ):
+        return cached.get("html") or ""
+    try:
+        response = requests.get(
+            normalized,
+            headers={"User-Agent": "EBB/1.0"},
+            timeout=(4, 6),
+        )
+        response.raise_for_status()
+        html = response.text
+    except Exception:
+        return ""
+    _PAGE_HTML_CACHE[normalized] = {
+        "html": html,
+        "expires_at": now + _PAGE_TEXT_CACHE_TTL_SECONDS,
+    }
+    return html
 
 
-def _search_event_performance_facts(query: str, limit: int = 5) -> List[Dict[str, Any]]:
+def _search_web_context(query: str, limit: int = 5, *, force_refresh: bool = False) -> List[Dict[str, Any]]:
+    return _duckduckgo_search(query, limit, force_refresh=force_refresh)
+
+
+def _search_event_performance_facts(query: str, limit: int = 5, *, force_refresh: bool = False) -> List[Dict[str, Any]]:
     query = (query or "").strip()
     if not query:
         return []
@@ -207,6 +290,7 @@ def _search_event_performance_facts(query: str, limit: int = 5) -> List[Dict[str
     return _duckduckgo_search(
         f"{query} {' '.join(qualifiers)}".strip(),
         limit,
+        force_refresh=force_refresh,
     )
 
 
@@ -266,6 +350,8 @@ def _extract_song_titles_from_text(text: str, limit: int = 16) -> List[str]:
         if len(candidate) < 2 or len(candidate) > 90:
             continue
         lowered = candidate.lower()
+        if lowered in _EVENT_NOISE_PHRASES:
+            continue
         if any(
             phrase in lowered
             for phrase in [
@@ -299,6 +385,8 @@ def _extract_loose_song_titles_from_text(text: str, limit: int = 16) -> List[str
         if len(line) < 2 or len(line) > 90:
             continue
         lowered = line.lower()
+        if lowered in _EVENT_NOISE_PHRASES:
+            continue
         if any(
             phrase in lowered
             for phrase in [
@@ -320,6 +408,8 @@ def _extract_loose_song_titles_from_text(text: str, limit: int = 16) -> List[str
             continue
         tokens = [token for token in re.split(r"\s+", line) if token]
         if not tokens or len(tokens) > 8:
+            continue
+        if len(tokens) == 1 and tokens[0].lower() in _EVENT_NOISE_PHRASES:
             continue
         titleish = sum(1 for token in tokens if token[:1].isupper() or token.lower() in {"i", "we", "you"})
         if titleish < max(1, len(tokens) // 2):
@@ -424,6 +514,132 @@ def _song_title_variants(title: str) -> List[str]:
     return variants
 
 
+def _expand_compound_song_titles(title: str) -> List[str]:
+    expanded: List[str] = []
+    seen = set()
+
+    def add(value: str) -> None:
+        cleaned = _trim_text(value)
+        normalized = cleaned.lower()
+        if not cleaned or normalized in seen:
+            return
+        seen.add(normalized)
+        expanded.append(cleaned)
+
+    cleaned_title = _trim_text(title)
+    if not cleaned_title:
+        return expanded
+    add(cleaned_title)
+    if "/" in cleaned_title:
+        for part in cleaned_title.split("/"):
+            add(part)
+    return expanded
+
+
+def _canonical_song_title(title: str) -> str:
+    normalized = _trim_text(title).lower()
+    normalized = re.sub(r"\([^)]*\)", " ", normalized)
+    normalized = re.sub(r"\[[^\]]*\]", " ", normalized)
+    normalized = re.sub(
+        r"\b(live|version|mix|edit|remaster(?:ed)?|soundtrack|from|acoustic|demo|take|session|reprise)\b",
+        " ",
+        normalized,
+    )
+    normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _playlist_reply_text(
+    req: Any,
+    *,
+    from_context: bool = False,
+    matched_count: int = 0,
+) -> str:
+    lowered = _trim_text(getattr(req, "message", "")).lower()
+    seed = int(hashlib.sha1(f"{lowered}|{matched_count}|{from_context}".encode("utf-8")).hexdigest(), 16)
+    if _looks_like_event_question(lowered):
+        templates = [
+            "I lined up the songs I could match from that performance into a playable draft below.",
+            "I pulled that performance into a playable playlist draft below.",
+            "I mapped that set into tracks you can play right away below.",
+        ]
+    elif from_context:
+        templates = [
+            "I pulled those songs into a playlist draft below.",
+            "I shaped those tracks into a playable draft below.",
+            "I turned those picks into a playlist you can use below.",
+        ]
+    else:
+        templates = [
+            "I put together a playable playlist draft below.",
+            "I lined that up as a playlist draft below.",
+            "I gathered those tracks into a playable draft below.",
+        ]
+    return templates[seed % len(templates)]
+
+
+def _playlist_summary_text(req: Any, *, from_context: bool = False) -> str:
+    lowered = _trim_text(getattr(req, "message", "")).lower()
+    if _looks_like_event_question(lowered):
+        return "Play-ready versions of the songs tied to that performance."
+    if from_context:
+        return "A playlist draft shaped from the songs already in this conversation."
+    return "A playable playlist draft shaped from your request."
+
+
+def _looks_like_possible_setlist_title(line: str) -> bool:
+    cleaned = _trim_text(re.sub(r"^(?:[-*â€¢]\s+|\d+[.)]\s+)", "", line))
+    if not cleaned or len(cleaned) > 90:
+        return False
+    lowered = cleaned.lower()
+    if lowered in _EVENT_NOISE_PHRASES:
+        return False
+    if any(phrase in lowered for phrase in _SETLIST_STOP_PHRASES):
+        return False
+    if any(
+        phrase in lowered
+        for phrase in [
+            "setlist",
+            "wikipedia",
+            "youtube",
+            "spotify",
+            "apple music",
+            "wembley",
+            "stadium",
+            "london",
+            "performance",
+            "festival",
+            "charity",
+            "july",
+            "note:",
+        ]
+    ):
+        return False
+    tokens = [token for token in re.split(r"\s+", cleaned) if token]
+    if not tokens or len(tokens) > 10:
+        return False
+    titleish = sum(1 for token in tokens if token[:1].isupper() or token.lower() in {"i", "we", "you"})
+    return titleish >= max(1, len(tokens) // 2)
+
+
+def _title_match_strength(track: Dict[str, Any], title: str) -> int:
+    track_title = _canonical_song_title(track.get("title") or "")
+    target_title = _canonical_song_title(title)
+    if not track_title or not target_title:
+        return 0
+    if track_title == target_title:
+        return 6
+    if track_title.startswith(target_title) or target_title.startswith(track_title):
+        return 5
+    if target_title in track_title:
+        return 4
+    target_tokens = [token for token in target_title.split() if token]
+    if target_tokens and all(token in track_title for token in target_tokens):
+        return 3
+    overlap = sum(1 for token in target_tokens if token in track_title)
+    return 2 if overlap >= max(1, len(target_tokens) - 1) else 0
+
+
 def _resolve_song_titles_to_tracks(
     titles: List[str],
     req: Any,
@@ -433,6 +649,7 @@ def _resolve_song_titles_to_tracks(
 ) -> List[Dict[str, Any]]:
     artist_hints = _artist_hint_tokens(getattr(req, "message", ""))
     artist_hint_text = " ".join(artist_hints[:2]).strip()
+    strict_event_match = _looks_like_event_question(getattr(req, "message", ""))
     resolved: List[Dict[str, Any]] = []
     seen_ids = set()
     for title in titles[: max(1, min(limit, 16))]:
@@ -455,7 +672,15 @@ def _resolve_song_titles_to_tracks(
                 track_id = track.get("id")
                 if not track_id or track_id in seen_ids:
                     continue
+                track_artist = _trim_text(track.get("channel") or track.get("artist")).lower()
+                artist_matches = sum(1 for token in artist_hints if token in track_artist)
+                title_strength = _title_match_strength(track, title)
+                if strict_event_match and artist_hints and artist_matches == 0:
+                    continue
+                if strict_event_match and title_strength < 3:
+                    continue
                 score = _score_resolved_track(track, title, artist_hints)
+                score += title_strength * 4
                 if score > best_score:
                     best_track = track
                     best_score = score
@@ -510,19 +735,20 @@ def _extract_fact_card_song_titles(
     return titles
 
 
-def _fetch_event_page_text(url: str) -> str:
+def _fetch_event_page_text(url: str, *, force_refresh: bool = False) -> str:
     normalized = _trim_text(url)
     if not normalized:
         return ""
-    try:
-        response = requests.get(
-            normalized,
-            headers={"User-Agent": "EBB/1.0"},
-            timeout=(4, 6),
-        )
-        response.raise_for_status()
-        html = response.text
-    except Exception:
+    cached = _PAGE_TEXT_CACHE.get(normalized)
+    now = time.time()
+    if (
+        not force_refresh
+        and cached
+        and cached.get("expires_at", 0) > now
+    ):
+        return cached.get("text") or ""
+    html = _fetch_event_page_html(normalized, force_refresh=force_refresh)
+    if not html:
         return ""
 
     html = re.sub(r"(?is)<script.*?>.*?</script>", " ", html)
@@ -532,7 +758,95 @@ def _fetch_event_page_text(url: str) -> str:
     text = unescape(text)
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{2,}", "\n", text)
-    return text.strip()
+    text = text.strip()
+    _PAGE_TEXT_CACHE[normalized] = {
+        "text": text,
+        "expires_at": now + _PAGE_TEXT_CACHE_TTL_SECONDS,
+    }
+    return text
+
+
+def _extract_setlist_titles_from_setlistfm_html(html: str, *, limit: int = 16) -> List[str]:
+    if not html:
+        return []
+    titles: List[str] = []
+    seen = set()
+
+    def add_title(value: str) -> None:
+        cleaned = _trim_text(unescape(re.sub(r"(?s)<[^>]+>", " ", value)))
+        for expanded in _expand_compound_song_titles(cleaned):
+            normalized = _trim_text(expanded).lower()
+            if not normalized or normalized in seen:
+                continue
+            if not _looks_like_possible_setlist_title(expanded):
+                continue
+            seen.add(normalized)
+            titles.append(expanded)
+            if len(titles) >= max(1, min(limit, 24)):
+                return
+
+    for match in re.finditer(
+        r'<a[^>]+href="[^"]*/song/[^"]*"[^>]*>(.*?)</a>',
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    ):
+        add_title(match.group(1))
+        if len(titles) >= limit:
+            return titles[:limit]
+
+    for match in re.finditer(
+        r'<[^>]+class="[^"]*(?:songLabel|songPart|setlistSong)[^"]*"[^>]*>(.*?)</[^>]+>',
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    ):
+        add_title(match.group(1))
+        if len(titles) >= limit:
+            return titles[:limit]
+
+    return titles[:limit]
+
+
+def _extract_setlist_titles_from_page_text(text: str, *, limit: int = 16) -> List[str]:
+    lines = [_trim_text(line) for line in (text or "").splitlines()]
+    lines = [line for line in lines if line]
+    if not lines:
+        return []
+
+    titles: List[str] = []
+    seen = set()
+    start_indexes = [
+        index
+        for index, line in enumerate(lines)
+        if "setlist" in line.lower() or "songs played" in line.lower()
+    ]
+    if not start_indexes:
+        start_indexes = [0]
+
+    for start in start_indexes[:2]:
+        candidate_lines: List[str] = []
+        capturing = False
+        for line in lines[start : start + 120]:
+            lowered = line.lower()
+            if any(phrase in lowered for phrase in _SETLIST_STOP_PHRASES):
+                if candidate_lines:
+                    break
+                continue
+            if _looks_like_possible_setlist_title(line):
+                capturing = True
+                candidate_lines.append(re.sub(r"^(?:[-*â€¢]\s+|\d+[.)]\s+)", "", line).strip())
+                continue
+            if capturing and len(candidate_lines) >= 3:
+                break
+        for title in candidate_lines:
+            for expanded in _expand_compound_song_titles(title):
+                normalized = _trim_text(expanded).lower()
+                if not normalized or normalized in seen:
+                    continue
+                seen.add(normalized)
+                titles.append(expanded)
+                if len(titles) >= max(1, min(limit, 20)):
+                    return titles
+    return titles
 
 
 def _extract_song_titles_from_event_results(
@@ -540,19 +854,44 @@ def _extract_song_titles_from_event_results(
     results: List[Dict[str, Any]],
     *,
     limit: int = 16,
+    force_refresh: bool = False,
 ) -> List[str]:
     titles: List[str] = []
     seen = set()
 
     def add_titles(found: List[str]) -> None:
         for title in found:
-            normalized = _trim_text(title).lower()
-            if not normalized or normalized in seen:
-                continue
-            seen.add(normalized)
-            titles.append(title)
-            if len(titles) >= max(1, min(limit, 24)):
-                break
+            for expanded in _expand_compound_song_titles(title):
+                normalized = _trim_text(expanded).lower()
+                if not normalized or normalized in seen:
+                    continue
+                seen.add(normalized)
+                titles.append(expanded)
+                if len(titles) >= max(1, min(limit, 24)):
+                    break
+
+    prioritized = sorted(
+        results[:6],
+        key=lambda item: 0 if "setlist.fm" in _trim_text(item.get("href") or "").lower() else 1,
+    )
+
+    setlist_results = [
+        item
+        for item in prioritized
+        if "setlist.fm" in _trim_text(item.get("href") or "").lower()
+    ]
+    for item in setlist_results[:3]:
+        href = item.get("href") or ""
+        html = _fetch_event_page_html(href, force_refresh=force_refresh)
+        add_titles(_extract_setlist_titles_from_setlistfm_html(html, limit=limit))
+        if titles:
+            return titles[:limit]
+        page_text = _fetch_event_page_text(href, force_refresh=force_refresh)
+        if not page_text:
+            continue
+        add_titles(_extract_setlist_titles_from_page_text(page_text, limit=limit))
+        if titles:
+            return titles[:limit]
 
     for item in results:
         chunks = [
@@ -569,8 +908,13 @@ def _extract_song_titles_from_event_results(
             if len(titles) >= limit:
                 return titles[:limit]
 
-    for item in results[:3]:
-        page_text = _fetch_event_page_text(item.get("href") or "")
+    for item in prioritized:
+        if "setlist.fm" in _trim_text(item.get("href") or "").lower():
+            continue
+        page_text = _fetch_event_page_text(
+            item.get("href") or "",
+            force_refresh=force_refresh,
+        )
         if not page_text:
             continue
         add_titles(_extract_song_titles_from_text(page_text, limit=limit))
@@ -663,7 +1007,7 @@ def _fast_event_playlist_response(req: Any, deps: Dict[str, Any]) -> Optional[Di
     cache_key = f"{_trim_text(getattr(req, 'user_scope_id', 'guest'))}::{_trim_text(req.message).lower()}"
     cached = _FAST_EVENT_PLAYLIST_CACHE.get(cache_key)
     now = time.time()
-    if cached and cached.get("expires_at", 0) > now:
+    if not getattr(req, "force_refresh", False) and cached and cached.get("expires_at", 0) > now:
         payload = dict(cached["payload"])
         diagnostics = dict(payload.get("diagnostics") or {})
         diagnostics["cache_hit"] = True
@@ -671,8 +1015,17 @@ def _fast_event_playlist_response(req: Any, deps: Dict[str, Any]) -> Optional[Di
         return payload
 
     started_at = time.perf_counter()
-    fact_results = _search_event_performance_facts(req.message, limit=6)
-    titles = _extract_song_titles_from_event_results(req.message, fact_results, limit=16)
+    fact_results = _search_event_performance_facts(
+        req.message,
+        limit=6,
+        force_refresh=bool(getattr(req, "force_refresh", False)),
+    )
+    titles = _extract_song_titles_from_event_results(
+        req.message,
+        fact_results,
+        limit=16,
+        force_refresh=bool(getattr(req, "force_refresh", False)),
+    )
     if not titles:
         return None
 
@@ -690,12 +1043,12 @@ def _fast_event_playlist_response(req: Any, deps: Dict[str, Any]) -> Optional[Di
     payload = {
         "status": "success",
         "mode": "playlist_create",
-        "reply": "I turned that set into a playable playlist draft below.",
+        "reply": _playlist_reply_text(req, matched_count=len(track_matches)),
         "follow_up_question": None,
         "tracks": track_cards,
         "playlist_draft": {
             "name": playlist_name,
-            "summary": "A playable setlist draft built from the event you asked for.",
+            "summary": _playlist_summary_text(req),
             "tracks": track_cards,
         },
         "target_playlist": None,
@@ -774,20 +1127,19 @@ def _fast_context_playlist_response(req: Any, deps: Dict[str, Any]) -> Optional[
 
     track_cards = deps["attach_reasons"](track_matches, [])
     playlist_name = _suggest_playlist_name(req, {"mode": "playlist_create"}, {}, track_matches)
-    reply = (
-        "I turned those songs into a playable playlist draft below."
-        if not _looks_like_event_question(req.message)
-        else "I turned that set into a playable playlist draft below."
-    )
     payload = {
         "status": "success",
         "mode": "playlist_create",
-        "reply": reply,
+        "reply": _playlist_reply_text(
+            req,
+            from_context=not _looks_like_event_question(req.message),
+            matched_count=len(track_matches),
+        ),
         "follow_up_question": None,
         "tracks": track_cards,
         "playlist_draft": {
             "name": playlist_name,
-            "summary": "A playlist draft built from the songs already in our conversation.",
+            "summary": _playlist_summary_text(req, from_context=True),
             "tracks": track_cards,
         },
         "target_playlist": None,
@@ -932,6 +1284,10 @@ def _looks_like_playlist_create_request(message: str) -> bool:
             "turn these into a playlist",
             "make me a playlist",
             "create for me a playlist",
+            "need a playlist",
+            "want a playlist",
+            "playlist of",
+            "playlist for",
             "actual playlist",
             "playlist draft",
         ]
@@ -1000,6 +1356,21 @@ def _dedupe_tool_calls(tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     return deduped
 
 
+def _default_deliverable_for_mode(mode: str) -> str:
+    normalized = _trim_text(mode).lower()
+    if normalized == "music_discovery":
+        return "track_suggestions"
+    if normalized == "factual_music_qa":
+        return "factual_answer"
+    if normalized in {"playlist_create", "playlist_edit"}:
+        return "playlist_draft"
+    if normalized == "playback_action":
+        return "playback_action"
+    if normalized == "clarify":
+        return "clarify"
+    return "chat"
+
+
 def _stabilize_classification(req: Any, classification: Dict[str, Any]) -> Dict[str, Any]:
     message = _trim_text(getattr(req, "message", ""))
     normalized = message.lower()
@@ -1046,6 +1417,10 @@ def _stabilize_classification(req: Any, classification: Dict[str, Any]) -> Dict[
         stabilized["follow_up_question"] = None
 
     stabilized["mode"] = mode
+    stabilized["deliverable"] = (
+        _trim_text(stabilized.get("deliverable"))
+        or _default_deliverable_for_mode(mode)
+    )
     stabilized["tool_calls"] = _dedupe_tool_calls(
         list(stabilized.get("tool_calls") or [])
     )
@@ -1076,6 +1451,18 @@ def _classification_schema() -> Dict[str, Any]:
                     "playlist_edit",
                     "playback_action",
                     "clarify",
+                ],
+            },
+            "deliverable": {
+                "type": "string",
+                "enum": [
+                    "chat",
+                    "track_suggestions",
+                    "playlist_draft",
+                    "playlist_choice",
+                    "factual_answer",
+                    "clarify",
+                    "playback_action",
                 ],
             },
             "reply": {"type": ["string", "null"]},
@@ -1132,6 +1519,7 @@ def _classification_schema() -> Dict[str, Any]:
         },
         "required": [
             "mode",
+            "deliverable",
             "reply",
             "follow_up_question",
             "playlist_name",
@@ -1631,8 +2019,8 @@ def run_langgraph_assistant(req: Any, deps: Dict[str, Any]) -> Dict[str, Any]:
             {
                 "role": "system",
                 "content": (
-                    "You are EBB, a professional music assistant with strong conversation skills. "
-                    "First decide the mode. "
+                "You are EBB, a professional music assistant with strong conversation skills. "
+                    "First decide the mode and the deliverable. "
                     "If the user wants normal conversation or comfort, stay conversational and provide a real reply. "
                     "If the user asks factual music questions, use factual tools. "
                     "If they want discovery, playlist creation, playlist editing, or playback actions, choose tools accordingly. "
@@ -1644,7 +2032,7 @@ def run_langgraph_assistant(req: Any, deps: Dict[str, Any]) -> Dict[str, Any]:
             {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
         ]
         try:
-            classification = deps["call_structured"](
+            classification = deps.get("call_planner_structured", deps["call_structured"])(
                 messages,
                 schema=_classification_schema(),
                 temperature=0.25,
@@ -1663,6 +2051,7 @@ def run_langgraph_assistant(req: Any, deps: Dict[str, Any]) -> Dict[str, Any]:
                 fallback_mode = "music_discovery"
             classification = {
                 "mode": fallback_mode,
+                "deliverable": _default_deliverable_for_mode(fallback_mode),
                 "reply": None,
                 "follow_up_question": None,
                 "playlist_name": None,
@@ -1683,6 +2072,7 @@ def run_langgraph_assistant(req: Any, deps: Dict[str, Any]) -> Dict[str, Any]:
             "classify_intent",
             started_at,
             mode=classification.get("mode") or "conversation",
+            deliverable=classification.get("deliverable") or _default_deliverable_for_mode(classification.get("mode") or "conversation"),
             planned_tools=[
                 raw_call.get("tool")
                 for raw_call in (classification.get("tool_calls") or [])
@@ -1827,12 +2217,20 @@ def run_langgraph_assistant(req: Any, deps: Dict[str, Any]) -> Dict[str, Any]:
             if tool == "search_web_context":
                 return {
                     "tool": f"search_web_context:{query}",
-                    "results": _search_web_context(query, min(limit, 5)),
+                    "results": _search_web_context(
+                        query,
+                        min(limit, 5),
+                        force_refresh=bool(getattr(req, "force_refresh", False)),
+                    ),
                 }
             if tool == "search_event_performance_facts":
                 return {
                     "tool": f"search_event_performance_facts:{query}",
-                    "results": _search_event_performance_facts(query, min(limit, 5)),
+                    "results": _search_event_performance_facts(
+                        query,
+                        min(limit, 5),
+                        force_refresh=bool(getattr(req, "force_refresh", False)),
+                    ),
                 }
             if tool == "disambiguate_entity":
                 return {
@@ -1993,6 +2391,7 @@ def run_langgraph_assistant(req: Any, deps: Dict[str, Any]) -> Dict[str, Any]:
                 for entry in req.conversation[-10:]
             ],
             "mode": classification.get("mode"),
+            "deliverable": classification.get("deliverable"),
             "memory_hits": state.get("memory_hits", []),
             "tool_outputs": execution.get("tool_outputs", []),
             "available_tracks": execution.get("track_pool", [])[:20],
@@ -2012,6 +2411,7 @@ def run_langgraph_assistant(req: Any, deps: Dict[str, Any]) -> Dict[str, Any]:
                 "content": (
                     "You are EBB, a warm, capable music assistant. "
                     "Answer naturally and directly. "
+                    "Satisfy the requested deliverable exactly. "
                     "If the user asked a factual question, answer the question first, then optionally mention that more detail is below. "
                     "If the user wants songs, recommend only from available_track_ids and vary the number of picks naturally. "
                     "If the user wants a playlist, use the available tracks or context tracks instead of inventing unrelated songs. "
@@ -2027,7 +2427,7 @@ def run_langgraph_assistant(req: Any, deps: Dict[str, Any]) -> Dict[str, Any]:
             },
             {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
         ]
-        response_payload = deps["call_structured"](
+        response_payload = deps.get("call_response_structured", deps["call_structured"])(
             messages,
             schema=_response_schema(),
             temperature=0.45,
@@ -2044,6 +2444,15 @@ def run_langgraph_assistant(req: Any, deps: Dict[str, Any]) -> Dict[str, Any]:
         started_at = time.perf_counter()
         classification = state.get("classification") or {}
         reply = _trim_text(classification.get("reply")) or deps["fallback_chat_reply"](req)
+        requested_deliverable = (
+            _trim_text(classification.get("deliverable"))
+            or _default_deliverable_for_mode(classification.get("mode") or "conversation")
+        )
+        direct_action_type = "chat"
+        if requested_deliverable == "clarify" or classification.get("mode") == "clarify":
+            direct_action_type = "clarify"
+        elif requested_deliverable == "factual_answer":
+            direct_action_type = "factual_answer"
         final_payload = {
             "status": "success",
             "mode": classification.get("mode") or "conversation",
@@ -2056,7 +2465,7 @@ def run_langgraph_assistant(req: Any, deps: Dict[str, Any]) -> Dict[str, Any]:
             "fact_cards": [],
             "source_links": [],
             "clarification_options": [],
-            "action_type": "clarify" if classification.get("mode") == "clarify" else "chat",
+            "action_type": direct_action_type,
             "diagnostics": {},
         }
         diagnostics = _with_stage_timing(
@@ -2117,6 +2526,10 @@ def run_langgraph_assistant(req: Any, deps: Dict[str, Any]) -> Dict[str, Any]:
             response_payload.get("reasons") or [],
         )
 
+        requested_deliverable = (
+            _trim_text(classification.get("deliverable"))
+            or _default_deliverable_for_mode(classification.get("mode") or "conversation")
+        )
         action_type = (response_payload.get("action_type") or "chat").strip() or "chat"
         target_playlist_name = _trim_text(
             response_payload.get("target_playlist_name")
@@ -2150,6 +2563,23 @@ def run_langgraph_assistant(req: Any, deps: Dict[str, Any]) -> Dict[str, Any]:
                 "summary": _trim_text(response_payload.get("playlist_summary")) or "A playlist shaped from your conversation.",
                 "tracks": track_cards,
             }
+
+        if requested_deliverable == "playlist_draft" and track_cards:
+            action_type = "create_playlist"
+            playlist_draft = {
+                "name": _suggest_playlist_name(
+                    req,
+                    classification,
+                    response_payload,
+                    selected_tracks,
+                ),
+                "summary": _trim_text(response_payload.get("playlist_summary")) or "A playlist shaped from your conversation.",
+                "tracks": track_cards,
+            }
+        elif requested_deliverable == "track_suggestions" and track_cards and action_type == "chat":
+            action_type = "suggest_tracks"
+        elif requested_deliverable == "factual_answer" and action_type == "chat":
+            action_type = "factual_answer"
 
         if (
             classification.get("mode") == "playlist_create"
@@ -2210,7 +2640,15 @@ def run_langgraph_assistant(req: Any, deps: Dict[str, Any]) -> Dict[str, Any]:
 
         reply = _trim_text(response_payload.get("reply"))
         if not reply:
-            if classification.get("mode") == "factual_music_qa" and selected_fact_cards:
+            if action_type == "create_playlist" and playlist_draft:
+                reply = _playlist_reply_text(
+                    req,
+                    from_context=not _looks_like_event_question(req.message),
+                    matched_count=len(track_cards),
+                )
+            elif action_type == "suggest_tracks" and track_cards:
+                reply = "I pulled together a set of playable tracks below."
+            elif classification.get("mode") == "factual_music_qa" and selected_fact_cards:
                 reply = selected_fact_cards[0].get("value") or selected_fact_cards[0].get("title") or deps["fallback_chat_reply"](req)
             elif classification.get("reply"):
                 reply = _trim_text(classification.get("reply"))
@@ -2246,14 +2684,14 @@ def run_langgraph_assistant(req: Any, deps: Dict[str, Any]) -> Dict[str, Any]:
                             response_payload,
                             inferred_tracks,
                         ),
-                        "summary": _trim_text(response_payload.get("playlist_summary")) or "A playlist shaped from your conversation.",
+                        "summary": _trim_text(response_payload.get("playlist_summary")) or _playlist_summary_text(req, from_context=True),
                         "tracks": track_cards,
                     }
 
         if action_type == "create_playlist" and track_cards:
             selected_fact_cards = []
             if _looks_like_event_question(req.message):
-                reply = "I turned that set into a playable playlist draft below."
+                reply = _playlist_reply_text(req, matched_count=len(track_cards))
 
         final_payload = {
             "status": "success",

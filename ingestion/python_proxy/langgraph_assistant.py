@@ -578,6 +578,67 @@ def _playlist_reply_text(
     return templates[seed % len(templates)]
 
 
+def _human_join(values: List[str]) -> str:
+    cleaned = [_trim_text(value) for value in values if _trim_text(value)]
+    if not cleaned:
+        return ""
+    if len(cleaned) == 1:
+        return cleaned[0]
+    if len(cleaned) == 2:
+        return f"{cleaned[0]} and {cleaned[1]}"
+    return f"{', '.join(cleaned[:-1])}, and {cleaned[-1]}"
+
+
+def _track_grounded_reply_text(
+    req: Any,
+    tracks: List[Dict[str, Any]],
+    *,
+    action_type: str,
+    from_context: bool = False,
+) -> str:
+    if not tracks:
+        return _playlist_reply_text(req, from_context=from_context, matched_count=0)
+
+    sample_titles = [
+        _trim_text(track.get("title"))
+        for track in tracks[:3]
+        if _trim_text(track.get("title"))
+    ]
+    joined_titles = _human_join(sample_titles)
+    lowered = _trim_text(getattr(req, "message", "")).lower()
+    seed_input = f"{lowered}|{action_type}|{joined_titles}|{len(tracks)}|{from_context}"
+    seed = int(hashlib.sha1(seed_input.encode("utf-8")).hexdigest(), 16)
+
+    if action_type == "create_playlist":
+        if _looks_like_event_question(lowered):
+            templates = [
+                "I built the playlist draft around {titles}, with the rest of the matched set right below.",
+                "I turned that performance into a playable draft starting with {titles}.",
+                "I lined up the closest playable versions I found, including {titles}, in the draft below.",
+            ]
+        elif from_context:
+            templates = [
+                "I shaped those conversation picks into a playlist draft starting with {titles}.",
+                "I turned those tracks into a draft playlist built around {titles}.",
+                "I bundled the songs we were already circling into a draft, led by {titles}.",
+            ]
+        else:
+            templates = [
+                "I turned your request into a playlist draft starting with {titles}.",
+                "I pulled together a playable draft built around {titles}.",
+                "I lined up a playlist draft below, starting with {titles}.",
+            ]
+    else:
+        templates = [
+            "I'd start with {titles}, then work through the rest of the picks below.",
+            "The set below leads with {titles}.",
+            "I pulled together a playable run starting with {titles}.",
+        ]
+
+    template = templates[seed % len(templates)]
+    return template.format(titles=joined_titles or "these tracks")
+
+
 def _playlist_summary_text(req: Any, *, from_context: bool = False) -> str:
     lowered = _trim_text(getattr(req, "message", "")).lower()
     if _looks_like_event_question(lowered):
@@ -667,6 +728,8 @@ def _resolve_song_titles_to_tracks(
                 queries.append(f"{variant} song {artist_hint_text}")
         best_track = None
         best_score = -1
+        best_title_strength = 0
+        best_artist_matches = 0
         for query in queries:
             for track in deps["tool_search_tracks"](query, 5):
                 track_id = track.get("id")
@@ -682,12 +745,300 @@ def _resolve_song_titles_to_tracks(
                 score = _score_resolved_track(track, title, artist_hints)
                 score += title_strength * 4
                 if score > best_score:
-                    best_track = track
+                    best_track = dict(track)
                     best_score = score
+                    best_title_strength = title_strength
+                    best_artist_matches = artist_matches
         if best_track is not None and best_track.get("id") not in seen_ids:
-            seen_ids.add(best_track["id"])
-            resolved.append(best_track)
+            enriched_track = dict(best_track)
+            sources = list(enriched_track.get("_assistant_sources") or [])
+            if "resolved_song_titles_to_tracks" not in sources:
+                sources.append("resolved_song_titles_to_tracks")
+            enriched_track["_assistant_sources"] = sources
+            enriched_track["_assistant_requested_title"] = title
+            enriched_track["_assistant_resolve_score"] = best_score
+            enriched_track["_assistant_title_strength"] = best_title_strength
+            enriched_track["_assistant_artist_matches"] = best_artist_matches
+            seen_ids.add(enriched_track["id"])
+            resolved.append(enriched_track)
     return resolved[: max(1, min(limit, 12))]
+
+
+def _validation_reference_titles(
+    req: Any,
+    classification: Dict[str, Any],
+    fact_cards: List[Dict[str, Any]],
+    *,
+    limit: int = 16,
+) -> List[str]:
+    titles: List[str] = []
+    seen = set()
+
+    def add(values: List[str]) -> None:
+        for value in values:
+            cleaned = _trim_text(value)
+            normalized = cleaned.lower()
+            if not cleaned or normalized in seen:
+                continue
+            seen.add(normalized)
+            titles.append(cleaned)
+            if len(titles) >= max(1, min(limit, 24)):
+                return
+
+    mode = _trim_text(classification.get("mode")).lower()
+    if _looks_like_event_question(getattr(req, "message", "")):
+        add(_extract_fact_card_song_titles(fact_cards, limit=limit))
+        if not titles:
+            add(_extract_song_titles_from_text(getattr(req, "message", ""), limit=limit))
+    elif mode in {"playlist_create", "playlist_edit"}:
+        add(_extract_context_song_titles(req, limit=limit))
+        add(_extract_song_titles_from_text(getattr(req, "message", ""), limit=limit))
+        add(_extract_fact_card_song_titles(fact_cards, limit=limit))
+    elif mode == "music_discovery":
+        add(_extract_song_titles_from_text(getattr(req, "message", ""), limit=min(limit, 8)))
+    return titles[: max(1, min(limit, 24))]
+
+
+def _track_has_live_markers(track: Dict[str, Any]) -> bool:
+    haystack = " ".join(
+        [
+            _trim_text(track.get("title")),
+            _trim_text(track.get("album")),
+            _trim_text(track.get("artist")),
+            _trim_text(track.get("channel")),
+        ]
+    ).lower()
+    return any(
+        marker in haystack
+        for marker in [
+            " live ",
+            "(live",
+            "[live",
+            "live at",
+            "live from",
+            "wembley",
+            "live aid",
+            "session",
+            "unplugged",
+            "in concert",
+        ]
+    )
+
+
+def _track_validation_threshold(
+    req: Any,
+    classification: Dict[str, Any],
+    *,
+    has_reference_titles: bool,
+) -> int:
+    mode = _trim_text(classification.get("mode")).lower()
+    deliverable = _trim_text(classification.get("deliverable")).lower()
+    strict_event_match = _looks_like_event_question(getattr(req, "message", ""))
+    if strict_event_match and has_reference_titles:
+        return 18
+    if deliverable == "playlist_draft" or mode in {"playlist_create", "playlist_edit"}:
+        return 12 if has_reference_titles else 8
+    if deliverable == "track_suggestions" or mode == "music_discovery":
+        return 7 if has_reference_titles else 5
+    return 5
+
+
+def _validate_track_candidate(
+    track: Dict[str, Any],
+    req: Any,
+    classification: Dict[str, Any],
+    reference_titles: List[str],
+) -> Dict[str, Any]:
+    artist_hints = _artist_hint_tokens(getattr(req, "message", ""))
+    track_artist = _trim_text(track.get("channel") or track.get("artist")).lower()
+    strict_event_match = _looks_like_event_question(getattr(req, "message", ""))
+    wants_live = "live" in _trim_text(getattr(req, "message", "")).lower()
+    best_title = ""
+    best_title_strength = 0
+    for title in reference_titles:
+        title_strength = _title_match_strength(track, title)
+        if title_strength > best_title_strength:
+            best_title_strength = title_strength
+            best_title = title
+
+    artist_matches = sum(1 for token in artist_hints if token in track_artist)
+    score = 0
+    if reference_titles:
+        score += best_title_strength * 6
+        if best_title_strength == 0:
+            score -= 14
+        elif best_title_strength < 3:
+            score -= 6
+    score += artist_matches * 6
+    if artist_hints and artist_matches == 0:
+        score -= 10
+    if _track_has_live_markers(track):
+        score += 3 if wants_live else 1
+    elif strict_event_match and wants_live:
+        score -= 2
+
+    sources = list(track.get("_assistant_sources") or [])
+    if any("resolved_fact_card_song_titles" in source for source in sources):
+        score += 3
+    if any("resolved_song_titles_to_tracks" in source for source in sources):
+        score += 2
+    if any("fallback_event_track_search" in source for source in sources):
+        score -= 2
+
+    threshold = _track_validation_threshold(
+        req,
+        classification,
+        has_reference_titles=bool(reference_titles),
+    )
+    valid = score >= threshold
+    if strict_event_match and reference_titles and best_title_strength < 3:
+        valid = False
+    if strict_event_match and artist_hints and artist_matches == 0:
+        valid = False
+
+    return {
+        "track_id": _trim_text(track.get("id")),
+        "score": score,
+        "threshold": threshold,
+        "valid": valid,
+        "artist_matches": artist_matches,
+        "best_title_strength": best_title_strength,
+        "matched_title": best_title if best_title_strength > 0 else "",
+        "sources": sources,
+    }
+
+
+def _validate_track_selection(
+    tracks: List[Dict[str, Any]],
+    req: Any,
+    classification: Dict[str, Any],
+    reference_titles: List[str],
+    *,
+    limit: int = 12,
+) -> Dict[str, Any]:
+    validated_tracks: List[Dict[str, Any]] = []
+    rejected_tracks: List[Dict[str, Any]] = []
+    seen_ids = set()
+    by_title: Dict[str, Dict[str, Any]] = {}
+    unmatched_valid: List[Dict[str, Any]] = []
+
+    for track in tracks or []:
+        track_id = _trim_text(track.get("id"))
+        if not track_id or track_id in seen_ids:
+            continue
+        validation = _validate_track_candidate(track, req, classification, reference_titles)
+        enriched_track = dict(track)
+        enriched_track["_assistant_validation"] = validation
+        if not validation.get("valid"):
+            rejected_tracks.append({"id": track_id, **validation})
+            continue
+        seen_ids.add(track_id)
+        matched_title = _trim_text(validation.get("matched_title"))
+        if reference_titles and matched_title:
+            key = _canonical_song_title(matched_title)
+            current = by_title.get(key)
+            if current is None or validation.get("score", 0) > (current.get("_assistant_validation", {}) or {}).get("score", 0):
+                by_title[key] = enriched_track
+        else:
+            unmatched_valid.append(enriched_track)
+
+    if reference_titles:
+        appended_ids = set()
+        for title in reference_titles:
+            key = _canonical_song_title(title)
+            track = by_title.get(key)
+            if track is None:
+                continue
+            track_id = _trim_text(track.get("id"))
+            if not track_id or track_id in appended_ids:
+                continue
+            appended_ids.add(track_id)
+            validated_tracks.append(track)
+            if len(validated_tracks) >= max(1, min(limit, 20)):
+                break
+        if not _looks_like_event_question(getattr(req, "message", "")):
+            for track in sorted(
+                unmatched_valid,
+                key=lambda item: (item.get("_assistant_validation", {}) or {}).get("score", 0),
+                reverse=True,
+            ):
+                track_id = _trim_text(track.get("id"))
+                if not track_id or track_id in appended_ids:
+                    continue
+                appended_ids.add(track_id)
+                validated_tracks.append(track)
+                if len(validated_tracks) >= max(1, min(limit, 20)):
+                    break
+    else:
+        validated_tracks = sorted(
+            unmatched_valid,
+            key=lambda item: (item.get("_assistant_validation", {}) or {}).get("score", 0),
+            reverse=True,
+        )[: max(1, min(limit, 20))]
+
+    scores = [
+        int((track.get("_assistant_validation", {}) or {}).get("score", 0))
+        for track in validated_tracks
+    ]
+    average_score = (sum(scores) / len(scores)) if scores else 0.0
+    return {
+        "tracks": validated_tracks,
+        "reference_titles": reference_titles,
+        "validated_track_count": len(validated_tracks),
+        "rejected_track_count": len(rejected_tracks),
+        "average_score": average_score,
+        "rejected_tracks": rejected_tracks[:12],
+    }
+
+
+def _confidence_gate_for_deliverable(
+    req: Any,
+    classification: Dict[str, Any],
+    validated_tracks: List[Dict[str, Any]],
+    reference_titles: List[str],
+) -> Dict[str, Any]:
+    mode = _trim_text(classification.get("mode")).lower()
+    deliverable = (
+        _trim_text(classification.get("deliverable"))
+        or _default_deliverable_for_mode(mode)
+    ).lower()
+    desired_count = _clamp_count(classification.get("desired_track_count"), low=3, high=12, default=6)
+    track_count = len(validated_tracks)
+    reference_count = len(reference_titles)
+    coverage_target = 0.0
+    minimum_tracks = 0
+
+    if deliverable == "playlist_draft" or mode in {"playlist_create", "playlist_edit"}:
+        minimum_tracks = 3 if desired_count >= 4 else 2
+        if _looks_like_event_question(getattr(req, "message", "")) and reference_count:
+            coverage_target = 0.5
+    elif deliverable == "track_suggestions" or mode == "music_discovery":
+        minimum_tracks = 3 if desired_count >= 4 else 2
+
+    denominator = max(1, min(reference_count or desired_count, desired_count))
+    coverage = track_count / denominator if denominator else 0.0
+    passed = track_count >= minimum_tracks and coverage >= coverage_target
+    return {
+        "passed": passed,
+        "track_count": track_count,
+        "minimum_tracks": minimum_tracks,
+        "coverage": coverage,
+        "coverage_target": coverage_target,
+        "reference_count": reference_count,
+    }
+
+
+def _confidence_gate_follow_up(
+    req: Any,
+    classification: Dict[str, Any],
+    gate: Dict[str, Any],
+) -> str:
+    if _looks_like_event_question(getattr(req, "message", "")):
+        return "I only found a few reliable playable matches for that set. Do you want me to fill the missing songs with the closest studio versions too?"
+    mode = _trim_text(classification.get("mode")).lower()
+    if mode in {"playlist_create", "playlist_edit"}:
+        return "I found a few close matches, but not enough reliable ones for a solid playlist yet. Do you want me to narrow it to one artist, era, or album first?"
+    return "I found a few close matches, but not enough reliable ones to recommend confidently yet. Want to narrow it to one artist, era, or mood?"
 
 
 def _extract_context_song_titles(req: Any, limit: int = 16) -> List[str]:
@@ -1037,13 +1388,33 @@ def _fast_event_playlist_response(req: Any, deps: Dict[str, Any]) -> Optional[Di
     )
     if not track_matches:
         return None
+    validation = _validate_track_selection(
+        track_matches,
+        req,
+        {"mode": "playlist_create", "deliverable": "playlist_draft", "desired_track_count": min(max(len(titles), 6), 12)},
+        titles,
+        limit=min(max(len(titles), 6), 12),
+    )
+    track_matches = list(validation.get("tracks") or [])
+    gate = _confidence_gate_for_deliverable(
+        req,
+        {"mode": "playlist_create", "deliverable": "playlist_draft", "desired_track_count": min(max(len(titles), 6), 12)},
+        track_matches,
+        titles,
+    )
+    if not gate.get("passed") or not track_matches:
+        return None
 
     track_cards = deps["attach_reasons"](track_matches, [])
     playlist_name = _suggest_playlist_name(req, {"mode": "playlist_create"}, {}, track_matches)
     payload = {
         "status": "success",
         "mode": "playlist_create",
-        "reply": _playlist_reply_text(req, matched_count=len(track_matches)),
+        "reply": _track_grounded_reply_text(
+            req,
+            track_matches,
+            action_type="create_playlist",
+        ),
         "follow_up_question": None,
         "tracks": track_cards,
         "playlist_draft": {
@@ -1067,6 +1438,9 @@ def _fast_event_playlist_response(req: Any, deps: Dict[str, Any]) -> Optional[Di
             "total_ms": int((time.perf_counter() - started_at) * 1000),
             "resolved_title_count": len(titles),
             "resolved_track_count": len(track_matches),
+            "validated_track_count": validation.get("validated_track_count"),
+            "rejected_track_count": validation.get("rejected_track_count"),
+            "evidence_average_score": validation.get("average_score"),
             "cache_hit": False,
         },
     }
@@ -1124,16 +1498,34 @@ def _fast_context_playlist_response(req: Any, deps: Dict[str, Any]) -> Optional[
     )
     if not track_matches:
         return None
+    reference_titles = _extract_context_song_titles(req, limit=16)
+    validation = _validate_track_selection(
+        track_matches,
+        req,
+        {"mode": "playlist_create", "deliverable": "playlist_draft", "desired_track_count": desired_count},
+        reference_titles,
+        limit=max(desired_count, 12),
+    )
+    track_matches = list(validation.get("tracks") or [])
+    gate = _confidence_gate_for_deliverable(
+        req,
+        {"mode": "playlist_create", "deliverable": "playlist_draft", "desired_track_count": desired_count},
+        track_matches,
+        reference_titles,
+    )
+    if not gate.get("passed") or not track_matches:
+        return None
 
     track_cards = deps["attach_reasons"](track_matches, [])
     playlist_name = _suggest_playlist_name(req, {"mode": "playlist_create"}, {}, track_matches)
     payload = {
         "status": "success",
         "mode": "playlist_create",
-        "reply": _playlist_reply_text(
+        "reply": _track_grounded_reply_text(
             req,
+            track_matches,
+            action_type="create_playlist",
             from_context=not _looks_like_event_question(req.message),
-            matched_count=len(track_matches),
         ),
         "follow_up_question": None,
         "tracks": track_cards,
@@ -1165,6 +1557,9 @@ def _fast_context_playlist_response(req: Any, deps: Dict[str, Any]) -> Optional[
             },
             "total_ms": int((time.perf_counter() - started_at) * 1000),
             "resolved_track_count": len(track_matches),
+            "validated_track_count": validation.get("validated_track_count"),
+            "rejected_track_count": validation.get("rejected_track_count"),
+            "evidence_average_score": validation.get("average_score"),
         },
     }
     deps["store_turn_memory"](
@@ -2136,10 +2531,22 @@ def run_langgraph_assistant(req: Any, deps: Dict[str, Any]) -> Dict[str, Any]:
                 track_id = item.get("id")
                 if not track_id:
                     continue
-                normalized_items.append(item)
-                if track_id not in track_map:
-                    track_map[track_id] = item
-                    track_pool.append(item)
+                normalized_item = dict(item)
+                sources = list(normalized_item.get("_assistant_sources") or [])
+                if source not in sources:
+                    sources.append(source)
+                normalized_item["_assistant_sources"] = sources
+                normalized_items.append(normalized_item)
+                if track_id in track_map:
+                    existing = track_map[track_id]
+                    existing_sources = list(existing.get("_assistant_sources") or [])
+                    for entry in sources:
+                        if entry not in existing_sources:
+                            existing_sources.append(entry)
+                    existing["_assistant_sources"] = existing_sources
+                else:
+                    track_map[track_id] = normalized_item
+                    track_pool.append(normalized_item)
             tool_outputs.append({"tool": source, "tracks": normalized_items})
 
         def run_single_tool(raw_call: Dict[str, Any]) -> Dict[str, Any]:
@@ -2352,6 +2759,26 @@ def run_langgraph_assistant(req: Any, deps: Dict[str, Any]) -> Dict[str, Any]:
                 if inferred_tracks:
                     add_tracks("resolved_context_song_titles", inferred_tracks)
 
+        reference_titles = _validation_reference_titles(
+            req,
+            classification,
+            fact_cards,
+            limit=max(8, desired_track_count * 2),
+        )
+        validation = _validate_track_selection(
+            track_pool,
+            req,
+            classification,
+            reference_titles,
+            limit=max(12, desired_track_count),
+        )
+        validated_track_pool = list(validation.get("tracks") or [])
+        validated_track_map = {
+            _trim_text(track.get("id")): track
+            for track in validated_track_pool
+            if _trim_text(track.get("id"))
+        }
+
         diagnostics = _with_stage_timing(
             state,
             "execute_tools",
@@ -2361,15 +2788,19 @@ def run_langgraph_assistant(req: Any, deps: Dict[str, Any]) -> Dict[str, Any]:
                 1 for output in tool_outputs if output.get("tool") == "error"
             ),
             fact_card_count=len(fact_cards[:10]),
-            track_pool_count=len(track_pool),
+            track_pool_count=len(validated_track_pool),
+            rejected_track_count=validation.get("rejected_track_count"),
+            evidence_average_score=validation.get("average_score"),
         )
         return {
             "execution": {
                 "tool_outputs": tool_outputs,
-                "track_pool": track_pool,
-                "track_map": track_map,
+                "track_pool": validated_track_pool,
+                "track_map": validated_track_map,
                 "fact_cards": fact_cards[:10],
                 "clarification_options": clarification_options[:8],
+                "reference_titles": reference_titles,
+                "validation": validation,
             },
             "diagnostics": diagnostics,
         }
@@ -2383,6 +2814,7 @@ def run_langgraph_assistant(req: Any, deps: Dict[str, Any]) -> Dict[str, Any]:
             "track_map": {},
             "fact_cards": [],
             "clarification_options": [],
+            "reference_titles": [],
         }
         prompt = {
             "user_message": req.message,
@@ -2402,6 +2834,7 @@ def run_langgraph_assistant(req: Any, deps: Dict[str, Any]) -> Dict[str, Any]:
             ],
             "fact_cards": execution.get("fact_cards", [])[:8],
             "clarification_options": execution.get("clarification_options", [])[:6],
+            "reference_titles": execution.get("reference_titles", [])[:12],
             "available_playlists": deps["tool_list_playlists"](req),
             "classification_reply": classification.get("reply"),
         }
@@ -2505,7 +2938,11 @@ def run_langgraph_assistant(req: Any, deps: Dict[str, Any]) -> Dict[str, Any]:
             "track_map": {},
             "fact_cards": [],
             "clarification_options": [],
+            "reference_titles": [],
+            "validation": {},
         }
+        reference_titles = list(execution.get("reference_titles") or [])
+        validation_summary = dict(execution.get("validation") or {})
 
         selected_tracks: List[Dict[str, Any]] = []
         seen_track_ids = set()
@@ -2520,6 +2957,18 @@ def run_langgraph_assistant(req: Any, deps: Dict[str, Any]) -> Dict[str, Any]:
         if not selected_tracks and classification.get("mode") in {"music_discovery", "playlist_create", "playlist_edit", "playback_action"}:
             desired = _clamp_count(classification.get("desired_track_count"), low=3, high=12, default=6)
             selected_tracks = list(execution.get("track_pool", [])[:desired])
+
+        selected_validation = _validate_track_selection(
+            selected_tracks,
+            req,
+            classification,
+            reference_titles,
+            limit=_clamp_count(classification.get("desired_track_count"), low=3, high=12, default=6),
+        )
+        selected_tracks = list(selected_validation.get("tracks") or [])
+        if not selected_tracks and classification.get("mode") in {"music_discovery", "playlist_create", "playlist_edit", "playback_action"}:
+            desired = _clamp_count(classification.get("desired_track_count"), low=3, high=12, default=6)
+            selected_tracks = list((execution.get("track_pool") or [])[:desired])
 
         track_cards = deps["attach_reasons"](
             selected_tracks,
@@ -2624,6 +3073,24 @@ def run_langgraph_assistant(req: Any, deps: Dict[str, Any]) -> Dict[str, Any]:
         if action_type in {"suggest_tracks", "create_playlist", "add_to_playlist", "playback_action"} and not track_cards:
             action_type = "clarify"
 
+        confidence_gate = _confidence_gate_for_deliverable(
+            req,
+            classification,
+            selected_tracks,
+            reference_titles,
+        )
+        if action_type in {"suggest_tracks", "create_playlist", "add_to_playlist", "playback_action"} and not confidence_gate.get("passed"):
+            action_type = "clarify"
+            track_cards = []
+            playlist_draft = None
+            response_payload["reply"] = None
+            if not response_payload.get("follow_up_question"):
+                response_payload["follow_up_question"] = _confidence_gate_follow_up(
+                    req,
+                    classification,
+                    confidence_gate,
+                )
+
         if action_type == "clarify" and not selected_clarifications:
             selected_clarifications = list(execution.get("clarification_options", [])[:6])
 
@@ -2639,17 +3106,24 @@ def run_langgraph_assistant(req: Any, deps: Dict[str, Any]) -> Dict[str, Any]:
             }
 
         reply = _trim_text(response_payload.get("reply"))
-        if not reply:
-            if action_type == "create_playlist" and playlist_draft:
-                reply = _playlist_reply_text(
-                    req,
-                    from_context=not _looks_like_event_question(req.message),
-                    matched_count=len(track_cards),
-                )
-            elif action_type == "suggest_tracks" and track_cards:
-                reply = "I pulled together a set of playable tracks below."
-            elif classification.get("mode") == "factual_music_qa" and selected_fact_cards:
+        if action_type == "create_playlist" and track_cards:
+            reply = _track_grounded_reply_text(
+                req,
+                selected_tracks,
+                action_type="create_playlist",
+                from_context=not _looks_like_event_question(req.message),
+            )
+        elif action_type == "suggest_tracks" and track_cards:
+            reply = _track_grounded_reply_text(
+                req,
+                selected_tracks,
+                action_type="suggest_tracks",
+            )
+        elif not reply:
+            if classification.get("mode") == "factual_music_qa" and selected_fact_cards:
                 reply = selected_fact_cards[0].get("value") or selected_fact_cards[0].get("title") or deps["fallback_chat_reply"](req)
+            elif action_type == "clarify" and response_payload.get("follow_up_question"):
+                reply = _trim_text(response_payload.get("follow_up_question"))
             elif classification.get("reply"):
                 reply = _trim_text(classification.get("reply"))
             else:
@@ -2672,10 +3146,20 @@ def run_langgraph_assistant(req: Any, deps: Dict[str, Any]) -> Dict[str, Any]:
                     limit=_clamp_count(classification.get("desired_track_count"), low=3, high=12, default=6),
                 )
                 if inferred_tracks:
+                    inferred_validation = _validate_track_selection(
+                        inferred_tracks,
+                        req,
+                        classification,
+                        inferred_titles,
+                        limit=_clamp_count(classification.get("desired_track_count"), low=3, high=12, default=6),
+                    )
+                    inferred_tracks = list(inferred_validation.get("tracks") or [])
+                if inferred_tracks:
                     track_cards = deps["attach_reasons"](
                         inferred_tracks,
                         response_payload.get("reasons") or [],
                     )
+                    selected_tracks = inferred_tracks
                     action_type = "create_playlist"
                     playlist_draft = {
                         "name": _suggest_playlist_name(
@@ -2690,8 +3174,12 @@ def run_langgraph_assistant(req: Any, deps: Dict[str, Any]) -> Dict[str, Any]:
 
         if action_type == "create_playlist" and track_cards:
             selected_fact_cards = []
-            if _looks_like_event_question(req.message):
-                reply = _playlist_reply_text(req, matched_count=len(track_cards))
+            reply = _track_grounded_reply_text(
+                req,
+                selected_tracks or [],
+                action_type="create_playlist",
+                from_context=not _looks_like_event_question(req.message),
+            )
 
         final_payload = {
             "status": "success",
@@ -2713,6 +3201,12 @@ def run_langgraph_assistant(req: Any, deps: Dict[str, Any]) -> Dict[str, Any]:
             "finalize_payload",
             started_at,
             total_ms=int((time.perf_counter() - total_started_at) * 1000),
+            evidence_reference_titles=reference_titles[:10],
+            validated_track_count=selected_validation.get("validated_track_count"),
+            rejected_selected_track_count=selected_validation.get("rejected_track_count"),
+            evidence_average_score=selected_validation.get("average_score"),
+            confidence_gate=confidence_gate,
+            execution_validation=validation_summary,
         )
         final_payload["diagnostics"] = diagnostics
         return {"final_payload": final_payload, "diagnostics": diagnostics}

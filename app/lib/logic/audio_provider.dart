@@ -1,6 +1,5 @@
 // ignore_for_file: experimental_member_use
 
-import 'dart:ui' as ui;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'dart:io';
 import 'dart:convert';
@@ -74,7 +73,10 @@ Future<void> initAudioService() async {
     config: const AudioServiceConfig(
       androidNotificationChannelId: 'com.danbeverley.ebb.channel.audio',
       androidNotificationChannelName: 'EBB Audio Playback',
-      androidStopForegroundOnPause: false,
+      androidNotificationOngoing: true,
+      androidStopForegroundOnPause: true,
+      fastForwardInterval: Duration(seconds: 10),
+      rewindInterval: Duration(seconds: 10),
     ),
   );
 }
@@ -84,6 +86,8 @@ class AuralisAudioHandler extends BaseAudioHandler
   Function()? onPlay;
   Function()? onPause;
   Function(Duration)? onSeek;
+  Function()? onFastForward;
+  Function()? onRewind;
   Future<void> Function()? onStop;
   Future<void> Function()? onSkipToNext;
   Future<void> Function()? onSkipToPrevious;
@@ -94,6 +98,10 @@ class AuralisAudioHandler extends BaseAudioHandler
   Future<void> pause() async => onPause?.call();
   @override
   Future<void> seek(Duration position) async => onSeek?.call(position);
+  @override
+  Future<void> fastForward() async => onFastForward?.call();
+  @override
+  Future<void> rewind() async => onRewind?.call();
   @override
   Future<void> stop() async => await onStop?.call();
   @override
@@ -122,6 +130,11 @@ int _parseInt(dynamic value) {
   return 0;
 }
 
+String _cleanString(dynamic value) {
+  final text = value?.toString().trim() ?? '';
+  return text;
+}
+
 Map<String, String> _parseHeaders(dynamic value) {
   if (value is! Map) return const {};
   final headers = <String, String>{};
@@ -140,23 +153,110 @@ String? extractTrackId(dynamic track) {
   return id;
 }
 
+String _extractPrimaryArtist(dynamic rawTrack) {
+  if (rawTrack is! Map) return '';
+  final artists = rawTrack['artists'];
+  if (artists is! List) return '';
+  for (final entry in artists) {
+    if (entry is Map) {
+      final name =
+          _cleanString(entry['name'] ?? entry['artist'] ?? entry['title']);
+      if (name.isNotEmpty) return name;
+    } else {
+      final name = _cleanString(entry);
+      if (name.isNotEmpty) return name;
+    }
+  }
+  return '';
+}
+
+List<String> extractTrackArtists(dynamic rawTrack) {
+  if (rawTrack is! Map) return const <String>[];
+  final results = <String>[];
+  final seen = <String>{};
+
+  void addArtist(String? rawValue) {
+    final value = _cleanString(rawValue);
+    final normalized = value.toLowerCase();
+    if (value.isEmpty ||
+        normalized == 'unknown artist' ||
+        !seen.add(normalized)) {
+      return;
+    }
+    results.add(value);
+  }
+
+  final artists = rawTrack['artists'];
+  if (artists is List) {
+    for (final entry in artists) {
+      if (entry is Map) {
+        addArtist(
+          entry['name']?.toString() ??
+              entry['artist']?.toString() ??
+              entry['title']?.toString(),
+        );
+      } else {
+        addArtist(entry?.toString());
+      }
+    }
+  }
+
+  addArtist(
+    rawTrack['channel']?.toString() ??
+        rawTrack['author']?.toString() ??
+        rawTrack['artist']?.toString(),
+  );
+
+  return results;
+}
+
 Map<String, dynamic> normalizeTrack(dynamic rawTrack) {
   final track = Map<String, dynamic>.from(rawTrack as Map);
   final id = extractTrackId(track);
+  final title = _cleanString(
+    track['title'] ??
+        track['name'] ??
+        track['track'] ??
+        track['song'] ??
+        track['video_title'],
+  );
+  final primaryArtist = _extractPrimaryArtist(track);
+  final channel = _cleanString(
+    track['channel'] ??
+        track['author'] ??
+        track['artist'] ??
+        primaryArtist ??
+        track['uploader'],
+  );
+  final album = _cleanString(track['album'] ?? track['album_title']);
   return {
     ...track,
     if (id != null) 'id': id,
     if (id != null && track['videoId'] == null) 'videoId': id,
-    if (track['channel'] == null && track['author'] != null)
-      'channel': track['author'],
-    if (track['author'] == null && track['channel'] != null)
-      'author': track['channel'],
-    if (track['channel'] == null && track['artist'] != null)
-      'channel': track['artist'],
-    if (track['author'] == null && track['artist'] != null)
-      'author': track['artist'],
+    'title': title.isNotEmpty ? title : 'Unknown Track',
+    'channel': channel,
+    'author': channel,
+    'artist': _cleanString(track['artist']).isNotEmpty
+        ? _cleanString(track['artist'])
+        : channel,
+    if (album.isNotEmpty) 'album': album,
+    if (album.isNotEmpty) 'album_title': album,
     'duration': _parseInt(track['duration']),
   };
+}
+
+bool _isTrackMetadataIncomplete(dynamic rawTrack) {
+  if (rawTrack is! Map) return true;
+  final title = _cleanString(
+    rawTrack['title'] ?? rawTrack['name'] ?? rawTrack['track'] ?? rawTrack['song'],
+  ).toLowerCase();
+  final artist = _cleanString(
+    rawTrack['channel'] ?? rawTrack['author'] ?? rawTrack['artist'],
+  ).toLowerCase();
+  return title.isEmpty ||
+      title == 'unknown track' ||
+      artist.isEmpty ||
+      artist == 'unknown artist';
 }
 
 bool isTrackHidden(dynamic track) {
@@ -191,12 +291,65 @@ Map<String, dynamic> _cloudTrackPayload(dynamic rawTrack) {
   };
 }
 
+Map<String, dynamic>? _trackFromDetailsPayload(dynamic rawPayload) {
+  if (rawPayload is! Map) return null;
+  final payload = Map<String, dynamic>.from(rawPayload);
+  final videoId =
+      payload['video_id']?.toString() ?? payload['id']?.toString() ?? '';
+  if (videoId.trim().isEmpty) return null;
+  return normalizeTrack({
+    'id': videoId,
+    'videoId': videoId,
+    'title': payload['title'],
+    'thumbnail': payload['thumbnail'],
+    'channel': payload['author'] ?? payload['artist'],
+    'author': payload['author'] ?? payload['artist'],
+    'artist': payload['author'] ?? payload['artist'],
+    'duration': payload['duration'],
+    'album': payload['album'] ?? payload['album_title'],
+    'album_title': payload['album_title'] ?? payload['album'],
+    'album_id': payload['album_id'],
+  });
+}
+
+Map<String, dynamic>? _lastTrackSnapshotFromRawTrack(
+  dynamic rawTrack, {
+  String? localPath,
+}) {
+  final normalized = normalizeTrack(rawTrack);
+  final trackId = extractTrackId(normalized);
+  if (trackId == null || trackId.isEmpty) return null;
+  return {
+    'id': trackId,
+    'videoId': trackId,
+    'title': normalized['title'],
+    'thumbnail': normalized['thumbnail'],
+    'channel': normalized['channel'],
+    'author': normalized['author'],
+    'artist': normalized['artist'],
+    'duration': _parseInt(normalized['duration']),
+    'album': normalized['album'] ?? normalized['album_title'],
+    'album_title': normalized['album_title'] ?? normalized['album'],
+    'album_id': normalized['album_id'],
+    if (localPath != null && localPath.trim().isNotEmpty) 'local_path': localPath,
+  };
+}
+
 Future<void> upsertCloudLibraryTrack(dynamic rawTrack) async {
+  final payload = _cloudTrackPayload(rawTrack);
+  final trackId = extractTrackId(payload);
+  if (trackId != null && trackId.isNotEmpty) {
+    unawaited(
+      recordProxyInteractionEvent(
+        'library',
+        trackId: trackId,
+        rawTrack: payload,
+      ),
+    );
+  }
   final client = supabaseClientOrNull;
   final userId = currentAuthenticatedUserId;
   if (client == null || userId == null || userId.isEmpty) return;
-  final payload = _cloudTrackPayload(rawTrack);
-  final trackId = extractTrackId(payload);
   if (trackId == null || trackId.isEmpty) return;
   try {
     await client.from('library_tracks').upsert(
@@ -255,6 +408,94 @@ Future<void> recordCloudSearchEvent(
     });
   } catch (error) {
     debugPrint('Cloud search event write failed: $error');
+  }
+}
+
+Map<String, dynamic>? _interactionEventTrackPayload(dynamic rawTrack) {
+  if (rawTrack == null) return null;
+  if (rawTrack is Map<String, dynamic>) {
+    return normalizeTrack(Map<String, dynamic>.from(rawTrack));
+  }
+  if (rawTrack is Map) {
+    return normalizeTrack(Map<String, dynamic>.from(rawTrack));
+  }
+  return null;
+}
+
+Future<void> recordProxyInteractionEvent(
+  String eventType, {
+  String? trackId,
+  dynamic rawTrack,
+  Map<String, dynamic>? metadata,
+  DateTime? occurredAt,
+}) async {
+  final normalizedTrack = _interactionEventTrackPayload(rawTrack);
+  final resolvedTrackId =
+      (trackId ?? extractTrackId(normalizedTrack))?.trim() ?? '';
+  if (resolvedTrackId.isEmpty) return;
+
+  final payload = <String, dynamic>{
+    if (normalizedTrack != null) ...normalizedTrack,
+    if (metadata != null) ...metadata,
+  };
+
+  try {
+    await appHttpClient
+        .post(
+          buildProxyUri('/interaction_event'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({
+            'user_scope_id': currentAuthenticatedUserId ?? 'guest',
+            'track_id': resolvedTrackId,
+            'event_type': eventType.trim().toLowerCase(),
+            'artist_name': payload['channel'] ?? payload['artist'],
+            'source': 'app',
+            'occurred_at':
+                (occurredAt ?? DateTime.now().toUtc()).millisecondsSinceEpoch /
+                    1000.0,
+            'metadata': payload,
+          }),
+        )
+        .timeout(const Duration(seconds: 3));
+  } catch (_) {
+    // Keep playback/search interactions non-blocking if the proxy is unavailable.
+  }
+}
+
+Future<void> recordProxySearchEvent(
+  String query, {
+  required int resultCount,
+  String searchScope = 'track',
+  Map<String, dynamic>? metadata,
+  DateTime? occurredAt,
+}) async {
+  final trimmedQuery = query.trim();
+  if (trimmedQuery.isEmpty) return;
+
+  final payload = <String, dynamic>{
+    'search_scope': searchScope.trim().isEmpty ? 'track' : searchScope.trim(),
+    if (metadata != null) ...metadata,
+  };
+
+  try {
+    await appHttpClient
+        .post(
+          buildProxyUri('/search_interaction'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({
+            'user_scope_id': currentAuthenticatedUserId ?? 'guest',
+            'query': trimmedQuery,
+            'result_count': resultCount,
+            'source': 'app_${payload['search_scope']}_search',
+            'occurred_at':
+                (occurredAt ?? DateTime.now().toUtc()).millisecondsSinceEpoch /
+                    1000.0,
+            'metadata': payload,
+          }),
+        )
+        .timeout(const Duration(seconds: 3));
+  } catch (_) {
+    // Search logging should never block the UI.
   }
 }
 
@@ -372,13 +613,86 @@ class TrackLyricsState {
 
 class HistoryManager {
   static final _seedController = StreamController<String?>.broadcast();
+  static final _trackController =
+      StreamController<Map<String, dynamic>>.broadcast();
   static Stream<String?> get seedStream => _seedController.stream;
+  static Stream<Map<String, dynamic>> get trackStream => _trackController.stream;
+  static String? _lastRecordedTrackId;
+  static DateTime? _lastRecordedAt;
+  static const int _legacyHistoryLimit = 50;
+  static const int _historyEntryLimit = 180;
+  static const Duration _duplicateSuppressWindow = Duration(seconds: 24);
+  static const int _historySchemaVersion = 2;
+  static Future<void>? _historySchemaFuture;
 
   static Future<File> get _file async {
     return getScopedDataFile('history.json');
   }
 
+  static Future<File> get _entriesFile async {
+    return getScopedDataFile('history_entries.json');
+  }
+
+  static Future<File> get _schemaFile async {
+    return getScopedDataFile('history_schema.json');
+  }
+
+  static Future<void> _ensureHistorySchema() {
+    return _historySchemaFuture ??= () async {
+      try {
+        final schemaFile = await _schemaFile;
+        var currentVersion = 0;
+        if (schemaFile.existsSync()) {
+          try {
+            final decoded = jsonDecode(await schemaFile.readAsString());
+            if (decoded is Map) {
+              currentVersion = _parseInt(decoded['version']);
+            }
+          } catch (_) {
+            currentVersion = 0;
+          }
+        }
+
+        if (currentVersion < _historySchemaVersion) {
+          await clearLocalListeningHistory();
+          await schemaFile.writeAsString(
+            jsonEncode({'version': _historySchemaVersion}),
+          );
+        }
+      } catch (error) {
+        debugPrint('History schema migration failed: $error');
+      }
+    }();
+  }
+
+  static Future<void> clearLocalListeningHistory() async {
+    try {
+      final historyFile = await _file;
+      final entriesFile = await _entriesFile;
+      final recommendationCacheFile =
+          await getScopedDataFile('recommendations_cache.json');
+      await historyFile.writeAsString('[]');
+      await entriesFile.writeAsString('[]');
+      await recommendationCacheFile.writeAsString(
+        jsonEncode({
+          'session_id': '',
+          'generated_at': 0,
+          'expires_at': 0,
+          'rows': <Map<String, dynamic>>[],
+        }),
+      );
+      _lastRecordedTrackId = null;
+      _lastRecordedAt = null;
+      if (!_seedController.isClosed) {
+        _seedController.add(null);
+      }
+    } catch (error) {
+      debugPrint('History reset failed: $error');
+    }
+  }
+
   static Future<List<String>> _readLocalHistory() async {
+    await _ensureHistorySchema();
     final f = await _file;
     if (!f.existsSync()) return const [];
     try {
@@ -399,6 +713,110 @@ class HistoryManager {
     }
   }
 
+  static bool _looksMeaningfulText(String? value) {
+    final text = value?.trim() ?? '';
+    if (text.isEmpty) return false;
+    return text.toLowerCase() != 'unknown track';
+  }
+
+  static bool _looksMeaningfulArtist(String? value) {
+    final text = value?.trim() ?? '';
+    if (text.isEmpty) return false;
+    return text.toLowerCase() != 'unknown artist';
+  }
+
+  static Map<String, dynamic>? _normalizeHistoryEntry(dynamic rawEntry) {
+    if (rawEntry is! Map) return null;
+    final entry = Map<String, dynamic>.from(rawEntry);
+    final snapshot = _lastTrackSnapshotFromRawTrack(
+      entry,
+      localPath: entry['local_path']?.toString(),
+    );
+    if (snapshot == null) return null;
+    final playedAt = entry['played_at']?.toString().trim();
+    return {
+      ...snapshot,
+      'played_at': playedAt?.isNotEmpty == true
+          ? playedAt
+          : DateTime.now().toUtc().toIso8601String(),
+    };
+  }
+
+  static Future<List<Map<String, dynamic>>> _readLocalHistoryEntries() async {
+    await _ensureHistorySchema();
+    final file = await _entriesFile;
+    if (!file.existsSync()) return const [];
+    try {
+      final raw = (await file.readAsString()).trim();
+      if (raw.isEmpty) return const [];
+      final decoded = jsonDecode(raw);
+      if (decoded is! List) return const [];
+      return decoded
+          .map(_normalizeHistoryEntry)
+          .whereType<Map<String, dynamic>>()
+          .toList(growable: false);
+    } catch (error) {
+      debugPrint('History entry cache parse failed, resetting entries: $error');
+      try {
+        await file.writeAsString('[]');
+      } catch (_) {}
+      return const [];
+    }
+  }
+
+  static Future<void> _writeLocalHistoryEntries(
+    List<Map<String, dynamic>> entries,
+  ) async {
+    final file = await _entriesFile;
+    await file.writeAsString(jsonEncode(entries));
+  }
+
+  static Map<String, dynamic> _mergeSnapshotWithExisting(
+    Map<String, dynamic> snapshot,
+    Map<String, dynamic>? existing,
+  ) {
+    if (existing == null) return snapshot;
+    final merged = Map<String, dynamic>.from(snapshot);
+    if (!_looksMeaningfulText(merged['title']?.toString()) &&
+        _looksMeaningfulText(existing['title']?.toString())) {
+      merged['title'] = existing['title'];
+    }
+    if (!_looksMeaningfulArtist(merged['channel']?.toString()) &&
+        _looksMeaningfulArtist(existing['channel']?.toString())) {
+      merged['channel'] = existing['channel'];
+      merged['author'] = existing['author'] ?? existing['channel'];
+      merged['artist'] = existing['artist'] ?? existing['channel'];
+    }
+    for (final key in const [
+      'thumbnail',
+      'album',
+      'album_title',
+      'album_id',
+      'local_path',
+    ]) {
+      final current = merged[key]?.toString().trim() ?? '';
+      final fallback = existing[key]?.toString().trim() ?? '';
+      if (current.isEmpty && fallback.isNotEmpty) {
+        merged[key] = existing[key];
+      }
+    }
+    if (_parseInt(merged['duration']) <= 0 && _parseInt(existing['duration']) > 0) {
+      merged['duration'] = _parseInt(existing['duration']);
+    }
+    return merged;
+  }
+
+  static Future<void> _writeLegacySeedHistory(String videoId) async {
+    final f = await _file;
+    List<String> history = await _readLocalHistory();
+    history.remove(videoId);
+    history.insert(0, videoId);
+    if (history.length > _legacyHistoryLimit) {
+      history = history.sublist(0, _legacyHistoryLimit);
+    }
+    await f.writeAsString(jsonEncode(history));
+  }
+
   static Future<void> _recordCloudPlayEvent(String videoId) async {
     final client = supabaseClientOrNull;
     final userId = currentAuthenticatedUserId;
@@ -415,15 +833,75 @@ class HistoryManager {
   }
 
   static Future<void> addHistory(String? videoId) async {
+    if (videoId == null || videoId.isEmpty) return;
+    await addHistoryTrack({
+      'id': videoId,
+      'videoId': videoId,
+      'title': 'Unknown Track',
+    });
+  }
+
+  static Future<void> addHistoryTrack(
+    dynamic rawTrack, {
+    String? localPath,
+  }) async {
     try {
-      if (videoId == null || videoId.isEmpty) return;
-      final f = await _file;
-      List<String> history = await _readLocalHistory();
-      history.remove(videoId);
-      history.insert(0, videoId);
-      if (history.length > 50) history = history.sublist(0, 50);
-      await f.writeAsString(jsonEncode(history));
+      await _ensureHistorySchema();
+      final snapshot = _lastTrackSnapshotFromRawTrack(
+        rawTrack,
+        localPath: localPath ??
+            (rawTrack is Map ? rawTrack['local_path']?.toString() : null),
+      );
+      final videoId = extractTrackId(snapshot);
+      if (snapshot == null || videoId == null || videoId.isEmpty) return;
+
+      final now = DateTime.now().toUtc();
+      if (_lastRecordedTrackId == videoId &&
+          _lastRecordedAt != null &&
+          now.difference(_lastRecordedAt!) < _duplicateSuppressWindow) {
+        return;
+      }
+      _lastRecordedTrackId = videoId;
+      _lastRecordedAt = now;
+
+      final existingEntries = await _readLocalHistoryEntries();
+      Map<String, dynamic>? previous;
+      for (final entry in existingEntries) {
+        if (extractTrackId(entry) == videoId) {
+          previous = entry;
+          break;
+        }
+      }
+      final mergedSnapshot = _mergeSnapshotWithExisting(snapshot, previous);
+      final entry = {
+        ...mergedSnapshot,
+        'played_at': now.toIso8601String(),
+      };
+      final nextEntries = <Map<String, dynamic>>[
+        entry,
+        ...existingEntries,
+      ];
+      if (nextEntries.length > _historyEntryLimit) {
+        nextEntries.removeRange(_historyEntryLimit, nextEntries.length);
+      }
+
+      await Future.wait([
+        _writeLegacySeedHistory(videoId),
+        _writeLocalHistoryEntries(nextEntries),
+      ]);
       _seedController.add(videoId);
+      if (!_trackController.isClosed) {
+        _trackController.add(Map<String, dynamic>.from(entry));
+      }
+      notifyRecommendationSignal(videoId);
+      unawaited(
+        recordProxyInteractionEvent(
+          'play',
+          trackId: videoId,
+          rawTrack: entry,
+          occurredAt: now,
+        ),
+      );
       unawaited(_recordCloudPlayEvent(videoId));
     } catch (e) {
       debugPrint("History Write Error: $e");
@@ -432,23 +910,16 @@ class HistoryManager {
 
   static Future<String?> getLatestSeed() async {
     try {
-      final history = await _readLocalHistory();
-      if (history.isNotEmpty) return history.first;
-
-      final client = supabaseClientOrNull;
-      final userId = currentAuthenticatedUserId;
-      if (client != null && userId != null && userId.isNotEmpty) {
-        final rows = await client
-            .from('play_events')
-            .select('track_id')
-            .eq('user_id', userId)
-            .eq('event_type', 'play')
-            .order('created_at', ascending: false)
-            .limit(1);
-        if (rows.isNotEmpty) {
-          return rows.first['track_id']?.toString();
+      final entries = await _readLocalHistoryEntries();
+      if (entries.isNotEmpty) {
+        final latestTrackId = extractTrackId(entries.first);
+        if (latestTrackId != null && latestTrackId.isNotEmpty) {
+          return latestTrackId;
         }
       }
+
+      final history = await _readLocalHistory();
+      if (history.isNotEmpty) return history.first;
     } catch (e) {
       debugPrint("History Read Error: $e");
     }
@@ -457,39 +928,75 @@ class HistoryManager {
 
   static Future<String?> getRecommendationSeed() async {
     try {
-      final client = supabaseClientOrNull;
-      final userId = currentAuthenticatedUserId;
-      if (client != null && userId != null && userId.isNotEmpty) {
-        final rows = await client
-            .from('play_events')
-            .select('track_id')
-            .eq('user_id', userId)
-            .eq('event_type', 'play')
-            .order('created_at', ascending: false)
-            .limit(40);
-        if (rows.isNotEmpty) {
-          final scores = <String, double>{};
-          for (var index = 0; index < rows.length; index++) {
-            final trackId = rows[index]['track_id']?.toString();
-            if (trackId == null || trackId.isEmpty) continue;
-            final recencyWeight = (rows.length - index).toDouble();
-            scores.update(
-              trackId,
-              (value) => value + recencyWeight,
-              ifAbsent: () => recencyWeight,
-            );
-          }
-          if (scores.isNotEmpty) {
-            final ranked = scores.entries.toList()
-              ..sort((a, b) => b.value.compareTo(a.value));
-            return ranked.first.key;
-          }
+      final recentSnapshots = await getLastPlayedTrackSnapshots(limit: 6);
+      if (recentSnapshots.isNotEmpty) {
+        final recentTrackId = extractTrackId(recentSnapshots.first);
+        if (recentTrackId != null && recentTrackId.isNotEmpty) {
+          return recentTrackId;
         }
       }
     } catch (error) {
       debugPrint('Recommendation seed lookup failed: $error');
     }
     return getLatestSeed();
+  }
+
+  static Future<List<Map<String, dynamic>>> getRecentTrackSnapshots({
+    int limit = 8,
+    bool unique = true,
+  }) async {
+    final entries = await _readLocalHistoryEntries();
+    if (entries.isEmpty) return const [];
+    final results = <Map<String, dynamic>>[];
+    final seen = <String>{};
+    for (final entry in entries) {
+      final trackId = extractTrackId(entry);
+      if (trackId == null || trackId.isEmpty) continue;
+      if (unique && !seen.add(trackId)) continue;
+      results.add(normalizeTrack(entry));
+      if (results.length >= limit) break;
+    }
+    return results;
+  }
+
+  static Future<List<Map<String, dynamic>>> getLastPlayedTrackSnapshots({
+    int limit = 8,
+  }) async {
+    return getRecentTrackSnapshots(limit: limit, unique: true);
+  }
+
+  static Future<List<Map<String, dynamic>>> getFrequentlyPlayedTrackSnapshots({
+    int limit = 8,
+  }) async {
+    final entries = await _readLocalHistoryEntries();
+    if (entries.isEmpty) return const [];
+
+    final scores = <String, double>{};
+    final latestById = <String, Map<String, dynamic>>{};
+    final total = entries.length;
+    for (var index = 0; index < entries.length; index++) {
+      final entry = entries[index];
+      final trackId = extractTrackId(entry);
+      if (trackId == null || trackId.isEmpty) continue;
+      latestById.putIfAbsent(trackId, () => normalizeTrack(entry));
+      final recencyWeight = ((total - index) / max(total, 1)) * 1.35;
+      scores.update(
+        trackId,
+        (current) => current + 1.0 + recencyWeight,
+        ifAbsent: () => 1.0 + recencyWeight,
+      );
+    }
+
+    final ranked = scores.entries.toList()
+      ..sort((a, b) => b.value.compareTo(a.value));
+    final results = <Map<String, dynamic>>[];
+    for (final entry in ranked) {
+      final snapshot = latestById[entry.key];
+      if (snapshot == null) continue;
+      results.add(snapshot);
+      if (results.length >= limit) break;
+    }
+    return results;
   }
 
   static Future<List<String>> getRecentSeeds({int limit = 8}) async {
@@ -502,6 +1009,14 @@ class HistoryManager {
     }
 
     try {
+      final recentSnapshots = await getRecentTrackSnapshots(limit: limit * 2);
+      for (final snapshot in recentSnapshots) {
+        addTrackId(extractTrackId(snapshot));
+        if (ordered.length >= limit) {
+          return ordered;
+        }
+      }
+
       final history = await _readLocalHistory();
       for (final trackId in history) {
         addTrackId(trackId);
@@ -509,29 +1024,49 @@ class HistoryManager {
           return ordered;
         }
       }
-
-      final client = supabaseClientOrNull;
-      final userId = currentAuthenticatedUserId;
-      if (client != null && userId != null && userId.isNotEmpty) {
-        final rows = await client
-            .from('play_events')
-            .select('track_id')
-            .eq('user_id', userId)
-            .eq('event_type', 'play')
-            .order('created_at', ascending: false)
-            .limit(limit * 3);
-        for (final row in rows) {
-          addTrackId(row['track_id']?.toString());
-          if (ordered.length >= limit) {
-            break;
-          }
-        }
-      }
     } catch (error) {
       debugPrint('Recent seed lookup failed: $error');
     }
 
     return ordered;
+  }
+
+  static Future<List<String>> getFrequentlyPlayedTrackIds({int limit = 8}) async {
+    final scores = <String, double>{};
+
+    void addWeight(String? trackId, double weight) {
+      final normalized = trackId?.trim();
+      if (normalized == null || normalized.isEmpty) return;
+      scores.update(
+        normalized,
+        (current) => current + weight,
+        ifAbsent: () => weight,
+      );
+    }
+
+    try {
+      final snapshotTracks = await getFrequentlyPlayedTrackSnapshots(limit: limit * 2);
+      for (var index = 0; index < snapshotTracks.length; index++) {
+        addWeight(
+          extractTrackId(snapshotTracks[index]),
+          (snapshotTracks.length - index) * 1.65,
+        );
+      }
+
+      final localHistory = await _readLocalHistory();
+      for (var index = 0; index < localHistory.length; index++) {
+        addWeight(localHistory[index], (localHistory.length - index) * 0.65);
+      }
+    } catch (error) {
+      debugPrint('Frequently played lookup failed: $error');
+    }
+
+    final ranked = scores.entries.toList()
+      ..sort((a, b) => b.value.compareTo(a.value));
+    return ranked
+        .take(limit)
+        .map((entry) => entry.key)
+        .toList(growable: false);
   }
 }
 
@@ -610,6 +1145,7 @@ class PlayerState {
 
 class AudioPlayerNotifier extends StateNotifier<PlayerState> {
   final AudioEngineFFI audioEngine;
+  Map<String, dynamic>? _restorableTrackMeta;
   Future<void> Function()? onTrackCompleted;
   Future<void> Function(String? videoId)? onTrackChanged;
   Timer? _playbackTimer;
@@ -662,8 +1198,11 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       handler.onPlay = play;
       handler.onPause = pause;
       handler.onSeek = (Duration d) => seek(d.inSeconds);
+      handler.onFastForward = () => seek(state.currentPosition + 10);
+      handler.onRewind = () => seek(state.currentPosition - 10);
       handler.onStop = () => stopPlayback(resetState: true);
     }
+    unawaited(_restoreRememberedTrack());
   }
 
   @override
@@ -704,24 +1243,41 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
   void _broadcastState() {
     if (globalAudioHandler is! AuralisAudioHandler) return;
     final handler = globalAudioHandler as AuralisAudioHandler;
+    final processingState = state.isDownloading
+        ? AudioProcessingState.buffering
+        : state.videoId == null || state.videoId!.isEmpty
+            ? AudioProcessingState.idle
+            : (!state.isPlaying &&
+                    state.duration > 0 &&
+                    state.currentPosition >= state.duration)
+                ? AudioProcessingState.completed
+                : AudioProcessingState.ready;
+    final currentQueueIndex = _managedQueueActive
+        ? (streamPlayer.currentIndex ?? 0)
+            .clamp(0, _managedQueueTracks.isEmpty ? 0 : _managedQueueTracks.length - 1)
+            .toInt()
+        : null;
 
     handler.broadcastState(PlaybackState(
       controls: [
         MediaControl.skipToPrevious,
+        MediaControl.rewind,
         if (state.isPlaying) MediaControl.pause else MediaControl.play,
-        MediaControl.stop,
+        MediaControl.fastForward,
         MediaControl.skipToNext,
       ],
-      systemActions: const {
+      systemActions: const <MediaAction>{
         MediaAction.seek,
+        MediaAction.seekForward,
+        MediaAction.seekBackward,
       },
-      androidCompactActionIndices: const [0, 1, 3],
-      processingState: state.isDownloading
-          ? AudioProcessingState.buffering
-          : AudioProcessingState.ready,
+      androidCompactActionIndices: const [0, 2, 4],
+      processingState: processingState,
       playing: state.isPlaying,
       updatePosition: Duration(seconds: state.currentPosition),
       bufferedPosition: Duration(seconds: state.currentPosition),
+      speed: state.isPlaying ? 1.0 : 0.0,
+      queueIndex: currentQueueIndex,
     ));
 
     handler.broadcastMediaItem(_currentMediaItem());
@@ -740,6 +1296,95 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       ),
     );
     handler.broadcastQueue(const []);
+  }
+
+  void refreshMediaSession() {
+    if (state.videoId == null || state.videoId!.isEmpty) {
+      _broadcastStoppedState();
+      return;
+    }
+    _broadcastManagedQueue();
+    _broadcastState();
+  }
+
+  Future<File> _lastTrackSnapshotFile() => getScopedDataFile('last_track_snapshot.json');
+
+  Future<void> _persistRememberedTrack() async {
+    final snapshot = _restorableTrackMeta;
+    if (snapshot == null) return;
+    try {
+      final file = await _lastTrackSnapshotFile();
+      await file.writeAsString(jsonEncode(snapshot));
+    } catch (error) {
+      debugPrint('Last track snapshot save failed: $error');
+    }
+  }
+
+  Future<void> _restoreRememberedTrack() async {
+    try {
+      final file = await _lastTrackSnapshotFile();
+      if (!file.existsSync()) return;
+      final raw = (await file.readAsString()).trim();
+      if (raw.isEmpty) return;
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map) return;
+      final snapshot = Map<String, dynamic>.from(decoded);
+      final trackId = extractTrackId(snapshot);
+      if (trackId == null || trackId.isEmpty) return;
+      final localPath = snapshot['local_path']?.toString();
+      if (localPath != null &&
+          localPath.isNotEmpty &&
+          !_hasValidDownloadedAudio(localPath)) {
+        snapshot.remove('local_path');
+      }
+      _restorableTrackMeta = snapshot;
+      if (!mounted) return;
+      state = state.copyWith(
+        isPlaying: false,
+        isDownloading: false,
+        currentTrackName: snapshot['title']?.toString() ?? 'Unknown Track',
+        thumbnail: snapshot['thumbnail']?.toString(),
+        artist: (snapshot['author'] ?? snapshot['artist'] ?? snapshot['channel'])
+            ?.toString(),
+        videoId: trackId,
+        duration: _parseInt(snapshot['duration']),
+        currentPosition: 0,
+        currentPositionMs: 0,
+      );
+    } catch (error) {
+      debugPrint('Last track snapshot restore failed: $error');
+    }
+  }
+
+  void _rememberTrackMeta(
+    dynamic rawTrack, {
+    String? localPath,
+  }) {
+    final snapshot =
+        _lastTrackSnapshotFromRawTrack(rawTrack, localPath: localPath);
+    if (snapshot == null) return;
+    _restorableTrackMeta = snapshot;
+    unawaited(_persistRememberedTrack());
+  }
+
+  Future<bool> _restoreRememberedTrackForPlayback() async {
+    final snapshot = _restorableTrackMeta;
+    if (snapshot == null) return false;
+    final localPath = snapshot['local_path']?.toString();
+    if (localPath != null && localPath.isNotEmpty) {
+      final loaded = await loadLocalWithMeta(localPath, snapshot);
+      if (loaded) {
+        return true;
+      }
+      _restorableTrackMeta = {
+        ...snapshot,
+      }..remove('local_path');
+      unawaited(_persistRememberedTrack());
+    }
+    final trackId = extractTrackId(snapshot);
+    if (trackId == null || trackId.isEmpty) return false;
+    await streamYoutube(trackId, snapshot);
+    return state.videoId == trackId;
   }
 
   MediaItem _currentMediaItem() {
@@ -795,8 +1440,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         return;
       }
       _applyManagedTrackMetadata(index, resetPosition: true);
-      final currentTrackId = extractTrackId(_managedQueueTracks[index]);
-      HistoryManager.addHistory(currentTrackId);
+      HistoryManager.addHistoryTrack(_managedQueueTracks[index]);
       unawaited(_refreshManagedQueueWarmup());
     });
 
@@ -1555,6 +2199,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       currentPosition: resetPosition ? 0 : state.currentPosition,
       currentPositionMs: resetPosition ? 0 : state.currentPositionMs,
     );
+    _rememberTrackMeta(track, localPath: track['local_path']?.toString());
   }
 
   Future<AudioSource> _buildManagedAudioSource(
@@ -1685,7 +2330,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       isDownloading: false,
       duration: streamPlayer.duration?.inSeconds ?? state.duration,
     );
-    HistoryManager.addHistory(extractTrackId(playableTracks[resolvedInitialIndex]));
+    HistoryManager.addHistoryTrack(playableTracks[resolvedInitialIndex]);
     unawaited(_prefetchManagedQueueAhead());
     if (_desiredStreamPlaying) {
       await _resumeStreamPlayback();
@@ -1803,7 +2448,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     });
     _streamTransitionInProgress = false;
     _applyManagedTrackMetadata(index, resetPosition: true);
-    HistoryManager.addHistory(extractTrackId(_managedQueueTracks[index]));
+    HistoryManager.addHistoryTrack(_managedQueueTracks[index]);
     unawaited(_refreshManagedQueueWarmup());
     await _resumeStreamPlayback();
   }
@@ -2020,6 +2665,9 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         currentPosition: 0,
         currentPositionMs: 0,
       );
+      _rememberTrackMeta({
+        'title': trackName,
+      }, localPath: path);
       return true;
     } catch (error) {
       _activeStream = false;
@@ -2098,7 +2746,15 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         currentPosition: 0,
         currentPositionMs: 0,
       );
-      HistoryManager.addHistory(meta['video_id'] ?? meta['id']);
+      _rememberTrackMeta(meta, localPath: path);
+      HistoryManager.addHistoryTrack(
+        {
+          ...Map<String, dynamic>.from(meta),
+          'id': meta['video_id'] ?? meta['id'],
+          'videoId': meta['video_id'] ?? meta['id'],
+        },
+        localPath: path,
+      );
       return true;
     } catch (error) {
       _activeStream = false;
@@ -2149,8 +2805,6 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         filesize: _parseInt(meta['filesize']),
         artist: meta['author'],
       );
-      HistoryManager.addHistory(videoId);
-
       // 2. Stream the byte data back from the proxy to the local flutter device
       final req = http.Request('GET', _proxyUri('/stream/$videoId'));
       final streamRes = await appHttpClient.send(req);
@@ -2215,8 +2869,6 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       }
 
       final meta = Map<String, dynamic>.from(jsonDecode(res.body) as Map);
-      HistoryManager.addHistory(videoId);
-
       final req = http.Request('GET', _proxyUri('/stream/$videoId'));
       final streamRes = await appHttpClient.send(req);
 
@@ -2310,8 +2962,16 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
           duration: dur > 0 ? dur : _parseInt(fallbackMeta['duration']),
           isDownloading: false,
           videoId: videoId);
-          
-      HistoryManager.addHistory(videoId);
+      _rememberTrackMeta({
+        ...fallbackMeta,
+        'id': videoId,
+        'videoId': videoId,
+      });
+      HistoryManager.addHistoryTrack({
+        ...Map<String, dynamic>.from(fallbackMeta),
+        'id': videoId,
+        'videoId': videoId,
+      });
       if (loadVersion == _streamLoadVersion && _desiredStreamPlaying) {
         await _resumeStreamPlayback();
       }
@@ -2336,8 +2996,16 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
             duration: dur > 0 ? dur : _parseInt(fallbackMeta['duration']),
             isDownloading: false,
             videoId: videoId);
-
-        HistoryManager.addHistory(videoId);
+        _rememberTrackMeta({
+          ...fallbackMeta,
+          'id': videoId,
+          'videoId': videoId,
+        });
+        HistoryManager.addHistoryTrack({
+          ...Map<String, dynamic>.from(fallbackMeta),
+          'id': videoId,
+          'videoId': videoId,
+        });
         if (loadVersion == _streamLoadVersion && _desiredStreamPlaying) {
           await _resumeStreamPlayback();
         }
@@ -2386,6 +3054,22 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
   }
 
   Future<void> play() async {
+    if (!_activeStream &&
+        streamPlayer.audioSource == null &&
+        _restorableTrackMeta != null) {
+      final restored = await _restoreRememberedTrackForPlayback();
+      if (restored) {
+        if (_activeStream) {
+          await _resumeStreamPlayback();
+        } else {
+          audioEngine.play();
+          state = state.copyWith(isPlaying: true);
+          _startTimer();
+        }
+      }
+      return;
+    }
+
     if (_activeStream) {
       await _resumeStreamPlayback();
       return;
@@ -2503,6 +3187,219 @@ final audioPlayerProvider =
 });
 
 // Search & Recommendation State Management
+void _bumpSearchSignalWeight(
+  Map<String, double> weights,
+  String? value,
+  double weight,
+) {
+  final normalized = value?.trim().toLowerCase();
+  if (normalized == null || normalized.isEmpty) return;
+  weights.update(
+    normalized,
+    (current) => current + weight,
+    ifAbsent: () => weight,
+  );
+}
+
+String? _extractSearchArtistHint(dynamic rawTrack) {
+  if (rawTrack is! Map) return null;
+  return rawTrack['channel']?.toString() ??
+      rawTrack['author']?.toString() ??
+      rawTrack['artist']?.toString();
+}
+
+String? _extractSearchAlbumHint(dynamic rawTrack) {
+  if (rawTrack is! Map) return null;
+  return rawTrack['album']?.toString() ?? rawTrack['album_title']?.toString();
+}
+
+bool _looksLikeSemanticTasteQuery(String query) {
+  final normalized = query.trim().toLowerCase();
+  if (normalized.isEmpty) return false;
+  if (normalized.length > 38) return true;
+  if (normalized.contains(' mix') ||
+      normalized.contains(' playlist') ||
+      normalized.contains(' songs') ||
+      normalized.contains(' music')) {
+    return true;
+  }
+  return _sharedTasteKeywords.any((keyword) => normalized.contains(keyword));
+}
+
+Future<Map<String, dynamic>> _buildSemanticSearchRequestBody(
+  Ref ref,
+  String query, {
+  required int limit,
+}) async {
+  final normalizedQuery = query.trim();
+  final searchSignals = await Future.wait<Object?>([
+    HistoryManager.getRecentTrackSnapshots(limit: 12),
+    HistoryManager.getLastPlayedTrackSnapshots(limit: 8),
+    HistoryManager.getFrequentlyPlayedTrackSnapshots(limit: 10),
+    HistoryManager.getRecentSeeds(limit: 12),
+    HistoryManager.getFrequentlyPlayedTrackIds(limit: 10),
+    getRecentCloudSearchQueries(limit: 8),
+  ]);
+
+  final recentTrackSnapshots =
+      List<Map<String, dynamic>>.from(searchSignals[0] as List);
+  final lastPlayedSnapshots =
+      List<Map<String, dynamic>>.from(searchSignals[1] as List);
+  final topTrackSnapshots =
+      List<Map<String, dynamic>>.from(searchSignals[2] as List);
+  final recentTrackIds = List<String>.from(searchSignals[3] as List);
+  final topTrackIds = List<String>.from(searchSignals[4] as List);
+  final recentQueries = List<String>.from(searchSignals[5] as List);
+  final playlists = ref.read(playlistProvider);
+  final libraryTracks = ref.read(libraryProvider).valueOrNull ?? const [];
+  final storageScopeId = ref.read(authProvider).storageScopeId;
+
+  final artistWeights = <String, double>{};
+  final albumWeights = <String, double>{};
+  final queryWeights = <String, double>{};
+  final blendedRecentQueries = <String>[];
+  final libraryTrackIds = <String>[];
+  final offlineTrackIds = <String>[];
+
+  void addRecentQuery(String? value) {
+    final normalized = value?.trim();
+    if (normalized == null || normalized.isEmpty) return;
+    if (!blendedRecentQueries.contains(normalized)) {
+      blendedRecentQueries.add(normalized);
+    }
+  }
+
+  void addAlbumWeight(String? value, double weight) {
+    final normalized = value?.trim().toLowerCase();
+    if (normalized == null || normalized.isEmpty) return;
+    albumWeights.update(
+      normalized,
+      (current) => current + weight,
+      ifAbsent: () => weight,
+    );
+  }
+
+  void addTrackHints(
+    Iterable<Map<String, dynamic>> tracks, {
+    required double artistWeight,
+    required double albumWeight,
+  }) {
+    for (final track in tracks) {
+      _bumpSearchSignalWeight(
+        artistWeights,
+        _extractSearchArtistHint(track),
+        artistWeight,
+      );
+      _bumpSearchSignalWeight(
+        queryWeights,
+        _extractSearchAlbumHint(track),
+        albumWeight * 0.8,
+      );
+      addAlbumWeight(_extractSearchAlbumHint(track), albumWeight);
+    }
+  }
+
+  addRecentQuery(normalizedQuery);
+  for (final queryValue in recentQueries) {
+    addRecentQuery(queryValue);
+  }
+
+  addTrackHints(
+    lastPlayedSnapshots,
+    artistWeight: 1.45,
+    albumWeight: 1.0,
+  );
+  addTrackHints(
+    recentTrackSnapshots,
+    artistWeight: 1.1,
+    albumWeight: 0.82,
+  );
+  addTrackHints(
+    topTrackSnapshots,
+    artistWeight: 1.7,
+    albumWeight: 1.18,
+  );
+
+  for (final playlist in playlists) {
+    _bumpSearchSignalWeight(queryWeights, playlist.name, 1.25);
+    for (final track in playlist.tracks.take(16)) {
+      _bumpSearchSignalWeight(
+        artistWeights,
+        _extractSearchArtistHint(track),
+        1.28,
+      );
+      _bumpSearchSignalWeight(
+        queryWeights,
+        _extractSearchAlbumHint(track),
+        0.84,
+      );
+      addAlbumWeight(_extractSearchAlbumHint(track), 1.0);
+    }
+  }
+
+  for (final track in libraryTracks.take(24)) {
+    final normalizedTrack = normalizeTrack(track);
+    final trackId = extractTrackId(normalizedTrack);
+    if (trackId != null && trackId.isNotEmpty) {
+      libraryTrackIds.add(trackId);
+      if (normalizedTrack['is_downloaded_locally'] == true) {
+        offlineTrackIds.add(trackId);
+      }
+    }
+    _bumpSearchSignalWeight(
+      artistWeights,
+      _extractSearchArtistHint(track),
+      1.12,
+    );
+    _bumpSearchSignalWeight(
+      queryWeights,
+      _extractSearchAlbumHint(track),
+      0.7,
+    );
+    addAlbumWeight(_extractSearchAlbumHint(track), 0.88);
+  }
+
+  _bumpSearchSignalWeight(queryWeights, normalizedQuery, 2.45);
+  if (_looksLikeSemanticTasteQuery(normalizedQuery)) {
+    _bumpSearchSignalWeight(queryWeights, normalizedQuery, 1.25);
+  }
+
+  for (final queryValue in blendedRecentQueries) {
+    if (_looksLikeSemanticTasteQuery(queryValue)) {
+      _bumpSearchSignalWeight(queryWeights, queryValue, 1.18);
+    }
+  }
+
+  final rankedArtists = artistWeights.entries.toList()
+    ..sort((a, b) => b.value.compareTo(a.value));
+  final rankedAlbums = albumWeights.entries.toList()
+    ..sort((a, b) => b.value.compareTo(a.value));
+  final rankedQueries = queryWeights.entries.toList()
+    ..sort((a, b) => b.value.compareTo(a.value));
+
+  return {
+    'query': normalizedQuery,
+    'limit': limit,
+    'user_scope_id': storageScopeId,
+    'recent_track_ids': recentTrackIds,
+    'top_track_ids': topTrackIds,
+    'recent_track_snapshots': recentTrackSnapshots,
+    'top_track_snapshots': topTrackSnapshots,
+    'last_played_tracks': lastPlayedSnapshots,
+    'recent_queries': blendedRecentQueries,
+    'taste_queries':
+        rankedQueries.take(8).map((entry) => entry.key).toList(growable: false),
+    'artist_hints':
+        rankedArtists.take(8).map((entry) => entry.key).toList(growable: false),
+    'album_hints':
+        rankedAlbums.take(6).map((entry) => entry.key).toList(growable: false),
+    'playlist_names':
+        playlists.map((playlist) => playlist.name).take(10).toList(growable: false),
+    'library_track_ids': libraryTrackIds.take(28).toList(growable: false),
+    'offline_track_ids': offlineTrackIds.take(28).toList(growable: false),
+  };
+}
+
 class SearchNotifier extends StateNotifier<List<dynamic>> {
   final Ref ref;
   int _requestVersion = 0;
@@ -2528,19 +3425,36 @@ class SearchNotifier extends StateNotifier<List<dynamic>> {
     isLoading = true;
     state = [...state];
     try {
+      final body = await _buildSemanticSearchRequestBody(
+        ref,
+        normalizedQuery,
+        limit: 30,
+      );
       final res = await appHttpClient
           .post(buildProxyUri('/search'),
               headers: {'Content-Type': 'application/json'},
-              body: jsonEncode({"query": normalizedQuery, "limit": 10}))
+              body: jsonEncode(body))
           .timeout(const Duration(seconds: 10));
       if (requestVersion != _requestVersion) return;
       if (res.statusCode == 200) {
-        state = jsonDecode(res.body)['results'];
+        final rawResults = (jsonDecode(res.body)['results'] as List<dynamic>? ?? const []);
+        state = rawResults
+            .whereType<Map>()
+            .map((entry) => normalizeTrack(Map<String, dynamic>.from(entry)))
+            .where((track) => (extractTrackId(track)?.isNotEmpty ?? false))
+            .toList(growable: false);
         _primeSearchResults(state);
         unawaited(
           recordCloudSearchEvent(
             normalizedQuery,
             resultCount: state.length,
+          ),
+        );
+        unawaited(
+          recordProxySearchEvent(
+            normalizedQuery,
+            resultCount: state.length,
+            searchScope: 'track',
           ),
         );
         notifyRecommendationSignal(normalizedQuery);
@@ -2570,43 +3484,289 @@ final searchProvider =
   return SearchNotifier(ref);
 });
 
-class RecommendationNotifier extends StateNotifier<List<dynamic>> {
+class RecommendationFeedRowState {
+  final String id;
+  final String title;
+  final String kind;
+  final String itemType;
+  final List<Map<String, dynamic>> items;
+  final int nextOffset;
+  final bool hasMore;
+
+  const RecommendationFeedRowState({
+    required this.id,
+    required this.title,
+    required this.kind,
+    required this.itemType,
+    required this.items,
+    required this.nextOffset,
+    required this.hasMore,
+  });
+
+  factory RecommendationFeedRowState.fromJson(Map<String, dynamic> json) {
+    final kind = (json['kind'] ?? json['id'] ?? 'tracks').toString();
+    final itemType = (json['item_type'] ??
+            (kind == 'recommended_albums' ? 'album' : 'track'))
+        .toString();
+    final rawItems = (json['items'] as List<dynamic>? ?? const []);
+    final items = rawItems
+        .whereType<Map>()
+        .map((entry) {
+          final map = Map<String, dynamic>.from(entry);
+          if (itemType == 'album') {
+            return map;
+          }
+          return normalizeTrack(map);
+        })
+        .where((item) {
+          if (itemType == 'album') {
+            final albumId = item['id']?.toString().trim() ?? '';
+            final albumTitle = item['title']?.toString().trim() ?? '';
+            return albumId.isNotEmpty || albumTitle.isNotEmpty;
+          }
+          return extractTrackId(item)?.isNotEmpty ?? false;
+        })
+        .toList(growable: false);
+    return RecommendationFeedRowState(
+      id: (json['id'] ?? kind).toString(),
+      title: (json['title'] ?? 'Recommended').toString(),
+      kind: kind,
+      itemType: itemType,
+      items: items,
+      nextOffset: (json['next_offset'] as num?)?.toInt() ?? items.length,
+      hasMore: json['has_more'] == true,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'title': title,
+        'kind': kind,
+        'item_type': itemType,
+        'items': items,
+        'next_offset': nextOffset,
+        'has_more': hasMore,
+      };
+
+  RecommendationFeedRowState copyWith({
+    String? id,
+    String? title,
+    String? kind,
+    String? itemType,
+    List<Map<String, dynamic>>? items,
+    int? nextOffset,
+    bool? hasMore,
+  }) {
+    return RecommendationFeedRowState(
+      id: id ?? this.id,
+      title: title ?? this.title,
+      kind: kind ?? this.kind,
+      itemType: itemType ?? this.itemType,
+      items: items ?? this.items,
+      nextOffset: nextOffset ?? this.nextOffset,
+      hasMore: hasMore ?? this.hasMore,
+    );
+  }
+}
+
+class RecommendationFeedState {
+  final String sessionId;
+  final List<RecommendationFeedRowState> rows;
+  final double? generatedAt;
+  final double? expiresAt;
+
+  const RecommendationFeedState({
+    this.sessionId = '',
+    this.rows = const [],
+    this.generatedAt,
+    this.expiresAt,
+  });
+
+  bool get isEmpty => rows.every((row) => row.items.isEmpty);
+  bool get hasRows => rows.any((row) => row.items.isNotEmpty);
+
+  List<Map<String, dynamic>> get visibleTracks => rows
+      .where((row) => row.itemType == 'track')
+      .expand((row) => row.items)
+      .toList(growable: false);
+
+  factory RecommendationFeedState.fromJson(Map<String, dynamic> json) {
+    final rawRows = (json['rows'] as List<dynamic>? ?? const []);
+    return RecommendationFeedState(
+      sessionId: (json['session_id'] ?? '').toString(),
+      rows: rawRows
+          .whereType<Map>()
+          .map((row) =>
+              RecommendationFeedRowState.fromJson(Map<String, dynamic>.from(row)))
+          .toList(growable: false),
+      generatedAt: (json['generated_at'] as num?)?.toDouble(),
+      expiresAt: (json['expires_at'] as num?)?.toDouble(),
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+        'session_id': sessionId,
+        'generated_at': generatedAt,
+        'expires_at': expiresAt,
+        'rows': rows.map((row) => row.toJson()).toList(growable: false),
+      };
+
+  RecommendationFeedState copyWith({
+    String? sessionId,
+    List<RecommendationFeedRowState>? rows,
+    double? generatedAt,
+    double? expiresAt,
+  }) {
+    return RecommendationFeedState(
+      sessionId: sessionId ?? this.sessionId,
+      rows: rows ?? this.rows,
+      generatedAt: generatedAt ?? this.generatedAt,
+      expiresAt: expiresAt ?? this.expiresAt,
+    );
+  }
+}
+
+String _recommendationRowItemKey(
+  String itemType,
+  Map<String, dynamic> item,
+) {
+  if (itemType == 'album') {
+    final albumId = item['id']?.toString().trim() ?? '';
+    if (albumId.isNotEmpty) return 'album:$albumId';
+    final title = item['title']?.toString().trim().toLowerCase() ?? '';
+    final artist = item['artist']?.toString().trim().toLowerCase() ?? '';
+    return 'album:$title|$artist';
+  }
+  final trackId = extractTrackId(item)?.trim() ?? '';
+  if (trackId.isNotEmpty) return 'track:$trackId';
+  final title = item['title']?.toString().trim().toLowerCase() ?? '';
+  final artist =
+      (item['channel'] ?? item['author'] ?? item['artist'])?.toString().trim().toLowerCase() ??
+          '';
+  return 'track:$title|$artist';
+}
+
+Future<List<Map<String, dynamic>>> _hydrateTracksFromIds(
+  Ref ref,
+  Iterable<String> trackIds, {
+  int limit = 8,
+}) async {
+  final orderedTrackIds = <String>[];
+  final seenTrackIds = <String>{};
+  for (final rawTrackId in trackIds) {
+    final trackId = rawTrackId.trim();
+    if (trackId.isEmpty || !seenTrackIds.add(trackId)) continue;
+    orderedTrackIds.add(trackId);
+    if (orderedTrackIds.length >= limit) break;
+  }
+  if (orderedTrackIds.isEmpty) return const [];
+
+  final libraryTracks = await ref
+      .read(libraryProvider.future)
+      .catchError((_) => <Map<String, dynamic>>[]);
+  final libraryById = <String, Map<String, dynamic>>{};
+  for (final rawTrack in libraryTracks) {
+    final track = normalizeTrack(rawTrack);
+    final trackId = extractTrackId(track);
+    if (trackId == null || trackId.isEmpty) continue;
+    libraryById[trackId] = track;
+  }
+
+  final resolved = <Map<String, dynamic>>[];
+  final resolvedIds = <String>{};
+  final missingIds = <String>[];
+  final localFallbacks = <String, Map<String, dynamic>>{};
+  for (final trackId in orderedTrackIds) {
+    final localTrack = libraryById[trackId];
+    if (localTrack != null) {
+      if (_isTrackMetadataIncomplete(localTrack)) {
+        localFallbacks[trackId] = localTrack;
+        missingIds.add(trackId);
+      } else {
+        resolved.add(localTrack);
+        resolvedIds.add(trackId);
+      }
+      continue;
+    }
+    missingIds.add(trackId);
+  }
+
+  if (missingIds.isNotEmpty) {
+    final futures = missingIds.take(limit).map((trackId) async {
+      try {
+        final response = await appHttpClient
+            .post(
+              buildProxyUri('/track_details'),
+              headers: {'Content-Type': 'application/json'},
+              body: jsonEncode({'video_id': trackId}),
+            )
+            .timeout(const Duration(seconds: 10));
+        if (response.statusCode != 200) return null;
+        return _trackFromDetailsPayload(jsonDecode(response.body));
+      } catch (_) {
+        return null;
+      }
+    }).toList(growable: false);
+    final fetched = await Future.wait(futures);
+    for (final track in fetched.whereType<Map<String, dynamic>>()) {
+      final trackId = extractTrackId(track);
+      if (trackId == null || trackId.isEmpty || resolvedIds.contains(trackId)) {
+        continue;
+      }
+      resolved.add(track);
+      resolvedIds.add(trackId);
+      if (resolved.length >= limit) break;
+    }
+  }
+
+  for (final trackId in orderedTrackIds) {
+    if (resolved.length >= limit) break;
+    if (resolvedIds.contains(trackId)) continue;
+    final fallback = localFallbacks[trackId];
+    if (fallback == null) continue;
+    resolved.add(fallback);
+    resolvedIds.add(trackId);
+  }
+
+  return resolved.take(limit).toList(growable: false);
+}
+
+class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
   final Ref ref;
-  final Random _random = Random();
-  RecommendationNotifier(this.ref) : super([]);
+  RecommendationNotifier(this.ref) : super(const RecommendationFeedState());
   bool isLoading = true;
-  bool isPaginating = false;
-  bool _hasMorePages = true;
+  final Set<String> _paginatingRows = <String>{};
   int _requestVersion = 0;
   final Set<String> _prewarmedRecommendationIds = <String>{};
 
-  bool get hasMorePages => _hasMorePages;
+  bool get isPaginating => _paginatingRows.isNotEmpty;
+  bool get hasMorePages => state.rows.any((row) => row.hasMore);
+  bool isRowPaginating(String rowId) => _paginatingRows.contains(rowId);
 
   bool _isRequestCurrent(int requestVersion) =>
       mounted && requestVersion == _requestVersion;
 
   Future<File> _cacheFile() => getScopedDataFile('recommendations_cache.json');
 
-  Future<List<dynamic>> _loadCachedRecommendations() async {
+  Future<RecommendationFeedState> _loadCachedRecommendations() async {
     try {
       final file = await _cacheFile();
-      if (!file.existsSync()) return const [];
+      if (!file.existsSync()) return const RecommendationFeedState();
       final decoded = jsonDecode(await file.readAsString());
-      if (decoded is! List) return const [];
-      return decoded
-          .whereType<Map>()
-          .map((entry) => Map<String, dynamic>.from(entry))
-          .toList(growable: false);
+      if (decoded is Map<String, dynamic>) {
+        return RecommendationFeedState.fromJson(decoded);
+      }
+      return const RecommendationFeedState();
     } catch (error) {
       debugPrint('Recommendation cache load failed: $error');
-      return const [];
+      return const RecommendationFeedState();
     }
   }
 
-  Future<void> _saveCachedRecommendations(List<dynamic> tracks) async {
+  Future<void> _saveCachedRecommendations(RecommendationFeedState feed) async {
     try {
       final file = await _cacheFile();
-      await file.writeAsString(jsonEncode(tracks.take(20).toList(growable: false)));
+      await file.writeAsString(jsonEncode(feed.toJson()));
     } catch (error) {
       debugPrint('Recommendation cache save failed: $error');
     }
@@ -2615,11 +3775,11 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
   Future<void> bootstrap() async {
     final cached = await _loadCachedRecommendations();
     if (!mounted) return;
-    if (cached.isNotEmpty) {
-      _hasMorePages = true;
+    if (cached.hasRows) {
       isLoading = false;
-      state = _prepareRecommendationResults(cached);
-      _primeRecommendationResults(state);
+      state = cached;
+      _primeRecommendationRows(cached.rows);
+      unawaited(refreshFromSignals(forceRefresh: true));
       return;
     }
 
@@ -2628,21 +3788,9 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
     if (quickSeed != null && quickSeed.isNotEmpty) {
       await loadQuickRecommendations(quickSeed);
       if (!mounted) return;
-      if (state.isNotEmpty) {
+      if (state.hasRows) {
         return;
       }
-    }
-
-    final fastDefault = await _fetchDefaultRecommendations();
-    if (!mounted) return;
-    if (fastDefault.isNotEmpty) {
-      final nextState = _prepareRecommendationResults(fastDefault);
-      _hasMorePages = true;
-      isLoading = false;
-      state = nextState;
-      _primeRecommendationResults(nextState);
-      unawaited(_saveCachedRecommendations(nextState));
-      return;
     }
 
     await refreshFromSignals();
@@ -2660,121 +3808,21 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
     super.dispose();
   }
 
-  String _defaultTrendingQuery() {
-    final locale = ui.PlatformDispatcher.instance.locale;
-    final countryCode = locale.countryCode?.trim();
-    if (countryCode != null && countryCode.isNotEmpty) {
-      return 'Trending songs in $countryCode';
+  RecommendationFeedState _feedStateFromPayload(Map<String, dynamic> payload) {
+    final rows = (payload['rows'] as List<dynamic>? ?? const []);
+    if (rows.isNotEmpty) {
+      final nextState = RecommendationFeedState.fromJson(payload);
+      if (nextState.hasRows) {
+        return nextState;
+      }
     }
-    final languageCode = locale.languageCode.trim();
-    if (languageCode.isNotEmpty) {
-      return 'Trending $languageCode music';
-    }
-    return 'Trending hit songs';
+    return const RecommendationFeedState();
   }
 
-  List<dynamic> _prepareRecommendationResults(
-    List<dynamic> source, {
-    Set<String> avoidIds = const <String>{},
-    bool forceRefresh = false,
-  }) {
-    final preferred = <dynamic>[];
-    final fallback = <dynamic>[];
-    final seen = <String>{};
-    for (final track in source) {
-      final id = (track['id'] ?? track['videoId'])?.toString();
-      if (id != null && id.isNotEmpty && !seen.add(id)) {
-        continue;
-      }
-      if (forceRefresh && id != null && avoidIds.contains(id)) {
-        fallback.add(track);
-      } else {
-        preferred.add(track);
-      }
-    }
-    final combined = [...preferred, ...fallback];
-    if (forceRefresh && combined.length > 1) {
-      combined.shuffle(_random);
-    }
-    return combined.take(15).toList(growable: false);
-  }
-
-  Future<List<dynamic>> _fetchDefaultRecommendations({
-    bool forceRefresh = false,
-  }) async {
-    try {
-      final res = await appHttpClient
-          .post(
-            buildProxyUri('/recommend'),
-            headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({
-              'query': '',
-              'limit': forceRefresh ? 16 : 12,
-              'seed_ids': const [],
-              'artist_hints': const [],
-              'taste_queries': const [],
-              'avoid_ids': const [],
-            }),
-          )
-          .timeout(const Duration(seconds: 4));
-      if (res.statusCode == 200) {
-        final payload = jsonDecode(res.body) as Map<String, dynamic>;
-        final recommendations =
-            payload['recommendations'] as List<dynamic>? ?? const [];
-        if (recommendations.isNotEmpty) {
-          return forceRefresh
-              ? ([...recommendations]..shuffle(_random))
-              : recommendations;
-        }
-      }
-    } catch (_) {
-      // Fall back to the broader search bootstrap below.
-    }
-
-    final queries = <String>[_defaultTrendingQuery(), 'Trending hit songs'];
-    final futures = queries.map((query) async {
-      try {
-        final res = await appHttpClient
-            .post(
-              buildProxyUri('/search'),
-              headers: {'Content-Type': 'application/json'},
-              body: jsonEncode({"query": query, "limit": forceRefresh ? 14 : 10}),
-            )
-            .timeout(const Duration(seconds: 4));
-        if (res.statusCode != 200) return const <dynamic>[];
-        final payload = jsonDecode(res.body) as Map<String, dynamic>;
-        return payload['results'] as List<dynamic>? ?? const <dynamic>[];
-      } catch (_) {
-        return const <dynamic>[];
-      }
-    }).toList(growable: false);
-
-    final responses = await Future.wait(futures);
-    final aggregated = <dynamic>[];
-    final seen = <String>{};
-    for (final results in responses) {
-      for (final track in results) {
-        final id = (track['id'] ?? track['videoId'])?.toString();
-        if (id != null && id.isNotEmpty && !seen.add(id)) {
-          continue;
-        }
-        aggregated.add(track);
-      }
-      if (!forceRefresh && aggregated.isNotEmpty) {
-        return aggregated;
-      }
-    }
-    if (forceRefresh && aggregated.isNotEmpty) {
-      aggregated.shuffle(_random);
-      return aggregated;
-    }
-    return const [];
-  }
-
-  void _primeRecommendationResults(List<dynamic> tracks) {
+  void _primeRecommendationResults(Iterable<dynamic> tracks) {
     final ids = <String>[];
     for (final track in tracks) {
-      final id = (track['id'] ?? track['videoId'])?.toString();
+      final id = extractTrackId(track);
       if (id == null || id.isEmpty || !_prewarmedRecommendationIds.add(id)) {
         continue;
       }
@@ -2790,6 +3838,19 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
       );
     }
     unawaited(ref.read(audioPlayerProvider.notifier).prewarmStreams(ids));
+  }
+
+  void _primeRecommendationRows(List<RecommendationFeedRowState> rows) {
+    final visibleTracks = <Map<String, dynamic>>[];
+    for (final row in rows) {
+      if (row.itemType != 'track') continue;
+      visibleTracks.addAll(row.items.take(3));
+      if (visibleTracks.length >= 12) {
+        break;
+      }
+    }
+    if (visibleTracks.isEmpty) return;
+    _primeRecommendationResults(visibleTracks);
   }
 
   void _bumpTasteWeight(
@@ -2834,8 +3895,44 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
     int offset = 0,
     Set<String> avoidIds = const <String>{},
     bool forceRefresh = false,
+    List<String> extraArtistHints = const <String>[],
+    List<String> extraTasteQueries = const <String>[],
   }) async {
     final seedIds = <String>[];
+    final requestSignals = await Future.wait<Object?>([
+      HistoryManager.getRecentTrackSnapshots(limit: forceRefresh ? 14 : 10),
+      HistoryManager.getLastPlayedTrackSnapshots(limit: 8),
+      HistoryManager.getFrequentlyPlayedTrackSnapshots(limit: 10),
+      HistoryManager.getRecentSeeds(limit: forceRefresh ? 14 : 10),
+      HistoryManager.getFrequentlyPlayedTrackIds(limit: 10),
+      getRecentCloudSearchQueries(limit: 8),
+    ]);
+    final recentTrackSnapshots =
+        List<Map<String, dynamic>>.from(requestSignals[0] as List);
+    final lastPlayedSnapshots =
+        List<Map<String, dynamic>>.from(requestSignals[1] as List);
+    final topTrackSnapshots =
+        List<Map<String, dynamic>>.from(requestSignals[2] as List);
+    final recentTrackIds = List<String>.from(requestSignals[3] as List);
+    final topTrackIds = List<String>.from(requestSignals[4] as List);
+    final recentQueries = List<String>.from(requestSignals[5] as List);
+    final blendedRecentQueries = <String>[];
+
+    void addRecentQuery(String? value) {
+      final normalized = value?.trim();
+      if (normalized == null || normalized.isEmpty) return;
+      if (!blendedRecentQueries.contains(normalized)) {
+        blendedRecentQueries.add(normalized);
+      }
+    }
+
+    for (final query in extraTasteQueries) {
+      addRecentQuery(query);
+    }
+    for (final query in recentQueries) {
+      addRecentQuery(query);
+    }
+
     void addSeed(String? id) {
       final normalized = id?.trim();
       if (normalized == null || normalized.isEmpty) return;
@@ -2845,31 +3942,95 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
     }
 
     addSeed(seedId);
-    for (final recentSeed
-        in await HistoryManager.getRecentSeeds(limit: forceRefresh ? 12 : 8)) {
+    for (final snapshot in recentTrackSnapshots) {
+      addSeed(extractTrackId(snapshot));
+    }
+    for (final recentSeed in recentTrackIds) {
       addSeed(recentSeed);
+    }
+    for (final frequentSeed in topTrackIds.take(6)) {
+      addSeed(frequentSeed);
     }
 
     final artistWeights = <String, double>{};
     final queryWeights = <String, double>{};
+    final albumWeights = <String, double>{};
     final playlists = ref.read(playlistProvider);
     final libraryTracks = ref.read(libraryProvider).valueOrNull ?? const [];
+    final storageScopeId = ref.read(authProvider).storageScopeId;
+    final libraryTrackIds = <String>[];
+    final offlineTrackIds = <String>[];
+
+    void addAlbumWeight(String? value, double weight) {
+      final normalized = value?.trim().toLowerCase();
+      if (normalized == null || normalized.isEmpty) return;
+      albumWeights.update(
+        normalized,
+        (current) => current + weight,
+        ifAbsent: () => weight,
+      );
+    }
+
+    void addTrackHints(
+      Iterable<Map<String, dynamic>> tracks, {
+      required double artistWeight,
+      required double albumWeight,
+    }) {
+      for (final track in tracks) {
+        _bumpTasteWeight(artistWeights, _extractArtistHint(track), artistWeight);
+        _bumpTasteWeight(queryWeights, _extractAlbumHint(track), albumWeight * 0.75);
+        addAlbumWeight(_extractAlbumHint(track), albumWeight);
+      }
+    }
+
+    addTrackHints(
+      lastPlayedSnapshots,
+      artistWeight: 1.35,
+      albumWeight: 0.95,
+    );
+    addTrackHints(
+      recentTrackSnapshots,
+      artistWeight: 1.05,
+      albumWeight: 0.8,
+    );
+    addTrackHints(
+      topTrackSnapshots,
+      artistWeight: 1.65,
+      albumWeight: 1.15,
+    );
+
+    for (final artistHint in extraArtistHints) {
+      _bumpTasteWeight(artistWeights, artistHint, 1.9);
+    }
+
+    for (final query in extraTasteQueries) {
+      _bumpTasteWeight(queryWeights, query, 1.95);
+    }
 
     for (final playlist in playlists) {
       _bumpTasteWeight(queryWeights, playlist.name, 1.4);
       for (final track in playlist.tracks.take(18)) {
         _bumpTasteWeight(artistWeights, _extractArtistHint(track), 1.4);
         _bumpTasteWeight(queryWeights, _extractAlbumHint(track), 0.8);
+        addAlbumWeight(_extractAlbumHint(track), 1.1);
       }
     }
 
     for (final track in libraryTracks.take(24)) {
+      final normalizedTrack = normalizeTrack(track);
+      final trackId = extractTrackId(normalizedTrack);
+      if (trackId != null && trackId.isNotEmpty) {
+        libraryTrackIds.add(trackId);
+        if (normalizedTrack['is_downloaded_locally'] == true) {
+          offlineTrackIds.add(trackId);
+        }
+      }
       _bumpTasteWeight(artistWeights, _extractArtistHint(track), 1.2);
       _bumpTasteWeight(queryWeights, _extractAlbumHint(track), 0.7);
+      addAlbumWeight(_extractAlbumHint(track), 0.9);
     }
 
-    final recentQueries = await getRecentCloudSearchQueries(limit: 8);
-    for (final query in recentQueries) {
+    for (final query in blendedRecentQueries) {
       if (_looksLikeTasteQuery(query)) {
         _bumpTasteWeight(queryWeights, query, 1.35);
       }
@@ -2879,15 +4040,31 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
       ..sort((a, b) => b.value.compareTo(a.value));
     final rankedQueries = queryWeights.entries.toList()
       ..sort((a, b) => b.value.compareTo(a.value));
+    final rankedAlbums = albumWeights.entries.toList()
+      ..sort((a, b) => b.value.compareTo(a.value));
 
     return {
       'query': '',
       'limit': limit,
       'offset': offset,
+      'user_scope_id': storageScopeId,
+      'force_refresh': forceRefresh,
       if (seedIds.isNotEmpty) 'seed_id': seedIds.first,
       'seed_ids': seedIds.take(forceRefresh ? 6 : 5).toList(growable: false),
+      'recent_track_ids': recentTrackIds,
+      'top_track_ids': topTrackIds,
+      'recent_track_snapshots': recentTrackSnapshots,
+      'top_track_snapshots': topTrackSnapshots,
+      'last_played_tracks': lastPlayedSnapshots,
+      'recent_queries': blendedRecentQueries,
+      'playlist_names':
+          playlists.map((playlist) => playlist.name).take(10).toList(growable: false),
+      'library_track_ids': libraryTrackIds.take(28).toList(growable: false),
+      'offline_track_ids': offlineTrackIds.take(28).toList(growable: false),
       'artist_hints':
           rankedArtists.take(6).map((entry) => entry.key).toList(growable: false),
+      'album_hints':
+          rankedAlbums.take(6).map((entry) => entry.key).toList(growable: false),
       'taste_queries':
           rankedQueries.take(8).map((entry) => entry.key).toList(growable: false),
       'avoid_ids': avoidIds.take(40).toList(growable: false),
@@ -2896,65 +4073,53 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
 
   Future<void> loadQuickRecommendations(String seedId) async {
     final requestVersion = ++_requestVersion;
-    _hasMorePages = true;
     isLoading = true;
-    state = [...state];
+    state = state.copyWith();
     try {
+      final body = await _buildRecommendationRequestBody(seedId, limit: 8);
       final res = await appHttpClient
           .post(
             buildProxyUri('/recommend'),
             headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({
-              'query': '',
-              'limit': 12,
-              'seed_id': seedId,
-              'seed_ids': [seedId],
-              'artist_hints': const [],
-              'taste_queries': const [],
-              'avoid_ids': const [],
-            }),
+            body: jsonEncode(body),
           )
-          .timeout(const Duration(seconds: 5));
+          .timeout(const Duration(seconds: 6));
       if (!_isRequestCurrent(requestVersion)) return;
       if (res.statusCode != 200) return;
-      final payload = jsonDecode(res.body) as Map<String, dynamic>;
-      final fetched = payload['recommendations'] as List<dynamic>;
-      if (fetched.isEmpty) return;
-      final nextState = _prepareRecommendationResults(fetched);
-      _hasMorePages = payload['has_more'] == true;
+      final nextState =
+          _feedStateFromPayload(jsonDecode(res.body) as Map<String, dynamic>);
+      if (!nextState.hasRows) return;
       state = nextState;
-      _primeRecommendationResults(nextState);
+      _primeRecommendationRows(nextState.rows);
       unawaited(_saveCachedRecommendations(nextState));
     } catch (_) {
       // Quick bootstrap is best-effort only.
     } finally {
       if (_isRequestCurrent(requestVersion)) {
         isLoading = false;
-        state = [...state];
+        state = state.copyWith();
       }
     }
   }
 
-  Future<void> loadRecommendations([String? seedId, bool forceRefresh = false]) async {
+  Future<void> loadRecommendations([
+    String? seedId,
+    bool forceRefresh = false,
+    List<String> extraArtistHints = const <String>[],
+    List<String> extraTasteQueries = const <String>[],
+  ]) async {
     final requestVersion = ++_requestVersion;
-    final previousIds = forceRefresh
-        ? state
-            .map((track) => (track['id'] ?? track['videoId'])?.toString())
-            .whereType<String>()
-            .toSet()
-        : const <String>{};
     isLoading = true;
-    _hasMorePages = true;
     if (_isRequestCurrent(requestVersion)) {
-      state = forceRefresh ? [...state] : [...state];
+      state = state.copyWith();
     }
     try {
       final body = await _buildRecommendationRequestBody(
         seedId,
-        limit: 15,
-        offset: 0,
-        avoidIds: previousIds,
+        limit: 8,
         forceRefresh: forceRefresh,
+        extraArtistHints: extraArtistHints,
+        extraTasteQueries: extraTasteQueries,
       );
       if (!_isRequestCurrent(requestVersion)) return;
       final res = await appHttpClient
@@ -2964,53 +4129,241 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
           .timeout(const Duration(seconds: 10));
       if (!_isRequestCurrent(requestVersion)) return;
       if (res.statusCode == 200) {
-        final payload = jsonDecode(res.body) as Map<String, dynamic>;
-        final fetched = payload['recommendations'] as List<dynamic>;
-        final nextState = _prepareRecommendationResults(
-          fetched,
-          avoidIds: previousIds,
-          forceRefresh: forceRefresh,
-        );
-        _hasMorePages = payload['has_more'] == true;
-        state = nextState;
-        _primeRecommendationResults(state);
-        unawaited(_saveCachedRecommendations(nextState));
-        return;
-      }
-
-      if (state.isEmpty || forceRefresh) {
-        final fallbackResults =
-            await _fetchDefaultRecommendations(forceRefresh: forceRefresh);
-        if (!_isRequestCurrent(requestVersion)) return;
-        if (fallbackResults.isNotEmpty) {
-          final nextState = _prepareRecommendationResults(
-            fallbackResults,
-            avoidIds: previousIds,
-            forceRefresh: forceRefresh,
-          );
-          _hasMorePages = fallbackResults.length >= (forceRefresh ? 16 : 12);
+        final nextState =
+            _feedStateFromPayload(jsonDecode(res.body) as Map<String, dynamic>);
+        if (nextState.hasRows) {
           state = nextState;
-          _primeRecommendationResults(state);
+          _primeRecommendationRows(state.rows);
           unawaited(_saveCachedRecommendations(nextState));
           return;
         }
       }
     } catch (e) {
-      if (state.isEmpty || forceRefresh) {
-        final fallbackResults =
-            await _fetchDefaultRecommendations(forceRefresh: forceRefresh);
-        if (!_isRequestCurrent(requestVersion)) return;
-        if (fallbackResults.isNotEmpty) {
-          final nextState = _prepareRecommendationResults(
-            fallbackResults,
-            avoidIds: previousIds,
-            forceRefresh: forceRefresh,
-          );
-          _hasMorePages = fallbackResults.length >= (forceRefresh ? 16 : 12);
-          state = nextState;
-          _primeRecommendationResults(state);
-          unawaited(_saveCachedRecommendations(nextState));
+      // Preserve the current feed on backend failures instead of
+      // reconstructing a static fallback lane locally.
+    } finally {
+      if (_isRequestCurrent(requestVersion)) {
+        isLoading = false;
+        state = state.copyWith();
+      }
+    }
+  }
+
+  Future<void> loadMoreRow(String rowId) async {
+    RecommendationFeedRowState? targetRow;
+    for (final row in state.rows) {
+      if (row.id == rowId) {
+        targetRow = row;
+        break;
+      }
+    }
+    if (targetRow == null ||
+        !targetRow.hasMore ||
+        state.sessionId.isEmpty ||
+        _paginatingRows.contains(rowId)) {
+      return;
+    }
+    _paginatingRows.add(rowId);
+    if (mounted) {
+      state = state.copyWith();
+    }
+    try {
+      final pageLimit = targetRow.kind == 'quiet_picks' ? 10 : 8;
+      final body = await _buildRecommendationRequestBody(
+        null,
+        limit: pageLimit,
+        offset: targetRow.nextOffset,
+      );
+      if (!mounted) return;
+      body['session_id'] = state.sessionId;
+      body['row_id'] = rowId;
+      final res = await appHttpClient.post(buildProxyUri('/recommend'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode(body)).timeout(const Duration(seconds: 10));
+      if (!mounted) return;
+      if (res.statusCode == 200) {
+        final payload = jsonDecode(res.body) as Map<String, dynamic>;
+        final rowPayload = payload['row'];
+        if (rowPayload is Map<String, dynamic>) {
+          final newRow = RecommendationFeedRowState.fromJson(rowPayload);
+          final mergedItems = <Map<String, dynamic>>[];
+          final seen = <String>{};
+          for (final track in [...targetRow.items, ...newRow.items]) {
+            final key = _recommendationRowItemKey(targetRow.itemType, track);
+            if (key.trim().isEmpty || !seen.add(key)) continue;
+            mergedItems.add(track);
+          }
+          final updatedRows = state.rows
+              .map(
+                (row) => row.id == rowId
+                    ? row.copyWith(
+                        itemType: newRow.itemType,
+                        items: mergedItems,
+                        nextOffset: newRow.nextOffset,
+                        hasMore: newRow.hasMore,
+                      )
+                    : row,
+              )
+              .toList(growable: false);
+          state = state.copyWith(rows: updatedRows);
+          _primeRecommendationResults(newRow.items);
+          unawaited(_saveCachedRecommendations(state));
         }
+      }
+    } catch (e) {
+      // print("Load more failed: $e");
+    } finally {
+      _paginatingRows.remove(rowId);
+      if (mounted) {
+        state = state.copyWith();
+      }
+    }
+  }
+
+  Future<void> loadMore([String? _]) async {
+    final nextRow = state.rows.firstWhere(
+      (row) => row.hasMore && !_paginatingRows.contains(row.id),
+      orElse: () => const RecommendationFeedRowState(
+        id: '',
+        title: '',
+        kind: '',
+        itemType: 'track',
+        items: [],
+        nextOffset: 0,
+        hasMore: false,
+      ),
+    );
+    if (nextRow.id.isEmpty) {
+      return;
+    }
+    await loadMoreRow(nextRow.id);
+  }
+}
+
+final recommendationProvider =
+    StateNotifierProvider<RecommendationNotifier, RecommendationFeedState>((ref) {
+  ref.watch(authProvider.select((state) => state.storageScopeId));
+  ref.watch(storageRefreshTickProvider);
+  final notifier = RecommendationNotifier(ref);
+  unawaited(notifier.bootstrap());
+  return notifier;
+});
+
+class FrequentlyPlayedNotifier extends StateNotifier<List<Map<String, dynamic>>> {
+  final Ref ref;
+  late final StreamSubscription<Map<String, dynamic>> _historySubscription;
+  bool isLoading = false;
+  int _requestVersion = 0;
+
+  FrequentlyPlayedNotifier._internal(this.ref) : super(const []);
+
+  factory FrequentlyPlayedNotifier(Ref ref) {
+    final notifier = FrequentlyPlayedNotifier._internal(ref);
+    notifier._historySubscription = HistoryManager.trackStream.listen((track) {
+      notifier._applyImmediateTrack(track);
+      unawaited(notifier.loadTracks());
+    });
+    return notifier;
+  }
+
+  void _applyImmediateTrack(Map<String, dynamic> rawTrack) {
+    if (!mounted) return;
+    final normalizedTrack = normalizeTrack(rawTrack);
+    final trackId = extractTrackId(normalizedTrack);
+    if (trackId == null || trackId.isEmpty) return;
+    final next = <Map<String, dynamic>>[normalizedTrack];
+    for (final existing in state) {
+      if (extractTrackId(existing) == trackId) continue;
+      next.add(existing);
+      if (next.length >= 8) break;
+    }
+    state = next;
+  }
+
+  bool _isRequestCurrent(int requestVersion) =>
+      mounted && requestVersion == _requestVersion;
+
+  Future<void> bootstrap() async {
+    await loadTracks();
+  }
+
+  Future<void> loadTracks({bool forceRefresh = false}) async {
+    final requestVersion = ++_requestVersion;
+    isLoading = true;
+    if (mounted) {
+      state = [...state];
+    }
+    try {
+      final frequentSnapshots =
+          await HistoryManager.getFrequentlyPlayedTrackSnapshots(limit: 8);
+      if (!_isRequestCurrent(requestVersion)) return;
+      final resolved = <Map<String, dynamic>>[];
+      final seen = <String>{};
+      final snapshotFallbacks = <String, Map<String, dynamic>>{};
+      for (final track in frequentSnapshots) {
+        final trackId = extractTrackId(track);
+        if (trackId == null || trackId.isEmpty || !seen.add(trackId)) continue;
+        final normalizedTrack = normalizeTrack(track);
+        if (_isTrackMetadataIncomplete(normalizedTrack)) {
+          snapshotFallbacks[trackId] = normalizedTrack;
+        } else {
+          resolved.add(normalizedTrack);
+        }
+        if (seen.length >= 8) break;
+      }
+
+      final trackIds =
+          await HistoryManager.getFrequentlyPlayedTrackIds(limit: 8);
+      if (!_isRequestCurrent(requestVersion)) return;
+      if (trackIds.isEmpty && resolved.isEmpty) {
+        if (!_isRequestCurrent(requestVersion)) return;
+        state = const [];
+        return;
+      }
+      for (final trackId in trackIds) {
+        if (seen.length >= 8) break;
+        if (!seen.contains(trackId)) {
+          seen.add(trackId);
+        }
+      }
+      final missingIds = {
+        ...trackIds.where((trackId) {
+          return !resolved.any((track) => extractTrackId(track) == trackId);
+        }),
+        ...snapshotFallbacks.keys.where((trackId) {
+          return !resolved.any((track) => extractTrackId(track) == trackId);
+        }),
+      }.toList(growable: false);
+
+      if (missingIds.isNotEmpty && resolved.length < 8) {
+        final hydrated = await _hydrateTracksFromIds(
+          ref,
+          missingIds,
+          limit: 8 - resolved.length,
+        );
+        if (!_isRequestCurrent(requestVersion)) return;
+        for (final track in hydrated) {
+          final trackId = extractTrackId(track);
+          if (trackId == null || trackId.isEmpty) continue;
+          if (resolved.any((entry) => extractTrackId(entry) == trackId)) continue;
+          resolved.add(track);
+        }
+      }
+
+      for (final entry in snapshotFallbacks.entries) {
+        if (resolved.any((track) => extractTrackId(track) == entry.key)) continue;
+        resolved.add(entry.value);
+        if (resolved.length >= 8) break;
+      }
+
+      if (!_isRequestCurrent(requestVersion)) return;
+      state = resolved.take(8).toList(growable: false);
+      if (_isRequestCurrent(requestVersion) && state.isNotEmpty) {
+        unawaited(
+          ref.read(audioPlayerProvider.notifier).prewarmStreams(
+                state.take(6).map(extractTrackId),
+              ),
+        );
       }
     } finally {
       if (_isRequestCurrent(requestVersion)) {
@@ -3020,71 +4373,135 @@ class RecommendationNotifier extends StateNotifier<List<dynamic>> {
     }
   }
 
-  Future<void> loadMore(String seedId) async {
-    if (isPaginating || !_hasMorePages) return;
+  @override
+  void dispose() {
+    _historySubscription.cancel();
+    _requestVersion++;
+    super.dispose();
+  }
+}
+
+final frequentlyPlayedProvider = StateNotifierProvider<FrequentlyPlayedNotifier,
+    List<Map<String, dynamic>>>((ref) {
+  ref.watch(authProvider.select((state) => state.storageScopeId));
+  ref.watch(storageRefreshTickProvider);
+  final notifier = FrequentlyPlayedNotifier(ref);
+  unawaited(notifier.bootstrap());
+  return notifier;
+});
+
+class LastPlayedNotifier extends StateNotifier<List<Map<String, dynamic>>> {
+  final Ref ref;
+  late final StreamSubscription<Map<String, dynamic>> _historySubscription;
+  bool isLoading = false;
+  int _requestVersion = 0;
+
+  LastPlayedNotifier._internal(this.ref) : super(const []);
+
+  factory LastPlayedNotifier(Ref ref) {
+    final notifier = LastPlayedNotifier._internal(ref);
+    notifier._historySubscription = HistoryManager.trackStream.listen((track) {
+      notifier._applyImmediateTrack(track);
+      unawaited(notifier.loadTracks());
+    });
+    return notifier;
+  }
+
+  void _applyImmediateTrack(Map<String, dynamic> rawTrack) {
+    if (!mounted) return;
+    final normalizedTrack = normalizeTrack(rawTrack);
+    final trackId = extractTrackId(normalizedTrack);
+    if (trackId == null || trackId.isEmpty) return;
+    final next = <Map<String, dynamic>>[normalizedTrack];
+    for (final existing in state) {
+      if (extractTrackId(existing) == trackId) continue;
+      next.add(existing);
+      if (next.length >= 8) break;
+    }
+    state = next;
+  }
+
+  bool _isRequestCurrent(int requestVersion) =>
+      mounted && requestVersion == _requestVersion;
+
+  Future<void> bootstrap() async {
+    await loadTracks();
+  }
+
+  Future<void> loadTracks({bool forceRefresh = false}) async {
     final requestVersion = ++_requestVersion;
-    isPaginating = true;
-    if (_isRequestCurrent(requestVersion)) {
+    isLoading = true;
+    if (mounted) {
       state = [...state];
     }
     try {
-      final effectiveSeedId = await HistoryManager.getRecommendationSeed() ?? seedId;
+      final tracks = await HistoryManager.getLastPlayedTrackSnapshots(limit: 8);
       if (!_isRequestCurrent(requestVersion)) return;
-      final existingIds = state
-          .map(extractTrackId)
-          .whereType<String>()
-          .where((id) => id.isNotEmpty)
-          .toSet();
-      final body = await _buildRecommendationRequestBody(
-        effectiveSeedId,
-        limit: 10,
-        offset: state.length,
-        avoidIds: existingIds,
-      );
-      if (!_isRequestCurrent(requestVersion)) return;
-      final res = await appHttpClient.post(buildProxyUri('/recommend'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode(body));
-      if (!_isRequestCurrent(requestVersion)) return;
-      if (res.statusCode == 200) {
-        final payload = jsonDecode(res.body) as Map<String, dynamic>;
-        final newRecs = payload['recommendations'] as List<dynamic>;
-        final uniqueNew = newRecs
-            .whereType<Map>()
-            .map((track) => normalizeTrack(track))
-            .where((track) {
-              final id = extractTrackId(track);
-              return id != null && id.isNotEmpty && !existingIds.contains(id);
-            })
-            .toList(growable: false);
-        _hasMorePages = payload['has_more'] == true;
-        state = [...state, ...uniqueNew];
-        _primeRecommendationResults(uniqueNew);
+      final resolved = <Map<String, dynamic>>[];
+      final pendingIds = <String>[];
+      final fallbacks = <String, Map<String, dynamic>>{};
+      for (final track in tracks) {
+        final normalizedTrack = normalizeTrack(track);
+        final trackId = extractTrackId(normalizedTrack);
+        if (trackId == null || trackId.isEmpty) continue;
+        if (_isTrackMetadataIncomplete(normalizedTrack)) {
+          pendingIds.add(trackId);
+          fallbacks[trackId] = normalizedTrack;
+        } else {
+          resolved.add(normalizedTrack);
+        }
+        if (resolved.length + pendingIds.length >= 8) break;
       }
-    } catch (e) {
-      // print("Load more failed: $e");
+      if (pendingIds.isNotEmpty) {
+        final hydrated = await _hydrateTracksFromIds(
+          ref,
+          pendingIds,
+          limit: pendingIds.length,
+        );
+        if (!_isRequestCurrent(requestVersion)) return;
+        for (final track in hydrated) {
+          final trackId = extractTrackId(track);
+          if (trackId == null || trackId.isEmpty) continue;
+          fallbacks.remove(trackId);
+          resolved.add(track);
+        }
+      }
+      if (!_isRequestCurrent(requestVersion)) return;
+      for (final fallback in fallbacks.values) {
+        resolved.add(fallback);
+        if (resolved.length >= 8) break;
+      }
+      state = resolved.take(8).toList(growable: false);
     } finally {
       if (_isRequestCurrent(requestVersion)) {
-        isPaginating = false;
+        isLoading = false;
         state = [...state];
       }
     }
   }
+
+  @override
+  void dispose() {
+    _historySubscription.cancel();
+    _requestVersion++;
+    super.dispose();
+  }
 }
 
-final recommendationProvider =
-    StateNotifierProvider<RecommendationNotifier, List<dynamic>>((ref) {
+final lastPlayedProvider =
+    StateNotifierProvider<LastPlayedNotifier, List<Map<String, dynamic>>>((ref) {
   ref.watch(authProvider.select((state) => state.storageScopeId));
   ref.watch(storageRefreshTickProvider);
-  final notifier = RecommendationNotifier(ref);
+  final notifier = LastPlayedNotifier(ref);
   unawaited(notifier.bootstrap());
   return notifier;
 });
 
 class SuggestNotifier extends StateNotifier<List<String>> {
+  final Ref ref;
   int _requestVersion = 0;
 
-  SuggestNotifier() : super([]);
+  SuggestNotifier(this.ref) : super([]);
 
   Future<void> fetchSuggestions(String query) async {
     if (query.isEmpty) {
@@ -3093,10 +4510,15 @@ class SuggestNotifier extends StateNotifier<List<String>> {
     }
     final requestVersion = ++_requestVersion;
     try {
+      final body = await _buildSemanticSearchRequestBody(
+        ref,
+        query,
+        limit: 5,
+      );
       final res = await appHttpClient
           .post(buildProxyUri('/suggest'),
               headers: {'Content-Type': 'application/json'},
-              body: jsonEncode({"query": query, "limit": 5}))
+              body: jsonEncode(body))
           .timeout(const Duration(seconds: 10));
       if (requestVersion != _requestVersion) return;
       if (res.statusCode == 200) {
@@ -3115,7 +4537,7 @@ class SuggestNotifier extends StateNotifier<List<String>> {
 
 final suggestProvider =
     StateNotifierProvider<SuggestNotifier, List<String>>((ref) {
-  return SuggestNotifier();
+  return SuggestNotifier(ref);
 });
 
 class TrackDetailsNotifier extends StateNotifier<Map<String, dynamic>?> {
@@ -3155,9 +4577,10 @@ final trackDetailsProvider =
 });
 
 class AlbumSearchNotifier extends StateNotifier<List<Map<String, dynamic>>> {
+  final Ref ref;
   int _requestVersion = 0;
 
-  AlbumSearchNotifier() : super(const []);
+  AlbumSearchNotifier(this.ref) : super(const []);
   bool isLoading = false;
 
   Future<void> search(String query) async {
@@ -3165,11 +4588,16 @@ class AlbumSearchNotifier extends StateNotifier<List<Map<String, dynamic>>> {
     isLoading = true;
     state = [...state];
     try {
+      final body = await _buildSemanticSearchRequestBody(
+        ref,
+        query,
+        limit: 12,
+      );
       final res = await appHttpClient
           .post(
             buildProxyUri('/search_albums'),
             headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({"query": query, "limit": 6}),
+            body: jsonEncode(body),
           )
           .timeout(const Duration(seconds: 10));
       if (requestVersion != _requestVersion) return;
@@ -3179,6 +4607,13 @@ class AlbumSearchNotifier extends StateNotifier<List<Map<String, dynamic>>> {
         state = albums
             .map((album) => Map<String, dynamic>.from(album as Map))
             .toList(growable: false);
+        unawaited(
+          recordProxySearchEvent(
+            query,
+            resultCount: state.length,
+            searchScope: 'album',
+          ),
+        );
       } else {
         state = const [];
       }
@@ -3203,7 +4638,7 @@ class AlbumSearchNotifier extends StateNotifier<List<Map<String, dynamic>>> {
 final albumSearchProvider =
     StateNotifierProvider<AlbumSearchNotifier, List<Map<String, dynamic>>>(
         (ref) {
-  return AlbumSearchNotifier();
+  return AlbumSearchNotifier(ref);
 });
 
 class AlbumDetailsState {
@@ -3268,10 +4703,11 @@ final albumDetailsProvider =
 });
 
 class ArtistSearchNotifier extends StateNotifier<List<Map<String, dynamic>>> {
+  final Ref ref;
   int _requestVersion = 0;
   bool isLoading = false;
 
-  ArtistSearchNotifier() : super(const []);
+  ArtistSearchNotifier(this.ref) : super(const []);
 
   Future<void> search(String query) async {
     final trimmed = query.trim();
@@ -3283,11 +4719,16 @@ class ArtistSearchNotifier extends StateNotifier<List<Map<String, dynamic>>> {
     isLoading = true;
     state = [...state];
     try {
+      final body = await _buildSemanticSearchRequestBody(
+        ref,
+        trimmed,
+        limit: 12,
+      );
       final res = await appHttpClient
           .post(
             buildProxyUri('/search_artists'),
             headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({"query": trimmed, "limit": 8}),
+            body: jsonEncode(body),
           )
           .timeout(const Duration(seconds: 10));
       if (requestVersion != _requestVersion) return;
@@ -3297,6 +4738,13 @@ class ArtistSearchNotifier extends StateNotifier<List<Map<String, dynamic>>> {
         state = artists
             .map((artist) => Map<String, dynamic>.from(artist as Map))
             .toList(growable: false);
+        unawaited(
+          recordProxySearchEvent(
+            trimmed,
+            resultCount: state.length,
+            searchScope: 'artist',
+          ),
+        );
       } else {
         state = const [];
       }
@@ -3321,7 +4769,7 @@ class ArtistSearchNotifier extends StateNotifier<List<Map<String, dynamic>>> {
 final artistSearchProvider =
     StateNotifierProvider<ArtistSearchNotifier, List<Map<String, dynamic>>>(
         (ref) {
-  return ArtistSearchNotifier();
+  return ArtistSearchNotifier(ref);
 });
 
 class RecommendedArtistsNotifier
@@ -3329,6 +4777,9 @@ class RecommendedArtistsNotifier
   final Ref ref;
   int _requestVersion = 0;
   bool isLoading = false;
+
+  bool _isRequestCurrent(int requestVersion) =>
+      mounted && requestVersion == _requestVersion;
 
   RecommendedArtistsNotifier(this.ref) : super(const []);
 
@@ -3342,24 +4793,26 @@ class RecommendedArtistsNotifier
     );
   }
 
-  String? _extractArtistHint(dynamic rawTrack) {
-    if (rawTrack is! Map) return null;
-    return rawTrack['channel']?.toString() ??
-        rawTrack['author']?.toString() ??
-        rawTrack['artist']?.toString();
+  void _bumpTrackArtists(
+    Map<String, double> weights,
+    dynamic rawTrack,
+    double weight,
+  ) {
+    for (final artist in extractTrackArtists(rawTrack)) {
+      _bumpWeight(weights, artist, weight);
+    }
   }
 
-  bool _looksLikeTasteQuery(String query) {
+  bool _looksLikeArtistOrSongQuery(String query) {
     final normalized = query.trim().toLowerCase();
     if (normalized.isEmpty) return false;
-    if (normalized.length > 38) return true;
-    if (normalized.contains(' mix') ||
-        normalized.contains(' playlist') ||
-        normalized.contains(' songs') ||
-        normalized.contains(' music')) {
-      return true;
+    if (normalized.contains(' playlist') ||
+        normalized.contains(' mix') ||
+        normalized.contains(' mood') ||
+        normalized.contains(' songs like')) {
+      return false;
     }
-    return _sharedTasteKeywords.any((keyword) => normalized.contains(keyword));
+    return true;
   }
 
   Future<void> bootstrap() async {
@@ -3372,41 +4825,50 @@ class RecommendedArtistsNotifier
   }) async {
     final requestVersion = ++_requestVersion;
     isLoading = true;
-    state = [...state];
+    if (mounted) {
+      state = [...state];
+    }
     try {
       final artistWeights = <String, double>{};
-      final queryWeights = <String, double>{};
-      final playlists = ref.read(playlistProvider);
       final libraryTracks = ref.read(libraryProvider).valueOrNull ?? const [];
+      final artistSignals = await Future.wait<Object?>([
+        HistoryManager.getLastPlayedTrackSnapshots(limit: 10),
+        HistoryManager.getFrequentlyPlayedTrackSnapshots(limit: 12),
+        HistoryManager.getRecentTrackSnapshots(limit: 12),
+        getRecentCloudSearchQueries(limit: 8),
+      ]);
+      if (!_isRequestCurrent(requestVersion)) return;
+      final lastPlayedSnapshots =
+          List<Map<String, dynamic>>.from(artistSignals[0] as List);
+      final frequentSnapshots =
+          List<Map<String, dynamic>>.from(artistSignals[1] as List);
+      final recentSnapshots =
+          List<Map<String, dynamic>>.from(artistSignals[2] as List);
+      final recentQueries = List<String>.from(artistSignals[3] as List);
 
       for (final artist in seedArtistHints) {
         _bumpWeight(artistWeights, artist, 2.8);
       }
-      for (final query in seedTasteQueries) {
-        _bumpWeight(queryWeights, query, 2.0);
+      for (final track in lastPlayedSnapshots) {
+        _bumpTrackArtists(artistWeights, track, 2.2);
       }
-
-      for (final playlist in playlists) {
-        _bumpWeight(queryWeights, playlist.name, 1.2);
-        for (final track in playlist.tracks.take(18)) {
-          _bumpWeight(artistWeights, _extractArtistHint(track), 1.5);
-        }
+      for (final track in frequentSnapshots) {
+        _bumpTrackArtists(artistWeights, track, 1.9);
+      }
+      for (final track in recentSnapshots) {
+        _bumpTrackArtists(artistWeights, track, 1.4);
       }
 
       for (final track in libraryTracks.take(24)) {
-        _bumpWeight(artistWeights, _extractArtistHint(track), 1.25);
+        _bumpTrackArtists(artistWeights, track, 1.1);
       }
 
-      final recentQueries = await getRecentCloudSearchQueries(limit: 8);
-      for (final query in recentQueries) {
-        if (_looksLikeTasteQuery(query)) {
-          _bumpWeight(queryWeights, query, 1.1);
-        }
-      }
+      final canonicalQueries = <String>[
+        ...seedTasteQueries.where(_looksLikeArtistOrSongQuery),
+        ...recentQueries.where(_looksLikeArtistOrSongQuery),
+      ];
 
       final rankedArtists = artistWeights.entries.toList()
-        ..sort((a, b) => b.value.compareTo(a.value));
-      final rankedQueries = queryWeights.entries.toList()
         ..sort((a, b) => b.value.compareTo(a.value));
 
       final res = await appHttpClient
@@ -3420,14 +4882,14 @@ class RecommendedArtistsNotifier
                   .take(8)
                   .map((entry) => entry.key)
                   .toList(growable: false),
-              'taste_queries': rankedQueries
-                  .take(6)
-                  .map((entry) => entry.key)
-                  .toList(growable: false),
+              'recent_queries': canonicalQueries.take(6).toList(growable: false),
+              'recent_track_snapshots': recentSnapshots,
+              'top_track_snapshots': frequentSnapshots,
+              'last_played_tracks': lastPlayedSnapshots,
             }),
           )
           .timeout(const Duration(seconds: 10));
-      if (requestVersion != _requestVersion) return;
+      if (!_isRequestCurrent(requestVersion)) return;
       if (res.statusCode == 200) {
         final payload = jsonDecode(res.body) as Map<String, dynamic>;
         final artists = (payload['artists'] as List<dynamic>? ?? const []);
@@ -3438,10 +4900,10 @@ class RecommendedArtistsNotifier
         state = const [];
       }
     } catch (_) {
-      if (requestVersion != _requestVersion) return;
+      if (!_isRequestCurrent(requestVersion)) return;
       state = const [];
     } finally {
-      if (requestVersion == _requestVersion) {
+      if (_isRequestCurrent(requestVersion)) {
         isLoading = false;
         state = [...state];
       }
@@ -3459,9 +4921,7 @@ final recommendedArtistsProvider = StateNotifierProvider<
     RecommendedArtistsNotifier, List<Map<String, dynamic>>>((ref) {
   ref.watch(authProvider.select((state) => state.storageScopeId));
   ref.watch(storageRefreshTickProvider);
-  final notifier = RecommendedArtistsNotifier(ref);
-  unawaited(notifier.bootstrap());
-  return notifier;
+  return RecommendedArtistsNotifier(ref);
 });
 
 class ArtistDetailsState {
@@ -3756,6 +5216,28 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
     return normalized;
   }
 
+  void _refreshHistorySignalConsumers() {
+    unawaited(ref.read(lastPlayedProvider.notifier).loadTracks(forceRefresh: true));
+    unawaited(
+      ref.read(frequentlyPlayedProvider.notifier).loadTracks(forceRefresh: true),
+    );
+  }
+
+  Future<void> _recordCurrentQueueInteraction(String eventType) async {
+    final trackId = state.currentTrackId;
+    if (trackId == null || trackId.isEmpty) return;
+    final currentIndex = _resolvedCurrentIndex();
+    final rawTrack =
+        currentIndex >= 0 && currentIndex < state.queue.length
+            ? state.queue[currentIndex]
+            : null;
+    await recordProxyInteractionEvent(
+      eventType,
+      trackId: trackId,
+      rawTrack: rawTrack,
+    );
+  }
+
   Future<List<Map<String, dynamic>>> _fetchRecommendations(
     String seedId, {
     int limit = 12,
@@ -3786,6 +5268,30 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
     return _uniqueTracks(rawTracks, excludedIds: {seedId});
   }
 
+  Future<List<Map<String, dynamic>>> _fetchSimilarTracks(
+    String seedId, {
+    int limit = 12,
+  }) async {
+    final res = await appHttpClient
+        .post(
+          buildProxyUri('/track_details'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({'video_id': seedId}),
+        )
+        .timeout(const Duration(seconds: 12));
+
+    if (res.statusCode != 200) {
+      throw Exception('Track detail lookup failed: ${res.statusCode}');
+    }
+
+    final payload = jsonDecode(res.body) as Map<String, dynamic>;
+    final rawTracks =
+        payload['similar_tracks'] as List<dynamic>? ?? const <dynamic>[];
+    return _uniqueTracks(rawTracks, excludedIds: {seedId})
+        .take(limit)
+        .toList(growable: false);
+  }
+
   Future<void> startRadioSession(dynamic track) async {
     final normalizedTrack = normalizeTrack(track);
     final videoId = extractTrackId(normalizedTrack);
@@ -3803,8 +5309,58 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
           [normalizedTrack],
           initialIndex: 0,
         );
+    _refreshHistorySignalConsumers();
     _primeUpcomingQueue();
     unawaited(_appendRadioRecommendations(seedId: videoId));
+  }
+
+  Future<void> startDiscoverySession(
+    dynamic track, {
+    String? sessionName,
+  }) async {
+    final normalizedTrack = normalizeTrack(track);
+    final videoId = extractTrackId(normalizedTrack);
+    if (videoId == null || videoId.isEmpty) return;
+
+    final frequentSnapshots = await HistoryManager.getFrequentlyPlayedTrackSnapshots(
+      limit: 2,
+    );
+    List<Map<String, dynamic>> similarTracks = const [];
+    List<Map<String, dynamic>> fillerTracks = const [];
+    try {
+      similarTracks = await _fetchSimilarTracks(videoId, limit: 10);
+    } catch (_) {
+      similarTracks = const [];
+    }
+    if (similarTracks.length < 6) {
+      try {
+        fillerTracks = await _fetchRecommendations(
+          videoId,
+          limit: 8 - similarTracks.length,
+        );
+      } catch (_) {
+        fillerTracks = const [];
+      }
+    }
+
+    final queue = _uniqueTracks(
+      [
+        normalizedTrack,
+        ...similarTracks,
+        if (similarTracks.isNotEmpty) ...frequentSnapshots,
+        ...fillerTracks,
+      ],
+      excludedIds: const {},
+    );
+
+    await startPlaylistSession(
+      playlistId: 'discovery:$videoId',
+      playlistName:
+          sessionName ??
+          'Inspired by ${normalizedTrack['title']?.toString() ?? 'this track'}',
+      tracks: queue,
+      currentTrack: normalizedTrack,
+    );
   }
 
   Future<bool> startLocalSession({
@@ -3841,6 +5397,7 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
         [localTrack],
         initialIndex: 0,
       );
+      _refreshHistorySignalConsumers();
       _primeTracks([localTrack], limit: 1);
       unawaited(_appendRadioRecommendations(seedId: videoId));
     } else {
@@ -3887,6 +5444,7 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
           normalizedQueue,
           initialIndex: currentIndex,
         );
+    _refreshHistorySignalConsumers();
     _primeUpcomingQueue();
     unawaited(_refreshPlaylistRecommendations(currentTrackId));
   }
@@ -3961,7 +5519,7 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
     _primeUpcomingQueue();
   }
 
-  Future<void> playNext() async {
+  Future<void> playNext({bool logCurrentSkip = true}) async {
     if (state.mode == PlaybackQueueMode.none) return;
 
     final audioNotifier = ref.read(audioPlayerProvider.notifier);
@@ -3970,6 +5528,9 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
       final resolvedCurrentIndex = _resolvedCurrentIndex();
       final nextIndex = _nextPlayableIndex(resolvedCurrentIndex);
       if (nextIndex >= 0) {
+        if (logCurrentSkip) {
+          unawaited(_recordCurrentQueueInteraction('skip'));
+        }
         if (nextIndex == resolvedCurrentIndex + 1 &&
             !isTrackHidden(state.queue[nextIndex])) {
           await audioNotifier.skipManagedQueueNext();
@@ -3987,6 +5548,9 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
 
     final nextIndex = _nextPlayableIndex(resolvedCurrentIndex);
     if (nextIndex >= 0) {
+      if (logCurrentSkip) {
+        unawaited(_recordCurrentQueueInteraction('skip'));
+      }
       await playQueueIndex(nextIndex);
       return;
     }
@@ -3995,21 +5559,30 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
       await _appendRadioRecommendations(seedId: state.currentTrackId);
       final refreshedNextIndex = _nextPlayableIndex(_resolvedCurrentIndex());
       if (refreshedNextIndex >= 0) {
+        if (logCurrentSkip) {
+          unawaited(_recordCurrentQueueInteraction('skip'));
+        }
         await playQueueIndex(refreshedNextIndex);
       }
     }
   }
 
-  Future<void> playPrevious() async {
+  Future<void> playPrevious({bool logCurrentSkip = true}) async {
     if (state.mode == PlaybackQueueMode.none) return;
     final audioNotifier = ref.read(audioPlayerProvider.notifier);
     if (audioNotifier.hasManagedQueue) {
+      if (logCurrentSkip && _resolvedCurrentIndex() > 0) {
+        unawaited(_recordCurrentQueueInteraction('skip'));
+      }
       await audioNotifier.skipManagedQueuePrevious();
       return;
     }
 
     final resolvedCurrentIndex = _resolvedCurrentIndex();
     final previousIndex = max(0, resolvedCurrentIndex - 1);
+    if (logCurrentSkip && previousIndex != resolvedCurrentIndex) {
+      unawaited(_recordCurrentQueueInteraction('skip'));
+    }
     await playQueueIndex(previousIndex);
   }
 
@@ -4267,9 +5840,9 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
     if (seedId == null || seedId.isEmpty) return;
     if (state.isLoadingRecommendations) return;
 
+    final existingRecommendations = state.recommendations;
     state = state.copyWith(
       isLoadingRecommendations: true,
-      recommendations: append ? state.recommendations : const [],
     );
     try {
       final excludedIds = <String>{
@@ -4277,11 +5850,42 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
         if (append)
           ...state.recommendations.map(extractTrackId).whereType<String>(),
       };
-      final fetchedTracks = await _fetchRecommendations(seedId);
+      final targetCount = append ? 8 : 10;
+
+      List<Map<String, dynamic>> similarTracks = const [];
+      try {
+        similarTracks = await _fetchSimilarTracks(seedId, limit: targetCount);
+      } catch (_) {
+        similarTracks = const [];
+      }
+
+      List<Map<String, dynamic>> fallbackTracks = const [];
+      if (similarTracks.length < targetCount) {
+        try {
+          fallbackTracks = await _fetchRecommendations(
+            seedId,
+            limit: targetCount - similarTracks.length,
+          );
+        } catch (_) {
+          fallbackTracks = const [];
+        }
+      }
+
+      final fetchedTracks = _uniqueTracks(
+        [
+          ...similarTracks,
+          ...fallbackTracks,
+        ],
+        excludedIds: excludedIds,
+      );
       final nextRecommendations = fetchedTracks
           .where((track) =>
               !excludedIds.contains(extractTrackId(track)))
           .toList(growable: false);
+      if (!append && nextRecommendations.isEmpty) {
+        state = state.copyWith(recommendations: existingRecommendations);
+        return;
+      }
       state = state.copyWith(
         recommendations: append
             ? [...state.recommendations, ...nextRecommendations]
@@ -4303,7 +5907,10 @@ final playbackQueueProvider =
   final notifier = PlaybackQueueNotifier(ref);
   final audioNotifier = ref.read(audioPlayerProvider.notifier);
 
-  Future<void> handleTrackCompleted() => notifier.playNext();
+  Future<void> handleTrackCompleted() async {
+    await notifier._recordCurrentQueueInteraction('complete');
+    await notifier.playNext(logCurrentSkip: false);
+  }
   Future<void> handleTrackChanged(String? videoId) =>
       notifier.handleTrackChanged(videoId);
 

@@ -9,6 +9,13 @@ String preferredArtworkUrl(String? thumbnail, {String? videoId}) {
   return thumbnail ?? '';
 }
 
+int? _cacheDimension(double value, {double multiplier = 1}) {
+  if (!value.isFinite || value <= 0) return null;
+  final scaled = value * multiplier;
+  if (!scaled.isFinite || scaled <= 0) return null;
+  return scaled.round();
+}
+
 class AppArtwork extends StatelessWidget {
   final String? thumbnail;
   final String? videoId;
@@ -86,10 +93,10 @@ class _ArtworkFrame extends StatelessWidget {
             : CachedNetworkImage(
                 imageUrl: imageUrl,
                 fit: fit,
-                memCacheWidth: (width * 3).round(),
-                memCacheHeight: (height * 3).round(),
-                maxWidthDiskCache: (width * 4).round(),
-                maxHeightDiskCache: (height * 4).round(),
+                memCacheWidth: _cacheDimension(width, multiplier: 3),
+                memCacheHeight: _cacheDimension(height, multiplier: 3),
+                maxWidthDiskCache: _cacheDimension(width, multiplier: 4),
+                maxHeightDiskCache: _cacheDimension(height, multiplier: 4),
                 fadeInDuration: const Duration(milliseconds: 220),
                 placeholder: (context, url) => const _ArtworkFallback(),
                 errorWidget: (context, url, error) => const _ArtworkFallback(),

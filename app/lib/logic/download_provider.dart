@@ -145,7 +145,7 @@ class DownloadCenterNotifier extends StateNotifier<DownloadCenterState> {
 
     try {
       final metaResponse = await http.post(
-        Uri.parse('$proxyBaseUrl/download'),
+        buildProxyUri('/download'),
         headers: {'Content-Type': 'application/json'},
         body: jsonEncode({"video_id": videoId, "title": title}),
       );
@@ -163,7 +163,7 @@ class DownloadCenterNotifier extends StateNotifier<DownloadCenterState> {
       final client = http.Client();
       try {
         final streamResponse = await client.send(
-          http.Request('GET', Uri.parse('$proxyBaseUrl/stream/$videoId')),
+          http.Request('GET', buildProxyUri('/stream/$videoId')),
         );
 
         if (streamResponse.statusCode != 200) {

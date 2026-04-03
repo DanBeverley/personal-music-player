@@ -14,9 +14,93 @@ import 'package:audio_service/audio_service.dart';
 import 'package:just_audio/just_audio.dart';
 
 late AudioHandler globalAudioHandler;
-const String proxyBaseUrl =
-    String.fromEnvironment('AURALIS_PROXY_URL', defaultValue: 'http://34.172.70.149');
+const String _configuredProxyBaseUrl =
+    String.fromEnvironment('AURALIS_PROXY_URL', defaultValue: '');
 final http.Client appHttpClient = http.Client();
+final http.Client proxyControlHttpClient = http.Client();
+const String _proxyUnavailableMessage =
+    'Recommendation service is unavailable right now. Check the proxy connection and try again.';
+const String _searchUnavailableMessage =
+    'Search could not complete right now. Try again in a moment.';
+const String _searchTimeoutMessage =
+    'Search is taking longer than expected. Try again in a moment.';
+const bool _disableRecommendationClientTimeouts = true;
+const Duration _recommendRequestTimeout = Duration(seconds: 45);
+const Duration _recommendRowPageTimeout = Duration(seconds: 30);
+const String _recommendTimeoutMessage =
+    'Recommendation service took too long to respond. Please try again.';
+
+Future<T> _runRecommendationRequest<T>(Future<T> future, Duration timeout) {
+  if (_disableRecommendationClientTimeouts) {
+    return future;
+  }
+  return future.timeout(timeout);
+}
+
+String _normalizeProxyBaseUrl(String baseUrl) {
+  final trimmed = baseUrl.trim();
+  if (trimmed.isEmpty) return trimmed;
+  return trimmed.endsWith('/')
+      ? trimmed.substring(0, trimmed.length - 1)
+      : trimmed;
+}
+
+List<String> get proxyBaseUrlCandidates {
+  final configured = _configuredProxyBaseUrl.trim();
+  if (configured.isNotEmpty) {
+    return <String>[_normalizeProxyBaseUrl(configured)];
+  }
+
+  final candidates = <String>[
+    if (Platform.isAndroid) 'http://10.0.2.2:8000',
+    'http://127.0.0.1:8000',
+  ];
+  final normalized = candidates
+      .map(_normalizeProxyBaseUrl)
+      .where((value) => value.isNotEmpty)
+      .toSet()
+      .toList(growable: false);
+  return normalized.isEmpty
+      ? const <String>['http://127.0.0.1:8000']
+      : normalized;
+}
+
+String get proxyBaseUrl => proxyBaseUrlCandidates.first;
+
+Future<bool> probeProxyHealth(
+    {Duration timeout = const Duration(seconds: 3)}) async {
+  for (final baseUrl in proxyBaseUrlCandidates) {
+    try {
+      final res = await proxyControlHttpClient
+          .get(Uri.parse('$baseUrl/'))
+          .timeout(timeout);
+      if (res.statusCode >= 200 && res.statusCode < 500) {
+        return true;
+      }
+    } catch (_) {
+      // Try the next candidate endpoint.
+    }
+  }
+  return false;
+}
+
+void _debugProxyLog(String area, String message) {
+  if (!kDebugMode) return;
+  debugPrint('[EBB:$area] $message');
+}
+
+String _compactDiagnosticValue(Object? value) {
+  if (value == null) return 'null';
+  try {
+    final encoded = jsonEncode(value);
+    if (encoded.length <= 480) {
+      return encoded;
+    }
+    return '${encoded.substring(0, 480)}...';
+  } catch (_) {
+    return value.toString();
+  }
+}
 
 const List<String> _sharedTasteKeywords = <String>[
   'rock',
@@ -248,7 +332,10 @@ Map<String, dynamic> normalizeTrack(dynamic rawTrack) {
 bool _isTrackMetadataIncomplete(dynamic rawTrack) {
   if (rawTrack is! Map) return true;
   final title = _cleanString(
-    rawTrack['title'] ?? rawTrack['name'] ?? rawTrack['track'] ?? rawTrack['song'],
+    rawTrack['title'] ??
+        rawTrack['name'] ??
+        rawTrack['track'] ??
+        rawTrack['song'],
   ).toLowerCase();
   final artist = _cleanString(
     rawTrack['channel'] ?? rawTrack['author'] ?? rawTrack['artist'],
@@ -331,7 +418,8 @@ Map<String, dynamic>? _lastTrackSnapshotFromRawTrack(
     'album': normalized['album'] ?? normalized['album_title'],
     'album_title': normalized['album_title'] ?? normalized['album'],
     'album_id': normalized['album_id'],
-    if (localPath != null && localPath.trim().isNotEmpty) 'local_path': localPath,
+    if (localPath != null && localPath.trim().isNotEmpty)
+      'local_path': localPath,
   };
 }
 
@@ -440,7 +528,7 @@ Future<void> recordProxyInteractionEvent(
   };
 
   try {
-    await appHttpClient
+    await proxyControlHttpClient
         .post(
           buildProxyUri('/interaction_event'),
           headers: {'Content-Type': 'application/json'},
@@ -478,7 +566,7 @@ Future<void> recordProxySearchEvent(
   };
 
   try {
-    await appHttpClient
+    await proxyControlHttpClient
         .post(
           buildProxyUri('/search_interaction'),
           headers: {'Content-Type': 'application/json'},
@@ -510,20 +598,48 @@ void notifyRecommendationSignal([String reason = '']) {
   _recommendationSignalController.add(reason);
 }
 
+const String _disableRecommendationTimeoutsRaw = String.fromEnvironment(
+  'AURALIS_DISABLE_TIMEOUTS',
+  defaultValue: '0',
+);
+const bool _disableRecommendationTimeouts =
+    _disableRecommendationTimeoutsRaw == '1' ||
+        _disableRecommendationTimeoutsRaw == 'true' ||
+        _disableRecommendationTimeoutsRaw == 'TRUE';
+const Duration _recentCloudSearchQueryTimeout = Duration(seconds: 2);
+const Duration _recentCloudSearchQueryCacheTtl = Duration(seconds: 45);
+List<String> _recentCloudSearchQueryCache = const [];
+DateTime? _recentCloudSearchQueryCacheAt;
+String _recentCloudSearchQueryCacheUserId = '';
+
 Future<List<String>> getRecentCloudSearchQueries({int limit = 8}) async {
-  final client = supabaseClientOrNull;
   final userId = currentAuthenticatedUserId;
+  final now = DateTime.now();
+  final cachedAt = _recentCloudSearchQueryCacheAt;
+  final cacheMatchesUser = userId != null &&
+      userId.isNotEmpty &&
+      _recentCloudSearchQueryCacheUserId == userId;
+  if (cachedAt != null &&
+      cacheMatchesUser &&
+      now.difference(cachedAt) < _recentCloudSearchQueryCacheTtl &&
+      _recentCloudSearchQueryCache.isNotEmpty) {
+    return _recentCloudSearchQueryCache.take(limit).toList(growable: false);
+  }
+  final client = supabaseClientOrNull;
   if (client == null || userId == null || userId.isEmpty) {
     return const [];
   }
 
   try {
-    final rows = await client
+    final queryFuture = client
         .from('search_events')
         .select('query,result_count,created_at')
         .eq('user_id', userId)
         .order('created_at', ascending: false)
         .limit(limit * 4);
+    final rows = _disableRecommendationTimeouts
+        ? await queryFuture
+        : await queryFuture.timeout(_recentCloudSearchQueryTimeout);
     if (rows.isEmpty) return const [];
 
     final weighted = <String, double>{};
@@ -543,9 +659,17 @@ Future<List<String>> getRecentCloudSearchQueries({int limit = 8}) async {
 
     final ranked = weighted.entries.toList()
       ..sort((a, b) => b.value.compareTo(a.value));
-    return ranked.take(limit).map((entry) => entry.key).toList(growable: false);
+    final results =
+        ranked.take(limit).map((entry) => entry.key).toList(growable: false);
+    _recentCloudSearchQueryCache = results;
+    _recentCloudSearchQueryCacheAt = now;
+    _recentCloudSearchQueryCacheUserId = userId;
+    return results;
   } catch (error) {
     debugPrint('Cloud search query lookup failed: $error');
+    if (cacheMatchesUser && _recentCloudSearchQueryCache.isNotEmpty) {
+      return _recentCloudSearchQueryCache.take(limit).toList(growable: false);
+    }
     return const [];
   }
 }
@@ -616,7 +740,8 @@ class HistoryManager {
   static final _trackController =
       StreamController<Map<String, dynamic>>.broadcast();
   static Stream<String?> get seedStream => _seedController.stream;
-  static Stream<Map<String, dynamic>> get trackStream => _trackController.stream;
+  static Stream<Map<String, dynamic>> get trackStream =>
+      _trackController.stream;
   static String? _lastRecordedTrackId;
   static DateTime? _lastRecordedAt;
   static const int _legacyHistoryLimit = 50;
@@ -669,18 +794,8 @@ class HistoryManager {
     try {
       final historyFile = await _file;
       final entriesFile = await _entriesFile;
-      final recommendationCacheFile =
-          await getScopedDataFile('recommendations_cache.json');
       await historyFile.writeAsString('[]');
       await entriesFile.writeAsString('[]');
-      await recommendationCacheFile.writeAsString(
-        jsonEncode({
-          'session_id': '',
-          'generated_at': 0,
-          'expires_at': 0,
-          'rows': <Map<String, dynamic>>[],
-        }),
-      );
       _lastRecordedTrackId = null;
       _lastRecordedAt = null;
       if (!_seedController.isClosed) {
@@ -800,7 +915,8 @@ class HistoryManager {
         merged[key] = existing[key];
       }
     }
-    if (_parseInt(merged['duration']) <= 0 && _parseInt(existing['duration']) > 0) {
+    if (_parseInt(merged['duration']) <= 0 &&
+        _parseInt(existing['duration']) > 0) {
       merged['duration'] = _parseInt(existing['duration']);
     }
     return merged;
@@ -905,6 +1021,57 @@ class HistoryManager {
       unawaited(_recordCloudPlayEvent(videoId));
     } catch (e) {
       debugPrint("History Write Error: $e");
+    }
+  }
+
+  static Future<void> removeHistoryTrack(
+    String? videoId, {
+    Map<String, dynamic>? rawTrack,
+    bool recordNegativeSignal = true,
+  }) async {
+    final normalizedId = videoId?.trim() ?? '';
+    if (normalizedId.isEmpty) return;
+    try {
+      await _ensureHistorySchema();
+      final existingEntries = await _readLocalHistoryEntries();
+      final remainingEntries = existingEntries
+          .where((entry) => extractTrackId(entry) != normalizedId)
+          .toList(growable: false);
+      final remainingSeeds = remainingEntries
+          .map(extractTrackId)
+          .whereType<String>()
+          .where((id) => id.isNotEmpty)
+          .take(_legacyHistoryLimit)
+          .toList(growable: false);
+      await Future.wait([
+        _writeLocalHistoryEntries(
+            List<Map<String, dynamic>>.from(remainingEntries)),
+        (await _file).writeAsString(jsonEncode(remainingSeeds)),
+      ]);
+      if (_lastRecordedTrackId == normalizedId) {
+        _lastRecordedTrackId = null;
+        _lastRecordedAt = null;
+      }
+      if (!_seedController.isClosed) {
+        _seedController
+            .add(remainingSeeds.isEmpty ? null : remainingSeeds.first);
+      }
+      notifyRecommendationSignal('history_remove:$normalizedId');
+      if (recordNegativeSignal) {
+        unawaited(
+          recordProxyInteractionEvent(
+            'skip',
+            trackId: normalizedId,
+            rawTrack: rawTrack,
+            metadata: {
+              'reason': 'history_delete',
+              'removed_from': 'local_history',
+            },
+          ),
+        );
+      }
+    } catch (error) {
+      debugPrint('History delete failed: $error');
     }
   }
 
@@ -1031,7 +1198,8 @@ class HistoryManager {
     return ordered;
   }
 
-  static Future<List<String>> getFrequentlyPlayedTrackIds({int limit = 8}) async {
+  static Future<List<String>> getFrequentlyPlayedTrackIds(
+      {int limit = 8}) async {
     final scores = <String, double>{};
 
     void addWeight(String? trackId, double weight) {
@@ -1045,7 +1213,8 @@ class HistoryManager {
     }
 
     try {
-      final snapshotTracks = await getFrequentlyPlayedTrackSnapshots(limit: limit * 2);
+      final snapshotTracks =
+          await getFrequentlyPlayedTrackSnapshots(limit: limit * 2);
       for (var index = 0; index < snapshotTracks.length; index++) {
         addWeight(
           extractTrackId(snapshotTracks[index]),
@@ -1063,10 +1232,7 @@ class HistoryManager {
 
     final ranked = scores.entries.toList()
       ..sort((a, b) => b.value.compareTo(a.value));
-    return ranked
-        .take(limit)
-        .map((entry) => entry.key)
-        .toList(growable: false);
+    return ranked.take(limit).map((entry) => entry.key).toList(growable: false);
   }
 }
 
@@ -1144,6 +1310,9 @@ class PlayerState {
 }
 
 class AudioPlayerNotifier extends StateNotifier<PlayerState> {
+  static const int _initialQueuePrepareLookahead = 3;
+  static const int _historyCommitMinSeconds = 12;
+  static const double _historyCommitMinRatio = 0.35;
   final AudioEngineFFI audioEngine;
   Map<String, dynamic>? _restorableTrackMeta;
   Future<void> Function()? onTrackCompleted;
@@ -1180,11 +1349,14 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
   final Map<String, String> _unavailableStreamReasons = <String, String>{};
   int _latencySummaryProbeCounter = 0;
   final Map<String, DateTime> _recentPrepareBatches = <String, DateTime>{};
-  final Map<String, Future<void>> _pendingPrepareBatches = <String, Future<void>>{};
+  final Map<String, Future<void>> _pendingPrepareBatches =
+      <String, Future<void>>{};
   Timer? _sleepTimer;
   DateTime? _sleepTimerEndsAt;
   final Map<String, Future<void>> _fullPrefetchTasks = {};
   bool _streamFailureRecoveryInProgress = false;
+  Map<String, dynamic>? _pendingHistorySnapshot;
+  String? _historyCommittedTrackId;
 
   AudioPlayerNotifier(this.audioEngine) : super(PlayerState()) {
     audioEngine.pause(); // Kill ghost audio surviving hot restarts
@@ -1217,9 +1389,17 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
 
     if (previousState.videoId != value.videoId) {
       _completedTrackIdNotified = null;
+      _historyCommittedTrackId = null;
+      final activeTrackId = value.videoId?.trim();
+      final pendingTrackId = extractTrackId(_pendingHistorySnapshot);
+      if (activeTrackId == null ||
+          activeTrackId.isEmpty ||
+          pendingTrackId != activeTrackId) {
+        _pendingHistorySnapshot = null;
+      }
       unawaited(onTrackChanged?.call(value.videoId) ?? Future<void>.value());
     }
-    
+
     if (shouldBroadcast) {
       _broadcastState();
     }
@@ -1236,6 +1416,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     final videoId = state.videoId;
     if (videoId == null || videoId.isEmpty) return;
     if (_completedTrackIdNotified == videoId) return;
+    unawaited(_commitPendingHistoryIfEligible(force: true));
     _completedTrackIdNotified = videoId;
     unawaited(onTrackCompleted?.call() ?? Future<void>.value());
   }
@@ -1254,7 +1435,11 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
                 : AudioProcessingState.ready;
     final currentQueueIndex = _managedQueueActive
         ? (streamPlayer.currentIndex ?? 0)
-            .clamp(0, _managedQueueTracks.isEmpty ? 0 : _managedQueueTracks.length - 1)
+            .clamp(
+                0,
+                _managedQueueTracks.isEmpty
+                    ? 0
+                    : _managedQueueTracks.length - 1)
             .toInt()
         : null;
 
@@ -1307,7 +1492,8 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     _broadcastState();
   }
 
-  Future<File> _lastTrackSnapshotFile() => getScopedDataFile('last_track_snapshot.json');
+  Future<File> _lastTrackSnapshotFile() =>
+      getScopedDataFile('last_track_snapshot.json');
 
   Future<void> _persistRememberedTrack() async {
     final snapshot = _restorableTrackMeta;
@@ -1344,8 +1530,9 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         isDownloading: false,
         currentTrackName: snapshot['title']?.toString() ?? 'Unknown Track',
         thumbnail: snapshot['thumbnail']?.toString(),
-        artist: (snapshot['author'] ?? snapshot['artist'] ?? snapshot['channel'])
-            ?.toString(),
+        artist:
+            (snapshot['author'] ?? snapshot['artist'] ?? snapshot['channel'])
+                ?.toString(),
         videoId: trackId,
         duration: _parseInt(snapshot['duration']),
         currentPosition: 0,
@@ -1364,7 +1551,79 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         _lastTrackSnapshotFromRawTrack(rawTrack, localPath: localPath);
     if (snapshot == null) return;
     _restorableTrackMeta = snapshot;
+    _stageHistorySnapshot(snapshot);
     unawaited(_persistRememberedTrack());
+  }
+
+  void _stageHistorySnapshot(
+    dynamic rawTrack, {
+    String? localPath,
+  }) {
+    final snapshot =
+        _lastTrackSnapshotFromRawTrack(rawTrack, localPath: localPath);
+    final trackId = extractTrackId(snapshot);
+    if (snapshot == null || trackId == null || trackId.isEmpty) return;
+    _pendingHistorySnapshot = Map<String, dynamic>.from(snapshot);
+    _historyCommittedTrackId = null;
+  }
+
+  bool _isCurrentTrackHistoryEligible() {
+    final activeTrackId = state.videoId?.trim();
+    final pendingTrackId = extractTrackId(_pendingHistorySnapshot);
+    if (activeTrackId == null ||
+        activeTrackId.isEmpty ||
+        pendingTrackId == null ||
+        pendingTrackId.isEmpty ||
+        pendingTrackId != activeTrackId) {
+      return false;
+    }
+    final positionSeconds = state.currentPosition;
+    final durationSeconds = state.duration;
+    if (positionSeconds <= 0) return false;
+    if (durationSeconds <= 0) {
+      return positionSeconds >= _historyCommitMinSeconds;
+    }
+    final requiredSeconds = max(
+      8,
+      min(
+        20,
+        (durationSeconds * _historyCommitMinRatio).round(),
+      ),
+    );
+    return positionSeconds >= requiredSeconds ||
+        positionSeconds >= durationSeconds - 1;
+  }
+
+  Future<void> _commitPendingHistoryIfEligible({
+    bool force = false,
+  }) async {
+    final snapshot = _pendingHistorySnapshot;
+    final pendingTrackId = extractTrackId(snapshot);
+    if (snapshot == null ||
+        pendingTrackId == null ||
+        pendingTrackId.isEmpty ||
+        _historyCommittedTrackId == pendingTrackId) {
+      return;
+    }
+    final activeTrackId = state.videoId?.trim();
+    if (!force &&
+        (activeTrackId == null ||
+            activeTrackId.isEmpty ||
+            activeTrackId != pendingTrackId ||
+            !_isCurrentTrackHistoryEligible())) {
+      return;
+    }
+    if (force &&
+        activeTrackId != null &&
+        activeTrackId.isNotEmpty &&
+        activeTrackId != pendingTrackId) {
+      return;
+    }
+    _historyCommittedTrackId = pendingTrackId;
+    await HistoryManager.addHistoryTrack(
+      snapshot,
+      localPath: snapshot['local_path']?.toString(),
+    );
   }
 
   Future<bool> _restoreRememberedTrackForPlayback() async {
@@ -1403,7 +1662,8 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     final thumbnail = track['thumbnail']?.toString();
     return MediaItem(
       id: extractTrackId(track) ?? track['title']?.toString() ?? 'track',
-      album: track['album']?.toString() ?? track['album_title']?.toString() ?? '',
+      album:
+          track['album']?.toString() ?? track['album_title']?.toString() ?? '',
       title: track['title']?.toString() ?? 'Unknown Track',
       artist: _trackArtist(track) ?? 'Unknown Artist',
       duration: duration > 0 ? Duration(seconds: duration) : null,
@@ -1440,7 +1700,6 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         return;
       }
       _applyManagedTrackMetadata(index, resetPosition: true);
-      HistoryManager.addHistoryTrack(_managedQueueTracks[index]);
       unawaited(_refreshManagedQueueWarmup());
     });
 
@@ -1454,6 +1713,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
           currentPosition: seconds,
           currentPositionMs: milliseconds,
         );
+        unawaited(_commitPendingHistoryIfEligible());
       }
     });
 
@@ -1466,15 +1726,12 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         final isBuffering = playerState.playing &&
             (processingState == ProcessingState.loading ||
                 processingState == ProcessingState.buffering);
-        final nextDuration =
-            streamPlayer.duration?.inSeconds ?? state.duration;
+        final nextDuration = streamPlayer.duration?.inSeconds ?? state.duration;
         final nextDurationMs = nextDuration * 1000;
-        final cappedPosition = isCompleted
-            ? nextDuration
-            : streamPlayer.position.inSeconds;
-        final cappedPositionMs = isCompleted
-            ? nextDurationMs
-            : streamPlayer.position.inMilliseconds;
+        final cappedPosition =
+            isCompleted ? nextDuration : streamPlayer.position.inSeconds;
+        final cappedPositionMs =
+            isCompleted ? nextDurationMs : streamPlayer.position.inMilliseconds;
 
         _playbackTimer?.cancel();
         state = state.copyWith(
@@ -1534,7 +1791,8 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     if (oldSource == null) return;
     try {
       final cacheFile = await oldSource.cacheFile;
-      if (cacheFile.path.contains('${Platform.pathSeparator}stream_cache${Platform.pathSeparator}')) {
+      if (cacheFile.path.contains(
+          '${Platform.pathSeparator}stream_cache${Platform.pathSeparator}')) {
         return;
       }
       await oldSource.clearCache();
@@ -1787,7 +2045,8 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         return;
       }
 
-      final nextIndex = failedIndex.clamp(0, remainingTracks.length - 1).toInt();
+      final nextIndex =
+          failedIndex.clamp(0, remainingTracks.length - 1).toInt();
       await configureManagedQueue(
         remainingTracks,
         initialIndex: nextIndex,
@@ -1936,9 +2195,8 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     }
 
     final lastPreparedAt = _recentPrepareBatches[batchKey];
-    final cooldown = activeQueue
-        ? const Duration(seconds: 6)
-        : const Duration(seconds: 12);
+    final cooldown =
+        activeQueue ? const Duration(seconds: 6) : const Duration(seconds: 12);
     if (lastPreparedAt != null &&
         DateTime.now().difference(lastPreparedAt) < cooldown) {
       return;
@@ -2015,9 +2273,8 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     final keepNames = keepIds.map(_sanitizeCacheKey).toSet();
     for (final entity in cacheDir.listSync(followLinks: false)) {
       if (entity is! File) continue;
-      final name = entity.uri.pathSegments.isEmpty
-          ? ''
-          : entity.uri.pathSegments.last;
+      final name =
+          entity.uri.pathSegments.isEmpty ? '' : entity.uri.pathSegments.last;
       if (name.isEmpty) continue;
       final baseName = name.endsWith('.done')
           ? name.substring(0, name.length - 5)
@@ -2070,7 +2327,8 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         }
         await tempFile.rename(cacheFile.path);
         await markerFile.writeAsString(DateTime.now().toIso8601String());
-        debugPrint('[EBB] full-prefetched $videoId bytes=${cacheFile.lengthSync()}');
+        debugPrint(
+            '[EBB] full-prefetched $videoId bytes=${cacheFile.lengthSync()}');
       } catch (error) {
         debugPrint('[EBB] full-prefetch failed for $videoId: $error');
         if (tempFile.existsSync()) {
@@ -2244,7 +2502,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       ...normalizedTracks
           .skip(initialIndex + 1)
           .where((track) => !isTrackHidden(track))
-          .take(8)
+          .take(_initialQueuePrepareLookahead - 1)
           .map(extractTrackId),
     ];
 
@@ -2275,7 +2533,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       lookaheadIds,
       currentVideoId: currentTrackId,
       activeQueue: true,
-      lookahead: 8,
+      lookahead: _initialQueuePrepareLookahead,
     );
     if (loadVersion != _streamLoadVersion) return;
 
@@ -2330,8 +2588,8 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       isDownloading: false,
       duration: streamPlayer.duration?.inSeconds ?? state.duration,
     );
-    HistoryManager.addHistoryTrack(playableTracks[resolvedInitialIndex]);
     unawaited(_prefetchManagedQueueAhead());
+    unawaited(_refreshManagedQueueWarmup());
     if (_desiredStreamPlaying) {
       await _resumeStreamPlayback();
     }
@@ -2387,7 +2645,8 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     }
     await _runStreamCommand(() async {
       for (var offset = 0; offset < sources.length; offset++) {
-        await streamPlayer.insertAudioSource(insertIndex + offset, sources[offset]);
+        await streamPlayer.insertAudioSource(
+            insertIndex + offset, sources[offset]);
       }
     });
     final updated = [..._managedQueueTracks];
@@ -2448,7 +2707,6 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     });
     _streamTransitionInProgress = false;
     _applyManagedTrackMetadata(index, resetPosition: true);
-    HistoryManager.addHistoryTrack(_managedQueueTracks[index]);
     unawaited(_refreshManagedQueueWarmup());
     await _resumeStreamPlayback();
   }
@@ -2739,7 +2997,8 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         isDownloading: false,
         currentTrackName: meta['title'] ?? 'Unknown Track',
         thumbnail: meta['thumbnail'],
-        duration: streamPlayer.duration?.inSeconds ?? _parseInt(meta['duration']),
+        duration:
+            streamPlayer.duration?.inSeconds ?? _parseInt(meta['duration']),
         filesize: _parseInt(meta['filesize']),
         artist: meta['author'] ?? meta['artist'],
         videoId: meta['video_id'] ?? meta['id'],
@@ -2747,14 +3006,6 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         currentPositionMs: 0,
       );
       _rememberTrackMeta(meta, localPath: path);
-      HistoryManager.addHistoryTrack(
-        {
-          ...Map<String, dynamic>.from(meta),
-          'id': meta['video_id'] ?? meta['id'],
-          'videoId': meta['video_id'] ?? meta['id'],
-        },
-        localPath: path,
-      );
       return true;
     } catch (error) {
       _activeStream = false;
@@ -2838,7 +3089,8 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
 
       final loaded = await loadLocalWithMeta(outPath, meta);
       if (!loaded) {
-        throw Exception('Downloaded file saved, but the player could not load it');
+        throw Exception(
+            'Downloaded file saved, but the player could not load it');
       }
       state = state.copyWith(isDownloading: false);
       await play();
@@ -2878,7 +3130,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
 
       final file = File(outPath);
       final sink = file.openWrite();
-      
+
       await for (var chunk in streamRes.stream) {
         sink.add(chunk);
       }
@@ -2944,8 +3196,11 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     try {
       final cachedPrepared = _freshStreamSource(videoId);
       final prepareStopwatch = Stopwatch()..start();
-      final source = cachedPrepared ?? await _resolveStreamSource(videoId);
+      final source = cachedPrepared ?? _buildProxyStreamSource(videoId);
       final prepareMs = prepareStopwatch.elapsedMilliseconds;
+      if (cachedPrepared == null) {
+        unawaited(prewarmStream(videoId));
+      }
       if (loadVersion != _streamLoadVersion) return;
       final attachStopwatch = Stopwatch()..start();
       await _runStreamCommand(() async {
@@ -2954,8 +3209,8 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       });
       if (loadVersion != _streamLoadVersion) return;
       final attachMs = attachStopwatch.elapsedMilliseconds;
-      final dur =
-          streamPlayer.duration?.inSeconds ?? _parseInt(fallbackMeta['duration']);
+      final dur = streamPlayer.duration?.inSeconds ??
+          _parseInt(fallbackMeta['duration']);
       _streamTransitionInProgress = false;
       state = state.copyWith(
           currentTrackName: fallbackMeta['title'],
@@ -2964,11 +3219,6 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
           videoId: videoId);
       _rememberTrackMeta({
         ...fallbackMeta,
-        'id': videoId,
-        'videoId': videoId,
-      });
-      HistoryManager.addHistoryTrack({
-        ...Map<String, dynamic>.from(fallbackMeta),
         'id': videoId,
         'videoId': videoId,
       });
@@ -2988,8 +3238,8 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
           await _setStreamSource(videoId, directSource);
         });
         if (loadVersion != _streamLoadVersion) return;
-        final dur =
-            streamPlayer.duration?.inSeconds ?? _parseInt(fallbackMeta['duration']);
+        final dur = streamPlayer.duration?.inSeconds ??
+            _parseInt(fallbackMeta['duration']);
         _streamTransitionInProgress = false;
         state = state.copyWith(
             currentTrackName: fallbackMeta['title'],
@@ -2998,11 +3248,6 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
             videoId: videoId);
         _rememberTrackMeta({
           ...fallbackMeta,
-          'id': videoId,
-          'videoId': videoId,
-        });
-        HistoryManager.addHistoryTrack({
-          ...Map<String, dynamic>.from(fallbackMeta),
           'id': videoId,
           'videoId': videoId,
         });
@@ -3031,18 +3276,20 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         return;
       }
       if (state.duration == 0 || state.currentPosition < state.duration) {
-        final pos =
-            _activeStream ? streamPlayer.position.inSeconds : audioEngine.getPosition() ~/ 1000;
+        final pos = _activeStream
+            ? streamPlayer.position.inSeconds
+            : audioEngine.getPosition() ~/ 1000;
         if (pos != state.currentPosition) {
           state = state.copyWith(
             currentPosition: pos,
             currentPositionMs: pos * 1000,
           );
+          unawaited(_commitPendingHistoryIfEligible());
         }
       } else {
         if (state.isLooping) {
           if (_activeStream) {
-             streamPlayer.seek(Duration.zero);
+            streamPlayer.seek(Duration.zero);
           }
           state = state.copyWith(currentPosition: 0, currentPositionMs: 0);
         } else {
@@ -3168,11 +3415,11 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
   Future<void> toggleLoop(int startMs, int endMs) async {
     final newState = !state.isLooping;
     if (_activeStream) {
-       await _runStreamCommand(() async {
-         await streamPlayer.setLoopMode(newState ? LoopMode.one : LoopMode.off);
-       });
+      await _runStreamCommand(() async {
+        await streamPlayer.setLoopMode(newState ? LoopMode.one : LoopMode.off);
+      });
     } else {
-       audioEngine.setLoop(newState, startMs, endMs);
+      audioEngine.setLoop(newState, startMs, endMs);
     }
     state = state.copyWith(isLooping: newState);
   }
@@ -3226,12 +3473,49 @@ bool _looksLikeSemanticTasteQuery(String query) {
   return _sharedTasteKeywords.any((keyword) => normalized.contains(keyword));
 }
 
+bool _isMetadataHeavyQuery(String query) {
+  final normalized = query.trim().toLowerCase();
+  if (normalized.isEmpty) return false;
+  const noisyPhrases = <String>[
+    'deluxe remastered',
+    'deluxe edition',
+    'original soundtrack',
+    'motion picture',
+    'tribute to',
+    'karaoke version',
+    'radio edit',
+  ];
+  if (noisyPhrases.any(normalized.contains)) {
+    return true;
+  }
+  const noisyTokens = <String>{
+    'bonus',
+    'deluxe',
+    'edition',
+    'karaoke',
+    'mono',
+    'original',
+    'remaster',
+    'remastered',
+    'soundtrack',
+    'stereo',
+    'tribute',
+    'version',
+  };
+  final hits =
+      normalized.split(RegExp(r'\s+')).where(noisyTokens.contains).length;
+  return hits >= 2;
+}
+
 Future<Map<String, dynamic>> _buildSemanticSearchRequestBody(
   Ref ref,
   String query, {
   required int limit,
 }) async {
   final normalizedQuery = query.trim();
+  final playlists = ref.read(playlistProvider);
+  final libraryTracks = ref.read(libraryProvider).valueOrNull ?? const [];
+  final storageScopeId = ref.read(authProvider).storageScopeId;
   final searchSignals = await Future.wait<Object?>([
     HistoryManager.getRecentTrackSnapshots(limit: 12),
     HistoryManager.getLastPlayedTrackSnapshots(limit: 8),
@@ -3250,9 +3534,6 @@ Future<Map<String, dynamic>> _buildSemanticSearchRequestBody(
   final recentTrackIds = List<String>.from(searchSignals[3] as List);
   final topTrackIds = List<String>.from(searchSignals[4] as List);
   final recentQueries = List<String>.from(searchSignals[5] as List);
-  final playlists = ref.read(playlistProvider);
-  final libraryTracks = ref.read(libraryProvider).valueOrNull ?? const [];
-  final storageScopeId = ref.read(authProvider).storageScopeId;
 
   final artistWeights = <String, double>{};
   final albumWeights = <String, double>{};
@@ -3393,16 +3674,232 @@ Future<Map<String, dynamic>> _buildSemanticSearchRequestBody(
         rankedArtists.take(8).map((entry) => entry.key).toList(growable: false),
     'album_hints':
         rankedAlbums.take(6).map((entry) => entry.key).toList(growable: false),
-    'playlist_names':
-        playlists.map((playlist) => playlist.name).take(10).toList(growable: false),
+    'playlist_names': playlists
+        .map((playlist) => playlist.name)
+        .take(10)
+        .toList(growable: false),
     'library_track_ids': libraryTrackIds.take(28).toList(growable: false),
     'offline_track_ids': offlineTrackIds.take(28).toList(growable: false),
   };
 }
 
+Map<String, dynamic> _buildSuggestRequestBody(
+  Ref ref,
+  String query, {
+  required int limit,
+}) {
+  final normalizedQuery = query.trim();
+  final storageScopeId = ref.read(authProvider).storageScopeId;
+  return {
+    'query': normalizedQuery,
+    'limit': limit,
+    'user_scope_id': storageScopeId,
+    'recent_queries':
+        _recentCloudSearchQueryCache.take(4).toList(growable: false),
+    'context_surface': 'suggest',
+    'force_refresh': false,
+  };
+}
+
+class _CachedSearchPayload {
+  final Map<String, dynamic> payload;
+  final DateTime storedAt;
+
+  const _CachedSearchPayload({
+    required this.payload,
+    required this.storedAt,
+  });
+}
+
+class _SearchFetchResult {
+  final Map<String, dynamic>? payload;
+  final String status;
+  final int? statusCode;
+
+  const _SearchFetchResult({
+    required this.status,
+    this.payload,
+    this.statusCode,
+  });
+
+  bool get hasPayload => payload != null;
+}
+
+final Map<String, _CachedSearchPayload> _searchPayloadCache =
+    <String, _CachedSearchPayload>{};
+final Map<String, Future<_SearchFetchResult>> _searchPayloadForegroundInflight =
+    <String, Future<_SearchFetchResult>>{};
+final Map<String, Future<_SearchFetchResult>> _searchPayloadBackgroundInflight =
+    <String, Future<_SearchFetchResult>>{};
+const Duration _searchCacheFreshTtl = Duration(minutes: 4);
+const Duration _searchCacheMaxTtl = Duration(minutes: 12);
+
+String _searchPayloadCacheKey(
+  Ref ref,
+  String query, {
+  required int limit,
+}) {
+  final normalizedQuery = query.trim().toLowerCase();
+  final storageScopeId = ref.read(authProvider).storageScopeId;
+  return '$storageScopeId|$limit|$normalizedQuery';
+}
+
+void _storeSearchPayloadCache(
+  String cacheKey,
+  Map<String, dynamic> payload,
+) {
+  _searchPayloadCache[cacheKey] = _CachedSearchPayload(
+    payload: Map<String, dynamic>.from(payload),
+    storedAt: DateTime.now(),
+  );
+  if (_searchPayloadCache.length > 36) {
+    final oldestEntries = _searchPayloadCache.entries.toList()
+      ..sort((a, b) => a.value.storedAt.compareTo(b.value.storedAt));
+    for (final entry in oldestEntries.take(_searchPayloadCache.length - 24)) {
+      _searchPayloadCache.remove(entry.key);
+    }
+  }
+}
+
+_CachedSearchPayload? _lookupSearchPayloadCache(
+  String cacheKey, {
+  bool allowStale = false,
+}) {
+  final cached = _searchPayloadCache[cacheKey];
+  if (cached == null) return null;
+  final age = DateTime.now().difference(cached.storedAt);
+  final ttl = allowStale ? _searchCacheMaxTtl : _searchCacheFreshTtl;
+  if (age > ttl) {
+    if (allowStale) {
+      _searchPayloadCache.remove(cacheKey);
+    }
+    return null;
+  }
+  return cached;
+}
+
+Future<_SearchFetchResult> _fetchSearchPayload(
+  Ref ref,
+  String query, {
+  required int limit,
+  required Duration timeout,
+  bool preferCache = true,
+  bool backgroundRefresh = false,
+}) async {
+  final normalizedQuery = query.trim();
+  if (normalizedQuery.isEmpty) {
+    return const _SearchFetchResult(status: 'empty_query');
+  }
+  final cacheKey = _searchPayloadCacheKey(
+    ref,
+    normalizedQuery,
+    limit: limit,
+  );
+  final freshCached = _lookupSearchPayloadCache(cacheKey);
+  if (preferCache && freshCached != null && !backgroundRefresh) {
+    return _SearchFetchResult(
+      status: 'cache_hit',
+      payload: Map<String, dynamic>.from(freshCached.payload),
+    );
+  }
+  if (!backgroundRefresh) {
+    final staleCached = _lookupSearchPayloadCache(cacheKey, allowStale: true);
+    if (staleCached != null) {
+      unawaited(
+        _fetchSearchPayload(
+          ref,
+          normalizedQuery,
+          limit: limit,
+          timeout: timeout,
+          preferCache: false,
+          backgroundRefresh: true,
+        ),
+      );
+      return _SearchFetchResult(
+        status: 'stale_cache',
+        payload: Map<String, dynamic>.from(staleCached.payload),
+      );
+    }
+  }
+  final inflightMap = backgroundRefresh
+      ? _searchPayloadBackgroundInflight
+      : _searchPayloadForegroundInflight;
+  final inflight = inflightMap[cacheKey];
+  if (inflight != null) {
+    return inflight;
+  }
+
+  final requestFuture = () async {
+    try {
+      final body = await _buildSemanticSearchRequestBody(
+        ref,
+        normalizedQuery,
+        limit: limit,
+      );
+      final res = await proxyControlHttpClient
+          .post(
+            buildProxyUri('/search'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode(body),
+          )
+          .timeout(timeout);
+      if (res.statusCode != 200) {
+        if (!backgroundRefresh) {
+          final staleCached =
+              _lookupSearchPayloadCache(cacheKey, allowStale: true);
+          if (staleCached != null) {
+            return _SearchFetchResult(
+              status: 'stale_cache',
+              payload: Map<String, dynamic>.from(staleCached.payload),
+              statusCode: res.statusCode,
+            );
+          }
+        }
+        return _SearchFetchResult(
+          status: 'http_error',
+          statusCode: res.statusCode,
+        );
+      }
+      final payload = jsonDecode(res.body) as Map<String, dynamic>;
+      _storeSearchPayloadCache(cacheKey, payload);
+      return _SearchFetchResult(status: 'network_success', payload: payload);
+    } on TimeoutException {
+      if (!backgroundRefresh) {
+        final staleCached =
+            _lookupSearchPayloadCache(cacheKey, allowStale: true);
+        if (staleCached != null) {
+          return _SearchFetchResult(
+            status: 'stale_cache',
+            payload: Map<String, dynamic>.from(staleCached.payload),
+          );
+        }
+      }
+      return const _SearchFetchResult(status: 'timeout');
+    } catch (_) {
+      if (!backgroundRefresh) {
+        final staleCached =
+            _lookupSearchPayloadCache(cacheKey, allowStale: true);
+        if (staleCached != null) {
+          return _SearchFetchResult(
+            status: 'stale_cache',
+            payload: Map<String, dynamic>.from(staleCached.payload),
+          );
+        }
+      }
+      return const _SearchFetchResult(status: 'exception');
+    } finally {
+      inflightMap.remove(cacheKey);
+    }
+  }();
+  inflightMap[cacheKey] = requestFuture;
+  return requestFuture;
+}
+
 class SearchNotifier extends StateNotifier<List<dynamic>> {
   final Ref ref;
   int _requestVersion = 0;
+  static const Duration _searchDebounce = Duration(milliseconds: 280);
+  static const Duration _searchTimeout = Duration(seconds: 8);
 
   SearchNotifier(this.ref) : super([]);
   bool isLoading = false;
@@ -3425,24 +3922,28 @@ class SearchNotifier extends StateNotifier<List<dynamic>> {
     isLoading = true;
     state = [...state];
     try {
-      final body = await _buildSemanticSearchRequestBody(
+      await Future<void>.delayed(_searchDebounce);
+      if (requestVersion != _requestVersion) return;
+      if (requestVersion != _requestVersion) return;
+      final fetchResult = await _fetchSearchPayload(
         ref,
         normalizedQuery,
-        limit: 30,
+        limit: 16,
+        timeout: _searchTimeout,
       );
-      final res = await appHttpClient
-          .post(buildProxyUri('/search'),
-              headers: {'Content-Type': 'application/json'},
-              body: jsonEncode(body))
-          .timeout(const Duration(seconds: 10));
       if (requestVersion != _requestVersion) return;
-      if (res.statusCode == 200) {
-        final rawResults = (jsonDecode(res.body)['results'] as List<dynamic>? ?? const []);
+      if (fetchResult.hasPayload) {
+        final payload = fetchResult.payload!;
+        final rawResults = (payload['results'] as List<dynamic>? ?? const []);
         state = rawResults
             .whereType<Map>()
             .map((entry) => normalizeTrack(Map<String, dynamic>.from(entry)))
             .where((track) => (extractTrackId(track)?.isNotEmpty ?? false))
             .toList(growable: false);
+        _debugProxyLog(
+          'search',
+          'track query="$normalizedQuery" status=200 results=${state.length} similar=${((payload['similar_artists'] as List?) ?? const []).length} diagnostics=${_compactDiagnosticValue(payload['diagnostics'])}',
+        );
         _primeSearchResults(state);
         unawaited(
           recordCloudSearchEvent(
@@ -3459,10 +3960,17 @@ class SearchNotifier extends StateNotifier<List<dynamic>> {
         );
         notifyRecommendationSignal(normalizedQuery);
       } else {
+        _debugProxyLog(
+          'search',
+          'track query="$normalizedQuery" status=${fetchResult.status}',
+        );
         state = [];
       }
+    } on TimeoutException catch (error) {
+      _debugProxyLog('search', 'track query="$normalizedQuery" timeout=$error');
+      state = [];
     } catch (e) {
-      // print("Search failed: $e");
+      _debugProxyLog('search', 'track query="$normalizedQuery" error=$e');
     } finally {
       final isLatestRequest = requestVersion == _requestVersion;
       if (isLatestRequest) {
@@ -3482,6 +3990,264 @@ class SearchNotifier extends StateNotifier<List<dynamic>> {
 final searchProvider =
     StateNotifierProvider<SearchNotifier, List<dynamic>>((ref) {
   return SearchNotifier(ref);
+});
+
+class SearchPageState {
+  final String requestState;
+  final String requestId;
+  final String modelVersion;
+  final String queryIntent;
+  final Map<String, dynamic>? topResult;
+  final List<Map<String, dynamic>> tracks;
+  final List<Map<String, dynamic>> artists;
+  final List<Map<String, dynamic>> albums;
+  final List<Map<String, dynamic>> similarArtists;
+  final Map<String, dynamic> diagnostics;
+  final String? errorMessage;
+
+  const SearchPageState({
+    this.requestState = 'idle',
+    this.requestId = '',
+    this.modelVersion = '',
+    this.queryIntent = 'mixed',
+    this.topResult,
+    this.tracks = const [],
+    this.artists = const [],
+    this.albums = const [],
+    this.similarArtists = const [],
+    this.diagnostics = const {},
+    this.errorMessage,
+  });
+
+  bool get hasResults =>
+      topResult != null ||
+      tracks.isNotEmpty ||
+      artists.isNotEmpty ||
+      albums.isNotEmpty ||
+      similarArtists.isNotEmpty;
+
+  factory SearchPageState.fromJson(Map<String, dynamic> json) {
+    final rawTopResult = json['top_result'];
+    Map<String, dynamic>? normalizedTopResult;
+    if (rawTopResult is Map) {
+      final topResultMap = Map<String, dynamic>.from(rawTopResult);
+      final entityType = topResultMap['entity_type']?.toString() ?? 'track';
+      final rawItem = topResultMap['item'];
+      if (rawItem is Map) {
+        final item = Map<String, dynamic>.from(rawItem);
+        topResultMap['item'] =
+            entityType == 'track' ? normalizeTrack(item) : item;
+        normalizedTopResult = topResultMap;
+      }
+    }
+    final rawTracks = (json['tracks'] as List<dynamic>? ??
+        json['results'] as List<dynamic>? ??
+        const []);
+    final rawArtists = (json['artists'] as List<dynamic>? ?? const []);
+    final rawAlbums = (json['albums'] as List<dynamic>? ?? const []);
+    final rawSimilarArtists =
+        (json['similar_artists'] as List<dynamic>? ?? const []);
+    final normalizedTracks = rawTracks
+        .whereType<Map>()
+        .map((entry) => normalizeTrack(Map<String, dynamic>.from(entry)))
+        .where((track) => extractTrackId(track)?.isNotEmpty ?? false)
+        .toList(growable: false);
+    if (normalizedTopResult == null && normalizedTracks.isNotEmpty) {
+      normalizedTopResult = <String, dynamic>{
+        'entity_type': 'track',
+        'item': normalizedTracks.first,
+      };
+    }
+    return SearchPageState(
+      requestState: (json['request_state'] ?? '').toString().trim().isNotEmpty
+          ? json['request_state'].toString()
+          : ((json['error_message']?.toString().trim().isNotEmpty ?? false)
+              ? 'failed'
+              : 'complete'),
+      requestId: (json['request_id'] ?? '').toString(),
+      modelVersion: (json['model_version'] ?? '').toString(),
+      queryIntent: (json['query_intent'] ??
+              (normalizedTracks.isNotEmpty ? 'track' : 'mixed'))
+          .toString(),
+      topResult: normalizedTopResult,
+      tracks: normalizedTracks,
+      artists: rawArtists
+          .whereType<Map>()
+          .map((entry) => Map<String, dynamic>.from(entry))
+          .where((artist) =>
+              (artist['id']?.toString().trim().isNotEmpty ?? false) ||
+              (artist['name']?.toString().trim().isNotEmpty ?? false))
+          .toList(growable: false),
+      albums: rawAlbums
+          .whereType<Map>()
+          .map((entry) => Map<String, dynamic>.from(entry))
+          .where((album) =>
+              (album['id']?.toString().trim().isNotEmpty ?? false) ||
+              (album['title']?.toString().trim().isNotEmpty ?? false))
+          .toList(growable: false),
+      similarArtists: rawSimilarArtists
+          .whereType<Map>()
+          .map((entry) => Map<String, dynamic>.from(entry))
+          .where((artist) =>
+              (artist['id']?.toString().trim().isNotEmpty ?? false) ||
+              (artist['name']?.toString().trim().isNotEmpty ?? false))
+          .toList(growable: false),
+      diagnostics: json['diagnostics'] is Map
+          ? Map<String, dynamic>.from(json['diagnostics'] as Map)
+          : const {},
+      errorMessage:
+          (json['error_message']?.toString().trim().isNotEmpty ?? false)
+              ? json['error_message'].toString().trim()
+              : null,
+    );
+  }
+
+  SearchPageState copyWith({
+    String? requestState,
+    String? requestId,
+    String? modelVersion,
+    String? queryIntent,
+    Map<String, dynamic>? topResult,
+    bool clearTopResult = false,
+    List<Map<String, dynamic>>? tracks,
+    List<Map<String, dynamic>>? artists,
+    List<Map<String, dynamic>>? albums,
+    List<Map<String, dynamic>>? similarArtists,
+    Map<String, dynamic>? diagnostics,
+    String? errorMessage,
+    bool clearError = false,
+  }) {
+    return SearchPageState(
+      requestState: requestState ?? this.requestState,
+      requestId: requestId ?? this.requestId,
+      modelVersion: modelVersion ?? this.modelVersion,
+      queryIntent: queryIntent ?? this.queryIntent,
+      topResult: clearTopResult ? null : topResult ?? this.topResult,
+      tracks: tracks ?? this.tracks,
+      artists: artists ?? this.artists,
+      albums: albums ?? this.albums,
+      similarArtists: similarArtists ?? this.similarArtists,
+      diagnostics: diagnostics ?? this.diagnostics,
+      errorMessage: clearError ? null : errorMessage ?? this.errorMessage,
+    );
+  }
+}
+
+class SearchPageNotifier extends StateNotifier<SearchPageState> {
+  final Ref ref;
+  int _requestVersion = 0;
+  bool isLoading = false;
+  static const Duration _searchDebounce = Duration.zero;
+  static const Duration _searchTimeout = Duration(seconds: 8);
+
+  SearchPageNotifier(this.ref) : super(const SearchPageState());
+
+  void _primeSearchResults(List<Map<String, dynamic>> tracks) {
+    unawaited(
+      ref.read(audioPlayerProvider.notifier).prewarmStreams(
+            tracks.map((track) => track['id'] ?? track['videoId']),
+          ),
+    );
+  }
+
+  Future<void> search(String query) async {
+    final normalizedQuery = query.trim();
+    if (normalizedQuery.isEmpty) {
+      clear();
+      return;
+    }
+    final requestVersion = ++_requestVersion;
+    isLoading = true;
+    state = state.copyWith(requestState: 'loading', clearError: true);
+    try {
+      if (_searchDebounce > Duration.zero) {
+        await Future<void>.delayed(_searchDebounce);
+        if (requestVersion != _requestVersion) return;
+      }
+      if (requestVersion != _requestVersion) return;
+      final fetchResult = await _fetchSearchPayload(
+        ref,
+        normalizedQuery,
+        limit: 16,
+        timeout: _searchTimeout,
+      );
+      if (requestVersion != _requestVersion) return;
+      if (fetchResult.hasPayload) {
+        final payload = fetchResult.payload!;
+        final nextState = SearchPageState.fromJson(payload);
+        state = nextState.copyWith(
+          requestState: 'complete',
+          clearError: true,
+        );
+        _debugProxyLog(
+          'search',
+          'page query="$normalizedQuery" status=200 tracks=${nextState.tracks.length} artists=${nextState.artists.length} albums=${nextState.albums.length} similar=${nextState.similarArtists.length} diagnostics=${_compactDiagnosticValue(nextState.diagnostics)}',
+        );
+        _primeSearchResults(nextState.tracks);
+        unawaited(
+          recordCloudSearchEvent(
+            normalizedQuery,
+            resultCount: nextState.tracks.length,
+          ),
+        );
+        unawaited(
+          recordProxySearchEvent(
+            normalizedQuery,
+            resultCount: nextState.tracks.length,
+            searchScope: 'search_page',
+          ),
+        );
+        notifyRecommendationSignal(normalizedQuery);
+      } else {
+        final errorMessage = fetchResult.status == 'timeout'
+            ? _searchTimeoutMessage
+            : _searchUnavailableMessage;
+        _debugProxyLog(
+          'search',
+          'page query="$normalizedQuery" status=${fetchResult.status}',
+        );
+        state = SearchPageState(
+          requestState: 'failed',
+          errorMessage: errorMessage,
+          diagnostics: <String, dynamic>{
+            'fetch_status': fetchResult.status,
+            if (fetchResult.statusCode != null)
+              'http_status': fetchResult.statusCode,
+          },
+        );
+      }
+    } on TimeoutException catch (error) {
+      _debugProxyLog('search', 'page query="$normalizedQuery" timeout=$error');
+      if (requestVersion != _requestVersion) return;
+      state = const SearchPageState(
+        requestState: 'failed',
+        errorMessage: _searchTimeoutMessage,
+      );
+    } catch (error) {
+      _debugProxyLog('search', 'page query="$normalizedQuery" error=$error');
+      if (requestVersion != _requestVersion) return;
+      state = const SearchPageState(
+        requestState: 'failed',
+        errorMessage: _searchUnavailableMessage,
+      );
+    } finally {
+      if (requestVersion == _requestVersion) {
+        isLoading = false;
+        state = state.copyWith();
+      }
+    }
+  }
+
+  void clear() {
+    _requestVersion++;
+    isLoading = false;
+    state = const SearchPageState(requestState: 'idle');
+  }
+}
+
+final searchPageProvider =
+    StateNotifierProvider<SearchPageNotifier, SearchPageState>((ref) {
+  return SearchPageNotifier(ref);
 });
 
 class RecommendationFeedRowState {
@@ -3505,28 +4271,32 @@ class RecommendationFeedRowState {
 
   factory RecommendationFeedRowState.fromJson(Map<String, dynamic> json) {
     final kind = (json['kind'] ?? json['id'] ?? 'tracks').toString();
-    final itemType = (json['item_type'] ??
-            (kind == 'recommended_albums' ? 'album' : 'track'))
-        .toString();
+    final inferredItemType = kind == 'recommended_albums'
+        ? 'album'
+        : kind == 'recommended_artists'
+            ? 'artist'
+            : 'track';
+    final itemType = (json['item_type'] ?? inferredItemType).toString();
     final rawItems = (json['items'] as List<dynamic>? ?? const []);
-    final items = rawItems
-        .whereType<Map>()
-        .map((entry) {
-          final map = Map<String, dynamic>.from(entry);
-          if (itemType == 'album') {
-            return map;
-          }
-          return normalizeTrack(map);
-        })
-        .where((item) {
-          if (itemType == 'album') {
-            final albumId = item['id']?.toString().trim() ?? '';
-            final albumTitle = item['title']?.toString().trim() ?? '';
-            return albumId.isNotEmpty || albumTitle.isNotEmpty;
-          }
-          return extractTrackId(item)?.isNotEmpty ?? false;
-        })
-        .toList(growable: false);
+    final items = rawItems.whereType<Map>().map((entry) {
+      final map = Map<String, dynamic>.from(entry);
+      if (itemType != 'track') {
+        return map;
+      }
+      return normalizeTrack(map);
+    }).where((item) {
+      if (itemType == 'album') {
+        final albumId = item['id']?.toString().trim() ?? '';
+        final albumTitle = item['title']?.toString().trim() ?? '';
+        return albumId.isNotEmpty || albumTitle.isNotEmpty;
+      }
+      if (itemType == 'artist') {
+        final artistId = item['id']?.toString().trim() ?? '';
+        final artistName = item['name']?.toString().trim() ?? '';
+        return artistId.isNotEmpty || artistName.isNotEmpty;
+      }
+      return extractTrackId(item)?.isNotEmpty ?? false;
+    }).toList(growable: false);
     return RecommendationFeedRowState(
       id: (json['id'] ?? kind).toString(),
       title: (json['title'] ?? 'Recommended').toString(),
@@ -3570,16 +4340,22 @@ class RecommendationFeedRowState {
 }
 
 class RecommendationFeedState {
+  final String requestState;
   final String sessionId;
   final List<RecommendationFeedRowState> rows;
   final double? generatedAt;
   final double? expiresAt;
+  final String? errorMessage;
+  final Map<String, dynamic> diagnostics;
 
   const RecommendationFeedState({
+    this.requestState = 'idle',
     this.sessionId = '',
     this.rows = const [],
     this.generatedAt,
     this.expiresAt,
+    this.errorMessage,
+    this.diagnostics = const <String, dynamic>{},
   });
 
   bool get isEmpty => rows.every((row) => row.items.isEmpty);
@@ -3593,35 +4369,57 @@ class RecommendationFeedState {
   factory RecommendationFeedState.fromJson(Map<String, dynamic> json) {
     final rawRows = (json['rows'] as List<dynamic>? ?? const []);
     return RecommendationFeedState(
+      requestState: (json['request_state'] ?? '').toString().trim().isNotEmpty
+          ? json['request_state'].toString()
+          : ((json['error_message']?.toString().trim().isNotEmpty ?? false)
+              ? 'failed'
+              : 'complete'),
       sessionId: (json['session_id'] ?? '').toString(),
       rows: rawRows
           .whereType<Map>()
-          .map((row) =>
-              RecommendationFeedRowState.fromJson(Map<String, dynamic>.from(row)))
+          .map((row) => RecommendationFeedRowState.fromJson(
+              Map<String, dynamic>.from(row)))
           .toList(growable: false),
       generatedAt: (json['generated_at'] as num?)?.toDouble(),
       expiresAt: (json['expires_at'] as num?)?.toDouble(),
+      errorMessage:
+          (json['error_message']?.toString().trim().isNotEmpty ?? false)
+              ? json['error_message'].toString().trim()
+              : null,
+      diagnostics: json['diagnostics'] is Map
+          ? Map<String, dynamic>.from(json['diagnostics'] as Map)
+          : const <String, dynamic>{},
     );
   }
 
   Map<String, dynamic> toJson() => {
+        'request_state': requestState,
         'session_id': sessionId,
         'generated_at': generatedAt,
         'expires_at': expiresAt,
         'rows': rows.map((row) => row.toJson()).toList(growable: false),
+        if (errorMessage != null) 'error_message': errorMessage,
+        if (diagnostics.isNotEmpty) 'diagnostics': diagnostics,
       };
 
   RecommendationFeedState copyWith({
+    String? requestState,
     String? sessionId,
     List<RecommendationFeedRowState>? rows,
     double? generatedAt,
     double? expiresAt,
+    String? errorMessage,
+    Map<String, dynamic>? diagnostics,
+    bool clearError = false,
   }) {
     return RecommendationFeedState(
+      requestState: requestState ?? this.requestState,
       sessionId: sessionId ?? this.sessionId,
       rows: rows ?? this.rows,
       generatedAt: generatedAt ?? this.generatedAt,
       expiresAt: expiresAt ?? this.expiresAt,
+      errorMessage: clearError ? null : errorMessage ?? this.errorMessage,
+      diagnostics: diagnostics ?? this.diagnostics,
     );
   }
 }
@@ -3637,12 +4435,20 @@ String _recommendationRowItemKey(
     final artist = item['artist']?.toString().trim().toLowerCase() ?? '';
     return 'album:$title|$artist';
   }
+  if (itemType == 'artist') {
+    final artistId = item['id']?.toString().trim() ?? '';
+    if (artistId.isNotEmpty) return 'artist:$artistId';
+    final name = item['name']?.toString().trim().toLowerCase() ?? '';
+    return 'artist:$name';
+  }
   final trackId = extractTrackId(item)?.trim() ?? '';
   if (trackId.isNotEmpty) return 'track:$trackId';
   final title = item['title']?.toString().trim().toLowerCase() ?? '';
-  final artist =
-      (item['channel'] ?? item['author'] ?? item['artist'])?.toString().trim().toLowerCase() ??
-          '';
+  final artist = (item['channel'] ?? item['author'] ?? item['artist'])
+          ?.toString()
+          .trim()
+          .toLowerCase() ??
+      '';
   return 'track:$title|$artist';
 }
 
@@ -3738,6 +4544,10 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
   final Set<String> _paginatingRows = <String>{};
   int _requestVersion = 0;
   final Set<String> _prewarmedRecommendationIds = <String>{};
+  bool _startupHealthChecked = false;
+  Timer? _heavyHydrationTimer;
+  String _heavyHydrationKey = '';
+  int _backgroundRefreshToken = 0;
 
   bool get isPaginating => _paginatingRows.isNotEmpty;
   bool get hasMorePages => state.rows.any((row) => row.hasMore);
@@ -3746,65 +4556,124 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
   bool _isRequestCurrent(int requestVersion) =>
       mounted && requestVersion == _requestVersion;
 
-  Future<File> _cacheFile() => getScopedDataFile('recommendations_cache.json');
-
-  Future<RecommendationFeedState> _loadCachedRecommendations() async {
-    try {
-      final file = await _cacheFile();
-      if (!file.existsSync()) return const RecommendationFeedState();
-      final decoded = jsonDecode(await file.readAsString());
-      if (decoded is Map<String, dynamic>) {
-        return RecommendationFeedState.fromJson(decoded);
-      }
-      return const RecommendationFeedState();
-    } catch (error) {
-      debugPrint('Recommendation cache load failed: $error');
-      return const RecommendationFeedState();
+  Future<bool> _ensureProxyHealthyAtStartup() async {
+    if (_startupHealthChecked) return true;
+    _startupHealthChecked = true;
+    final healthy = await probeProxyHealth();
+    if (!healthy) {
+      _debugProxyLog(
+        'recommend',
+        'startup health check failed for candidates=${_compactDiagnosticValue(proxyBaseUrlCandidates)}',
+      );
     }
-  }
-
-  Future<void> _saveCachedRecommendations(RecommendationFeedState feed) async {
-    try {
-      final file = await _cacheFile();
-      await file.writeAsString(jsonEncode(feed.toJson()));
-    } catch (error) {
-      debugPrint('Recommendation cache save failed: $error');
-    }
+    return healthy;
   }
 
   Future<void> bootstrap() async {
-    final cached = await _loadCachedRecommendations();
-    if (!mounted) return;
-    if (cached.hasRows) {
+    final authState = ref.read(authProvider);
+    if (authState.isConfigured && !authState.isInitialized) {
       isLoading = false;
-      state = cached;
-      _primeRecommendationRows(cached.rows);
-      unawaited(refreshFromSignals(forceRefresh: true));
+      if (mounted) {
+        state = state.copyWith(requestState: 'idle');
+      }
+      _debugProxyLog(
+        'recommend',
+        'bootstrap deferred until auth initialization completes for scope=${authState.storageScopeId}',
+      );
+      return;
+    }
+    final proxyHealthy = await _ensureProxyHealthyAtStartup();
+    if (!mounted) return;
+    if (!proxyHealthy) {
+      isLoading = false;
+      state = state.copyWith(
+        requestState: 'failed',
+        errorMessage:
+            'Recommendation engine is unreachable. Check proxy/server connection and refresh.',
+      );
       return;
     }
 
-    final quickSeed = await HistoryManager.getLatestSeed();
-    if (!mounted) return;
-    if (quickSeed != null && quickSeed.isNotEmpty) {
-      await loadQuickRecommendations(quickSeed);
-      if (!mounted) return;
-      if (state.hasRows) {
-        return;
-      }
-    }
-
-    await refreshFromSignals();
+    await refreshFromSignals(forceRefresh: false);
   }
 
   Future<void> refreshFromSignals({bool forceRefresh = false}) async {
     final seed = await HistoryManager.getRecommendationSeed();
     if (!mounted) return;
+    if (forceRefresh) {
+      await loadRecommendations(
+        seed,
+        false,
+        const <String>[],
+        const <String>[],
+        const <String>[],
+        true,
+      );
+      unawaited(_refreshRecommendationsInBackground(seed));
+      return;
+    }
     await loadRecommendations(seed, forceRefresh);
+  }
+
+  Future<void> _refreshRecommendationsInBackground(String? seedId) async {
+    final refreshToken = ++_backgroundRefreshToken;
+    final requestVersion = ++_requestVersion;
+    try {
+      final body = await _buildRecommendationRequestBody(
+        seedId,
+        limit: 8,
+        forceRefresh: true,
+      );
+      if (!mounted ||
+          requestVersion != _requestVersion ||
+          refreshToken != _backgroundRefreshToken) {
+        return;
+      }
+      _debugProxyLog(
+        'recommend',
+        'background refresh start scope=${body['user_scope_id']} seed=${body['seed_id'] ?? ''}',
+      );
+      final res = await _runRecommendationRequest(
+        proxyControlHttpClient.post(buildProxyUri('/recommend'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode(body)),
+        _recommendRequestTimeout,
+      );
+      if (!mounted ||
+          requestVersion != _requestVersion ||
+          refreshToken != _backgroundRefreshToken) {
+        return;
+      }
+      if (res.statusCode != 200) {
+        _debugProxyLog(
+          'recommend',
+          'background refresh status=${res.statusCode} body=${res.body}',
+        );
+        return;
+      }
+      final payload = jsonDecode(res.body) as Map<String, dynamic>;
+      _logRecommendationDiagnostics('background', payload);
+      final nextState = _feedStateFromPayload(payload);
+      if (!nextState.hasRows) {
+        _debugProxyLog('recommend', 'background refresh returned empty rows');
+        return;
+      }
+      state = nextState.copyWith(
+        requestState: 'complete',
+        clearError: true,
+      );
+      _primeRecommendationRows(state.rows);
+    } on TimeoutException catch (error) {
+      _debugProxyLog('recommend', 'background refresh timeout=$error');
+    } catch (error) {
+      _debugProxyLog('recommend', 'background refresh error=$error');
+    }
   }
 
   @override
   void dispose() {
     _requestVersion++;
+    _heavyHydrationTimer?.cancel();
     super.dispose();
   }
 
@@ -3816,7 +4685,58 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
         return nextState;
       }
     }
-    return const RecommendationFeedState();
+    final recommendations =
+        (payload['recommendations'] as List<dynamic>? ?? const [])
+            .whereType<Map>()
+            .map((entry) => normalizeTrack(Map<String, dynamic>.from(entry)))
+            .where((track) => extractTrackId(track)?.isNotEmpty ?? false)
+            .toList(growable: false);
+    if (recommendations.isNotEmpty) {
+      final rebuiltPayload = <String, dynamic>{
+        ...payload,
+        'rows': <Map<String, dynamic>>[
+          {
+            'id': 'recommended_tracks',
+            'title': 'Recommended for you',
+            'kind': 'recommended_tracks',
+            'item_type': 'track',
+            'items': recommendations,
+            'next_offset': recommendations.length,
+            'has_more': false,
+          }
+        ],
+      };
+      final nextState = RecommendationFeedState.fromJson(rebuiltPayload);
+      if (nextState.hasRows) {
+        return nextState;
+      }
+    }
+    return const RecommendationFeedState(requestState: 'complete');
+  }
+
+  void _logRecommendationDiagnostics(
+    String phase,
+    Map<String, dynamic> payload,
+  ) {
+    final diagnosticsRaw = payload['diagnostics'];
+    if (diagnosticsRaw is! Map) return;
+    final diagnostics = Map<String, dynamic>.from(diagnosticsRaw);
+    final rowStatusSummary = <String, String>{};
+    final rowStatusRaw = diagnostics['row_status'];
+    if (rowStatusRaw is Map) {
+      for (final entry in rowStatusRaw.entries) {
+        final key = entry.key?.toString() ?? '';
+        if (key.isEmpty) continue;
+        final value = entry.value;
+        if (value is Map) {
+          rowStatusSummary[key] = value['status']?.toString() ?? '';
+        }
+      }
+    }
+    _debugProxyLog(
+      'recommend',
+      '$phase timing requestMs=${diagnostics['request_ms']} profileMs=${diagnostics['profile_build_ms']} rowMs=${diagnostics['row_assembly_ms']} stageMs=${_compactDiagnosticValue(diagnostics['stage_timings_ms'])} rowStatus=${_compactDiagnosticValue(rowStatusSummary)} requestId=${payload['request_id'] ?? diagnostics['request_id'] ?? ''}',
+    );
   }
 
   void _primeRecommendationResults(Iterable<dynamic> tracks) {
@@ -3834,7 +4754,8 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
     if (ids.isEmpty) return;
     if (_prewarmedRecommendationIds.length > 160) {
       _prewarmedRecommendationIds.removeAll(
-        _prewarmedRecommendationIds.take(_prewarmedRecommendationIds.length - 80),
+        _prewarmedRecommendationIds
+            .take(_prewarmedRecommendationIds.length - 80),
       );
     }
     unawaited(ref.read(audioPlayerProvider.notifier).prewarmStreams(ids));
@@ -3851,6 +4772,101 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
     }
     if (visibleTracks.isEmpty) return;
     _primeRecommendationResults(visibleTracks);
+  }
+
+  bool _diagnosticFlag(
+    Map<String, dynamic> payload,
+    String key,
+  ) {
+    final diagnosticsRaw = payload['diagnostics'];
+    if (diagnosticsRaw is! Map) return false;
+    final value = diagnosticsRaw[key];
+    return value == true || value?.toString().toLowerCase() == 'true';
+  }
+
+  void _scheduleHeavyRowsHydration(
+    String? seedId, {
+    List<String> extraArtistHints = const <String>[],
+    List<String> extraTasteQueries = const <String>[],
+  }) {
+    final stateKey = [
+      ref.read(authProvider).storageScopeId,
+      seedId ?? '',
+      state.sessionId,
+      state.generatedAt?.toString() ?? '',
+    ].join('|');
+    if (stateKey.trim().isEmpty || _heavyHydrationKey == stateKey) {
+      return;
+    }
+    _heavyHydrationKey = stateKey;
+    _heavyHydrationTimer?.cancel();
+    _heavyHydrationTimer = Timer(const Duration(milliseconds: 900), () {
+      unawaited(
+        _hydrateHeavyRows(
+          seedId,
+          extraArtistHints: extraArtistHints,
+          extraTasteQueries: extraTasteQueries,
+          expectedStateKey: stateKey,
+        ),
+      );
+    });
+  }
+
+  Future<void> _hydrateHeavyRows(
+    String? seedId, {
+    required String expectedStateKey,
+    List<String> extraArtistHints = const <String>[],
+    List<String> extraTasteQueries = const <String>[],
+  }) async {
+    if (!mounted) return;
+    final currentStateKey = [
+      ref.read(authProvider).storageScopeId,
+      seedId ?? '',
+      state.sessionId,
+      state.generatedAt?.toString() ?? '',
+    ].join('|');
+    if (currentStateKey != expectedStateKey || isLoading) {
+      return;
+    }
+    try {
+      final body = await _buildRecommendationRequestBody(
+        seedId,
+        limit: 8,
+        forceRefresh: false,
+        hydrateHeavyRows: true,
+        extraArtistHints: extraArtistHints,
+        extraTasteQueries: extraTasteQueries,
+      );
+      if (!mounted) return;
+      _debugProxyLog(
+        'recommend',
+        'heavy hydrate start scope=${body['user_scope_id']} seed=${body['seed_id'] ?? ''}',
+      );
+      final res = await _runRecommendationRequest(
+        proxyControlHttpClient.post(buildProxyUri('/recommend'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode(body)),
+        _recommendRequestTimeout,
+      );
+      if (!mounted || currentStateKey != expectedStateKey) return;
+      if (res.statusCode != 200) return;
+      final payload = jsonDecode(res.body) as Map<String, dynamic>;
+      final nextState = _feedStateFromPayload(payload);
+      if (!nextState.hasRows || nextState.rows.length <= state.rows.length) {
+        return;
+      }
+      state = nextState.copyWith(
+        requestState: 'complete',
+        clearError: true,
+      );
+      _primeRecommendationRows(state.rows);
+      _debugProxyLog(
+        'recommend',
+        'heavy hydrate rows=${state.rows.length} session=${state.sessionId}',
+      );
+    } catch (_) {
+      return;
+    }
   }
 
   void _bumpTasteWeight(
@@ -3879,7 +4895,11 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
   bool _looksLikeTasteQuery(String query) {
     final normalized = query.trim().toLowerCase();
     if (normalized.isEmpty) return false;
-    if (normalized.length > 38) return true;
+    if (_isMetadataHeavyQuery(normalized)) return false;
+    if (normalized.length > 38) {
+      return _sharedTasteKeywords
+          .any((keyword) => normalized.contains(keyword));
+    }
     if (normalized.contains(' mix') ||
         normalized.contains(' playlist') ||
         normalized.contains(' songs') ||
@@ -3895,10 +4915,16 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
     int offset = 0,
     Set<String> avoidIds = const <String>{},
     bool forceRefresh = false,
+    bool preferFreshRows = false,
+    bool hydrateHeavyRows = false,
     List<String> extraArtistHints = const <String>[],
     List<String> extraTasteQueries = const <String>[],
+    List<String> extraSessionQueries = const <String>[],
   }) async {
     final seedIds = <String>[];
+    final playlists = ref.read(playlistProvider);
+    final libraryTracks = ref.read(libraryProvider).valueOrNull ?? const [];
+    final storageScopeId = ref.read(authProvider).storageScopeId;
     final requestSignals = await Future.wait<Object?>([
       HistoryManager.getRecentTrackSnapshots(limit: forceRefresh ? 14 : 10),
       HistoryManager.getLastPlayedTrackSnapshots(limit: 8),
@@ -3917,6 +4943,7 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
     final topTrackIds = List<String>.from(requestSignals[4] as List);
     final recentQueries = List<String>.from(requestSignals[5] as List);
     final blendedRecentQueries = <String>[];
+    final softSessionQueries = <String>{};
 
     void addRecentQuery(String? value) {
       final normalized = value?.trim();
@@ -3928,6 +4955,12 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
 
     for (final query in extraTasteQueries) {
       addRecentQuery(query);
+    }
+    for (final query in extraSessionQueries) {
+      final normalized = query.trim();
+      if (normalized.isEmpty) continue;
+      softSessionQueries.add(normalized);
+      addRecentQuery(normalized);
     }
     for (final query in recentQueries) {
       addRecentQuery(query);
@@ -3955,9 +4988,6 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
     final artistWeights = <String, double>{};
     final queryWeights = <String, double>{};
     final albumWeights = <String, double>{};
-    final playlists = ref.read(playlistProvider);
-    final libraryTracks = ref.read(libraryProvider).valueOrNull ?? const [];
-    final storageScopeId = ref.read(authProvider).storageScopeId;
     final libraryTrackIds = <String>[];
     final offlineTrackIds = <String>[];
 
@@ -3977,8 +5007,8 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
       required double albumWeight,
     }) {
       for (final track in tracks) {
-        _bumpTasteWeight(artistWeights, _extractArtistHint(track), artistWeight);
-        _bumpTasteWeight(queryWeights, _extractAlbumHint(track), albumWeight * 0.75);
+        _bumpTasteWeight(
+            artistWeights, _extractArtistHint(track), artistWeight);
         addAlbumWeight(_extractAlbumHint(track), albumWeight);
       }
     }
@@ -4006,12 +5036,18 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
     for (final query in extraTasteQueries) {
       _bumpTasteWeight(queryWeights, query, 1.95);
     }
+    for (final query in extraSessionQueries) {
+      if (_looksLikeTasteQuery(query)) {
+        _bumpTasteWeight(queryWeights, query, 0.65);
+      }
+    }
 
     for (final playlist in playlists) {
-      _bumpTasteWeight(queryWeights, playlist.name, 1.4);
+      if (_looksLikeTasteQuery(playlist.name)) {
+        _bumpTasteWeight(queryWeights, playlist.name, 1.4);
+      }
       for (final track in playlist.tracks.take(18)) {
         _bumpTasteWeight(artistWeights, _extractArtistHint(track), 1.4);
-        _bumpTasteWeight(queryWeights, _extractAlbumHint(track), 0.8);
         addAlbumWeight(_extractAlbumHint(track), 1.1);
       }
     }
@@ -4026,11 +5062,13 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
         }
       }
       _bumpTasteWeight(artistWeights, _extractArtistHint(track), 1.2);
-      _bumpTasteWeight(queryWeights, _extractAlbumHint(track), 0.7);
       addAlbumWeight(_extractAlbumHint(track), 0.9);
     }
 
     for (final query in blendedRecentQueries) {
+      if (softSessionQueries.contains(query)) {
+        continue;
+      }
       if (_looksLikeTasteQuery(query)) {
         _bumpTasteWeight(queryWeights, query, 1.35);
       }
@@ -4049,51 +5087,122 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
       'offset': offset,
       'user_scope_id': storageScopeId,
       'force_refresh': forceRefresh,
+      'prefer_fresh_rows': preferFreshRows,
+      if (preferFreshRows)
+        'refresh_token': DateTime.now().millisecondsSinceEpoch.toString(),
+      'hydrate_heavy_rows': hydrateHeavyRows,
       if (seedIds.isNotEmpty) 'seed_id': seedIds.first,
       'seed_ids': seedIds.take(forceRefresh ? 6 : 5).toList(growable: false),
+      'recent_tracks': recentTrackSnapshots,
+      'top_tracks': topTrackSnapshots,
       'recent_track_ids': recentTrackIds,
       'top_track_ids': topTrackIds,
       'recent_track_snapshots': recentTrackSnapshots,
       'top_track_snapshots': topTrackSnapshots,
       'last_played_tracks': lastPlayedSnapshots,
       'recent_queries': blendedRecentQueries,
-      'playlist_names':
-          playlists.map((playlist) => playlist.name).take(10).toList(growable: false),
+      'playlist_names': playlists
+          .map((playlist) => playlist.name)
+          .take(10)
+          .toList(growable: false),
       'library_track_ids': libraryTrackIds.take(28).toList(growable: false),
       'offline_track_ids': offlineTrackIds.take(28).toList(growable: false),
-      'artist_hints':
-          rankedArtists.take(6).map((entry) => entry.key).toList(growable: false),
-      'album_hints':
-          rankedAlbums.take(6).map((entry) => entry.key).toList(growable: false),
-      'taste_queries':
-          rankedQueries.take(8).map((entry) => entry.key).toList(growable: false),
+      'artist_hints': rankedArtists
+          .take(6)
+          .map((entry) => entry.key)
+          .toList(growable: false),
+      'album_hints': rankedAlbums
+          .take(6)
+          .map((entry) => entry.key)
+          .toList(growable: false),
+      'taste_queries': rankedQueries
+          .take(8)
+          .map((entry) => entry.key)
+          .toList(growable: false),
       'avoid_ids': avoidIds.take(40).toList(growable: false),
     };
   }
 
   Future<void> loadQuickRecommendations(String seedId) async {
     final requestVersion = ++_requestVersion;
+    final previousState = state;
     isLoading = true;
-    state = state.copyWith();
+    if (_isRequestCurrent(requestVersion)) {
+      state = state.copyWith(requestState: 'loading', clearError: true);
+    }
     try {
       final body = await _buildRecommendationRequestBody(seedId, limit: 8);
-      final res = await appHttpClient
-          .post(
-            buildProxyUri('/recommend'),
-            headers: {'Content-Type': 'application/json'},
-            body: jsonEncode(body),
-          )
-          .timeout(const Duration(seconds: 6));
       if (!_isRequestCurrent(requestVersion)) return;
-      if (res.statusCode != 200) return;
-      final nextState =
-          _feedStateFromPayload(jsonDecode(res.body) as Map<String, dynamic>);
-      if (!nextState.hasRows) return;
-      state = nextState;
-      _primeRecommendationRows(nextState.rows);
-      unawaited(_saveCachedRecommendations(nextState));
-    } catch (_) {
-      // Quick bootstrap is best-effort only.
+      _debugProxyLog(
+        'recommend',
+        'quick request start scope=${body['user_scope_id']} seed=$seedId force=false',
+      );
+      final res = await _runRecommendationRequest(
+        proxyControlHttpClient.post(
+          buildProxyUri('/recommend'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode(body),
+        ),
+        _recommendRequestTimeout,
+      );
+      if (!_isRequestCurrent(requestVersion)) return;
+      if (res.statusCode != 200) {
+        _debugProxyLog(
+          'recommend',
+          'quick request status=${res.statusCode} body=${res.body}',
+        );
+        if (_isRequestCurrent(requestVersion)) {
+          state = previousState.copyWith(
+            requestState: 'failed',
+            errorMessage: _proxyUnavailableMessage,
+          );
+        }
+        return;
+      }
+      final payload = jsonDecode(res.body) as Map<String, dynamic>;
+      _logRecommendationDiagnostics('quick', payload);
+      final nextState = _feedStateFromPayload(payload);
+      _debugProxyLog(
+        'recommend',
+        'quick response rows=${nextState.rows.length} hasRows=${nextState.hasRows} firstRow=${nextState.rows.isEmpty ? '' : nextState.rows.first.id} diagnostics=${_compactDiagnosticValue(payload['diagnostics'])}',
+      );
+      if (!nextState.hasRows) {
+        _debugProxyLog(
+          'recommend',
+          'quick response parsed empty rows rawRows=${((payload['rows'] as List?) ?? const []).length}',
+        );
+        if (_isRequestCurrent(requestVersion)) {
+          state = previousState.copyWith(
+            requestState: 'failed',
+            errorMessage:
+                'Recommendation engine returned no rows. Pull to refresh and try again.',
+          );
+        }
+        return;
+      }
+      if (_isRequestCurrent(requestVersion)) {
+        state = nextState.copyWith(
+          requestState: 'complete',
+          clearError: true,
+        );
+        _primeRecommendationRows(nextState.rows);
+      }
+    } on TimeoutException catch (error) {
+      _debugProxyLog('recommend', 'quick request timeout=$error');
+      if (_isRequestCurrent(requestVersion)) {
+        state = previousState.copyWith(
+          requestState: 'failed',
+          errorMessage: _recommendTimeoutMessage,
+        );
+      }
+    } catch (error) {
+      _debugProxyLog('recommend', 'quick request error=$error');
+      if (_isRequestCurrent(requestVersion)) {
+        state = previousState.copyWith(
+          requestState: 'failed',
+          errorMessage: _proxyUnavailableMessage,
+        );
+      }
     } finally {
       if (_isRequestCurrent(requestVersion)) {
         isLoading = false;
@@ -4107,40 +5216,104 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
     bool forceRefresh = false,
     List<String> extraArtistHints = const <String>[],
     List<String> extraTasteQueries = const <String>[],
+    List<String> extraSessionQueries = const <String>[],
+    bool preferFreshRows = false,
   ]) async {
     final requestVersion = ++_requestVersion;
+    final previousState = state;
     isLoading = true;
+    final preserveVisibleRows = preferFreshRows && state.hasRows;
     if (_isRequestCurrent(requestVersion)) {
-      state = state.copyWith();
+      state = preserveVisibleRows
+          ? state.copyWith(clearError: true)
+          : state.copyWith(requestState: 'loading', clearError: true);
     }
     try {
       final body = await _buildRecommendationRequestBody(
         seedId,
         limit: 8,
         forceRefresh: forceRefresh,
+        preferFreshRows: preferFreshRows,
         extraArtistHints: extraArtistHints,
         extraTasteQueries: extraTasteQueries,
+        extraSessionQueries: extraSessionQueries,
       );
       if (!_isRequestCurrent(requestVersion)) return;
-      final res = await appHttpClient
-          .post(buildProxyUri('/recommend'),
-              headers: {'Content-Type': 'application/json'},
-              body: jsonEncode(body))
-          .timeout(const Duration(seconds: 10));
+      _debugProxyLog(
+        'recommend',
+        'request start scope=${body['user_scope_id']} seed=${body['seed_id'] ?? ''} force=$forceRefresh preferFresh=$preferFreshRows artistHints=${_compactDiagnosticValue(body['artist_hints'])} tasteQueries=${_compactDiagnosticValue(body['taste_queries'])}',
+      );
+      final res = await _runRecommendationRequest(
+        proxyControlHttpClient.post(buildProxyUri('/recommend'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode(body)),
+        _recommendRequestTimeout,
+      );
       if (!_isRequestCurrent(requestVersion)) return;
       if (res.statusCode == 200) {
-        final nextState =
-            _feedStateFromPayload(jsonDecode(res.body) as Map<String, dynamic>);
+        final payload = jsonDecode(res.body) as Map<String, dynamic>;
+        _logRecommendationDiagnostics('main', payload);
+        final nextState = _feedStateFromPayload(payload);
+        _debugProxyLog(
+          'recommend',
+          'response rows=${nextState.rows.length} hasRows=${nextState.hasRows} firstRow=${nextState.rows.isEmpty ? '' : nextState.rows.first.id} diagnostics=${_compactDiagnosticValue(payload['diagnostics'])}',
+        );
         if (nextState.hasRows) {
-          state = nextState;
+          state = nextState.copyWith(
+            requestState: 'complete',
+            clearError: true,
+          );
           _primeRecommendationRows(state.rows);
-          unawaited(_saveCachedRecommendations(nextState));
+          if (!forceRefresh &&
+              !preferFreshRows &&
+              _diagnosticFlag(payload, 'heavy_rows_pending')) {
+            _scheduleHeavyRowsHydration(
+              seedId,
+              extraArtistHints: extraArtistHints,
+              extraTasteQueries: extraTasteQueries,
+            );
+          }
           return;
         }
+        _debugProxyLog(
+          'recommend',
+          'response parsed empty rows rawRows=${((payload['rows'] as List?) ?? const []).length}',
+        );
+        if (_isRequestCurrent(requestVersion)) {
+          state = previousState.copyWith(
+            requestState: 'failed',
+            errorMessage:
+                'Recommendation engine returned no rows. Pull to refresh and try again.',
+          );
+        }
+      } else {
+        _debugProxyLog(
+          'recommend',
+          'request status=${res.statusCode} body=${res.body}',
+        );
+        if (_isRequestCurrent(requestVersion)) {
+          state = previousState.copyWith(
+            requestState: 'failed',
+            errorMessage: _proxyUnavailableMessage,
+          );
+        }
+      }
+    } on TimeoutException catch (e) {
+      _debugProxyLog('recommend', 'request timeout=$e');
+      if (_isRequestCurrent(requestVersion)) {
+        state = previousState.copyWith(
+          requestState: 'failed',
+          errorMessage: _recommendTimeoutMessage,
+        );
       }
     } catch (e) {
-      // Preserve the current feed on backend failures instead of
-      // reconstructing a static fallback lane locally.
+      _debugProxyLog('recommend', 'request error=$e');
+      if (_isRequestCurrent(requestVersion)) {
+        state = previousState.copyWith(
+          requestState: 'failed',
+          errorMessage: _proxyUnavailableMessage,
+        );
+      }
     } finally {
       if (_isRequestCurrent(requestVersion)) {
         isLoading = false;
@@ -4163,6 +5336,7 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
         _paginatingRows.contains(rowId)) {
       return;
     }
+    final currentRow = targetRow;
     _paginatingRows.add(rowId);
     if (mounted) {
       state = state.copyWith();
@@ -4177,9 +5351,12 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
       if (!mounted) return;
       body['session_id'] = state.sessionId;
       body['row_id'] = rowId;
-      final res = await appHttpClient.post(buildProxyUri('/recommend'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode(body)).timeout(const Duration(seconds: 10));
+      final res = await _runRecommendationRequest(
+        proxyControlHttpClient.post(buildProxyUri('/recommend'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode(body)),
+        _recommendRowPageTimeout,
+      );
       if (!mounted) return;
       if (res.statusCode == 200) {
         final payload = jsonDecode(res.body) as Map<String, dynamic>;
@@ -4188,30 +5365,45 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
           final newRow = RecommendationFeedRowState.fromJson(rowPayload);
           final mergedItems = <Map<String, dynamic>>[];
           final seen = <String>{};
-          for (final track in [...targetRow.items, ...newRow.items]) {
-            final key = _recommendationRowItemKey(targetRow.itemType, track);
+          for (final track in [...currentRow.items, ...newRow.items]) {
+            final key = _recommendationRowItemKey(currentRow.itemType, track);
             if (key.trim().isEmpty || !seen.add(key)) continue;
             mergedItems.add(track);
           }
+          final progressed = mergedItems.length > currentRow.items.length ||
+              newRow.nextOffset > currentRow.nextOffset;
           final updatedRows = state.rows
               .map(
                 (row) => row.id == rowId
                     ? row.copyWith(
                         itemType: newRow.itemType,
                         items: mergedItems,
-                        nextOffset: newRow.nextOffset,
-                        hasMore: newRow.hasMore,
+                        nextOffset: progressed
+                            ? newRow.nextOffset
+                            : currentRow.nextOffset,
+                        hasMore: progressed ? newRow.hasMore : false,
                       )
                     : row,
               )
               .toList(growable: false);
           state = state.copyWith(rows: updatedRows);
           _primeRecommendationResults(newRow.items);
-          unawaited(_saveCachedRecommendations(state));
         }
       }
+    } on TimeoutException {
+      if (mounted) {
+        state = state.copyWith(
+          requestState: 'failed',
+          errorMessage: _recommendTimeoutMessage,
+        );
+      }
     } catch (e) {
-      // print("Load more failed: $e");
+      if (mounted) {
+        state = state.copyWith(
+          requestState: 'failed',
+          errorMessage: _proxyUnavailableMessage,
+        );
+      }
     } finally {
       _paginatingRows.remove(rowId);
       if (mounted) {
@@ -4241,15 +5433,16 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
 }
 
 final recommendationProvider =
-    StateNotifierProvider<RecommendationNotifier, RecommendationFeedState>((ref) {
+    StateNotifierProvider<RecommendationNotifier, RecommendationFeedState>(
+        (ref) {
   ref.watch(authProvider.select((state) => state.storageScopeId));
-  ref.watch(storageRefreshTickProvider);
   final notifier = RecommendationNotifier(ref);
   unawaited(notifier.bootstrap());
   return notifier;
 });
 
-class FrequentlyPlayedNotifier extends StateNotifier<List<Map<String, dynamic>>> {
+class FrequentlyPlayedNotifier
+    extends StateNotifier<List<Map<String, dynamic>>> {
   final Ref ref;
   late final StreamSubscription<Map<String, dynamic>> _historySubscription;
   bool isLoading = false;
@@ -4284,10 +5477,13 @@ class FrequentlyPlayedNotifier extends StateNotifier<List<Map<String, dynamic>>>
       mounted && requestVersion == _requestVersion;
 
   Future<void> bootstrap() async {
-    await loadTracks();
+    await loadTracks(allowPrewarm: false);
   }
 
-  Future<void> loadTracks({bool forceRefresh = false}) async {
+  Future<void> loadTracks({
+    bool forceRefresh = false,
+    bool allowPrewarm = true,
+  }) async {
     final requestVersion = ++_requestVersion;
     isLoading = true;
     if (mounted) {
@@ -4345,20 +5541,26 @@ class FrequentlyPlayedNotifier extends StateNotifier<List<Map<String, dynamic>>>
         for (final track in hydrated) {
           final trackId = extractTrackId(track);
           if (trackId == null || trackId.isEmpty) continue;
-          if (resolved.any((entry) => extractTrackId(entry) == trackId)) continue;
+          if (resolved.any((entry) => extractTrackId(entry) == trackId)) {
+            continue;
+          }
           resolved.add(track);
         }
       }
 
       for (final entry in snapshotFallbacks.entries) {
-        if (resolved.any((track) => extractTrackId(track) == entry.key)) continue;
+        if (resolved.any((track) => extractTrackId(track) == entry.key)) {
+          continue;
+        }
         resolved.add(entry.value);
         if (resolved.length >= 8) break;
       }
 
       if (!_isRequestCurrent(requestVersion)) return;
       state = resolved.take(8).toList(growable: false);
-      if (_isRequestCurrent(requestVersion) && state.isNotEmpty) {
+      if (_isRequestCurrent(requestVersion) &&
+          allowPrewarm &&
+          state.isNotEmpty) {
         unawaited(
           ref.read(audioPlayerProvider.notifier).prewarmStreams(
                 state.take(6).map(extractTrackId),
@@ -4381,8 +5583,9 @@ class FrequentlyPlayedNotifier extends StateNotifier<List<Map<String, dynamic>>>
   }
 }
 
-final frequentlyPlayedProvider = StateNotifierProvider<FrequentlyPlayedNotifier,
-    List<Map<String, dynamic>>>((ref) {
+final frequentlyPlayedProvider =
+    StateNotifierProvider<FrequentlyPlayedNotifier, List<Map<String, dynamic>>>(
+        (ref) {
   ref.watch(authProvider.select((state) => state.storageScopeId));
   ref.watch(storageRefreshTickProvider);
   final notifier = FrequentlyPlayedNotifier(ref);
@@ -4489,7 +5692,8 @@ class LastPlayedNotifier extends StateNotifier<List<Map<String, dynamic>>> {
 }
 
 final lastPlayedProvider =
-    StateNotifierProvider<LastPlayedNotifier, List<Map<String, dynamic>>>((ref) {
+    StateNotifierProvider<LastPlayedNotifier, List<Map<String, dynamic>>>(
+        (ref) {
   ref.watch(authProvider.select((state) => state.storageScopeId));
   ref.watch(storageRefreshTickProvider);
   final notifier = LastPlayedNotifier(ref);
@@ -4500,6 +5704,7 @@ final lastPlayedProvider =
 class SuggestNotifier extends StateNotifier<List<String>> {
   final Ref ref;
   int _requestVersion = 0;
+  static const Duration _suggestDebounce = Duration(milliseconds: 160);
 
   SuggestNotifier(this.ref) : super([]);
 
@@ -4510,16 +5715,18 @@ class SuggestNotifier extends StateNotifier<List<String>> {
     }
     final requestVersion = ++_requestVersion;
     try {
-      final body = await _buildSemanticSearchRequestBody(
+      await Future<void>.delayed(_suggestDebounce);
+      if (requestVersion != _requestVersion) return;
+      final body = _buildSuggestRequestBody(
         ref,
         query,
         limit: 5,
       );
-      final res = await appHttpClient
+      final res = await proxyControlHttpClient
           .post(buildProxyUri('/suggest'),
               headers: {'Content-Type': 'application/json'},
               body: jsonEncode(body))
-          .timeout(const Duration(seconds: 10));
+          .timeout(const Duration(seconds: 4));
       if (requestVersion != _requestVersion) return;
       if (res.statusCode == 200) {
         state = List<String>.from(jsonDecode(res.body)['results']);
@@ -4549,20 +5756,20 @@ class TrackDetailsNotifier extends StateNotifier<Map<String, dynamic>?> {
     state = null; // show loading
     unawaited(ref.read(audioPlayerProvider.notifier).prewarmStream(videoId));
     try {
-      final res = await appHttpClient.post(
-          buildProxyUri('/track_details'),
+      final res = await appHttpClient.post(buildProxyUri('/track_details'),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({"video_id": videoId}));
       if (res.statusCode == 200) {
         state = jsonDecode(res.body);
-        final similarTracks = (state?['similar_tracks'] as List<dynamic>?) ?? const [];
+        final similarTracks =
+            (state?['similar_tracks'] as List<dynamic>?) ?? const [];
         unawaited(
           ref.read(audioPlayerProvider.notifier).prewarmStreams([
-                videoId,
-                ...similarTracks
-                    .take(8)
-                    .map((track) => track['id'] ?? track['videoId']),
-              ]),
+            videoId,
+            ...similarTracks
+                .take(8)
+                .map((track) => track['id'] ?? track['videoId']),
+          ]),
         );
       }
     } catch (e) {
@@ -4593,7 +5800,7 @@ class AlbumSearchNotifier extends StateNotifier<List<Map<String, dynamic>>> {
         query,
         limit: 12,
       );
-      final res = await appHttpClient
+      final res = await proxyControlHttpClient
           .post(
             buildProxyUri('/search_albums'),
             headers: {'Content-Type': 'application/json'},
@@ -4607,6 +5814,10 @@ class AlbumSearchNotifier extends StateNotifier<List<Map<String, dynamic>>> {
         state = albums
             .map((album) => Map<String, dynamic>.from(album as Map))
             .toList(growable: false);
+        _debugProxyLog(
+          'search',
+          'album query="$query" status=200 results=${state.length} diagnostics=${_compactDiagnosticValue(payload['diagnostics'])}',
+        );
         unawaited(
           recordProxySearchEvent(
             query,
@@ -4615,9 +5826,14 @@ class AlbumSearchNotifier extends StateNotifier<List<Map<String, dynamic>>> {
           ),
         );
       } else {
+        _debugProxyLog(
+          'search',
+          'album query="$query" status=${res.statusCode} body=${res.body}',
+        );
         state = const [];
       }
-    } catch (_) {
+    } catch (error) {
+      _debugProxyLog('search', 'album query="$query" error=$error');
       if (requestVersion != _requestVersion) return;
       state = const [];
     } finally {
@@ -4724,7 +5940,7 @@ class ArtistSearchNotifier extends StateNotifier<List<Map<String, dynamic>>> {
         trimmed,
         limit: 12,
       );
-      final res = await appHttpClient
+      final res = await proxyControlHttpClient
           .post(
             buildProxyUri('/search_artists'),
             headers: {'Content-Type': 'application/json'},
@@ -4738,6 +5954,10 @@ class ArtistSearchNotifier extends StateNotifier<List<Map<String, dynamic>>> {
         state = artists
             .map((artist) => Map<String, dynamic>.from(artist as Map))
             .toList(growable: false);
+        _debugProxyLog(
+          'search',
+          'artist query="$trimmed" status=200 results=${state.length} diagnostics=${_compactDiagnosticValue(payload['diagnostics'])}',
+        );
         unawaited(
           recordProxySearchEvent(
             trimmed,
@@ -4746,9 +5966,14 @@ class ArtistSearchNotifier extends StateNotifier<List<Map<String, dynamic>>> {
           ),
         );
       } else {
+        _debugProxyLog(
+          'search',
+          'artist query="$trimmed" status=${res.statusCode} body=${res.body}',
+        );
         state = const [];
       }
-    } catch (_) {
+    } catch (error) {
+      _debugProxyLog('search', 'artist query="$trimmed" error=$error');
       if (requestVersion != _requestVersion) return;
       state = const [];
     } finally {
@@ -4806,6 +6031,7 @@ class RecommendedArtistsNotifier
   bool _looksLikeArtistOrSongQuery(String query) {
     final normalized = query.trim().toLowerCase();
     if (normalized.isEmpty) return false;
+    if (_isMetadataHeavyQuery(normalized)) return false;
     if (normalized.contains(' playlist') ||
         normalized.contains(' mix') ||
         normalized.contains(' mood') ||
@@ -4815,21 +6041,76 @@ class RecommendedArtistsNotifier
     return true;
   }
 
+  List<Map<String, dynamic>> _normalizeAnchorTracks(
+    Iterable<dynamic> rawTracks, {
+    int limit = 6,
+  }) {
+    final tracks = <Map<String, dynamic>>[];
+    final seen = <String>{};
+    for (final rawTrack in rawTracks) {
+      if (rawTrack is! Map) continue;
+      final track = normalizeTrack(Map<String, dynamic>.from(rawTrack));
+      final key = _recommendationRowItemKey('track', track);
+      if (key.trim().isEmpty || !seen.add(key)) continue;
+      tracks.add(track);
+      if (tracks.length >= limit) {
+        break;
+      }
+    }
+    return tracks;
+  }
+
   Future<void> bootstrap() async {
-    await loadRecommendedArtists();
+    final authState = ref.read(authProvider);
+    if (authState.isConfigured && !authState.isInitialized) {
+      isLoading = false;
+      if (mounted) {
+        state = [...state];
+      }
+      _debugProxyLog(
+        'artists',
+        'bootstrap deferred until auth initialization completes for scope=${authState.storageScopeId}',
+      );
+      return;
+    }
+    final recState = ref.read(recommendationProvider);
+    if (!recState.hasRows) {
+      isLoading = false;
+      if (mounted) {
+        state = [...state];
+      }
+      _debugProxyLog(
+        'artists',
+        'bootstrap deferred until recommendation rows are available for scope=${authState.storageScopeId}',
+      );
+      return;
+    }
+    await loadRecommendedArtists(
+      seedArtistHints: recState.visibleTracks
+          .expand(extractTrackArtists)
+          .take(6)
+          .toSet()
+          .toList(growable: false),
+      surface: 'home_feed',
+    );
   }
 
   Future<void> loadRecommendedArtists({
     List<String> seedArtistHints = const [],
     List<String> seedTasteQueries = const [],
+    String surface = 'home_feed',
+    List<Map<String, dynamic>> anchorTracks = const [],
+    bool forceRefresh = false,
   }) async {
     final requestVersion = ++_requestVersion;
+    final previousState = List<Map<String, dynamic>>.from(state);
     isLoading = true;
     if (mounted) {
       state = [...state];
     }
     try {
       final artistWeights = <String, double>{};
+      final recState = ref.read(recommendationProvider);
       final libraryTracks = ref.read(libraryProvider).valueOrNull ?? const [];
       final artistSignals = await Future.wait<Object?>([
         HistoryManager.getLastPlayedTrackSnapshots(limit: 10),
@@ -4845,8 +6126,18 @@ class RecommendedArtistsNotifier
       final recentSnapshots =
           List<Map<String, dynamic>>.from(artistSignals[2] as List);
       final recentQueries = List<String>.from(artistSignals[3] as List);
+      final normalizedAnchorTracks = _normalizeAnchorTracks(anchorTracks);
+      final effectiveSeedArtistHints = seedArtistHints.isNotEmpty
+          ? seedArtistHints
+          : surface == 'home_feed'
+              ? recState.visibleTracks
+                  .expand(extractTrackArtists)
+                  .take(6)
+                  .toSet()
+                  .toList(growable: false)
+              : const <String>[];
 
-      for (final artist in seedArtistHints) {
+      for (final artist in effectiveSeedArtistHints) {
         _bumpWeight(artistWeights, artist, 2.8);
       }
       for (final track in lastPlayedSnapshots) {
@@ -4863,26 +6154,52 @@ class RecommendedArtistsNotifier
         _bumpTrackArtists(artistWeights, track, 1.1);
       }
 
-      final canonicalQueries = <String>[
-        ...seedTasteQueries.where(_looksLikeArtistOrSongQuery),
-        ...recentQueries.where(_looksLikeArtistOrSongQuery),
-      ];
+      final canonicalQueries = surface == 'home_feed'
+          ? <String>[
+              ...seedTasteQueries.where(_looksLikeArtistOrSongQuery),
+            ]
+          : <String>[
+              ...seedTasteQueries.where(_looksLikeArtistOrSongQuery),
+              ...recentQueries.where(_looksLikeArtistOrSongQuery),
+            ];
 
       final rankedArtists = artistWeights.entries.toList()
         ..sort((a, b) => b.value.compareTo(a.value));
+      final requestArtistHints = rankedArtists
+          .take(8)
+          .map((entry) => entry.key)
+          .toList(growable: false);
+      if (surface == 'home_feed' &&
+          requestArtistHints.isEmpty &&
+          normalizedAnchorTracks.isEmpty) {
+        _debugProxyLog(
+          'artists',
+          'recommended deferred for home_feed because stable feed seeds are not available yet',
+        );
+        if (!_isRequestCurrent(requestVersion)) return;
+        state = previousState;
+        return;
+      }
+      _debugProxyLog(
+        'artists',
+        'recommended start surface=$surface force=$forceRefresh hints=${_compactDiagnosticValue(requestArtistHints)} anchors=${normalizedAnchorTracks.length}',
+      );
 
-      final res = await appHttpClient
+      final res = await proxyControlHttpClient
           .post(
             buildProxyUri('/recommended_artists'),
             headers: {'Content-Type': 'application/json'},
             body: jsonEncode({
-              'query': '',
+              'query': canonicalQueries.isEmpty ? '' : canonicalQueries.first,
               'limit': 8,
-              'artist_hints': rankedArtists
-                  .take(8)
-                  .map((entry) => entry.key)
-                  .toList(growable: false),
-              'recent_queries': canonicalQueries.take(6).toList(growable: false),
+              'surface': surface,
+              'force_refresh': forceRefresh,
+              'artist_hints': requestArtistHints,
+              'anchor_artist_hints':
+                  effectiveSeedArtistHints.take(6).toList(growable: false),
+              'anchor_track_snapshots': normalizedAnchorTracks,
+              'recent_queries':
+                  canonicalQueries.take(6).toList(growable: false),
               'recent_track_snapshots': recentSnapshots,
               'top_track_snapshots': frequentSnapshots,
               'last_played_tracks': lastPlayedSnapshots,
@@ -4896,12 +6213,21 @@ class RecommendedArtistsNotifier
         state = artists
             .map((artist) => Map<String, dynamic>.from(artist as Map))
             .toList(growable: false);
+        _debugProxyLog(
+          'artists',
+          'recommended surface=$surface status=200 results=${state.length} diagnostics=${_compactDiagnosticValue(payload['diagnostics'])}',
+        );
       } else {
-        state = const [];
+        _debugProxyLog(
+          'artists',
+          'recommended surface=$surface status=${res.statusCode} body=${res.body}',
+        );
+        state = previousState;
       }
-    } catch (_) {
+    } catch (error) {
+      _debugProxyLog('artists', 'recommended surface=$surface error=$error');
       if (!_isRequestCurrent(requestVersion)) return;
-      state = const [];
+      state = previousState;
     } finally {
       if (_isRequestCurrent(requestVersion)) {
         isLoading = false;
@@ -4918,6 +6244,13 @@ class RecommendedArtistsNotifier
 }
 
 final recommendedArtistsProvider = StateNotifierProvider<
+    RecommendedArtistsNotifier, List<Map<String, dynamic>>>((ref) {
+  ref.watch(authProvider.select((state) => state.storageScopeId));
+  ref.watch(storageRefreshTickProvider);
+  return RecommendedArtistsNotifier(ref);
+});
+
+final searchSimilarArtistsProvider = StateNotifierProvider<
     RecommendedArtistsNotifier, List<Map<String, dynamic>>>((ref) {
   ref.watch(authProvider.select((state) => state.storageScopeId));
   ref.watch(storageRefreshTickProvider);
@@ -5099,8 +6432,9 @@ class PlaybackQueueState {
       playedTrackIds: playedTrackIds ?? this.playedTrackIds,
       playlistId: clearPlaylist ? null : playlistId ?? this.playlistId,
       playlistName: clearPlaylist ? null : playlistName ?? this.playlistName,
-      recommendations:
-          clearRecommendations ? const [] : recommendations ?? this.recommendations,
+      recommendations: clearRecommendations
+          ? const []
+          : recommendations ?? this.recommendations,
       isLoadingQueue: isLoadingQueue ?? this.isLoadingQueue,
       isLoadingRecommendations:
           isLoadingRecommendations ?? this.isLoadingRecommendations,
@@ -5111,6 +6445,8 @@ class PlaybackQueueState {
 class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
   final Ref ref;
   final Random _random = Random();
+  static const int _playedTrackMinSeconds = 12;
+  static const double _playedTrackMinRatio = 0.35;
 
   PlaybackQueueNotifier(this.ref) : super(const PlaybackQueueState());
 
@@ -5201,6 +6537,47 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
     return [...state.playedTrackIds, trackId];
   }
 
+  bool _shouldCountTrackAsPlayed(String? trackId) {
+    if (trackId == null || trackId.isEmpty) return false;
+    final playerState = ref.read(audioPlayerProvider);
+    final activeTrackId = playerState.videoId?.trim();
+    if (activeTrackId == null ||
+        activeTrackId.isEmpty ||
+        activeTrackId != trackId) {
+      return false;
+    }
+    final durationSeconds = playerState.duration;
+    final positionSeconds = playerState.currentPosition;
+    if (durationSeconds <= 0) {
+      return positionSeconds >= _playedTrackMinSeconds;
+    }
+    final requiredSeconds = max(
+      8,
+      min(
+        20,
+        (durationSeconds * _playedTrackMinRatio).round(),
+      ),
+    );
+    return positionSeconds >= requiredSeconds ||
+        positionSeconds >= durationSeconds - 1;
+  }
+
+  List<String> _playedTrackIdsAfterCurrentProgress(String? trackId) {
+    if (!_shouldCountTrackAsPlayed(trackId)) {
+      return state.playedTrackIds;
+    }
+    return _withPlayedTrack(trackId);
+  }
+
+  void _markCurrentTrackPlayedIfEligible() {
+    final nextPlayedTrackIds = _playedTrackIdsAfterCurrentProgress(
+      state.currentTrackId,
+    );
+    if (!listEquals(nextPlayedTrackIds, state.playedTrackIds)) {
+      state = state.copyWith(playedTrackIds: nextPlayedTrackIds);
+    }
+  }
+
   List<Map<String, dynamic>> _uniqueTracks(
     Iterable<dynamic> tracks, {
     Set<String>? excludedIds,
@@ -5217,9 +6594,12 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
   }
 
   void _refreshHistorySignalConsumers() {
-    unawaited(ref.read(lastPlayedProvider.notifier).loadTracks(forceRefresh: true));
     unawaited(
-      ref.read(frequentlyPlayedProvider.notifier).loadTracks(forceRefresh: true),
+        ref.read(lastPlayedProvider.notifier).loadTracks(forceRefresh: true));
+    unawaited(
+      ref
+          .read(frequentlyPlayedProvider.notifier)
+          .loadTracks(forceRefresh: true),
     );
   }
 
@@ -5227,10 +6607,9 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
     final trackId = state.currentTrackId;
     if (trackId == null || trackId.isEmpty) return;
     final currentIndex = _resolvedCurrentIndex();
-    final rawTrack =
-        currentIndex >= 0 && currentIndex < state.queue.length
-            ? state.queue[currentIndex]
-            : null;
+    final rawTrack = currentIndex >= 0 && currentIndex < state.queue.length
+        ? state.queue[currentIndex]
+        : null;
     await recordProxyInteractionEvent(
       eventType,
       trackId: trackId,
@@ -5242,7 +6621,8 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
     String seedId, {
     int limit = 12,
   }) async {
-    final body = await RecommendationNotifier(ref)._buildRecommendationRequestBody(
+    final body =
+        await RecommendationNotifier(ref)._buildRecommendationRequestBody(
       seedId,
       limit: limit,
       avoidIds: state.queue
@@ -5250,13 +6630,14 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
           .whereType<String>()
           .toSet(),
     );
-    final res = await appHttpClient
-        .post(
-          buildProxyUri('/recommend'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode(body),
-        )
-        .timeout(const Duration(seconds: 12));
+    final res = await _runRecommendationRequest(
+      proxyControlHttpClient.post(
+        buildProxyUri('/recommend'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode(body),
+      ),
+      _recommendRequestTimeout,
+    );
 
     if (res.statusCode != 200) {
       throw Exception('Recommendation lookup failed: ${res.statusCode}');
@@ -5306,9 +6687,9 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
     );
 
     await ref.read(audioPlayerProvider.notifier).configureManagedQueue(
-          [normalizedTrack],
-          initialIndex: 0,
-        );
+      [normalizedTrack],
+      initialIndex: 0,
+    );
     _refreshHistorySignalConsumers();
     _primeUpcomingQueue();
     unawaited(_appendRadioRecommendations(seedId: videoId));
@@ -5322,7 +6703,8 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
     final videoId = extractTrackId(normalizedTrack);
     if (videoId == null || videoId.isEmpty) return;
 
-    final frequentSnapshots = await HistoryManager.getFrequentlyPlayedTrackSnapshots(
+    final frequentSnapshots =
+        await HistoryManager.getFrequentlyPlayedTrackSnapshots(
       limit: 2,
     );
     List<Map<String, dynamic>> similarTracks = const [];
@@ -5355,8 +6737,7 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
 
     await startPlaylistSession(
       playlistId: 'discovery:$videoId',
-      playlistName:
-          sessionName ??
+      playlistName: sessionName ??
           'Inspired by ${normalizedTrack['title']?.toString() ?? 'this track'}',
       tracks: queue,
       currentTrack: normalizedTrack,
@@ -5373,12 +6754,13 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
       'local_path': path,
     };
     final audioNotifier = ref.read(audioPlayerProvider.notifier);
-    final loaded = localTrack['thumbnail'] != null || extractTrackId(localTrack) != null
-        ? await audioNotifier.loadLocalWithMeta(path, localTrack)
-        : await audioNotifier.loadLocalFile(
-            path,
-            localTrack['title']?.toString() ?? 'Unknown Track',
-          );
+    final loaded =
+        localTrack['thumbnail'] != null || extractTrackId(localTrack) != null
+            ? await audioNotifier.loadLocalWithMeta(path, localTrack)
+            : await audioNotifier.loadLocalFile(
+                path,
+                localTrack['title']?.toString() ?? 'Unknown Track',
+              );
     if (!loaded) {
       clearSession();
       return false;
@@ -5465,8 +6847,8 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
     if (playableIndexes.isEmpty) {
       if (state.mode == PlaybackQueueMode.radio &&
           state.recommendations.isNotEmpty) {
-        final track =
-            state.recommendations[_random.nextInt(state.recommendations.length)];
+        final track = state
+            .recommendations[_random.nextInt(state.recommendations.length)];
         await startRadioSession(track);
       }
       return;
@@ -5488,12 +6870,13 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
     if (state.mode == PlaybackQueueMode.none) return;
 
     final previousTrackId = state.currentTrackId;
-    final nextPlayedTrackIds = previousTrackId != null && previousTrackId != videoId
-        ? _withPlayedTrack(previousTrackId)
-        : state.playedTrackIds;
+    final nextPlayedTrackIds =
+        previousTrackId != null && previousTrackId != videoId
+            ? _playedTrackIdsAfterCurrentProgress(previousTrackId)
+            : state.playedTrackIds;
 
-    final matchingIndex = state.queue
-        .indexWhere((track) => extractTrackId(track) == videoId);
+    final matchingIndex =
+        state.queue.indexWhere((track) => extractTrackId(track) == videoId);
     if (matchingIndex >= 0) {
       state = state.copyWith(
         currentIndex: matchingIndex,
@@ -5612,7 +6995,7 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
       currentIndex: index,
       currentTrackId: videoId,
       playedTrackIds: previousTrackId != null && previousTrackId != videoId
-          ? _withPlayedTrack(previousTrackId)
+          ? _playedTrackIdsAfterCurrentProgress(previousTrackId)
           : state.playedTrackIds,
     );
     _primeUpcomingQueue();
@@ -5634,13 +7017,13 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
 
     final resolvedCurrentIndex = _resolvedCurrentIndex();
     if (index == resolvedCurrentIndex) {
-      final replacementIndex =
-          index.clamp(0, updatedQueue.length - 1).toInt();
+      final replacementIndex = index.clamp(0, updatedQueue.length - 1).toInt();
       state = state.copyWith(
         queue: updatedQueue,
         currentIndex: replacementIndex,
         currentTrackId: extractTrackId(updatedQueue[replacementIndex]),
-        playedTrackIds: state.playedTrackIds.where((id) => id != videoId).toList(),
+        playedTrackIds:
+            state.playedTrackIds.where((id) => id != videoId).toList(),
       );
       unawaited(audioNotifier.removeManagedQueueItem(index));
       unawaited(playQueueIndex(replacementIndex));
@@ -5654,7 +7037,8 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
     state = state.copyWith(
       queue: updatedQueue,
       currentIndex: nextCurrentIndex,
-      playedTrackIds: state.playedTrackIds.where((id) => id != videoId).toList(),
+      playedTrackIds:
+          state.playedTrackIds.where((id) => id != videoId).toList(),
     );
     unawaited(audioNotifier.removeManagedQueueItem(index));
     _primeUpcomingQueue();
@@ -5694,7 +7078,8 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
       queue: updatedQueue,
       currentIndex: nextCurrentIndex,
       currentTrackId: extractTrackId(updatedQueue[nextCurrentIndex]),
-      playedTrackIds: state.playedTrackIds.where((id) => id != trackId).toList(),
+      playedTrackIds:
+          state.playedTrackIds.where((id) => id != trackId).toList(),
     );
     unawaited(audioNotifier.removeManagedQueueItem(index));
     _primeUpcomingQueue();
@@ -5728,9 +7113,9 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
       recommendations: nextRecommendations,
     );
     unawaited(ref.read(audioPlayerProvider.notifier).insertManagedQueueTracks(
-          insertIndex,
-          [normalizedTrack],
-        ));
+      insertIndex,
+      [normalizedTrack],
+    ));
     _primeTracks([normalizedTrack], limit: 1);
   }
 
@@ -5749,7 +7134,8 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
     final activeTrackId = state.currentTrackId;
     final nextCurrentIndex = activeTrackId == null
         ? state.currentIndex.clamp(0, updatedQueue.length - 1).toInt()
-        : updatedQueue.indexWhere((track) => extractTrackId(track) == activeTrackId);
+        : updatedQueue
+            .indexWhere((track) => extractTrackId(track) == activeTrackId);
 
     state = state.copyWith(
       queue: updatedQueue,
@@ -5811,8 +7197,7 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
           state.queue.map(extractTrackId).whereType<String>().toSet();
       final fetchedTracks = await _fetchRecommendations(effectiveSeedId);
       final newTracks = fetchedTracks
-          .where((track) =>
-              !existingIds.contains(extractTrackId(track)))
+          .where((track) => !existingIds.contains(extractTrackId(track)))
           .toList(growable: false);
       if (newTracks.isNotEmpty) {
         state = state.copyWith(queue: [...state.queue, ...newTracks]);
@@ -5879,8 +7264,7 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
         excludedIds: excludedIds,
       );
       final nextRecommendations = fetchedTracks
-          .where((track) =>
-              !excludedIds.contains(extractTrackId(track)))
+          .where((track) => !excludedIds.contains(extractTrackId(track)))
           .toList(growable: false);
       if (!append && nextRecommendations.isEmpty) {
         state = state.copyWith(recommendations: existingRecommendations);
@@ -5908,9 +7292,11 @@ final playbackQueueProvider =
   final audioNotifier = ref.read(audioPlayerProvider.notifier);
 
   Future<void> handleTrackCompleted() async {
+    notifier._markCurrentTrackPlayedIfEligible();
     await notifier._recordCurrentQueueInteraction('complete');
     await notifier.playNext(logCurrentSkip: false);
   }
+
   Future<void> handleTrackChanged(String? videoId) =>
       notifier.handleTrackChanged(videoId);
 
@@ -5943,7 +7329,8 @@ final playbackQueueProvider =
   return notifier;
 });
 
-Future<List<Map<String, dynamic>>> _loadLocalLibraryTracks(String scopeId) async {
+Future<List<Map<String, dynamic>>> _loadLocalLibraryTracks(
+    String scopeId) async {
   final dir = await getScopedDownloadsDirectory(scopeId);
   final files = dir.listSync().where((f) => f.path.endsWith('.mp3')).toList()
     ..sort((a, b) {
@@ -5998,21 +7385,19 @@ Future<List<Map<String, dynamic>>> _loadCloudLibraryTracks() async {
         .select('track_id,track_data,added_at')
         .eq('user_id', userId)
         .order('added_at', ascending: false);
-    return (rows as List<dynamic>)
-        .map((rawRow) {
-          final row = Map<String, dynamic>.from(rawRow as Map);
-          final payload = normalizeTrack(
-            Map<String, dynamic>.from(row['track_data'] as Map),
-          );
-          final trackId = row['track_id']?.toString();
-          if (trackId != null && trackId.isNotEmpty) {
-            payload['id'] = trackId;
-            payload['videoId'] = trackId;
-          }
-          payload['is_cloud_saved'] = true;
-          return payload;
-        })
-        .toList(growable: false);
+    return (rows as List<dynamic>).map((rawRow) {
+      final row = Map<String, dynamic>.from(rawRow as Map);
+      final payload = normalizeTrack(
+        Map<String, dynamic>.from(row['track_data'] as Map),
+      );
+      final trackId = row['track_id']?.toString();
+      if (trackId != null && trackId.isNotEmpty) {
+        payload['id'] = trackId;
+        payload['videoId'] = trackId;
+      }
+      payload['is_cloud_saved'] = true;
+      return payload;
+    }).toList(growable: false);
   } catch (error) {
     debugPrint('Cloud library load failed: $error');
     return const [];

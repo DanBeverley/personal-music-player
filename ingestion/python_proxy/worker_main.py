@@ -4,10 +4,13 @@ import sys
 import time
 import traceback
 
-import server
+from auralis_backend.legacy import get_server
+from auralis_backend.storage.postgres import ensure_backend_schema
 
 
 def main() -> int:
+    server = get_server()
+    ensure_backend_schema()
     print("Auralis Recommendation Worker")
     print(
         "scheduler="

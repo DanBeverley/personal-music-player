@@ -1,0 +1,600 @@
+from __future__ import annotations
+
+from typing import Any, Dict, Optional
+
+from ..legacy import get_server
+from ..search.runtime import search_artist_seed_tracks
+from .feature_layer import album_catalog_alignment, build_catalog_feature_profile
+
+
+def _server():
+    return get_server()
+
+
+def _recommendation_quiet_base_query(profile) -> str:
+    server = _server()
+    top_artists = server._recommendation_unique_strings(
+        [
+            *(profile.get("top_artists") or []),
+            *(profile.get("artist_hints") or []),
+            *(profile.get("listened_artists") or []),
+        ],
+        6,
+    )
+    if top_artists:
+        return top_artists[0]
+    top_albums = server._recommendation_unique_strings(
+        [
+            *(profile.get("top_albums") or []),
+            *(profile.get("album_hints") or []),
+        ],
+        4,
+    )
+    if top_albums:
+        return top_albums[0]
+    return ""
+
+
+def _recommendation_anchor_query(
+    track: Optional[Dict[str, Any]],
+    *,
+    include_album: bool = False,
+) -> str:
+    server = _server()
+    if not isinstance(track, dict):
+        return ""
+    parts = [
+        server._recommendation_trim_text(track.get("title")),
+        server._recommendation_trim_text(
+            track.get("channel") or track.get("author") or track.get("artist")
+        ),
+    ]
+    if include_album:
+        parts.append(server._recommendation_trim_text(track.get("album")))
+    return " ".join([part for part in parts if part]).strip()
+
+
+def _recommendation_album_candidates_for_track(
+    track: Optional[Dict[str, Any]],
+    *,
+    limit: int = 2,
+):
+    server = _server()
+    if not isinstance(track, dict):
+        return []
+
+    albums = []
+    seen = set()
+
+    def add_album(raw_album: Optional[Dict[str, Any]]):
+        if not isinstance(raw_album, dict):
+            return
+        album_id = server._recommendation_trim_text(raw_album.get("id"))
+        title = server._recommendation_trim_text(raw_album.get("title"))
+        artist = server._recommendation_trim_text(raw_album.get("artist"))
+        key = album_id or f"{server._normalize_text(title)}|{server._normalize_text(artist)}"
+        if not key or key in seen:
+            return
+        seen.add(key)
+        albums.append(raw_album)
+
+    album_id = server._recommendation_trim_text(track.get("album_id"))
+    album_title = server._recommendation_trim_text(track.get("album"))
+    if album_id:
+        add_album(
+            {
+                "id": album_id,
+                "title": album_title or "Unknown Album",
+                "artist": track.get("channel") or track.get("artist"),
+                "thumbnail": track.get("thumbnail"),
+            }
+        )
+    elif album_title:
+        add_album(
+            {
+                "id": None,
+                "title": album_title,
+                "artist": track.get("channel") or track.get("artist"),
+                "thumbnail": track.get("thumbnail"),
+            }
+        )
+
+    search_query = _recommendation_anchor_query(track, include_album=True)
+    if search_query:
+        for album in server._assistant_tool_search_albums(search_query, max(limit * 2, 4)):
+            add_album(album)
+            if len(albums) >= limit:
+                break
+
+    return albums[:limit]
+
+
+def _recommendation_candidate_sources_for_track(track: Optional[Dict[str, Any]]):
+    server = _server()
+    if not isinstance(track, dict):
+        return []
+
+    track_id = server._recommendation_trim_text(track.get("id"))
+    artist_name = server._recommendation_trim_text(
+        track.get("channel") or track.get("author") or track.get("artist")
+    )
+    futures = {}
+
+    if track_id:
+        futures["similar"] = server.recommendation_executor.submit(
+            server._assistant_tool_get_similar_tracks,
+            track.get("id"),
+            12,
+        )
+        futures["collaborative"] = server.recommendation_executor.submit(
+            server._recommendation_collaborative_neighbor_tracks,
+            track_id,
+            10,
+        )
+
+    if artist_name:
+        futures["artist_seed"] = server.recommendation_executor.submit(
+            search_artist_seed_tracks,
+            artist_name,
+            8,
+        )
+
+    def fetch_album_context():
+        album_tracks = []
+        for album in _recommendation_album_candidates_for_track(track, limit=2):
+            album_id = server._recommendation_trim_text(album.get("id"))
+            if not album_id:
+                continue
+            album_details = server._assistant_tool_get_album_details(album_id)
+            album_tracks.extend(album_details.get("tracks") or [])
+        return album_tracks
+
+    futures["album_context"] = server.recommendation_executor.submit(fetch_album_context)
+
+    source_results = {
+        "similar": [],
+        "collaborative": [],
+        "artist_seed": [],
+        "album_context": [],
+        "fallback_context": [],
+    }
+    for source_name, future in futures.items():
+        try:
+            source_results[source_name] = future.result(
+                timeout=server.RECOMMENDATION_CANDIDATE_SOURCE_TIMEOUT_SECONDS
+            ) or []
+        except Exception:
+            source_results[source_name] = []
+
+    if not (
+        source_results["similar"]
+        or source_results["collaborative"]
+        or source_results["artist_seed"]
+    ):
+        fallback_tracks = _recommendation_anchor_fallback_tracks(track, limit=16)
+        if artist_name:
+            normalized_artist = server._normalize_text(artist_name)
+            filtered = [
+                fallback_track
+                for fallback_track in fallback_tracks
+                if server._normalize_text(
+                    fallback_track.get("channel")
+                    or fallback_track.get("artist")
+                    or ""
+                ) == normalized_artist
+            ]
+            source_results["fallback_context"] = filtered[:10] or fallback_tracks[:8]
+        else:
+            source_results["fallback_context"] = fallback_tracks[:8]
+
+    return [
+        ("similar", source_results["similar"], 4.8),
+        ("collaborative", source_results["collaborative"], 4.6),
+        ("artist_seed", source_results["artist_seed"], 3.7),
+        ("album_context", source_results["album_context"], 3.5),
+        ("fallback_context", source_results["fallback_context"], 2.4),
+    ]
+
+
+def _recommendation_anchor_fallback_tracks(
+    track: Optional[Dict[str, Any]],
+    *,
+    limit: int,
+):
+    server = _server()
+    if not isinstance(track, dict):
+        return []
+
+    artist_name = server._recommendation_trim_text(
+        track.get("channel") or track.get("author") or track.get("artist")
+    )
+    title = server._recommendation_trim_text(track.get("title"))
+    album = server._recommendation_trim_text(track.get("album"))
+    seen_keys = set()
+    ranked_tracks = []
+
+    def add_track(raw_track: Optional[Dict[str, Any]], base_score: float) -> None:
+        if not isinstance(raw_track, dict):
+            return
+        track_id = server._recommendation_trim_text(raw_track.get("id"))
+        key = track_id or "|".join(
+            [
+                server._normalize_text(raw_track.get("title") or ""),
+                server._normalize_text(
+                    raw_track.get("channel") or raw_track.get("author") or raw_track.get("artist") or ""
+                ),
+                server._normalize_text(raw_track.get("album") or ""),
+            ]
+        )
+        if not key or key in seen_keys:
+            return
+        seen_keys.add(key)
+        ranked_tracks.append((base_score, raw_track))
+
+    queries = []
+    if title and artist_name:
+        queries.append(f"{title} {artist_name}")
+    if artist_name:
+        queries.append(artist_name)
+    if title and album:
+        queries.append(f"{title} {album}")
+
+    for index, query in enumerate(server._recommendation_unique_strings(queries, 3)):
+        try:
+            results = server._assistant_tool_search_tracks(query, max(limit * 2, 8))
+        except Exception:
+            results = []
+        for result in results or []:
+            add_track(result, max(2.4 - (index * 0.15), 1.9))
+        if len(ranked_tracks) >= max(limit * 2, 12):
+            break
+
+    if len(ranked_tracks) < max(4, limit // 2):
+        for base_index, fallback_track in enumerate(
+            [item for item, _score in server._fallback_home_candidates(limit + 8)]
+        ):
+            add_track(fallback_track, max(1.6 - (base_index * 0.02), 1.1))
+            if len(ranked_tracks) >= max(limit * 2, 12):
+                break
+
+    ranked_tracks.sort(key=lambda item: item[0], reverse=True)
+    return [track_item for _score, track_item in ranked_tracks[: max(1, limit)]]
+
+
+def _recommendation_home_fallback_tracks(profile, *, limit: int):
+    server = _server()
+    profile = dict(profile or {})
+    candidate_tracks = []
+
+    candidate_tracks.extend(
+        server._recommendation_unique_snapshot_tracks(
+            [
+                *(profile.get("last_played_tracks") or []),
+                *(profile.get("recent_track_snapshots") or []),
+                *(profile.get("top_track_snapshots") or []),
+            ],
+            max(limit * 2, limit + 8),
+        )
+    )
+
+    collaborative_ids = list(
+        ((profile.get("collaborative") or {}).get("candidate_track_ids") or [])
+    )[: max(limit, 12)]
+    if collaborative_ids:
+        candidate_tracks.extend(
+            server._recommendation_fetch_tracks_for_ids(
+                collaborative_ids,
+                limit=max(limit, 12),
+            )
+        )
+
+    library_track_ids = list(
+        profile.get("offline_track_ids") or profile.get("library_track_ids") or []
+    )[: max(limit, 12)]
+    if library_track_ids:
+        candidate_tracks.extend(
+            server._recommendation_fetch_tracks_for_ids(
+                library_track_ids,
+                limit=max(limit, 12),
+            )
+        )
+
+    deduped_candidates = server._recommendation_unique_snapshot_tracks(
+        candidate_tracks,
+        max(limit * 3, limit + 10),
+    )
+
+    if len(deduped_candidates) < max(6, limit // 2):
+        deduped_candidates.extend(
+            [item for item, _score in server._fallback_home_candidates(limit + 8)]
+        )
+        deduped_candidates = server._recommendation_unique_snapshot_tracks(
+            deduped_candidates,
+            max(limit * 3, limit + 10),
+        )
+
+    return _recommendation_taste_filtered_tracks(
+        deduped_candidates,
+        profile,
+        limit=limit,
+    )
+
+
+def _recommendation_recommended_albums_row(profile):
+    server = _server()
+    albums = []
+    seen = set()
+    catalog_profile = build_catalog_feature_profile(server, profile)
+    affinity_artists = {
+        server._normalize_text(name)
+        for name in [
+            *(profile.get("top_artists") or []),
+            *(profile.get("artist_hints") or []),
+            *(profile.get("listened_artists") or []),
+        ]
+        if server._normalize_text(name)
+    }
+    album_seed_artists: Dict[str, set[str]] = {}
+    for track in [
+        *(profile.get("last_played_tracks") or []),
+        *(profile.get("top_track_snapshots") or []),
+        *(profile.get("recent_track_snapshots") or []),
+    ]:
+        if not isinstance(track, dict):
+            continue
+        album_title = server._normalize_text(track.get("album") or "")
+        artist_name = server._normalize_text(
+            track.get("channel") or track.get("artist") or track.get("author") or ""
+        )
+        if not album_title or not artist_name:
+            continue
+        album_seed_artists.setdefault(album_title, set()).add(artist_name)
+
+    def add_album(raw_album, base_score: float, *, required_artist_keys: Optional[set[str]] = None):
+        if not isinstance(raw_album, dict):
+            return
+        album_id = server._recommendation_trim_text(raw_album.get("id"))
+        title = server._recommendation_trim_text(raw_album.get("title"))
+        artist = server._recommendation_trim_text(raw_album.get("artist"))
+        artist_key = server._normalize_text(artist)
+        title_key = server._normalize_text(title)
+        if required_artist_keys and artist_key not in required_artist_keys:
+            return
+        if (
+            title_key in album_seed_artists
+            and artist_key
+            and artist_key not in album_seed_artists[title_key]
+            and artist_key not in affinity_artists
+        ):
+            return
+        key = album_id or f"{server._normalize_text(title)}|{server._normalize_text(artist)}"
+        if not key or key in seen:
+            return
+        seen.add(key)
+        albums.append(
+            {
+                "id": album_id or None,
+                "title": title or "Unknown Album",
+                "artist": artist or "Unknown Artist",
+                "thumbnail": raw_album.get("thumbnail"),
+                "year": raw_album.get("year") or "",
+                "track_count": raw_album.get("track_count") or raw_album.get("trackCount") or 0,
+                "generator_score": round(base_score, 3),
+            }
+        )
+
+    for index, album_hint in enumerate(profile.get("top_albums") or []):
+        normalized_hint = server._normalize_text(album_hint)
+        required_artist_keys = set(album_seed_artists.get(normalized_hint) or set()) or None
+        for offset, album in enumerate(server._assistant_tool_search_albums(album_hint, 5)):
+            add_album(
+                album,
+                4.2 - (index * 0.28) - (offset * 0.16),
+                required_artist_keys=required_artist_keys,
+            )
+            if len(albums) >= 18:
+                break
+        if len(albums) >= 18:
+            break
+
+    for index, artist_hint in enumerate(profile.get("top_artists") or []):
+        direct_artists = server._assistant_tool_search_artists_direct(artist_hint, 1)
+        if direct_artists:
+            artist_id = server._recommendation_trim_text(direct_artists[0].get("id"))
+            if artist_id:
+                try:
+                    artist_payload = server._build_artist_details_payload(artist_id)
+                except Exception:
+                    artist_payload = {}
+                for offset, album in enumerate(artist_payload.get("albums") or []):
+                    add_album(
+                        album,
+                        4.0 - (index * 0.22) - (offset * 0.18),
+                        required_artist_keys={server._normalize_text(artist_hint)},
+                    )
+                    if len(albums) >= 18:
+                        break
+        if len(albums) < 12:
+            for offset, album in enumerate(server._assistant_tool_search_albums(f"{artist_hint} album", 4)):
+                add_album(
+                    album,
+                    3.6 - (index * 0.18) - (offset * 0.14),
+                    required_artist_keys={server._normalize_text(artist_hint)},
+                )
+                if len(albums) >= 18:
+                    break
+        if len(albums) >= 18:
+            break
+
+    if len(albums) < 12:
+        snapshot_tracks = [
+            *(profile.get("last_played_tracks") or []),
+            *(profile.get("top_track_snapshots") or []),
+            *(profile.get("recent_track_snapshots") or []),
+        ]
+        for index, track in enumerate(snapshot_tracks):
+            album_title = server._recommendation_trim_text(track.get("album"))
+            if not album_title:
+                continue
+            add_album(
+                {
+                    "id": track.get("album_id"),
+                    "title": album_title,
+                    "artist": track.get("channel"),
+                    "thumbnail": track.get("thumbnail"),
+                },
+                3.2 - (index * 0.12),
+                required_artist_keys={
+                    server._normalize_text(
+                        track.get("channel") or track.get("artist") or track.get("author") or ""
+                    )
+                },
+            )
+            if len(albums) >= 18:
+                break
+
+    if len(albums) < 1:
+        return None
+
+    album_embeddings = server._recommendation_album_embeddings(albums)
+    vectors = profile.get("vectors") or {}
+    top_album_names = {
+        server._normalize_text(name)
+        for name in (profile.get("top_albums") or [])
+        if server._normalize_text(name)
+    }
+    top_artist_names = {
+        server._normalize_text(name)
+        for name in (profile.get("top_artists") or [])
+        if server._normalize_text(name)
+    }
+    for album in albums:
+        album_key = server._recommendation_album_embedding_key(album)
+        album_vector = album_embeddings.get(album_key) or []
+        catalog_alignment = album_catalog_alignment(server, album, profile)
+        overexposed_artist_penalty = (
+            1.0
+            if server._normalize_text(album.get("artist") or "")
+            in set(catalog_profile.get("dominant_artist_keys") or set())
+            else 0.0
+        )
+        similarities = {
+            "taste": server._assistant_cosine_similarity(
+                album_vector,
+                vectors.get("taste_vector") or [],
+            ),
+            "artist": server._assistant_cosine_similarity(
+                album_vector,
+                vectors.get("artist_vector") or [],
+            ),
+            "long": server._assistant_cosine_similarity(
+                album_vector,
+                vectors.get("long_term_vector") or [],
+            ),
+        }
+        ranking_score = (
+            (float(album.get("generator_score") or 0.0) * 0.45)
+            + (similarities["taste"] * 4.8)
+            + (similarities["artist"] * 3.6)
+            + (similarities["long"] * 1.4)
+            + (float(catalog_alignment.get("scene_affinity") or 0.0) * 1.65)
+            + (float(catalog_alignment.get("genre_affinity") or 0.0) * 1.15)
+            + (float(catalog_alignment.get("subgenre_affinity") or 0.0) * 0.6)
+            + (float(catalog_alignment.get("era_affinity") or 0.0) * 0.8)
+            + (float(catalog_alignment.get("adjacent_era_affinity") or 0.0) * 0.35)
+            + (float(catalog_alignment.get("language_affinity") or 0.0) * 0.4)
+            + (float(catalog_alignment.get("popularity_taste_fit") or 0.0) * 0.45)
+            - (float(catalog_alignment.get("negative_feedback_penalty") or 0.0) * 2.2)
+            - (float(catalog_alignment.get("same_title_ambiguity_penalty") or 0.0) * 2.1)
+            - (float(overexposed_artist_penalty) * 0.75)
+        )
+        if server._normalize_text(album.get("title") or "") in top_album_names:
+            ranking_score += 0.8
+        if server._normalize_text(album.get("artist") or "") in top_artist_names:
+            ranking_score += 0.6
+        album["generator_score"] = round(ranking_score, 3)
+        album["item_feature_summary"] = dict(catalog_alignment.get("item_feature_summary") or {})
+        album["ml_similarities"] = {
+            name: round(value, 4)
+            for name, value in similarities.items()
+        }
+        album["ml_similarities"].update(
+            {
+                "scene_fit": round(float(catalog_alignment.get("scene_affinity") or 0.0), 4),
+                "genre_fit": round(float(catalog_alignment.get("genre_affinity") or 0.0), 4),
+                "era_fit": round(float(catalog_alignment.get("era_affinity") or 0.0), 4),
+                "language_fit": round(float(catalog_alignment.get("language_affinity") or 0.0), 4),
+                "negative_feedback_penalty": round(float(catalog_alignment.get("negative_feedback_penalty") or 0.0), 4),
+                "same_title_ambiguity_penalty": round(float(catalog_alignment.get("same_title_ambiguity_penalty") or 0.0), 4),
+            }
+        )
+
+    albums.sort(key=lambda item: item.get("generator_score", 0), reverse=True)
+    return {
+        "title": "Recommended albums",
+        "kind": "recommended_albums",
+        "item_type": "album",
+        "items": albums[:18],
+    }
+
+
+def _recommendation_taste_filtered_tracks(tracks, profile, *, limit: int):
+    server = _server()
+    ranked = []
+    artist_hints = {
+        server._normalize_text(item)
+        for item in server._recommendation_unique_strings(
+            [
+                *(profile.get("top_artists") or []),
+                *(profile.get("artist_hints") or []),
+                *(profile.get("listened_artists") or []),
+            ],
+            14,
+        )
+        if server._normalize_text(item)
+    }
+    album_hints = {
+        server._normalize_text(item)
+        for item in server._recommendation_unique_strings(
+            [
+                *(profile.get("top_albums") or []),
+                *(profile.get("album_hints") or []),
+            ],
+            8,
+        )
+        if server._normalize_text(item)
+    }
+    title_hints = {
+        server._normalize_text(item.get("title"))
+        for item in server._recommendation_unique_snapshot_tracks(
+            [
+                *(profile.get("top_track_snapshots") or []),
+                *(profile.get("recent_track_snapshots") or []),
+                *(profile.get("last_played_tracks") or []),
+            ],
+            10,
+        )
+        if server._normalize_text(item.get("title"))
+    }
+    for index, track in enumerate(tracks or []):
+        if not isinstance(track, dict):
+            continue
+        artist_key = server._normalize_text(
+            track.get("channel") or track.get("author") or track.get("artist") or ""
+        )
+        title_key = server._normalize_text(track.get("title") or "")
+        album_key = server._normalize_text(track.get("album") or "")
+        taste_score = 0.0
+        if artist_key and artist_key in artist_hints:
+            taste_score += 2.0
+        if album_key and album_key in album_hints:
+            taste_score += 1.1
+        if title_key and title_key in title_hints:
+            taste_score += 0.6
+        taste_score += max(0.0, 0.25 - (index * 0.015))
+        ranked.append((taste_score, track))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    selected = [track for _score, track in ranked[: max(1, limit)]]
+    if selected:
+        return selected
+    return list(tracks or [])[: max(1, limit)]

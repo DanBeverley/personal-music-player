@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import (
+    Future,
+    ThreadPoolExecutor,
+    TimeoutError as FutureTimeoutError,
+    as_completed,
+    wait,
+)
 from threading import Event, Lock, Thread
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 import json
@@ -16,6 +21,7 @@ import os
 import random
 import re
 import sqlite3
+import sys
 import time
 import traceback
 import uuid
@@ -23,6 +29,29 @@ import uuid
 import requests
 import yt_dlp
 from ytmusicapi import YTMusic
+
+from auralis_backend.storage.cache_runtime import (
+    clear_ttl_namespace as _cache_clear_namespace,
+    detail_result_cache,
+    detail_result_cache_lock,
+    lookup_home_candidates as _cache_lookup_home_candidates,
+    lookup_recommendation_track_detail as _cache_lookup_recommendation_track_detail,
+    lookup_ttl_cache as _cache_runtime_lookup,
+    recommendation_embedding_cache,
+    recommendation_embedding_lock,
+    search_result_cache,
+    search_result_cache_lock,
+    store_home_candidates as _cache_store_home_candidates,
+    store_recommendation_track_detail as _cache_store_recommendation_track_detail,
+    store_ttl_cache as _cache_runtime_store,
+    stream_chunk_cache,
+    stream_chunk_inflight,
+    stream_chunk_inflight_lock,
+    stream_chunk_lock,
+    stream_info_cache,
+    stream_info_inflight,
+    stream_info_lock,
+)
 
 try:
     import psycopg
@@ -40,6 +69,178 @@ except Exception as exc:
 
     def run_langgraph_assistant(req: Any, deps: Dict[str, Any]):
         raise RuntimeError(f"LangGraph assistant import failed: {exc}")
+
+from auralis_backend.recommend.source_runtime import (
+    _recommendation_album_candidates_for_track,
+    _recommendation_anchor_query,
+    _recommendation_candidate_sources_for_track,
+    _recommendation_home_fallback_tracks,
+    _recommendation_quiet_base_query,
+    _recommendation_recommended_albums_row,
+    _recommendation_taste_filtered_tracks,
+)
+
+try:
+    from auralis_backend.domain.ranking import (
+        HOME_GLOBAL_DEFAULT_WEIGHTS,
+        defaults_for_model as _ranking_defaults_for_model,
+        SEARCH_ALBUM_DEFAULT_WEIGHTS,
+        SEARCH_ARTIST_DEFAULT_WEIGHTS,
+        SEARCH_TRACK_DEFAULT_WEIGHTS,
+        model_version as _ranking_model_version,
+        score_features as _ranking_score_features,
+    )
+except Exception:
+    SEARCH_TRACK_DEFAULT_WEIGHTS = {
+        "source_score": 0.34,
+        "retrieval_votes": 0.58,
+        "lexical": 0.74,
+        "title_lexical": 0.48,
+        "query_similarity": 8.0,
+        "semantic_query_similarity": 6.0,
+        "context_similarity": 2.5,
+        "taste_similarity": 1.4,
+        "artist_similarity": 2.0,
+        "short_similarity": 0.9,
+        "long_similarity": 0.5,
+        "collab_latent": 5.1,
+        "collab_neighbor": 0.9,
+        "collab_artist": 0.2,
+        "anchor_artist_match": 1.4,
+        "popularity": 0.25,
+    }
+    SEARCH_ARTIST_DEFAULT_WEIGHTS = {
+        "source_score": 0.35,
+        "retrieval_votes": 0.62,
+        "lexical": 0.54,
+        "query_similarity": 5.4,
+        "semantic_query_similarity": 4.4,
+        "context_similarity": 1.8,
+        "taste_similarity": 1.1,
+        "artist_similarity": 2.6,
+        "anchor_artist_similarity": 5.8,
+        "anchor_track_similarity": 3.4,
+        "collab_artist": 0.34,
+    }
+    SEARCH_ALBUM_DEFAULT_WEIGHTS = {
+        "source_score": 0.3,
+        "retrieval_votes": 0.55,
+        "lexical": 0.6,
+        "query_similarity": 7.6,
+        "semantic_query_similarity": 4.2,
+        "context_similarity": 1.9,
+        "taste_similarity": 1.25,
+        "artist_similarity": 1.6,
+        "collab_artist": 0.2,
+    }
+    HOME_GLOBAL_DEFAULT_WEIGHTS = {
+        "source_score": 0.36,
+        "source_votes": 0.68,
+        "taste_similarity": 5.4,
+        "short_similarity": 1.8,
+        "long_similarity": 1.2,
+        "query_similarity": 1.8,
+        "artist_similarity": 2.0,
+        "anchor_similarity": 2.5,
+        "collab_latent": 5.6,
+        "collab_neighbor": 1.0,
+        "collab_artist": 0.22,
+        "offline_bonus": 1.1,
+        "library_bonus": 0.65,
+        "top_bonus": 1.8,
+        "recent_bonus": 0.35,
+        "popularity": 0.18,
+        "novelty": 0.2,
+        "scene_affinity": 1.05,
+        "peer_scene_bonus": 0.72,
+        "era_affinity": 0.62,
+        "adjacent_era_affinity": 0.24,
+        "type_affinity": 0.18,
+        "script_affinity": 0.12,
+    }
+
+    def _ranking_defaults_for_model(model_key: str, fallback: Dict[str, float]) -> Dict[str, float]:
+        return dict(fallback or {})
+
+    def _ranking_model_version(model_key: str) -> str:
+        return f"local:{model_key}"
+
+    def _ranking_score_features(
+        *,
+        model_key: str,
+        defaults: Dict[str, float],
+        features: Dict[str, float],
+    ) -> float:
+        score = 0.0
+        for key, value in features.items():
+            score += float(defaults.get(key, 0.0)) * float(value)
+        return score
+
+try:
+    from auralis_backend.storage.postgres import (
+        activate_model_version as _pg_activate_model_version,
+        list_model_versions as _pg_list_model_versions,
+        list_rollout_events as _pg_list_rollout_events,
+        log_request as _pg_log_request,
+        rollback_model_version as _pg_rollback_model_version,
+    )
+except Exception:
+    def _pg_log_request(
+        *,
+        request_id: str,
+        request_type: str,
+        user_scope_id: str,
+        session_id: str = "",
+        model_version: str = "",
+        diagnostics: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        return
+
+    def _pg_list_model_versions(*, model_key: str, limit: int = 20):
+        return []
+
+    def _pg_activate_model_version(
+        *,
+        model_key: str,
+        version: str,
+        actor: str = "system",
+        reason: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ):
+        return False
+
+    def _pg_rollback_model_version(
+        *,
+        model_key: str,
+        target_version: str = "",
+        actor: str = "system",
+        reason: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ):
+        return {"ok": False, "reason": "postgres_unavailable"}
+
+    def _pg_list_rollout_events(*, model_key: str = "", limit: int = 50):
+        return []
+
+try:
+    from auralis_backend.recommend.precompute import (
+        invalidate_user as _nearline_invalidate_user,
+        invalidate_user_query as _nearline_invalidate_user_query,
+        run_precompute_cycle as _nearline_run_precompute_cycle,
+        runtime_snapshot as _nearline_runtime_snapshot,
+    )
+except Exception:
+    def _nearline_invalidate_user(user_scope_id: str) -> None:
+        return
+
+    def _nearline_invalidate_user_query(user_scope_id: str, query: str) -> None:
+        return
+
+    def _nearline_run_precompute_cycle(*, server=None, force: bool = False) -> Dict[str, Any]:
+        return {"enabled": False, "reason": "nearline_precompute_unavailable"}
+
+    def _nearline_runtime_snapshot() -> Dict[str, Any]:
+        return {"enabled": False}
 
 def extract_thumbnail(data):
     if not data: return None
@@ -565,7 +766,8 @@ def _build_artist_details_payload(artist_id: str, *, enrich_related: bool = True
         "status": "success",
         "id": artist_id,
         "name": name,
-        "description": artist.get("description") or "",
+        "description": _summarize_artist_description(artist.get("description") or ""),
+        "full_description": artist.get("description") or "",
         "thumbnail": extract_thumbnail(artist),
         "stats": _normalize_artist_stats(artist),
         "top_songs": top_songs[:12],
@@ -583,6 +785,64 @@ def _build_artist_details_payload(artist_id: str, *, enrich_related: bool = True
         )
     return payload
 
+def _recommended_artist_anchor_penalty(anchor_names, candidate_name: str) -> float:
+    normalized_candidate = _normalize_text(candidate_name)
+    if not normalized_candidate:
+        return 0.0
+    penalty = 0.0
+    for anchor_name in anchor_names or []:
+        normalized_anchor = _normalize_text(anchor_name)
+        if not normalized_anchor:
+            continue
+        if normalized_candidate == normalized_anchor:
+            return 8.0
+        penalty = max(penalty, _artist_related_name_penalty(anchor_name, candidate_name))
+        if (
+            normalized_candidate.startswith(normalized_anchor)
+            or normalized_anchor.startswith(normalized_candidate)
+        ):
+            penalty = max(penalty, 1.6)
+    return penalty
+
+
+def _recommended_artist_reference_vectors(anchor_tracks, anchor_artist_names):
+    anchor_track_snapshots = _recommendation_unique_snapshot_tracks(anchor_tracks, 6)
+    track_embeddings = _recommendation_track_embeddings(anchor_track_snapshots)
+    anchor_track_vectors = []
+    for index, track in enumerate(anchor_track_snapshots):
+        track_key = _recommendation_track_embedding_key(track)
+        track_vector = track_embeddings.get(track_key) or []
+        if not track_vector:
+            continue
+        anchor_track_vectors.append((track_vector, max(2.1 - (index * 0.22), 0.65)))
+
+    anchor_artist_entries = []
+    for index, artist_name in enumerate(
+        _recommendation_unique_strings(anchor_artist_names, 6)
+    ):
+        text = f"artist {artist_name}"
+        key = _recommendation_text_embedding_key(
+            "recommended_artist_anchor",
+            text,
+        )
+        anchor_artist_entries.append((key, text, max(2.0 - (index * 0.18), 0.6)))
+
+    artist_embeddings = _recommendation_embed_entries(
+        "text",
+        [(key, text) for key, text, _weight in anchor_artist_entries],
+    )
+    anchor_artist_vectors = []
+    for key, _text, weight in anchor_artist_entries:
+        artist_vector = artist_embeddings.get(key) or []
+        if not artist_vector:
+            continue
+        anchor_artist_vectors.append((artist_vector, weight))
+
+    return {
+        "anchor_track_vector": _vector_weighted_average(anchor_track_vectors),
+        "anchor_artist_vector": _vector_weighted_average(anchor_artist_vectors),
+    }
+
 
 def _recommended_artists_payload(req: SearchRequest):
     cache_key = _recommended_artists_cache_key(req)
@@ -598,21 +858,7 @@ def _recommended_artists_payload(req: SearchRequest):
             "artists": [dict(item) for item in cached[: max(1, min(req.limit or 8, 12))]],
         }
 
-    query_seeds = _recommendation_unique_strings(
-        [
-            *(req.recent_queries or []),
-            *(req.taste_queries or []),
-        ],
-        8,
-    )
-    query_artist_futures = {
-        query: recommendation_executor.submit(
-            _assistant_tool_search_artists_direct,
-            query,
-            2,
-        )
-        for query in query_seeds
-    }
+    surface = _recommendation_trim_text(req.surface or "home_feed") or "home_feed"
     profile = _recommendation_build_profile(req)
     profile_vectors = profile.get("vectors") or {}
     collaborative = profile.get("collaborative") or {}
@@ -621,6 +867,30 @@ def _recommended_artists_payload(req: SearchRequest):
         for name in (profile.get("listened_artists") or [])
         if _normalize_text(name)
     }
+    query_seeds = _recommendation_unique_strings(
+        [
+            req.query,
+            *(req.recent_queries or []),
+            *(req.taste_queries or []),
+        ],
+        8,
+    )
+    anchor_tracks = _recommendation_unique_snapshot_tracks(
+        req.anchor_track_snapshots or profile.get("anchor_track_snapshots") or [],
+        6,
+    )
+    anchor_artist_names = _recommendation_unique_strings(
+        [
+            *(req.anchor_artist_hints or []),
+            *(profile.get("anchor_artist_hints") or []),
+            *(
+                artist_name
+                for track in anchor_tracks
+                for artist_name in extract_artist_names(track)
+            ),
+        ],
+        8,
+    )
     weighted_artist_names = {}
 
     def add_artist_seed(raw_name: Optional[str], weight: float) -> None:
@@ -641,47 +911,68 @@ def _recommended_artists_payload(req: SearchRequest):
                     max(base_weight - (index * 0.12), 0.45),
                 )
 
-    for index, artist_hint in enumerate(req.artist_hints or []):
-        add_artist_seed(artist_hint, max(3.8 - (index * 0.18), 1.6))
-
-    add_track_artist_seeds(req.last_played_tracks, 4.4)
-    add_track_artist_seeds(req.top_track_snapshots, 3.5)
-    add_track_artist_seeds(req.recent_track_snapshots, 3.0)
-
-    query_artist_results = {}
-    for query, future in query_artist_futures.items():
-        try:
-            query_artist_results[query] = future.result(timeout=6)
-        except Exception:
-            query_artist_results[query] = []
-
-    for query in query_seeds:
-        for artist_name, score in _artist_names_from_track_query(query, 3):
-            add_artist_seed(artist_name, score + 1.3)
-        for artist in query_artist_results.get(query) or []:
-            add_artist_seed(artist.get("name"), 2.1)
-    for index, item in enumerate(
-        sorted(
-            (collaborative.get("artist_scores") or {}).items(),
-            key=lambda entry: entry[1],
-            reverse=True,
-        )[:6]
-    ):
-        artist_key, score = item
-        if not artist_key:
-            continue
-        add_artist_seed(artist_key, max(float(score) * 0.55, 1.1) - (index * 0.08))
+    if surface == "search_results":
+        for index, anchor_artist in enumerate(anchor_artist_names):
+            add_artist_seed(anchor_artist, max(5.0 - (index * 0.35), 2.0))
+        add_track_artist_seeds(anchor_tracks, 4.6)
+        if not weighted_artist_names:
+            for query in query_seeds:
+                for artist_name, score in _artist_names_from_track_query(query, 3):
+                    add_artist_seed(artist_name, score + 1.8)
+        if not weighted_artist_names:
+            for index, item in enumerate(
+                sorted(
+                    (collaborative.get("artist_scores") or {}).items(),
+                    key=lambda entry: entry[1],
+                    reverse=True,
+                )[:6]
+            ):
+                artist_key, score = item
+                if not artist_key:
+                    continue
+                add_artist_seed(
+                    artist_key,
+                    max(float(score) * 0.6, 1.0) - (index * 0.08),
+                )
+    else:
+        for index, artist_hint in enumerate(profile.get("artist_hints") or []):
+            add_artist_seed(artist_hint, max(3.8 - (index * 0.18), 1.6))
+        add_track_artist_seeds(profile.get("last_played_tracks"), 4.4)
+        add_track_artist_seeds(profile.get("top_track_snapshots"), 3.5)
+        add_track_artist_seeds(profile.get("recent_track_snapshots"), 3.0)
+        for query in query_seeds:
+            for artist_name, score in _artist_names_from_track_query(query, 3):
+                add_artist_seed(artist_name, score + 1.25)
+        for index, item in enumerate(
+            sorted(
+                (collaborative.get("artist_scores") or {}).items(),
+                key=lambda entry: entry[1],
+                reverse=True,
+            )[:6]
+        ):
+            artist_key, score = item
+            if not artist_key:
+                continue
+            add_artist_seed(
+                artist_key,
+                max(float(score) * 0.55, 1.05) - (index * 0.08),
+            )
 
     ranked_seed_names = sorted(
         weighted_artist_names.items(),
         key=lambda item: item[1],
         reverse=True,
     )
-    top_seed_names = ranked_seed_names[:4]
+    top_seed_names = ranked_seed_names[: (5 if surface == "search_results" else 4)]
 
     artists = []
     seen_artist_ids = set()
     seen_artist_names = set()
+    excluded_artist_names = {
+        _normalize_text(name)
+        for name in anchor_artist_names
+        if _normalize_text(name)
+    } if surface == "search_results" else set()
 
     def add_artist_result(raw_artist, score: float):
         artist_id = (raw_artist.get("id") or "").strip()
@@ -692,6 +983,7 @@ def _recommended_artists_payload(req: SearchRequest):
             or not artist_name
             or artist_id in seen_artist_ids
             or normalized_name in seen_artist_names
+            or (excluded_artist_names and normalized_name in excluded_artist_names)
         ):
             return
         artist = dict(raw_artist)
@@ -700,14 +992,26 @@ def _recommended_artists_payload(req: SearchRequest):
         seen_artist_names.add(normalized_name)
         artists.append(artist)
 
+    direct_search_limit = 3 if surface == "search_results" else 2
     direct_seed_futures = {
         seed_index: recommendation_executor.submit(
             _assistant_tool_search_artists_direct,
             seed_name,
-            2,
+            direct_search_limit,
         )
         for seed_index, (seed_name, _seed_weight) in enumerate(top_seed_names)
     }
+    semantic_seed_futures = {}
+    if surface == "search_results":
+        semantic_seed_futures = {
+            seed_index: recommendation_executor.submit(
+                _assistant_tool_search_artists,
+                seed_name,
+                4,
+            )
+            for seed_index, (seed_name, _seed_weight) in enumerate(top_seed_names[:2])
+        }
+
     direct_results_by_seed = {}
     for seed_index, future in direct_seed_futures.items():
         try:
@@ -715,9 +1019,20 @@ def _recommended_artists_payload(req: SearchRequest):
         except Exception:
             direct_results_by_seed[seed_index] = []
 
+    semantic_results_by_seed = {}
+    for seed_index, future in semantic_seed_futures.items():
+        try:
+            semantic_results_by_seed[seed_index] = future.result(timeout=8)
+        except Exception:
+            semantic_results_by_seed[seed_index] = []
+
     related_artist_futures = {}
     for seed_index, direct_results in direct_results_by_seed.items():
-        if not direct_results or seed_index >= 2:
+        if not direct_results:
+            continue
+        if surface == "search_results" and seed_index >= 3:
+            continue
+        if surface != "search_results" and seed_index >= 2:
             continue
         primary_artist_id = (direct_results[0].get("id") or "").strip()
         if not primary_artist_id:
@@ -725,22 +1040,47 @@ def _recommended_artists_payload(req: SearchRequest):
         related_artist_futures[seed_index] = recommendation_executor.submit(
             _build_artist_details_payload,
             primary_artist_id,
-            enrich_related=False,
+            enrich_related=(surface == "search_results"),
         )
 
-    for seed_index, (seed_name, seed_weight) in enumerate(top_seed_names):
+    for seed_index, (_seed_name, seed_weight) in enumerate(top_seed_names):
         direct_results = direct_results_by_seed.get(seed_index) or []
         for index, artist in enumerate(direct_results):
-            add_artist_result(artist, seed_weight + max(1.8 - (index * 0.3), 0.6))
+            add_artist_result(
+                artist,
+                seed_weight + max(2.0 - (index * 0.28), 0.7),
+            )
+        for index, artist in enumerate(semantic_results_by_seed.get(seed_index) or []):
+            add_artist_result(
+                artist,
+                max(seed_weight - 0.35 - (index * 0.18), 0.45),
+            )
         related_future = related_artist_futures.get(seed_index)
         if related_future is not None:
             try:
                 artist_payload = related_future.result(timeout=10)
             except Exception:
                 artist_payload = {}
-            for index, related in enumerate((artist_payload.get("related_artists") or [])[:4]):
-                add_artist_result(related, max(seed_weight - 0.7 - (index * 0.16), 0.35))
+            related_limit = 6 if surface == "search_results" else 4
+            for index, related in enumerate(
+                (artist_payload.get("related_artists") or [])[:related_limit]
+            ):
+                add_artist_result(
+                    related,
+                    max(seed_weight - 0.55 - (index * 0.15), 0.4),
+                )
 
+    if not artists and surface == "search_results":
+        for query in query_seeds[:2]:
+            for index, artist in enumerate(_assistant_tool_search_artists(query, 4)):
+                add_artist_result(artist, max(1.25 - (index * 0.18), 0.35))
+
+    reference_vectors = _recommended_artist_reference_vectors(
+        anchor_tracks if surface == "search_results" else [],
+        anchor_artist_names
+        if surface == "search_results"
+        else (profile.get("top_artists") or [])[:6],
+    )
     artist_embeddings = _recommendation_artist_embeddings(artists)
     ranked_artists = []
     for artist in artists:
@@ -768,19 +1108,47 @@ def _recommended_artists_payload(req: SearchRequest):
                 artist_vector,
                 profile_vectors.get("long_term_vector") or [],
             ),
+            "anchor_artist": _assistant_cosine_similarity(
+                artist_vector,
+                reference_vectors.get("anchor_artist_vector") or [],
+            ),
+            "anchor_track": _assistant_cosine_similarity(
+                artist_vector,
+                reference_vectors.get("anchor_track_vector") or [],
+            ),
         }
-        ranking_score = (
-            seed_score
-            + (similarities["taste"] * 5.1)
-            + (similarities["artist"] * 4.7)
-            + (similarities["query"] * 1.9)
-            + (similarities["short"] * 1.3)
-            + (similarities["long"] * 1.1)
-        )
         normalized_name = _normalize_text(artist.get("name") or "")
-        ranking_score += float((collaborative.get("artist_scores") or {}).get(normalized_name) or 0.0) * 0.4
-        if normalized_name in listened_artist_names:
-            ranking_score -= 0.9
+        collaborative_score = float(
+            (collaborative.get("artist_scores") or {}).get(normalized_name) or 0.0
+        )
+        if surface == "search_results":
+            ranking_score = (
+                (seed_score * 0.38)
+                + (similarities["anchor_artist"] * 6.2)
+                + (similarities["anchor_track"] * 4.4)
+                + (similarities["artist"] * 2.0)
+                + (similarities["query"] * 1.2)
+                + (similarities["taste"] * 0.9)
+                + (similarities["short"] * 0.6)
+                + (collaborative_score * 0.18)
+            )
+            ranking_score -= _recommended_artist_anchor_penalty(
+                anchor_artist_names,
+                artist.get("name") or "",
+            )
+        else:
+            ranking_score = (
+                seed_score
+                + (similarities["taste"] * 5.1)
+                + (similarities["artist"] * 4.7)
+                + (similarities["query"] * 1.9)
+                + (similarities["short"] * 1.3)
+                + (similarities["long"] * 1.1)
+                + (max(similarities["anchor_artist"], similarities["anchor_track"]) * 0.75)
+            )
+            ranking_score += collaborative_score * 0.4
+            if normalized_name in listened_artist_names:
+                ranking_score -= 0.9
         artist["score"] = round(ranking_score, 3)
         artist["ml_similarities"] = {
             name: round(value, 4)
@@ -827,6 +1195,8 @@ def _normalize_song_result(entry):
         "channel": extract_artist(entry),
         "album": album_info.get("title"),
         "album_id": album_info.get("id"),
+        "year": entry.get("year") or "",
+        "release_date": entry.get("releaseDate") or entry.get("release_date") or "",
     }
 
 def _ytmusic_song_search(query: str, limit: int):
@@ -843,10 +1213,12 @@ def _ytmusic_song_search(query: str, limit: int):
         seen.add(track_id)
         results.append(normalized)
 
-    try:
-        raw_results = ytmusic.search(query, filter="songs", limit=limit)
-    except Exception:
-        raw_results = []
+    raw_results = _search_upstream_call_with_retry(
+        lambda: ytmusic.search(query, filter="songs", limit=limit),
+        attempts=UPSTREAM_RETRY_ATTEMPTS,
+        backoff_seconds=UPSTREAM_RETRY_BACKOFF_SECONDS,
+        default=[],
+    )
 
     for entry in raw_results:
         add_entry(entry)
@@ -854,10 +1226,12 @@ def _ytmusic_song_search(query: str, limit: int):
             return results
 
     if len(results) < limit:
-        try:
-            fallback_results = ytmusic.search(query, limit=max(limit * 3, 12))
-        except Exception:
-            fallback_results = []
+        fallback_results = _search_upstream_call_with_retry(
+            lambda: ytmusic.search(query, limit=max(limit * 3, 12)),
+            attempts=UPSTREAM_RETRY_ATTEMPTS,
+            backoff_seconds=UPSTREAM_RETRY_BACKOFF_SECONDS,
+            default=[],
+        )
 
         for entry in fallback_results:
             result_type = (entry.get("resultType") or entry.get("type") or "").lower()
@@ -905,10 +1279,12 @@ def _ytdlp_song_search(query: str, limit: int):
 
 def lookup_album_for_song(video_id: str, title: str, artist: str):
     candidates = []
-    try:
-        raw_results = ytmusic.search(f"{title} {artist}".strip(), filter="songs", limit=6)
-    except Exception:
-        raw_results = []
+    raw_results = _upstream_call_with_retry(
+        lambda: ytmusic.search(f"{title} {artist}".strip(), filter="songs", limit=6),
+        attempts=UPSTREAM_RETRY_ATTEMPTS,
+        backoff_seconds=UPSTREAM_RETRY_BACKOFF_SECONDS,
+        default=[],
+    )
 
     for entry in raw_results:
         album_info = extract_album_info(entry)
@@ -1118,19 +1494,177 @@ def _playlist_lookup_by_name(playlists, target_name):
             fuzzy_match = fuzzy_match or playlist
     return exact_match or fuzzy_match
 
-app = FastAPI(title="Auralis Proxy & Recommendation Engine")
 
-# Allow Flutter emulator to connect
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+def _summarize_artist_description(text: str, *, max_chars: int = 320) -> str:
+    cleaned = re.sub(r"\s+", " ", (text or "").strip())
+    if not cleaned:
+        return ""
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+", cleaned)
+        if sentence.strip()
+    ]
+    summary_parts = []
+    for sentence in sentences[:3]:
+        projected = " ".join([*summary_parts, sentence]).strip()
+        if summary_parts and len(projected) > max_chars:
+            break
+        summary_parts.append(sentence)
+        if len(summary_parts) >= 2 and len(projected) >= min(180, max_chars):
+            break
+    summary = " ".join(summary_parts).strip() or cleaned[:max_chars].strip()
+    if len(summary) < len(cleaned) and not summary.endswith(("...", ".", "!", "?")):
+        summary = summary.rstrip(",;:- ") + "..."
+    return summary
 
 
-@app.on_event("startup")
+def _trace_start(
+    request_type: str,
+    *,
+    user_scope_id: str = "guest",
+    surface: str = "",
+    query: str = "",
+) -> Dict[str, Any]:
+    return {
+        "request_id": str(uuid.uuid4()),
+        "request_type": request_type,
+        "user_scope_id": _assistant_safe_scope_id(user_scope_id or "guest"),
+        "surface": _recommendation_trim_text(surface),
+        "query": _recommendation_trim_text(query),
+        "started_at": time.perf_counter(),
+        "stage_ms": {},
+        "candidate_counts": {},
+        "source_counts": {},
+        "ranking_meta": {},
+        "status": "started",
+        "error": "",
+    }
+
+
+def _trace_stage(trace: Optional[Dict[str, Any]], stage: str, started_at: float) -> None:
+    if not isinstance(trace, dict):
+        return
+    elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+    stage_ms = trace.setdefault("stage_ms", {})
+    stage_ms[stage] = stage_ms.get(stage, 0) + max(elapsed_ms, 0)
+
+
+def _trace_put(trace: Optional[Dict[str, Any]], group: str, key: str, value: Any) -> None:
+    if not isinstance(trace, dict):
+        return
+    payload = trace.setdefault(group, {})
+    payload[key] = value
+
+def _trace_finalize(trace: Optional[Dict[str, Any]], *, status: str = "success", error: str = "") -> Dict[str, Any]:
+    if not isinstance(trace, dict):
+        return {}
+    trace["status"] = status
+    trace["error"] = _recommendation_trim_text(error)
+    total_ms = int((time.perf_counter() - float(trace.get("started_at") or 0.0)) * 1000)
+    trace["total_ms"] = max(total_ms, 0)
+    return trace
+
+
+def _trace_diagnostics(trace: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(trace, dict):
+        return {}
+    return {
+        "request_id": trace.get("request_id") or "",
+        "request_type": trace.get("request_type") or "",
+        "status": trace.get("status") or "unknown",
+        "stage_timings_ms": dict(trace.get("stage_ms") or {}),
+        "candidate_counts": dict(trace.get("candidate_counts") or {}),
+        "source_counts": dict(trace.get("source_counts") or {}),
+        "ranking_meta": dict(trace.get("ranking_meta") or {}),
+        "total_ms": int(trace.get("total_ms") or 0),
+        "error": trace.get("error") or "",
+    }
+
+
+def _trace_log_request(
+    trace: Optional[Dict[str, Any]],
+    *,
+    request_type: str,
+    user_scope_id: str,
+    session_id: str = "",
+    model_version: str = "",
+) -> None:
+    if not isinstance(trace, dict):
+        return
+    diagnostics = _trace_diagnostics(trace)
+    try:
+        _pg_log_request(
+            request_id=(trace.get("request_id") or str(uuid.uuid4())),
+            request_type=request_type,
+            user_scope_id=_assistant_safe_scope_id(user_scope_id or "guest"),
+            session_id=_recommendation_trim_text(session_id),
+            model_version=_recommendation_trim_text(model_version),
+            diagnostics=diagnostics,
+        )
+    except Exception:
+        return
+
+
+def _upstream_call_with_retry(
+    fn,
+    *,
+    attempts: int = 2,
+    backoff_seconds: float = 0.12,
+    default=None,
+):
+    for attempt in range(max(1, int(attempts or 1))):
+        try:
+            return fn()
+        except Exception:
+            if attempt + 1 >= max(1, int(attempts or 1)):
+                break
+            time.sleep(max(0.0, backoff_seconds) * (attempt + 1))
+    return default
+
+
+def _executor_call_with_retry(
+    fn,
+    *,
+    executor,
+    attempts: int = 2,
+    backoff_seconds: float = 0.12,
+    timeout_seconds: float | None = None,
+    default=None,
+):
+    for attempt in range(max(1, int(attempts or 1))):
+        future = None
+        try:
+            future = executor.submit(fn)
+            if timeout_seconds is None:
+                return future.result()
+            return future.result(timeout=max(0.05, float(timeout_seconds)))
+        except Exception:
+            if future is not None:
+                future.cancel()
+            if attempt + 1 >= max(1, int(attempts or 1)):
+                break
+            time.sleep(max(0.0, backoff_seconds) * (attempt + 1))
+    return default
+
+
+def _search_upstream_call_with_retry(
+    fn,
+    *,
+    attempts: int = 2,
+    backoff_seconds: float = 0.12,
+    timeout_seconds: float | None = None,
+    default=None,
+):
+    return _executor_call_with_retry(
+        fn,
+        executor=search_upstream_executor,
+        attempts=attempts,
+        backoff_seconds=backoff_seconds,
+        timeout_seconds=timeout_seconds or SEARCH_UPSTREAM_TIMEOUT_SECONDS,
+        default=default,
+    )
+
+
 def startup_recommendation_runtime():
     _recommendation_init_store_db()
     if RECOMMENDATION_ENABLE_SCHEDULER and not RECOMMENDATION_EXTERNAL_WORKER:
@@ -1144,8 +1678,6 @@ def startup_recommendation_runtime():
         )
         bootstrap_thread.start()
 
-
-@app.on_event("shutdown")
 def shutdown_recommendation_runtime():
     _recommendation_stop_scheduler()
 
@@ -1162,11 +1694,83 @@ RECOMMENDATION_CACHE_TTL_SECONDS = int(os.environ.get("RECOMMENDATION_CACHE_TTL_
 RECOMMENDATION_FEED_SESSION_TTL_SECONDS = int(os.environ.get("RECOMMENDATION_FEED_SESSION_TTL_SECONDS", "900"))
 RECOMMENDATION_PROFILE_CACHE_TTL_SECONDS = int(os.environ.get("RECOMMENDATION_PROFILE_CACHE_TTL_SECONDS", "300"))
 RECOMMENDATION_TRACK_CACHE_TTL_SECONDS = int(os.environ.get("RECOMMENDATION_TRACK_CACHE_TTL_SECONDS", "900"))
+RECOMMENDATION_TRACK_LOOKUP_EXTRA = max(
+    2,
+    int(os.environ.get("RECOMMENDATION_TRACK_LOOKUP_EXTRA", "8")),
+)
+RECOMMENDATION_TRACK_FETCH_BUDGET_SECONDS = max(
+    2.0,
+    float(os.environ.get("RECOMMENDATION_TRACK_FETCH_BUDGET_SECONDS", "6.0")),
+)
+RECOMMENDATION_TRACK_FETCH_PER_FUTURE_TIMEOUT_SECONDS = max(
+    0.5,
+    float(
+        os.environ.get(
+            "RECOMMENDATION_TRACK_FETCH_PER_FUTURE_TIMEOUT_SECONDS",
+            "2.0",
+        )
+    ),
+)
 RECOMMENDATION_ROW_PAGE_SIZE = int(os.environ.get("RECOMMENDATION_ROW_PAGE_SIZE", "8"))
 RECOMMENDATION_EMBED_CACHE_TTL_SECONDS = int(os.environ.get("RECOMMENDATION_EMBED_CACHE_TTL_SECONDS", "1800"))
 SEARCH_RESULT_CACHE_TTL_SECONDS = int(os.environ.get("SEARCH_RESULT_CACHE_TTL_SECONDS", "600"))
 DETAIL_RESULT_CACHE_TTL_SECONDS = int(os.environ.get("DETAIL_RESULT_CACHE_TTL_SECONDS", "1800"))
+SEARCH_EXECUTOR_WORKERS = max(
+    2,
+    int(os.environ.get("SEARCH_EXECUTOR_WORKERS", "6")),
+)
+SEARCH_UPSTREAM_WORKERS = max(
+    2,
+    int(os.environ.get("SEARCH_UPSTREAM_WORKERS", "4")),
+)
+SEARCH_UPSTREAM_TIMEOUT_SECONDS = max(
+    0.8,
+    float(os.environ.get("SEARCH_UPSTREAM_TIMEOUT_SECONDS", "2.4")),
+)
 RECOMMENDED_ARTISTS_CACHE_TTL_SECONDS = int(os.environ.get("RECOMMENDED_ARTISTS_CACHE_TTL_SECONDS", "600"))
+SEARCH_TRACK_CANDIDATE_MIN = int(os.environ.get("SEARCH_TRACK_CANDIDATE_MIN", "24"))
+SEARCH_TRACK_CANDIDATE_MAX = int(os.environ.get("SEARCH_TRACK_CANDIDATE_MAX", "72"))
+SEARCH_ALBUM_CANDIDATE_MAX = int(os.environ.get("SEARCH_ALBUM_CANDIDATE_MAX", "24"))
+SEARCH_ARTIST_CANDIDATE_MAX = int(os.environ.get("SEARCH_ARTIST_CANDIDATE_MAX", "32"))
+SEARCH_METADATA_ENRICH_LIMIT = int(os.environ.get("SEARCH_METADATA_ENRICH_LIMIT", "12"))
+SEARCH_METADATA_ENRICH_BUDGET_SECONDS = max(
+    1.0,
+    float(os.environ.get("SEARCH_METADATA_ENRICH_BUDGET_SECONDS", "4.0")),
+)
+SEARCH_METADATA_ENRICH_PER_TRACK_TIMEOUT_SECONDS = max(
+    0.25,
+    float(
+        os.environ.get(
+            "SEARCH_METADATA_ENRICH_PER_TRACK_TIMEOUT_SECONDS",
+            "1.2",
+        )
+    ),
+)
+RECOMMENDATION_METADATA_ENRICH_LIMIT = int(
+    os.environ.get("RECOMMENDATION_METADATA_ENRICH_LIMIT", "12")
+)
+RECOMMENDATION_METADATA_ENRICH_PER_TRACK_TIMEOUT_SECONDS = max(
+    0.4,
+    float(
+        os.environ.get(
+            "RECOMMENDATION_METADATA_ENRICH_PER_TRACK_TIMEOUT_SECONDS",
+            "1.8",
+        )
+    ),
+)
+RECOMMENDATION_CANDIDATE_SOURCE_TIMEOUT_SECONDS = max(
+    1.0,
+    float(
+        os.environ.get(
+            "RECOMMENDATION_CANDIDATE_SOURCE_TIMEOUT_SECONDS",
+            "4.0",
+        )
+    ),
+)
+UPSTREAM_RETRY_ATTEMPTS = int(os.environ.get("UPSTREAM_RETRY_ATTEMPTS", "2"))
+UPSTREAM_RETRY_BACKOFF_SECONDS = float(
+    os.environ.get("UPSTREAM_RETRY_BACKOFF_SECONDS", "0.12")
+)
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434/api").rstrip("/")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "minimax-m2.7:cloud")
 OLLAMA_THINKING_MODEL = os.environ.get("OLLAMA_THINKING_MODEL", OLLAMA_MODEL).strip() or OLLAMA_MODEL
@@ -1177,6 +1781,14 @@ OLLAMA_EMBED_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", OLLAMA_MODEL).strip()
 OLLAMA_KEEP_ALIVE = os.environ.get("OLLAMA_KEEP_ALIVE", "15m").strip()
 OLLAMA_CONNECT_TIMEOUT_SECONDS = float(os.environ.get("OLLAMA_CONNECT_TIMEOUT_SECONDS", "10"))
 OLLAMA_READ_TIMEOUT_SECONDS = float(os.environ.get("OLLAMA_READ_TIMEOUT_SECONDS", "90"))
+ASSISTANT_EMBED_OLLAMA_TIMEOUT_SECONDS = max(
+    0.5,
+    float(os.environ.get("ASSISTANT_EMBED_OLLAMA_TIMEOUT_SECONDS", "2.5")),
+)
+ASSISTANT_EMBED_OLLAMA_COOLDOWN_SECONDS = max(
+    0.0,
+    float(os.environ.get("ASSISTANT_EMBED_OLLAMA_COOLDOWN_SECONDS", "90")),
+)
 ASSISTANT_EMBED_BACKEND = os.environ.get("ASSISTANT_EMBED_BACKEND", "local").strip().lower()
 ASSISTANT_EMBED_DIM = int(os.environ.get("ASSISTANT_EMBED_DIM", "256"))
 USE_LANGGRAPH_ASSISTANT = os.environ.get("USE_LANGGRAPH_ASSISTANT", "1").strip().lower() not in {"0", "false", "no"}
@@ -1191,6 +1803,10 @@ RECOMMENDATION_STORE_DB_PATH = os.path.join(os.getcwd(), "recommendation_store.s
 RECOMMENDATION_MODEL_CACHE_TTL_SECONDS = int(
     os.environ.get("RECOMMENDATION_MODEL_CACHE_TTL_SECONDS", "180")
 )
+RECOMMENDATION_MODEL_STALE_REFRESH_ENABLED = os.environ.get(
+    "RECOMMENDATION_MODEL_STALE_REFRESH_ENABLED",
+    "1",
+).strip().lower() not in {"0", "false", "no"}
 RECOMMENDATION_MODEL_MIN_EVENTS = int(
     os.environ.get("RECOMMENDATION_MODEL_MIN_EVENTS", "24")
 )
@@ -1220,6 +1836,9 @@ RECOMMENDATION_EXTERNAL_WORKER = os.environ.get(
 RECOMMENDATION_SYNC_INTERVAL_SECONDS = int(
     os.environ.get("RECOMMENDATION_SYNC_INTERVAL_SECONDS", "300")
 )
+RECOMMENDATION_SYNC_FAILURE_RETRY_SECONDS = int(
+    os.environ.get("RECOMMENDATION_SYNC_FAILURE_RETRY_SECONDS", "300")
+)
 RECOMMENDATION_TRAIN_INTERVAL_SECONDS = int(
     os.environ.get("RECOMMENDATION_TRAIN_INTERVAL_SECONDS", "900")
 )
@@ -1246,63 +1865,70 @@ RECOMMENDATION_EXPERIMENT_KEY = os.environ.get(
     "RECOMMENDATION_EXPERIMENT_KEY",
     "feed_ranking_v2",
 ).strip() or "feed_ranking_v2"
+RECOMMENDATION_ROW_BUILD_WORKERS = max(
+    1,
+    int(os.environ.get("RECOMMENDATION_ROW_BUILD_WORKERS", "4")),
+)
+RECOMMENDATION_EXECUTOR_WORKERS = max(
+    6,
+    int(os.environ.get("RECOMMENDATION_EXECUTOR_WORKERS", "12")),
+)
+RECOMMENDATION_ROW_BUILDER_TIMEOUT_SECONDS = max(
+    4.0,
+    float(os.environ.get("RECOMMENDATION_ROW_BUILDER_TIMEOUT_SECONDS", "8.0")),
+)
+RECOMMENDATION_ROW_FINALIZE_BUDGET_SECONDS = max(
+    2.0,
+    float(os.environ.get("RECOMMENDATION_ROW_FINALIZE_BUDGET_SECONDS", "8.0")),
+)
+RECOMMENDATION_REQUIRED_ROWS = tuple(
+    item.strip()
+    for item in os.environ.get(
+        "RECOMMENDATION_REQUIRED_ROWS",
+        "continue_listening,because_you_played,trending_for_you,quiet_picks",
+    ).split(",")
+    if item.strip()
+)
+RECOMMENDATION_QUERY_DERIVED_SOURCE_SHARE_CAP = min(
+    0.9,
+    max(
+        0.2,
+        float(
+            os.environ.get(
+                "RECOMMENDATION_QUERY_DERIVED_SOURCE_SHARE_CAP",
+                "0.45",
+            )
+        ),
+    ),
+)
+RECOMMENDATION_QUERY_DERIVED_SOURCE_ITEM_CAP = max(
+    2,
+    int(os.environ.get("RECOMMENDATION_QUERY_DERIVED_SOURCE_ITEM_CAP", "7")),
+)
+RECOMMENDATION_QUIET_FALLBACK_LIMIT = max(
+    8,
+    int(os.environ.get("RECOMMENDATION_QUIET_FALLBACK_LIMIT", "28")),
+)
 RECOMMENDATION_MODEL_EXPORT_DIR = os.environ.get(
     "RECOMMENDATION_MODEL_EXPORT_DIR",
     os.path.join(os.getcwd(), "downloads", "recommendation_models"),
 ).strip()
-stream_info_cache = {}
-stream_info_inflight = {}
-stream_info_lock = Lock()
-stream_chunk_cache = {}
-stream_chunk_lock = Lock()
-stream_chunk_inflight = {}
-stream_chunk_inflight_lock = Lock()
 prepare_metrics = deque(maxlen=180)
 prepare_metrics_lock = Lock()
-recommendation_cache = {}
-recommendation_cache_lock = Lock()
-home_candidates_cache = {"expires_at": 0, "results": []}
-home_candidates_lock = Lock()
-recommendation_profile_cache = {}
-recommendation_profile_lock = Lock()
-recommendation_track_details_cache = {}
-recommendation_track_details_lock = Lock()
-recommendation_feed_sessions = {}
-recommendation_feed_index = {}
-recommendation_feed_lock = Lock()
-search_result_cache = {
-    "tracks": {},
-    "albums": {},
-    "artists_direct": {},
-    "artists": {},
-    "recommended_artists": {},
-    "suggestions": {},
-}
-search_result_cache_lock = Lock()
-detail_result_cache = {
-    "track": {},
-    "album": {},
-    "artist": {},
-}
-detail_result_cache_lock = Lock()
-recommendation_embedding_cache = {
-    "track": {},
-    "artist": {},
-    "text": {},
-    "album": {},
-}
-recommendation_embedding_lock = Lock()
-recommendation_model_cache = {
-    "artifact": None,
-    "source_signature": "",
-    "expires_at": 0,
-}
-recommendation_model_lock = Lock()
+assistant_embed_ollama_backoff_lock = Lock()
+assistant_embed_ollama_backoff_until = 0.0
 recommendation_store_lock = Lock()
 recommendation_scheduler_stop = Event()
 recommendation_scheduler_thread = None
 stream_warm_executor = ThreadPoolExecutor(max_workers=STREAM_WARM_WORKERS)
-recommendation_executor = ThreadPoolExecutor(max_workers=6)
+recommendation_executor = ThreadPoolExecutor(
+    max_workers=RECOMMENDATION_EXECUTOR_WORKERS
+)
+search_executor = ThreadPoolExecutor(max_workers=SEARCH_EXECUTOR_WORKERS)
+search_upstream_executor = ThreadPoolExecutor(max_workers=SEARCH_UPSTREAM_WORKERS)
+recommendation_row_executor = ThreadPoolExecutor(
+    max_workers=RECOMMENDATION_ROW_BUILD_WORKERS
+)
 upstream_http = requests.Session()
 ollama_http = requests.Session()
 assistant_memory_lock = Lock()
@@ -1310,10 +1936,12 @@ assistant_memory_lock = Lock()
 class SearchRequest(BaseModel):
     query: str
     limit: int = 10
+    surface: str = "home_feed"
     seed_id: str = None
     seed_ids: List[str] = Field(default_factory=list)
     taste_queries: List[str] = Field(default_factory=list)
     artist_hints: List[str] = Field(default_factory=list)
+    anchor_artist_hints: List[str] = Field(default_factory=list)
     album_hints: List[str] = Field(default_factory=list)
     avoid_ids: List[str] = Field(default_factory=list)
     offset: int = 0
@@ -1321,6 +1949,9 @@ class SearchRequest(BaseModel):
     session_id: Optional[str] = None
     row_id: Optional[str] = None
     force_refresh: bool = False
+    prefer_fresh_rows: bool = False
+    refresh_token: str = ""
+    hydrate_heavy_rows: bool = False
     recent_track_ids: List[str] = Field(default_factory=list)
     top_track_ids: List[str] = Field(default_factory=list)
     recent_queries: List[str] = Field(default_factory=list)
@@ -1329,6 +1960,7 @@ class SearchRequest(BaseModel):
     offline_track_ids: List[str] = Field(default_factory=list)
     recent_track_snapshots: List[Dict[str, Any]] = Field(default_factory=list)
     top_track_snapshots: List[Dict[str, Any]] = Field(default_factory=list)
+    anchor_track_snapshots: List[Dict[str, Any]] = Field(default_factory=list)
     last_played_tracks: List[Dict[str, Any]] = Field(default_factory=list)
 
 
@@ -1356,24 +1988,123 @@ class RecommendationModelTrainRequest(BaseModel):
 
 
 def _cache_lookup(cache_root, lock: Lock, namespace: str, key: str):
-    now = time.time()
-    with lock:
-        namespace_cache = cache_root.get(namespace) or {}
-        cached = namespace_cache.get(key)
-        if cached and cached.get("expires_at", 0) > now:
-            return cached.get("value")
-        if cached:
-            namespace_cache.pop(key, None)
-    return None
+    return _cache_runtime_lookup(cache_root, lock, namespace, key)
 
 
 def _cache_store(cache_root, lock: Lock, namespace: str, key: str, value, ttl_seconds: int):
-    with lock:
-        namespace_cache = cache_root.setdefault(namespace, {})
-        namespace_cache[key] = {
-            "value": value,
-            "expires_at": time.time() + ttl_seconds,
+    _cache_runtime_store(cache_root, lock, namespace, key, value, ttl_seconds)
+
+
+def _recommendation_required_row_fallback_seed(
+    row_kind: str,
+    snapshot: Dict[str, Any] | None,
+    profile: Dict[str, Any] | None = None,
+):
+    from auralis_backend.recommend.home_pipeline import (
+        build_required_fallback_seed as _home_build_required_fallback_seed,
+    )
+
+    resolved_profile = dict(profile or {})
+    if not resolved_profile:
+        resolved_profile = {
+            "collaborative": ((snapshot or {}).get("collaborative") or {}),
         }
+    seed = _home_build_required_fallback_seed(
+        server=sys.modules[__name__],
+        row_kind=row_kind,
+        profile=resolved_profile,
+        snapshot=dict(snapshot or {}),
+    )
+    if isinstance(seed, dict):
+        return seed
+    fallback_tracks = _recommendation_home_fallback_tracks(
+        resolved_profile,
+        limit=24,
+    )
+    fallback_candidates = _recommendation_candidates_from_tracks(
+        fallback_tracks,
+        f"required_fallback:{row_kind}",
+        2.25,
+        "Fallback picks while personalization data is warming up.",
+    )
+
+    if row_kind == "trending_for_you":
+        candidates = []
+        collaborative_ids = (
+            (resolved_profile.get("collaborative") or {}).get("candidate_track_ids") or []
+        )
+        if collaborative_ids:
+            collaborative_tracks = _recommendation_fetch_tracks_for_ids(
+                collaborative_ids,
+                limit=12,
+            )
+            candidates.extend(
+                _recommendation_candidates_from_tracks(
+                    collaborative_tracks,
+                    "trending_required:collaborative",
+                    3.4,
+                    "Trending among listeners similar to you.",
+                )
+            )
+        candidates.extend(
+            _recommendation_candidates_from_tracks(
+                fallback_tracks,
+                "trending_required:fallback",
+                2.4,
+                "Trending picks filtered by your profile.",
+            )
+        )
+        return {
+            "title": "Trending for you",
+            "kind": "trending_for_you",
+            "candidates": candidates,
+            "row_strategy": "hybrid" if collaborative_ids else "fallback",
+            "fallback_reason": "required_row_missing",
+        }
+
+    if row_kind == "quiet_picks":
+        quiet_query = _recommendation_quiet_base_query(resolved_profile)
+        return {
+            "title": "Quiet picks",
+            "kind": "quiet_picks",
+            "quiet_query": quiet_query,
+            "used_queries": [quiet_query] if quiet_query else [],
+            "candidates": fallback_candidates,
+            "row_strategy": "fallback",
+            "fallback_reason": "required_row_missing",
+        }
+
+    if row_kind == "continue_listening":
+        return {
+            "title": "Continue the vibe",
+            "kind": "continue_listening",
+            "candidates": fallback_candidates,
+            "row_strategy": "fallback",
+            "fallback_reason": "required_row_missing",
+        }
+
+    if row_kind == "because_you_played":
+        return {
+            "title": "Because you played recently",
+            "kind": "because_you_played",
+            "candidates": fallback_candidates,
+            "row_strategy": "fallback",
+            "fallback_reason": "required_row_missing",
+        }
+
+    return None
+
+
+def _recommendation_apply_quiet_row_runtime_fields(finalized, row_seed):
+    from auralis_backend.recommend.home_pipeline import (
+        apply_quiet_row_runtime_fields as _home_apply_quiet_row_runtime_fields,
+    )
+
+    return _home_apply_quiet_row_runtime_fields(
+        server=sys.modules[__name__],
+        finalized=dict(finalized or {}),
+        row_seed=dict(row_seed or {}),
+    )
 
 
 def _search_cache_key(query: str, limit: int) -> str:
@@ -1385,7 +2116,9 @@ def _recommended_artists_cache_key(req: SearchRequest) -> str:
     payload = {
         "user_scope_id": _recommendation_trim_text(req.user_scope_id or "guest"),
         "limit": max(int(req.limit or 0), 0),
+        "surface": _recommendation_trim_text(req.surface or "home_feed") or "home_feed",
         "artist_hints": _recommendation_unique_strings(req.artist_hints, 12),
+        "anchor_artist_hints": _recommendation_unique_strings(req.anchor_artist_hints, 12),
         "recent_queries": _recommendation_unique_strings(req.recent_queries, 12),
         "taste_queries": _recommendation_unique_strings(req.taste_queries, 12),
         "recent_track_ids": [
@@ -1399,6 +2132,10 @@ def _recommended_artists_cache_key(req: SearchRequest) -> str:
         "last_played_ids": [
             track.get("id")
             for track in _recommendation_unique_snapshot_tracks(req.last_played_tracks, 12)
+        ],
+        "anchor_track_ids": [
+            track.get("id")
+            for track in _recommendation_unique_snapshot_tracks(req.anchor_track_snapshots, 8)
         ],
     }
     return hashlib.sha1(
@@ -1567,7 +2304,7 @@ def _assistant_preview_text(text: Optional[str], limit: int = 180):
     preview = re.sub(r"\s+", " ", (text or "").strip())
     if len(preview) <= limit:
         return preview
-    return preview[: limit - 1].rstrip() + "…"
+    return preview[: limit - 1].rstrip() + "â€¦"
 
 
 def _assistant_init_session_db():
@@ -1880,6 +2617,7 @@ def _assistant_delete_session(session_id: str, user_scope_id: str):
         connection.close()
 
 def _assistant_embed_texts(texts: List[str]):
+    global assistant_embed_ollama_backoff_until
     payload_texts = [text.strip() for text in texts if text and text.strip()]
     if not payload_texts:
         return []
@@ -1903,26 +2641,46 @@ def _assistant_embed_texts(texts: List[str]):
         return vector
 
     if ASSISTANT_EMBED_BACKEND == "ollama":
-        try:
-            response = ollama_http.post(
-                f"{OLLAMA_BASE_URL}/embed",
-                headers=_ollama_headers(),
-                json={
-                    "model": OLLAMA_EMBED_MODEL,
-                    "input": payload_texts,
-                },
-                timeout=20,
-            )
-            response.raise_for_status()
-            data = response.json()
-            embeddings = data.get("embeddings")
-            if isinstance(embeddings, list) and embeddings:
-                return embeddings
-            embedding = data.get("embedding")
-            if isinstance(embedding, list) and embedding:
-                return [embedding]
-        except Exception:
-            pass
+        now = time.time()
+        with assistant_embed_ollama_backoff_lock:
+            backoff_until = assistant_embed_ollama_backoff_until
+        if now >= backoff_until:
+            try:
+                response = ollama_http.post(
+                    f"{OLLAMA_BASE_URL}/embed",
+                    headers=_ollama_headers(),
+                    json={
+                        "model": OLLAMA_EMBED_MODEL,
+                        "input": payload_texts,
+                    },
+                    timeout=(
+                        min(OLLAMA_CONNECT_TIMEOUT_SECONDS, ASSISTANT_EMBED_OLLAMA_TIMEOUT_SECONDS),
+                        ASSISTANT_EMBED_OLLAMA_TIMEOUT_SECONDS,
+                    ),
+                )
+                response.raise_for_status()
+                data = response.json()
+                embeddings = data.get("embeddings")
+                if isinstance(embeddings, list) and embeddings:
+                    if len(embeddings) >= len(payload_texts):
+                        with assistant_embed_ollama_backoff_lock:
+                            assistant_embed_ollama_backoff_until = 0.0
+                        return embeddings[: len(payload_texts)]
+                embedding = data.get("embedding")
+                if (
+                    isinstance(embedding, list)
+                    and embedding
+                    and len(payload_texts) == 1
+                ):
+                    with assistant_embed_ollama_backoff_lock:
+                        assistant_embed_ollama_backoff_until = 0.0
+                    return [embedding]
+            except Exception:
+                pass
+            with assistant_embed_ollama_backoff_lock:
+                assistant_embed_ollama_backoff_until = (
+                    time.time() + ASSISTANT_EMBED_OLLAMA_COOLDOWN_SECONDS
+                )
     return [local_embed(text) for text in payload_texts]
 
 def _assistant_cosine_similarity(a: List[float], b: List[float]):
@@ -2348,14 +3106,18 @@ def _assistant_tool_search_tracks(query: str, limit: int):
     query = (query or "").strip()
     if not query:
         return []
-    return _search_tracks_blended(query, limit)
+    from auralis_backend.search.runtime import search_tracks_blended
+
+    return search_tracks_blended(query, limit)
 
 
 def _assistant_tool_search_albums(query: str, limit: int):
     query = (query or "").strip()
     if not query:
         return []
-    return _search_albums_blended(query, limit)
+    from auralis_backend.search.runtime import search_albums_blended
+
+    return search_albums_blended(query, limit)
 
 
 def _assistant_tool_search_artists_direct(query: str, limit: int):
@@ -2371,16 +3133,20 @@ def _assistant_tool_search_artists_direct(query: str, limit: int):
     )
     if cached is not None:
         return [dict(item) for item in cached]
-    try:
-        raw_results = ytmusic.search(query, filter="artists", limit=limit)
-    except Exception:
-        raw_results = []
+    raw_results = _search_upstream_call_with_retry(
+        lambda: ytmusic.search(query, filter="artists", limit=limit),
+        attempts=UPSTREAM_RETRY_ATTEMPTS,
+        backoff_seconds=UPSTREAM_RETRY_BACKOFF_SECONDS,
+        default=[],
+    )
     artists = normalize_artist_results(raw_results)
     if not artists:
-        try:
-            fallback_results = ytmusic.search(query, limit=max(limit * 3, 12))
-        except Exception:
-            fallback_results = []
+        fallback_results = _search_upstream_call_with_retry(
+            lambda: ytmusic.search(query, limit=max(limit * 3, 12)),
+            attempts=UPSTREAM_RETRY_ATTEMPTS,
+            backoff_seconds=UPSTREAM_RETRY_BACKOFF_SECONDS,
+            default=[],
+        )
         artists = normalize_artist_results(fallback_results)
     normalized_query = _normalize_text(query)
     tokens = _query_tokens(query)
@@ -2634,6 +3400,7 @@ def _build_album_details_payload(album_id: str):
             "album": album.get("title"),
             "album_title": album.get("title"),
             "album_id": album_id,
+            "year": album.get("year") or "",
         })
 
     payload = {
@@ -2733,1094 +3500,6 @@ def _recommendation_enrich_track_metadata(track: Dict[str, Any]):
     enriched = _merge_track_metadata(normalized, details_track)
     _recommendation_store_cached_track(track_id, enriched)
     return enriched
-
-
-def _search_artist_seed_tracks(query: str, limit: int):
-    artists = _assistant_tool_search_artists(query, 2)
-    if not artists:
-        return []
-    normalized_query = _normalize_text(query)
-    query_tokens = _query_tokens(query)
-    tracks = []
-    seen = set()
-    for artist in artists:
-        artist_name = _normalize_text(artist.get("name"))
-        if normalized_query and artist_name:
-            if normalized_query not in artist_name and not any(
-                token in artist_name for token in query_tokens
-            ):
-                continue
-        artist_id = _recommendation_trim_text(artist.get("id"))
-        if not artist_id:
-            continue
-        try:
-            payload = _build_artist_details_payload(artist_id)
-        except Exception:
-            payload = {}
-        for track in payload.get("top_songs") or []:
-            normalized = normalize_recommendation_track(track)
-            track_id = _recommendation_trim_text((normalized or {}).get("id"))
-            if not track_id or track_id in seen:
-                continue
-            seen.add(track_id)
-            tracks.append(normalized)
-            if len(tracks) >= limit:
-                return tracks
-    return tracks
-
-
-def _search_albums_for_artist_name(artist_name: str):
-    normalized_artist = _recommendation_trim_text(artist_name)
-    if not normalized_artist:
-        return {}
-    direct_artists = _assistant_tool_search_artists_direct(normalized_artist, 1)
-    if not direct_artists:
-        return {}
-    artist_id = _recommendation_trim_text(direct_artists[0].get("id"))
-    if not artist_id:
-        return {}
-    try:
-        return _build_artist_details_payload(artist_id)
-    except Exception:
-        return {}
-
-
-def _search_albums_blended(query: str, limit: int):
-    query = (query or "").strip()
-    limit = max(1, min(limit, 18))
-    if not query:
-        return []
-    cache_key = _search_cache_key(query, limit)
-    cached = _cache_lookup(
-        search_result_cache,
-        search_result_cache_lock,
-        "albums",
-        cache_key,
-    )
-    if cached is not None:
-        return [dict(item) for item in cached]
-
-    results = []
-    seen = set()
-
-    def add_albums(albums, max_to_add: Optional[int] = None):
-        added = 0
-        for raw_album in albums or []:
-            if not isinstance(raw_album, dict):
-                continue
-            album_id = _recommendation_trim_text(raw_album.get("id"))
-            title = _recommendation_trim_text(raw_album.get("title"))
-            artist = _recommendation_trim_text(raw_album.get("artist"))
-            key = album_id or f"{_normalize_text(title)}|{_normalize_text(artist)}"
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            results.append(raw_album)
-            added += 1
-            if len(results) >= limit:
-                break
-            if max_to_add is not None and added >= max_to_add:
-                break
-
-    try:
-        direct_results = ytmusic.search(query, filter="albums", limit=max(limit, 8))
-    except Exception:
-        direct_results = []
-    direct_albums = normalize_album_results(direct_results)
-    add_albums(direct_albums, max_to_add=min(max(4, limit // 2), 8))
-
-    track_anchor_future = recommendation_executor.submit(
-        _ytmusic_song_search,
-        query,
-        max(6, limit),
-    )
-    query_artist_future = recommendation_executor.submit(
-        _assistant_tool_search_artists,
-        query,
-        2,
-    )
-
-    try:
-        track_anchor_results = track_anchor_future.result(timeout=8)
-    except Exception:
-        track_anchor_results = []
-
-    anchor_artist_payload_futures = {}
-    for index, track in enumerate(track_anchor_results[:4]):
-        artist_name = _recommendation_trim_text(track.get("channel"))
-        if not artist_name:
-            continue
-        anchor_artist_payload_futures[index] = recommendation_executor.submit(
-            _search_albums_for_artist_name,
-            artist_name,
-        )
-
-    for index, track in enumerate(track_anchor_results[:4]):
-        album_title = _recommendation_trim_text(track.get("album"))
-        album_id = _recommendation_trim_text(track.get("album_id"))
-        if album_title:
-            add_albums(
-                [
-                    {
-                        "id": album_id or None,
-                        "title": album_title,
-                        "artist": track.get("channel"),
-                        "thumbnail": track.get("thumbnail"),
-                    }
-                ],
-                max_to_add=1,
-            )
-        try:
-            artist_payload = anchor_artist_payload_futures[index].result(timeout=8)
-        except Exception:
-            artist_payload = {}
-        add_albums(
-            artist_payload.get("albums") or [],
-            max_to_add=max(2, 4 - index),
-        )
-        if len(results) >= limit:
-            return results[:limit]
-
-    if len(results) < limit:
-        try:
-            direct_artists = query_artist_future.result(timeout=8)
-        except Exception:
-            direct_artists = []
-        for artist in direct_artists:
-            artist_id = _recommendation_trim_text(artist.get("id"))
-            if not artist_id:
-                continue
-            try:
-                artist_payload = _build_artist_details_payload(artist_id)
-            except Exception:
-                artist_payload = {}
-            add_albums(artist_payload.get("albums") or [], max_to_add=4)
-            if len(results) >= limit:
-                break
-
-    if len(results) < limit:
-        try:
-            fallback_results = ytmusic.search(query, limit=max(limit * 3, 12))
-        except Exception:
-            fallback_results = []
-        add_albums(normalize_album_results(fallback_results))
-
-    final_results = results[:limit]
-    _cache_store(
-        search_result_cache,
-        search_result_cache_lock,
-        "albums",
-        cache_key,
-        final_results,
-        SEARCH_RESULT_CACHE_TTL_SECONDS,
-    )
-    return [dict(item) for item in final_results]
-
-
-def _search_tracks_blended(query: str, limit: int):
-    query = (query or "").strip()
-    limit = max(1, min(limit, 30))
-    if not query:
-        return []
-    cache_key = _search_cache_key(query, limit)
-    cached = _cache_lookup(
-        search_result_cache,
-        search_result_cache_lock,
-        "tracks",
-        cache_key,
-    )
-    if cached is not None:
-        return [dict(item) for item in cached]
-
-    direct_pool = _ytmusic_song_search(query, max(limit, 14))
-    if not direct_pool:
-        direct_pool = _ytdlp_song_search(query, max(limit, 14))
-
-    results = []
-    seen = set()
-
-    def add_tracks(tracks, max_to_add: Optional[int] = None):
-        added = 0
-        for raw_track in tracks or []:
-            normalized = normalize_recommendation_track(raw_track)
-            if normalized is None:
-                continue
-            track_id = _recommendation_trim_text(normalized.get("id"))
-            if not track_id or track_id in seen:
-                continue
-            seen.add(track_id)
-            results.append(normalized)
-            added += 1
-            if len(results) >= limit:
-                break
-            if max_to_add is not None and added >= max_to_add:
-                break
-
-    add_tracks(direct_pool, max_to_add=min(max(6, limit // 3), 10))
-
-    anchor_track = results[0] if results else (direct_pool[0] if direct_pool else None)
-    query_tokens = _query_tokens(query)
-    similar_tracks_future = None
-    if anchor_track is not None and anchor_track.get("id"):
-        anchor_text = _normalize_text(
-            f"{anchor_track.get('title') or ''} {anchor_track.get('channel') or ''}"
-        )
-        if not query_tokens or any(token in anchor_text for token in query_tokens):
-            similar_tracks_future = recommendation_executor.submit(
-                _assistant_tool_get_similar_tracks,
-                anchor_track["id"],
-                max(6, min(10, limit // 2)),
-            )
-    artist_seed_future = recommendation_executor.submit(
-        _search_artist_seed_tracks,
-        query,
-        max(4, min(8, limit // 3)),
-    )
-
-    if similar_tracks_future is not None:
-        try:
-            similar_tracks = similar_tracks_future.result(timeout=8)
-        except Exception:
-            similar_tracks = []
-        add_tracks(
-            similar_tracks,
-            max_to_add=max(6, min(10, limit // 2)),
-        )
-
-    if len(results) < limit:
-        try:
-            artist_seed_tracks = artist_seed_future.result(timeout=8)
-        except Exception:
-            artist_seed_tracks = []
-        add_tracks(
-            artist_seed_tracks,
-            max_to_add=max(4, min(8, limit // 3)),
-        )
-
-    if len(results) < limit:
-        add_tracks(direct_pool)
-
-    if len(results) < limit:
-        try:
-            broad_results = ytmusic.search(query, limit=max(limit * 4, 24))
-        except Exception:
-            broad_results = []
-        filtered = []
-        for entry in broad_results:
-            result_type = (entry.get("resultType") or entry.get("type") or "").lower()
-            if result_type and result_type not in {"song", "video"}:
-                continue
-            filtered.append(entry)
-        add_tracks(filtered)
-
-    if len(results) < limit:
-        add_tracks(_ytdlp_song_search(query, limit))
-
-    final_results = results[:limit]
-    _cache_store(
-        search_result_cache,
-        search_result_cache_lock,
-        "tracks",
-        cache_key,
-        final_results,
-        SEARCH_RESULT_CACHE_TTL_SECONDS,
-    )
-    return [dict(item) for item in final_results]
-
-
-def _semantic_search_cache_key(req: SearchRequest, namespace: str) -> str:
-    payload = {
-        "namespace": namespace,
-        "limit": max(int(req.limit or 0), 0),
-        "profile_key": _recommendation_profile_key(req),
-    }
-    return hashlib.sha1(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
-    ).hexdigest()
-
-
-def _semantic_search_lexical_score(query: str, *texts) -> float:
-    normalized_query = _normalize_text(query)
-    tokens = _query_tokens(query)
-    normalized_texts = [
-        _normalize_text(text)
-        for text in texts
-        if _normalize_text(text)
-    ]
-    if not normalized_query and not tokens:
-        return 0.0
-    if not normalized_texts:
-        return 0.0
-
-    primary_text = normalized_texts[0]
-    combined_text = " ".join(normalized_texts)
-    score = 0.0
-
-    if normalized_query and primary_text == normalized_query:
-        score += 5.2
-    elif normalized_query and normalized_query in primary_text:
-        score += 4.2
-    elif normalized_query and normalized_query in combined_text:
-        score += 3.4
-
-    if tokens:
-        token_hits = sum(1 for token in tokens[:6] if token in combined_text)
-        if token_hits:
-            score += min(token_hits, 4) * 0.62
-        if all(token in combined_text for token in tokens[:4]):
-            score += 1.15
-
-    return score
-
-
-def _semantic_search_vectors(req: SearchRequest, profile):
-    query_text = _recommendation_trim_text(req.query)
-    query_vector = []
-    if query_text:
-        query_key = _recommendation_text_embedding_key("semantic_search_query", query_text)
-        if query_key:
-            text_embeddings = _recommendation_embed_entries(
-                "text",
-                [(query_key, query_text)],
-            )
-            query_vector = text_embeddings.get(query_key) or []
-
-    vectors = profile.get("vectors") or {}
-    semantic_query_vector = _vector_weighted_average(
-        [
-            (query_vector, 2.2),
-            (vectors.get("query_vector") or [], 0.95),
-            (vectors.get("artist_vector") or [], 0.35),
-        ]
-    )
-    semantic_context_vector = _vector_weighted_average(
-        [
-            (semantic_query_vector, 1.55),
-            (vectors.get("taste_vector") or [], 0.75),
-            (vectors.get("short_term_vector") or [], 0.35),
-        ]
-    )
-    return {
-        "current_query_vector": query_vector,
-        "semantic_query_vector": semantic_query_vector,
-        "semantic_context_vector": semantic_context_vector,
-    }
-
-
-def _semantic_search_vector_similarities(candidate_vector, search_vectors, profile):
-    vectors = profile.get("vectors") or {}
-    if not candidate_vector:
-        return {
-            "query": 0.0,
-            "semantic_query": 0.0,
-            "context": 0.0,
-            "taste": 0.0,
-            "artist": 0.0,
-            "short": 0.0,
-            "long": 0.0,
-        }
-    return {
-        "query": _assistant_cosine_similarity(
-            candidate_vector,
-            search_vectors.get("current_query_vector") or [],
-        ),
-        "semantic_query": _assistant_cosine_similarity(
-            candidate_vector,
-            search_vectors.get("semantic_query_vector") or [],
-        ),
-        "context": _assistant_cosine_similarity(
-            candidate_vector,
-            search_vectors.get("semantic_context_vector") or [],
-        ),
-        "taste": _assistant_cosine_similarity(
-            candidate_vector,
-            vectors.get("taste_vector") or [],
-        ),
-        "artist": _assistant_cosine_similarity(
-            candidate_vector,
-            vectors.get("artist_vector") or [],
-        ),
-        "short": _assistant_cosine_similarity(
-            candidate_vector,
-            vectors.get("short_term_vector") or [],
-        ),
-        "long": _assistant_cosine_similarity(
-            candidate_vector,
-            vectors.get("long_term_vector") or [],
-        ),
-    }
-
-
-def _semantic_suggestion_text(value: Optional[str]) -> str:
-    return re.sub(r"\s+", " ", _recommendation_trim_text(value))
-
-
-def _semantic_track_suggestion_text(track: Optional[Dict[str, Any]]) -> str:
-    if not isinstance(track, dict):
-        return ""
-    title = _semantic_suggestion_text(track.get("title"))
-    artist = _semantic_suggestion_text(
-        track.get("channel") or track.get("author") or track.get("artist")
-    )
-    if not title:
-        return ""
-    if artist and _normalize_text(artist) not in _normalize_text(title):
-        return f"{title} - {artist}"
-    return title
-
-
-def _semantic_album_suggestion_text(album: Optional[Dict[str, Any]]) -> str:
-    if not isinstance(album, dict):
-        return ""
-    title = _semantic_suggestion_text(album.get("title"))
-    artist = _semantic_suggestion_text(album.get("artist"))
-    if not title:
-        return ""
-    if artist and _normalize_text(artist) not in _normalize_text(title):
-        return f"{title} - {artist}"
-    return title
-
-
-def _semantic_search_suggestions(req: SearchRequest):
-    query = _recommendation_trim_text(req.query)
-    limit = max(1, min(req.limit or 5, 8))
-    if not query:
-        return []
-
-    cache_key = _semantic_search_cache_key(req, "suggestions")
-    cached = _cache_lookup(
-        search_result_cache,
-        search_result_cache_lock,
-        "suggestions",
-        cache_key,
-    )
-    if cached is not None:
-        return list(cached[:limit])
-
-    profile = _recommendation_build_profile(req)
-    search_vectors = _semantic_search_vectors(req, profile)
-    normalized_query = _normalize_text(query)
-    user_scope_id = _assistant_safe_scope_id(profile.get("user_scope_id") or "guest")
-    collaborative_model = (profile.get("collaborative") or {}).get("model") or {}
-    candidates = {}
-
-    def add_candidate(
-        raw_text: Optional[str],
-        source_score: float,
-        source_name: str,
-        suggestion_type: str,
-    ) -> None:
-        text = _semantic_suggestion_text(raw_text)
-        normalized = _normalize_text(text)
-        if not text or not normalized or normalized == normalized_query:
-            return
-        current = candidates.get(normalized)
-        if current is None or float(source_score) > float(current.get("source_score") or 0.0):
-            candidates[normalized] = {
-                "text": text,
-                "source_score": float(source_score),
-                "source_name": source_name,
-                "suggestion_type": suggestion_type,
-            }
-
-    try:
-        upstream_suggestions = ytmusic.get_search_suggestions(query)
-    except Exception:
-        upstream_suggestions = []
-    for index, raw_suggestion in enumerate(upstream_suggestions[:8]):
-        suggestion_text = (
-            raw_suggestion.get("text", "")
-            if isinstance(raw_suggestion, dict)
-            else str(raw_suggestion or "")
-        )
-        add_candidate(
-            suggestion_text,
-            max(4.1 - (index * 0.18), 1.2),
-            "upstream_suggestion",
-            "query",
-        )
-
-    for index, artist in enumerate(_assistant_tool_search_artists_direct(query, 4)):
-        add_candidate(
-            artist.get("name"),
-            max(3.7 - (index * 0.16), 1.0),
-            "direct_artist_search",
-            "artist",
-        )
-
-    for index, track in enumerate(_ytmusic_song_search(query, 6)):
-        add_candidate(
-            _semantic_track_suggestion_text(track),
-            max(3.2 - (index * 0.15), 0.9),
-            "direct_song_search",
-            "track",
-        )
-
-    try:
-        direct_album_results = ytmusic.search(query, filter="albums", limit=4)
-    except Exception:
-        direct_album_results = []
-    for index, album in enumerate(normalize_album_results(direct_album_results)):
-        add_candidate(
-            _semantic_album_suggestion_text(album),
-            max(2.8 - (index * 0.14), 0.8),
-            "direct_album_search",
-            "album",
-        )
-
-    for index, recent_query in enumerate(profile.get("recent_queries") or []):
-        recent_query_text = _semantic_suggestion_text(recent_query)
-        if not recent_query_text:
-            continue
-        if normalized_query and normalized_query not in _normalize_text(recent_query_text):
-            continue
-        add_candidate(
-            recent_query_text,
-            max(2.2 - (index * 0.12), 0.6),
-            "recent_query_history",
-            "query",
-        )
-
-    user_query_profile = (
-        (collaborative_model.get("user_query_profiles") or {}).get(user_scope_id) or []
-    )
-    for index, entry in enumerate(user_query_profile[:6]):
-        query_text = _semantic_suggestion_text(entry.get("query"))
-        if not query_text:
-            continue
-        add_candidate(
-            query_text,
-            max(float(entry.get("weight") or 0.0) * 0.28, 0.45) + max(1.0 - (index * 0.1), 0.28),
-            "collaborative_query_profile",
-            "query",
-        )
-
-    if not candidates:
-        return []
-
-    suggestion_entries = list(candidates.values())
-    suggestion_embeddings = _recommendation_embed_entries(
-        "text",
-        [
-            (_recommendation_text_embedding_key("semantic_suggestion", item["text"]), item["text"])
-            for item in suggestion_entries
-            if item.get("text")
-        ],
-    )
-
-    ranked = []
-    for item in suggestion_entries:
-        suggestion_text = item["text"]
-        suggestion_key = _recommendation_text_embedding_key(
-            "semantic_suggestion",
-            suggestion_text,
-        )
-        suggestion_vector = suggestion_embeddings.get(suggestion_key) or []
-        similarities = _semantic_search_vector_similarities(
-            suggestion_vector,
-            search_vectors,
-            profile,
-        )
-        lexical_score = _semantic_search_lexical_score(query, suggestion_text)
-        normalized_text = _normalize_text(suggestion_text)
-        ranking_score = (
-            (float(item.get("source_score") or 0.0) * 0.44)
-            + lexical_score
-            + (similarities["query"] * 8.1)
-            + (similarities["semantic_query"] * 4.7)
-            + (similarities["context"] * 1.35)
-            + (similarities["taste"] * 0.55)
-            + (similarities["artist"] * 0.5)
-        )
-        if normalized_query and normalized_text.startswith(normalized_query):
-            ranking_score += 1.25
-        elif normalized_query and normalized_query in normalized_text:
-            ranking_score += 0.5
-        if item.get("suggestion_type") == "artist":
-            ranking_score += similarities["artist"] * 0.65
-        elif item.get("suggestion_type") == "track":
-            ranking_score += similarities["short"] * 0.35
-        elif item.get("suggestion_type") == "query":
-            ranking_score += similarities["context"] * 0.3
-
-        ranked.append(
-            {
-                **item,
-                "score": round(ranking_score, 3),
-                "ml_similarities": {
-                    "query": round(similarities["query"], 4),
-                    "semantic_query": round(similarities["semantic_query"], 4),
-                    "context": round(similarities["context"], 4),
-                    "taste": round(similarities["taste"], 4),
-                    "artist": round(similarities["artist"], 4),
-                    "lexical": round(lexical_score, 4),
-                },
-            }
-        )
-
-    ranked.sort(
-        key=lambda item: (
-            item.get("score", 0.0),
-            item.get("text") or "",
-        ),
-        reverse=True,
-    )
-
-    results = []
-    type_counts = {}
-    type_caps = {
-        "query": 3,
-        "artist": 2,
-        "track": 2,
-        "album": 2,
-    }
-    for item in ranked:
-        suggestion_type = item.get("suggestion_type") or "query"
-        if type_counts.get(suggestion_type, 0) >= type_caps.get(suggestion_type, limit):
-            if len(results) + 1 < limit:
-                continue
-        results.append(item["text"])
-        type_counts[suggestion_type] = type_counts.get(suggestion_type, 0) + 1
-        if len(results) >= limit:
-            break
-
-    _cache_store(
-        search_result_cache,
-        search_result_cache_lock,
-        "suggestions",
-        cache_key,
-        results,
-        SEARCH_RESULT_CACHE_TTL_SECONDS,
-    )
-    return list(results)
-
-
-def _semantic_search_track_results(req: SearchRequest):
-    query = _recommendation_trim_text(req.query)
-    limit = max(1, min(req.limit or 24, 30))
-    if not query:
-        return []
-
-    cache_key = _semantic_search_cache_key(req, "tracks")
-    cached = _cache_lookup(
-        search_result_cache,
-        search_result_cache_lock,
-        "tracks",
-        cache_key,
-    )
-    if cached is not None:
-        return [dict(item) for item in cached[:limit]]
-
-    profile = _recommendation_build_profile(req)
-    search_vectors = _semantic_search_vectors(req, profile)
-    candidate_limit = min(max(limit * 4, 24), 72)
-    combined = {}
-
-    def add_track_candidate(raw_track, source_score: float, source_name: str) -> None:
-        normalized = normalize_recommendation_track(raw_track)
-        if normalized is None:
-            return
-        if _track_metadata_incomplete(normalized):
-            normalized = _recommendation_enrich_track_metadata(normalized)
-        track_id = _recommendation_trim_text(normalized.get("id"))
-        if not track_id:
-            return
-        current = combined.get(track_id)
-        if current is None:
-            combined[track_id] = {
-                "track": normalized,
-                "source_score": float(source_score),
-                "source_name": source_name,
-            }
-            return
-        if float(source_score) > float(current.get("source_score") or 0.0):
-            current["source_score"] = float(source_score)
-            current["source_name"] = source_name
-        if _track_metadata_incomplete(current.get("track")):
-            current["track"] = _merge_track_metadata(current["track"], normalized)
-
-    direct_pool = _ytmusic_song_search(query, max(limit * 2, 18))
-    if not direct_pool:
-        direct_pool = _ytdlp_song_search(query, max(limit * 2, 18))
-    for index, track in enumerate(direct_pool[:candidate_limit]):
-        add_track_candidate(
-            track,
-            max(4.8 - (index * 0.14), 1.6),
-            "direct_song_search",
-        )
-
-    blended_pool = _search_tracks_blended(query, min(candidate_limit, 42))
-    for index, track in enumerate(blended_pool):
-        add_track_candidate(
-            track,
-            max(3.6 - (index * 0.06), 1.1),
-            "semantic_candidate_pool",
-        )
-
-    collaborative_track_ids = (
-        (profile.get("collaborative") or {}).get("candidate_track_ids") or []
-    )
-    if collaborative_track_ids:
-        collaborative_tracks = _recommendation_fetch_tracks_for_ids(
-            collaborative_track_ids,
-            limit=min(max(limit, 10), 16),
-        )
-        for index, track in enumerate(collaborative_tracks):
-            add_track_candidate(
-                track,
-                max(2.2 - (index * 0.08), 0.55),
-                "collaborative_query_match",
-            )
-
-    if not combined:
-        return []
-
-    candidate_embeddings = _recommendation_track_embeddings(
-        [entry.get("track") for entry in combined.values()]
-    )
-    ranked = []
-    for entry in combined.values():
-        track = dict(entry.get("track") or {})
-        track_id = _recommendation_trim_text(track.get("id"))
-        track_key = _recommendation_track_embedding_key(track)
-        track_vector = candidate_embeddings.get(track_key) or []
-        similarities = _semantic_search_vector_similarities(
-            track_vector,
-            search_vectors,
-            profile,
-        )
-        collaborative_scores = _recommendation_collaborative_track_scores(track, profile)
-        lexical_score = _semantic_search_lexical_score(
-            query,
-            track.get("title"),
-            track.get("channel"),
-            track.get("album"),
-        )
-        title_lexical_score = _semantic_search_lexical_score(
-            query,
-            track.get("title"),
-        )
-        ranking_score = (
-            (float(entry.get("source_score") or 0.0) * 0.46)
-            + (title_lexical_score * 1.1)
-            + lexical_score
-            + (similarities["query"] * 8.6)
-            + (similarities["semantic_query"] * 5.4)
-            + (similarities["context"] * 2.0)
-            + (similarities["taste"] * 1.2)
-            + (similarities["artist"] * 1.4)
-            + (similarities["short"] * 0.7)
-            + (similarities["long"] * 0.45)
-            + (collaborative_scores["latent"] * 4.6)
-            + (min(collaborative_scores["neighbor"], 5.0) * 0.72)
-            + (min(collaborative_scores["artist"], 6.0) * 0.14)
-        )
-        if (
-            lexical_score < 0.75
-            and similarities["query"] < 0.12
-            and entry.get("source_name") == "collaborative_query_match"
-        ):
-            ranking_score -= 1.4
-        if track_id in (profile.get("recent_track_ids") or []) and title_lexical_score < 1.8:
-            ranking_score -= 0.25
-
-        track["score"] = round(ranking_score, 3)
-        track["search_source"] = entry.get("source_name") or ""
-        track["ml_similarities"] = {
-            "query": round(similarities["query"], 4),
-            "semantic_query": round(similarities["semantic_query"], 4),
-            "context": round(similarities["context"], 4),
-            "taste": round(similarities["taste"], 4),
-            "artist": round(similarities["artist"], 4),
-            "short": round(similarities["short"], 4),
-            "long": round(similarities["long"], 4),
-            "lexical": round(lexical_score + title_lexical_score, 4),
-            "collab_latent": round(collaborative_scores["latent"], 4),
-            "collab_neighbor": round(collaborative_scores["neighbor"], 4),
-            "collab_artist": round(collaborative_scores["artist"], 4),
-        }
-        ranked.append(track)
-
-    ranked.sort(
-        key=lambda item: (
-            item.get("score", 0.0),
-            item.get("title") or "",
-        ),
-        reverse=True,
-    )
-
-    results = []
-    artist_counts = {}
-    for track in ranked:
-        artist_key = _normalize_text(track.get("channel") or track.get("artist") or "")
-        if artist_key:
-            artist_count = artist_counts.get(artist_key, 0)
-            if artist_count >= 2 and len(results) + 1 < limit:
-                continue
-            artist_counts[artist_key] = artist_count + 1
-        results.append(track)
-        if len(results) >= limit:
-            break
-
-    _cache_store(
-        search_result_cache,
-        search_result_cache_lock,
-        "tracks",
-        cache_key,
-        results,
-        SEARCH_RESULT_CACHE_TTL_SECONDS,
-    )
-    return [dict(item) for item in results]
-
-
-def _semantic_search_album_results(req: SearchRequest):
-    query = _recommendation_trim_text(req.query)
-    limit = max(1, min(req.limit or 12, 18))
-    if not query:
-        return []
-
-    cache_key = _semantic_search_cache_key(req, "albums")
-    cached = _cache_lookup(
-        search_result_cache,
-        search_result_cache_lock,
-        "albums",
-        cache_key,
-    )
-    if cached is not None:
-        return [dict(item) for item in cached[:limit]]
-
-    profile = _recommendation_build_profile(req)
-    search_vectors = _semantic_search_vectors(req, profile)
-    candidates = _search_albums_blended(query, min(max(limit * 3, 18), 24))
-    if not candidates:
-        return []
-
-    collaborative_artist_scores = (
-        (profile.get("collaborative") or {}).get("artist_scores") or {}
-    )
-    album_embeddings = _recommendation_album_embeddings(candidates)
-    ranked = []
-    for index, album in enumerate(candidates):
-        album_copy = dict(album)
-        album_key = _recommendation_album_embedding_key(album_copy)
-        album_vector = album_embeddings.get(album_key) or []
-        similarities = _semantic_search_vector_similarities(
-            album_vector,
-            search_vectors,
-            profile,
-        )
-        lexical_score = _semantic_search_lexical_score(
-            query,
-            album_copy.get("title"),
-            album_copy.get("artist"),
-        )
-        collaborative_artist_score = float(
-            collaborative_artist_scores.get(
-                _normalize_text(album_copy.get("artist") or "")
-            ) or 0.0
-        )
-        ranking_score = (
-            (max(2.9 - (index * 0.08), 0.65) * 0.42)
-            + lexical_score
-            + (similarities["query"] * 8.0)
-            + (similarities["semantic_query"] * 4.4)
-            + (similarities["context"] * 1.85)
-            + (similarities["taste"] * 1.35)
-            + (similarities["artist"] * 1.55)
-            + (min(collaborative_artist_score, 6.0) * 0.18)
-        )
-        album_copy["score"] = round(ranking_score, 3)
-        album_copy["ml_similarities"] = {
-            "query": round(similarities["query"], 4),
-            "semantic_query": round(similarities["semantic_query"], 4),
-            "context": round(similarities["context"], 4),
-            "taste": round(similarities["taste"], 4),
-            "artist": round(similarities["artist"], 4),
-            "lexical": round(lexical_score, 4),
-            "collab_artist": round(collaborative_artist_score, 4),
-        }
-        ranked.append(album_copy)
-
-    ranked.sort(
-        key=lambda item: (
-            item.get("score", 0.0),
-            item.get("title") or "",
-        ),
-        reverse=True,
-    )
-
-    results = []
-    artist_counts = {}
-    for album in ranked:
-        artist_key = _normalize_text(album.get("artist") or "")
-        if artist_key:
-            artist_count = artist_counts.get(artist_key, 0)
-            if artist_count >= 2 and len(results) + 1 < limit:
-                continue
-            artist_counts[artist_key] = artist_count + 1
-        results.append(album)
-        if len(results) >= limit:
-            break
-
-    _cache_store(
-        search_result_cache,
-        search_result_cache_lock,
-        "albums",
-        cache_key,
-        results,
-        SEARCH_RESULT_CACHE_TTL_SECONDS,
-    )
-    return [dict(item) for item in results]
-
-
-def _semantic_search_artist_results(req: SearchRequest):
-    query = _recommendation_trim_text(req.query)
-    limit = max(1, min(req.limit or 12, 18))
-    if not query:
-        return []
-
-    cache_key = _semantic_search_cache_key(req, "artists")
-    cached = _cache_lookup(
-        search_result_cache,
-        search_result_cache_lock,
-        "artists",
-        cache_key,
-    )
-    if cached is not None:
-        return [dict(item) for item in cached[:limit]]
-
-    profile = _recommendation_build_profile(req)
-    search_vectors = _semantic_search_vectors(req, profile)
-    combined = {}
-
-    def add_artist_candidate(raw_artist, source_score: float, source_name: str) -> None:
-        if not isinstance(raw_artist, dict):
-            return
-        artist_id = _recommendation_trim_text(raw_artist.get("id"))
-        artist_name = _recommendation_trim_text(raw_artist.get("name"))
-        normalized_name = _normalize_text(artist_name)
-        if not artist_id or not artist_name or not normalized_name:
-            return
-        current = combined.get(artist_id)
-        if current is None:
-            combined[artist_id] = {
-                "artist": dict(raw_artist),
-                "source_score": float(source_score),
-                "source_name": source_name,
-            }
-            return
-        if float(source_score) > float(current.get("source_score") or 0.0):
-            current["source_score"] = float(source_score)
-            current["source_name"] = source_name
-        if not current["artist"].get("thumbnail") and raw_artist.get("thumbnail"):
-            current["artist"]["thumbnail"] = raw_artist.get("thumbnail")
-
-    direct_artists = _assistant_tool_search_artists_direct(query, max(limit * 2, 12))
-    for index, artist in enumerate(direct_artists):
-        add_artist_candidate(
-            artist,
-            max(4.9 - (index * 0.15), 1.6),
-            "direct_artist_search",
-        )
-
-    semantic_artists = _assistant_tool_search_artists(query, min(max(limit * 3, 18), 24))
-    for index, artist in enumerate(semantic_artists):
-        add_artist_candidate(
-            artist,
-            max(3.9 - (index * 0.08), 1.0),
-            "semantic_artist_pool",
-        )
-
-    collaborative_artist_scores = (
-        (profile.get("collaborative") or {}).get("artist_scores") or {}
-    )
-    collaborative_seed_names = sorted(
-        collaborative_artist_scores.items(),
-        key=lambda item: item[1],
-        reverse=True,
-    )[:6]
-    for artist_key, seed_score in collaborative_seed_names:
-        for index, artist in enumerate(_assistant_tool_search_artists_direct(artist_key, 1)):
-            add_artist_candidate(
-                artist,
-                max(float(seed_score) * 0.12, 0.35) + max(1.0 - (index * 0.14), 0.3),
-                "collaborative_query_match",
-            )
-
-    if not combined:
-        return []
-
-    artist_embeddings = _recommendation_artist_embeddings(
-        [entry.get("artist") for entry in combined.values()]
-    )
-    ranked = []
-    for entry in combined.values():
-        artist = dict(entry.get("artist") or {})
-        artist_key = _recommendation_artist_embedding_key(artist)
-        artist_vector = artist_embeddings.get(artist_key) or []
-        similarities = _semantic_search_vector_similarities(
-            artist_vector,
-            search_vectors,
-            profile,
-        )
-        lexical_score = _semantic_search_lexical_score(
-            query,
-            artist.get("name"),
-            artist.get("description"),
-        )
-        collaborative_artist_score = float(
-            collaborative_artist_scores.get(
-                _normalize_text(artist.get("name") or "")
-            ) or 0.0
-        )
-        penalty = _artist_related_name_penalty(query, artist.get("name") or "") * 0.25
-        ranking_score = (
-            (float(entry.get("source_score") or 0.0) * 0.5)
-            + lexical_score
-            + (similarities["query"] * 8.4)
-            + (similarities["semantic_query"] * 4.9)
-            + (similarities["context"] * 1.65)
-            + (similarities["taste"] * 1.15)
-            + (similarities["artist"] * 1.85)
-            + (min(collaborative_artist_score, 6.0) * 0.4)
-            - penalty
-        )
-        if (
-            lexical_score < 0.65
-            and similarities["query"] < 0.1
-            and entry.get("source_name") == "collaborative_query_match"
-        ):
-            ranking_score -= 1.1
-        artist["score"] = round(ranking_score, 3)
-        artist["search_source"] = entry.get("source_name") or ""
-        artist["ml_similarities"] = {
-            "query": round(similarities["query"], 4),
-            "semantic_query": round(similarities["semantic_query"], 4),
-            "context": round(similarities["context"], 4),
-            "taste": round(similarities["taste"], 4),
-            "artist": round(similarities["artist"], 4),
-            "lexical": round(lexical_score, 4),
-            "collab_artist": round(collaborative_artist_score, 4),
-        }
-        ranked.append(artist)
-
-    ranked.sort(
-        key=lambda item: (
-            item.get("score", 0.0),
-            item.get("name") or "",
-        ),
-        reverse=True,
-    )
-    results = ranked[:limit]
-    _cache_store(
-        search_result_cache,
-        search_result_cache_lock,
-        "artists",
-        cache_key,
-        results,
-        SEARCH_RESULT_CACHE_TTL_SECONDS,
-    )
-    return [dict(item) for item in results]
 
 
 def _assistant_tool_get_user_taste_profile(req: AssistantChatRequest):
@@ -4568,24 +4247,6 @@ def _iter_upstream_stream(video_id: str, stream_info: dict, start: int = 0, end:
             if req is not None:
                 req.close()
 
-def _warm_stream_safely(video_id: str):
-    _prepare_stream_track_safely(
-        video_id,
-        _chunk_target_bytes(4, False),
-        False,
-    )
-
-def queue_stream_warmup(video_ids: List[str], limit: int = 18):
-    seen = set()
-    for video_id in video_ids:
-        if not video_id or video_id in seen:
-            continue
-        seen.add(video_id)
-        stream_warm_executor.submit(_warm_stream_safely, video_id)
-        if len(seen) >= limit:
-            break
-
-@app.post("/prepare_session")
 def prepare_session(req: WarmStreamRequest):
     start_time = time.perf_counter()
     limit = min(max(req.lookahead or len(req.video_ids), 1), PREPARE_SESSION_MAX_LOOKAHEAD)
@@ -4605,7 +4266,6 @@ def prepare_session(req: WarmStreamRequest):
         "server_ms": int((time.perf_counter() - start_time) * 1000),
     }
 
-@app.get("/latency_summary")
 def latency_summary():
     return {
         "status": "success",
@@ -4614,18 +4274,15 @@ def latency_summary():
         "stream_chunk_cache_size": len(stream_chunk_cache),
     }
 
-@app.get("/")
 def health_check():
     return {"status": "Auralis Python Proxy is running"}
 
-@app.post("/track_details")
 def get_track_details(req: DownloadRequest):
     try:
         return _build_track_details_payload(req.video_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/lyrics/{video_id}")
 def get_track_lyrics(video_id: str):
     try:
         watch = ytmusic.get_watch_playlist(videoId=video_id)
@@ -4687,64 +4344,23 @@ def get_track_lyrics(video_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/search")
 def search_youtube(req: SearchRequest):
-    query = (req.query or "").strip()
-    limit = max(18, min(req.limit or 24, 30))
-    results = []
+    from auralis_backend.search.service import SearchService
 
-    # Check if the query is a direct YouTube URL
-    url_match = re.search(r"(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/shorts\/)([a-zA-Z0-9_-]{11})", query)
-    if url_match:
-        video_id = url_match.group(1)
-        try:
-            watch = ytmusic.get_watch_playlist(videoId=video_id)
-            vd = watch.get("videoDetails", {})
-            results.append({
-                "id": video_id,
-                "title": vd.get("title") or "Unknown URL Track",
-                "duration": vd.get("lengthSeconds") or 0,
-                "thumbnail": extract_thumbnail(vd),
-                "channel": extract_artist(vd)
-            })
-            return {"status": "success", "results": results}
-        except Exception:
-            pass # Fallback to normal search if extraction fails
+    return SearchService().search(req)
 
-    results = _semantic_search_track_results(req)
-    return {
-        "status": "success",
-        "results": results[:limit],
-        "diagnostics": {"ranking_backend": "semantic_search_profile"},
-    }
-
-@app.post("/search_albums")
 def search_albums(req: SearchRequest):
-    try:
-        albums = _semantic_search_album_results(req)
-        return {
-            "status": "success",
-            "albums": albums[: max(1, min(req.limit, 12))],
-            "diagnostics": {"ranking_backend": "semantic_search_profile"},
-        }
-    except Exception as e:
-        return {"status": "success", "albums": []}
+    from auralis_backend.search.service import SearchService
+
+    return SearchService().search_albums(req)
 
 
-@app.post("/search_artists")
 def search_artists(req: SearchRequest):
-    try:
-        artists = _semantic_search_artist_results(req)
-        return {
-            "status": "success",
-            "artists": artists[: max(1, min(req.limit, 12))],
-            "diagnostics": {"ranking_backend": "semantic_search_profile"},
-        }
-    except Exception:
-        return {"status": "success", "artists": []}
+    from auralis_backend.search.service import SearchService
+
+    return SearchService().search_artists(req)
 
 
-@app.post("/recommended_artists")
 def recommended_artists(req: SearchRequest):
     try:
         return _recommended_artists_payload(req)
@@ -4752,7 +4368,6 @@ def recommended_artists(req: SearchRequest):
         return {"status": "success", "artists": []}
 
 
-@app.post("/interaction_event")
 def recommendation_interaction_event(req: RecommendationInteractionEventRequest):
     try:
         stored = _recommendation_store_interaction_event(req)
@@ -4761,7 +4376,6 @@ def recommendation_interaction_event(req: RecommendationInteractionEventRequest)
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-@app.post("/search_interaction")
 def recommendation_search_interaction(req: RecommendationSearchEventRequest):
     try:
         stored = _recommendation_store_search_event(req)
@@ -4770,7 +4384,6 @@ def recommendation_search_interaction(req: RecommendationSearchEventRequest):
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-@app.get("/recommendation_model")
 def recommendation_model_status():
     try:
         model = _recommendation_get_collaborative_model()
@@ -4800,6 +4413,7 @@ def recommendation_model_status():
                     "search_event_count": int(sync_payload.get("search_event_count") or 0),
                     "user_count": int(sync_payload.get("user_count") or 0),
                     "item_count": int(sync_payload.get("item_count") or 0),
+                    "external_sync": _recommendation_external_sync_health_snapshot(),
                 },
                 "runtime": _recommendation_runtime_snapshot(),
             },
@@ -4808,18 +4422,127 @@ def recommendation_model_status():
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-@app.get("/recommendation_model/versions")
 def recommendation_model_versions():
     try:
+        tracked_model_keys = [
+            "search_track_reranker_v2",
+            "search_artist_reranker_v2",
+            "search_album_reranker_v2",
+            "home_global_ranker_v4",
+            "home_continue_ranker_v1",
+            "home_because_played_ranker_v1",
+            "home_quiet_ranker_v1",
+            "home_trending_ranker_v1",
+            "home_discovery_ranker_v1",
+        ]
         return {
             "status": "success",
             "runtime": _recommendation_runtime_snapshot(version_limit=12),
+            "model_registry": {
+                model_key: _pg_list_model_versions(model_key=model_key, limit=4)
+                for model_key in tracked_model_keys
+            },
+            "rollout_events": _pg_list_rollout_events(limit=24),
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-@app.get("/recommendation_experiments")
+def model_registry_versions(model_key: str, limit: int = 20):
+    normalized_key = _recommendation_trim_text(model_key)
+    if not normalized_key:
+        raise HTTPException(status_code=400, detail="model_key is required")
+    try:
+        return {
+            "status": "success",
+            "model_key": normalized_key,
+            "versions": _pg_list_model_versions(
+                model_key=normalized_key,
+                limit=limit,
+            ),
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+def model_registry_activate(
+    model_key: str,
+    version: str,
+    actor: str = "system",
+    reason: str = "",
+):
+    normalized_key = _recommendation_trim_text(model_key)
+    normalized_version = _recommendation_trim_text(version)
+    if not normalized_key or not normalized_version:
+        raise HTTPException(status_code=400, detail="model_key and version are required")
+    try:
+        ok = _pg_activate_model_version(
+            model_key=normalized_key,
+            version=normalized_version,
+            actor=_recommendation_trim_text(actor) or "system",
+            reason=_recommendation_trim_text(reason),
+            metadata={"source": "server_api"},
+        )
+        if not ok:
+            raise HTTPException(status_code=404, detail="model version not found")
+        return {
+            "status": "success",
+            "model_key": normalized_key,
+            "active_version": normalized_version,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+def model_registry_rollback(
+    model_key: str,
+    target_version: str = "",
+    actor: str = "system",
+    reason: str = "",
+):
+    normalized_key = _recommendation_trim_text(model_key)
+    if not normalized_key:
+        raise HTTPException(status_code=400, detail="model_key is required")
+    try:
+        result = _pg_rollback_model_version(
+            model_key=normalized_key,
+            target_version=_recommendation_trim_text(target_version),
+            actor=_recommendation_trim_text(actor) or "system",
+            reason=_recommendation_trim_text(reason),
+            metadata={"source": "server_api"},
+        )
+        if not bool((result or {}).get("ok")):
+            raise HTTPException(
+                status_code=400,
+                detail=f"rollback failed: {(result or {}).get('reason') or 'unknown'}",
+            )
+        return {
+            "status": "success",
+            "model_key": normalized_key,
+            "rollback": result,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+def model_registry_rollouts(model_key: str = "", limit: int = 50):
+    try:
+        return {
+            "status": "success",
+            "model_key": _recommendation_trim_text(model_key),
+            "events": _pg_list_rollout_events(
+                model_key=_recommendation_trim_text(model_key),
+                limit=limit,
+            ),
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 def recommendation_experiments(window_hours: int = RECOMMENDATION_EXPERIMENT_EVAL_WINDOW_HOURS):
     try:
         return {
@@ -4830,7 +4553,6 @@ def recommendation_experiments(window_hours: int = RECOMMENDATION_EXPERIMENT_EVA
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-@app.post("/recommendation_experiments/evaluate")
 def recommendation_experiments_evaluate(
     force_promote: bool = False,
     window_hours: int = RECOMMENDATION_EXPERIMENT_EVAL_WINDOW_HOURS,
@@ -4847,7 +4569,6 @@ def recommendation_experiments_evaluate(
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-@app.post("/recommendation_model/train")
 def recommendation_model_train(req: RecommendationModelTrainRequest):
     try:
         if req.force_sync:
@@ -4873,7 +4594,6 @@ def recommendation_model_train(req: RecommendationModelTrainRequest):
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
-@app.get("/album/{album_id}")
 def get_album_details(album_id: str):
     try:
         return _build_album_details_payload(album_id)
@@ -4881,31 +4601,21 @@ def get_album_details(album_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/artist/{artist_id}")
 def get_artist_details(artist_id: str):
     try:
         return _build_artist_details_payload(artist_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/suggest")
 def get_suggestions(req: SearchRequest):
-    try:
-        results = _semantic_search_suggestions(req)
-        return {
-            "status": "success",
-            "results": results[: max(1, min(req.limit or 5, 8))],
-            "diagnostics": {"ranking_backend": "semantic_search_profile"},
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    from auralis_backend.search.service import SearchService
+
+    return SearchService().suggest(req)
 
 def _fallback_home_candidates(limit: int):
-    now = time.time()
-    with home_candidates_lock:
-        cached = home_candidates_cache.get("results") or []
-        if home_candidates_cache.get("expires_at", 0) > now and len(cached) >= max(5, limit):
-            return cached[: limit + 10]
+    cached = _cache_lookup_home_candidates(limit)
+    if cached:
+        return cached
 
     results = []
     try:
@@ -4936,122 +4646,12 @@ def _fallback_home_candidates(limit: int):
                 break
 
     if results:
-        with home_candidates_lock:
-            home_candidates_cache["results"] = results[: limit + 10]
-            home_candidates_cache["expires_at"] = now + RECOMMENDATION_CACHE_TTL_SECONDS
+        _cache_store_home_candidates(
+            results,
+            ttl_seconds=RECOMMENDATION_CACHE_TTL_SECONDS,
+            limit=limit,
+        )
     return results
-
-def _recommendation_cache_key(req: SearchRequest):
-    payload = {
-        "query": (req.query or "").strip().lower(),
-        "limit": int(req.limit),
-        "offset": max(int(req.offset or 0), 0),
-        "seed_id": (req.seed_id or "").strip(),
-        "seed_ids": [item for item in (req.seed_ids or []) if item][:6],
-        "artist_hints": [item.strip().lower() for item in (req.artist_hints or []) if item][:6],
-        "taste_queries": [item.strip().lower() for item in (req.taste_queries or []) if item][:8],
-        "avoid_ids": [item for item in (req.avoid_ids or []) if item][:40],
-    }
-    return json.dumps(payload, sort_keys=True)
-
-def _get_cached_recommendations(cache_key: str):
-    now = time.time()
-    with recommendation_cache_lock:
-        cached = recommendation_cache.get(cache_key)
-        if cached and cached["expires_at"] > now:
-            return cached["results"]
-        if cached:
-            recommendation_cache.pop(cache_key, None)
-    return None
-
-def _set_cached_recommendations(cache_key: str, results):
-    with recommendation_cache_lock:
-        recommendation_cache[cache_key] = {
-            "results": results,
-            "expires_at": time.time() + RECOMMENDATION_CACHE_TTL_SECONDS,
-        }
-
-
-def _recommendation_candidate_window(req: SearchRequest) -> int:
-    limit = max(int(req.limit or 0), 1)
-    offset = max(int(req.offset or 0), 0)
-    avoid_count = len([item for item in (req.avoid_ids or []) if item])
-    bias = max(offset, avoid_count)
-    return min(max(limit + bias + 8, limit + 8), 72)
-
-def _rank_recommendation_candidates(
-    candidates,
-    *,
-    limit: int,
-    avoid_ids,
-    seed_ids,
-    artist_hints,
-    taste_queries,
-):
-    ranked = {}
-    blocked_ids = {item for item in avoid_ids if item}.union(
-        {item for item in seed_ids if item}
-    )
-    normalized_artist_hints = [
-        _normalize_text(item) for item in artist_hints if _normalize_text(item)
-    ]
-    query_token_groups = [
-        tokens[:4]
-        for tokens in (_query_tokens(item) for item in taste_queries)
-        if tokens
-    ]
-
-    for track, base_score in candidates:
-        track_id = track.get("id")
-        if not track_id or track_id in blocked_ids:
-            continue
-        title_text = _normalize_text(track.get("title"))
-        artist_text = _normalize_text(track.get("channel"))
-        album_text = _normalize_text(track.get("album"))
-        score = float(base_score)
-
-        for index, artist_hint in enumerate(normalized_artist_hints):
-            if artist_hint and artist_hint in artist_text:
-                score += max(3.2 - (index * 0.35), 0.8)
-
-        for index, tokens in enumerate(query_token_groups):
-            hits = sum(
-                1
-                for token in tokens
-                if token in title_text or token in artist_text or token in album_text
-            )
-            if hits:
-                score += min(hits, 2) * max(2.1 - (index * 0.18), 0.45)
-
-        existing = ranked.get(track_id)
-        if existing is None or score > existing["score"]:
-            ranked[track_id] = {
-                "track": track,
-                "score": score,
-                "artist_key": artist_text,
-            }
-
-    ordered = sorted(
-        ranked.values(),
-        key=lambda item: (item["score"], item["track"].get("title") or ""),
-        reverse=True,
-    )
-
-    results = []
-    artist_counts = {}
-    for item in ordered:
-        artist_key = item["artist_key"]
-        if artist_key:
-            artist_count = artist_counts.get(artist_key, 0)
-            if artist_count >= 2 and len(results) + 1 < limit:
-                continue
-            artist_counts[artist_key] = artist_count + 1
-        results.append(item["track"])
-        if len(results) >= limit:
-            break
-    return results
-
-
 def _recommendation_trim_text(value: Optional[str]) -> str:
     return (value or "").strip()
 
@@ -5125,35 +4725,70 @@ def _recommendation_track_from_details(payload: Dict[str, Any]):
     }
 
 
-def _recommendation_cached_track(track_id: str):
+def _recommendation_track_from_song_payload(payload: Dict[str, Any]):
+    if not isinstance(payload, dict):
+        return None
+    video_details = payload.get("videoDetails") or {}
+    track_payload = normalize_recommendation_track(
+        {
+            "id": payload.get("videoId") or video_details.get("videoId"),
+            "videoId": video_details.get("videoId"),
+            "title": video_details.get("title"),
+            "lengthSeconds": video_details.get("lengthSeconds"),
+            "author": video_details.get("author"),
+            "thumbnail": extract_thumbnail(video_details),
+            "album": (extract_album_info(payload) or {}).get("title")
+            or (extract_album_info(video_details) or {}).get("title"),
+            "album_id": (extract_album_info(payload) or {}).get("id")
+            or (extract_album_info(video_details) or {}).get("id"),
+        }
+    )
+    if track_payload is None:
+        return None
+    return track_payload
+
+
+def _recommendation_fetch_track_for_id_lightweight(track_id: str):
     normalized_id = _recommendation_trim_text(track_id)
     if not normalized_id:
         return None
-    now = time.time()
-    with recommendation_track_details_lock:
-        cached = recommendation_track_details_cache.get(normalized_id)
-        if cached and cached["expires_at"] > now:
-            return dict(cached["track"])
-        if cached:
-            recommendation_track_details_cache.pop(normalized_id, None)
+    song_payload = _upstream_call_with_retry(
+        lambda: ytmusic.get_song(normalized_id),
+        attempts=UPSTREAM_RETRY_ATTEMPTS,
+        backoff_seconds=UPSTREAM_RETRY_BACKOFF_SECONDS,
+        default={},
+    )
+    track = _recommendation_track_from_song_payload(song_payload or {})
+    if track is not None:
+        return track
     return None
+
+
+def _recommendation_cached_track(track_id: str):
+    return _cache_lookup_recommendation_track_detail(
+        _recommendation_trim_text(track_id)
+    )
 
 
 def _recommendation_store_cached_track(track_id: str, track: Dict[str, Any]):
     normalized_id = _recommendation_trim_text(track_id)
     if not normalized_id:
         return
-    with recommendation_track_details_lock:
-        recommendation_track_details_cache[normalized_id] = {
-            "track": dict(track),
-            "expires_at": time.time() + RECOMMENDATION_TRACK_CACHE_TTL_SECONDS,
-        }
+    _cache_store_recommendation_track_detail(
+        normalized_id,
+        track,
+        ttl_seconds=RECOMMENDATION_TRACK_CACHE_TTL_SECONDS,
+    )
 
 
 def _recommendation_fetch_track_for_id(track_id: str):
     cached = _recommendation_cached_track(track_id)
     if cached is not None:
         return cached
+    lightweight = _recommendation_fetch_track_for_id_lightweight(track_id)
+    if lightweight is not None:
+        _recommendation_store_cached_track(track_id, lightweight)
+        return lightweight
     try:
         details = _assistant_tool_get_track_details(track_id)
     except Exception:
@@ -5389,7 +5024,10 @@ def _recommendation_init_store_db():
 def _recommendation_external_pg_connection():
     if psycopg is None or not RECOMMENDATION_SYNC_DATABASE_DSN:
         return None
-    connection = psycopg.connect(RECOMMENDATION_SYNC_DATABASE_DSN)
+    connection = psycopg.connect(
+        RECOMMENDATION_SYNC_DATABASE_DSN,
+        connect_timeout=5,
+    )
     connection.autocommit = True
     return connection
 
@@ -5445,6 +5083,114 @@ def _recommendation_sync_state_float(name: str, default: float = 0.0) -> float:
         return float(_recommendation_sync_state_get(name, str(default)) or default)
     except Exception:
         return default
+
+
+def _recommendation_mark_external_sync_failure(message: str):
+    status, reachable = _recommendation_classify_external_sync_error(message)
+    _recommendation_sync_state_set("external_sync_status", status)
+    _recommendation_sync_state_set("external_sync_reachable", "1" if reachable else "0")
+    _recommendation_sync_state_set(
+        "external_last_sync_error",
+        (message or "unknown external sync error")[:1000],
+    )
+    _recommendation_sync_state_set(
+        "external_last_sync_failure_at",
+        str(time.time()),
+    )
+    _recommendation_sync_state_set(
+        "external_last_sync_attempt_at",
+        str(time.time()),
+    )
+
+
+def _recommendation_clear_external_sync_failure():
+    _recommendation_sync_state_set("external_sync_status", "reachable")
+    _recommendation_sync_state_set("external_sync_reachable", "1")
+    _recommendation_sync_state_set("external_last_sync_error", "")
+    _recommendation_sync_state_set("external_last_sync_failure_at", "0")
+
+
+def _recommendation_classify_external_sync_error(message: str) -> tuple[str, bool]:
+    normalized = _recommendation_trim_text(message).lower()
+    if not normalized:
+        return "connection_error", False
+    if any(
+        token in normalized
+        for token in [
+            "authentication failed",
+            "password authentication failed",
+            "auth failed",
+            "too many authentication errors",
+            "circuit breaker open",
+        ]
+    ):
+        return "auth_failed", True
+    if any(
+        token in normalized
+        for token in [
+            "connection timeout",
+            "timeout expired",
+            "timed out",
+            "getaddrinfo failed",
+            "name or service not known",
+            "temporary failure in name resolution",
+        ]
+    ):
+        return "connect_timeout", False
+    return "connection_error", False
+
+
+def _recommendation_mark_external_sync_success():
+    now = str(time.time())
+    _recommendation_sync_state_set("external_sync_status", "reachable")
+    _recommendation_sync_state_set("external_sync_reachable", "1")
+    _recommendation_sync_state_set("external_last_sync_attempt_at", now)
+    _recommendation_sync_state_set("external_last_sync_success_at", now)
+    _recommendation_clear_external_sync_failure()
+
+
+def _recommendation_external_sync_health_snapshot():
+    status = _recommendation_trim_text(
+        _recommendation_sync_state_get(
+            "external_sync_status",
+            "disabled" if not RECOMMENDATION_SYNC_DATABASE_DSN else "unknown",
+        )
+    ) or ("disabled" if not RECOMMENDATION_SYNC_DATABASE_DSN else "unknown")
+    last_error = _recommendation_trim_text(
+        _recommendation_sync_state_get("external_last_sync_error", "")
+    )
+    last_error_at = _recommendation_sync_state_float("external_last_sync_failure_at", 0.0)
+    last_success_at = _recommendation_sync_state_float("external_last_sync_success_at", 0.0)
+    last_attempt_at = _recommendation_sync_state_float("external_last_sync_attempt_at", 0.0)
+    reachable = status in {"reachable", "auth_failed"}
+    return {
+        "status": status,
+        "reachable": reachable,
+        "auth_failed": status == "auth_failed",
+        "connect_timeout": status == "connect_timeout",
+        "dsn_configured": bool(RECOMMENDATION_SYNC_DATABASE_DSN),
+        "last_success_at": last_success_at,
+        "last_error_at": last_error_at,
+        "last_attempt_at": last_attempt_at,
+        "last_error": last_error,
+    }
+
+
+def _recommendation_should_retry_external_sync(force: bool = False) -> bool:
+    if force or RECOMMENDATION_SYNC_FAILURE_RETRY_SECONDS <= 0:
+        return True
+    last_error = _recommendation_trim_text(
+        _recommendation_sync_state_get("external_last_sync_error", "")
+    )
+    if not last_error:
+        return True
+    last_failure_at = _recommendation_sync_state_float(
+        "external_last_sync_failure_at",
+        0.0,
+    )
+    if last_failure_at <= 0:
+        return True
+    return (time.time() - last_failure_at) >= RECOMMENDATION_SYNC_FAILURE_RETRY_SECONDS
 
 
 def _recommendation_active_promotion():
@@ -5990,6 +5736,11 @@ def _recommendation_runtime_snapshot(version_limit: int = 5):
             "external_last_sync_error",
             "",
         ),
+        "last_external_sync_failure_at": _recommendation_sync_state_float(
+            "external_last_sync_failure_at",
+            0.0,
+        ),
+        "external_sync_failure_retry_seconds": RECOMMENDATION_SYNC_FAILURE_RETRY_SECONDS,
         "last_scheduler_sync_at": _recommendation_sync_state_float(
             "scheduler_last_sync_at",
             0.0,
@@ -6016,6 +5767,9 @@ def _recommendation_runtime_snapshot(version_limit: int = 5):
         ),
         "active_promotion": active_promotion,
         "export_dir": RECOMMENDATION_MODEL_EXPORT_DIR,
+        "nearline_precompute": _nearline_runtime_snapshot(),
+        "nearline_last_cycle_at": _recommendation_sync_state_float("nearline_last_cycle_at", 0.0),
+        "nearline_last_cycle_status": _recommendation_sync_state_get("nearline_last_cycle_status", ""),
     }
 
 
@@ -6062,6 +5816,8 @@ def _recommendation_store_search_event(req: RecommendationSearchEventRequest):
     finally:
         connection.close()
     _recommendation_invalidate_collaborative_cache()
+    _nearline_invalidate_user(user_scope_id)
+    _nearline_invalidate_user_query(user_scope_id, query)
     return True
 
 
@@ -6230,17 +5986,18 @@ def _recommendation_record_impressions(session, rows):
 
 
 def _recommendation_invalidate_collaborative_cache():
-    with recommendation_model_lock:
-        recommendation_model_cache["artifact"] = None
-        recommendation_model_cache["source_signature"] = ""
-        recommendation_model_cache["expires_at"] = 0
-    with recommendation_profile_lock:
-        recommendation_profile_cache.clear()
-    with recommendation_feed_lock:
-        recommendation_feed_sessions.clear()
-        recommendation_feed_index.clear()
-    with search_result_cache_lock:
-        search_result_cache["recommended_artists"] = {}
+    from auralis_backend.recommend.model_runtime import invalidate_model_cache
+    from auralis_backend.recommend.profile_runtime import invalidate_profile_cache
+    from auralis_backend.recommend.session_runtime import clear_feed_sessions
+
+    invalidate_model_cache()
+    invalidate_profile_cache()
+    clear_feed_sessions(sys.modules[__name__])
+    _cache_clear_namespace(
+        search_result_cache,
+        search_result_cache_lock,
+        "recommended_artists",
+    )
 
 
 def _recommendation_store_interaction_event(req: RecommendationInteractionEventRequest):
@@ -6306,29 +6063,61 @@ def _recommendation_store_interaction_event(req: RecommendationInteractionEventR
         occurred_at=occurred_at,
         payload=payload,
     )
+    try:
+        from auralis_backend.recommend.profile_runtime import invalidate_profile_cache
+        from auralis_backend.recommend.taste_runtime import apply_interaction_feedback
+
+        apply_interaction_feedback(sys.modules[__name__], req)
+        invalidate_profile_cache()
+    except Exception:
+        pass
     _recommendation_invalidate_collaborative_cache()
+    _nearline_invalidate_user(user_scope_id)
     return True
 
 
 def _recommendation_sync_external_events(force: bool = False):
     _recommendation_init_store_db()
     if psycopg is None or not RECOMMENDATION_SYNC_DATABASE_DSN:
-        _recommendation_sync_state_set("external_last_sync_error", "")
+        _recommendation_sync_state_set("external_sync_status", "disabled")
+        _recommendation_sync_state_set("external_sync_reachable", "0")
         return {"synced": 0, "enabled": False}
 
-    connection = _recommendation_external_pg_connection()
+    _recommendation_sync_state_set("external_last_sync_attempt_at", str(time.time()))
+    if not _recommendation_should_retry_external_sync(force=force):
+        return {
+            "synced": 0,
+            "enabled": True,
+            "skipped": True,
+            "reason": "recent_external_sync_error",
+            "error": _recommendation_sync_state_get("external_last_sync_error", ""),
+            "sync_health": _recommendation_external_sync_health_snapshot(),
+        }
+
+    try:
+        connection = _recommendation_external_pg_connection()
+    except Exception as exc:
+        _recommendation_mark_external_sync_failure(str(exc))
+        return {
+            "synced": 0,
+            "enabled": True,
+            "error": str(exc)[:1000],
+            "sync_health": _recommendation_external_sync_health_snapshot(),
+        }
     if connection is None:
-        _recommendation_sync_state_set(
-            "external_last_sync_error",
-            "psycopg connection unavailable",
-        )
-        return {"synced": 0, "enabled": False}
+        _recommendation_mark_external_sync_failure("psycopg connection unavailable")
+        return {
+            "synced": 0,
+            "enabled": False,
+            "sync_health": _recommendation_external_sync_health_snapshot(),
+        }
 
     local_connection = _recommendation_store_connection()
     total_synced = 0
     last_play_ts = float(_recommendation_sync_state_get("external_play_ts", "0") or 0)
     last_library_ts = float(_recommendation_sync_state_get("external_library_ts", "0") or 0)
     last_search_ts = float(_recommendation_sync_state_get("external_search_ts", "0") or 0)
+    sync_succeeded = False
 
     try:
         with connection.cursor() as cursor:
@@ -6475,11 +6264,9 @@ def _recommendation_sync_external_events(force: bool = False):
                 local_connection.commit()
                 if len(rows) < RECOMMENDATION_SYNC_BATCH_SIZE:
                     break
+        sync_succeeded = True
     except Exception as exc:
-        _recommendation_sync_state_set(
-            "external_last_sync_error",
-            str(exc)[:1000],
-        )
+        _recommendation_mark_external_sync_failure(str(exc))
     finally:
         local_connection.close()
         connection.close()
@@ -6489,13 +6276,15 @@ def _recommendation_sync_external_events(force: bool = False):
     _recommendation_sync_state_set("external_search_ts", str(last_search_ts))
     _recommendation_sync_state_set("external_last_sync_at", str(time.time()))
     _recommendation_sync_state_set("external_last_synced_count", str(total_synced))
-    if total_synced or force:
-        _recommendation_sync_state_set("external_last_sync_error", "")
-    if total_synced or force:
+    if sync_succeeded:
+        _recommendation_mark_external_sync_success()
+    if total_synced:
         _recommendation_invalidate_collaborative_cache()
     return {
         "synced": total_synced,
         "enabled": True,
+        "success": sync_succeeded,
+        "sync_health": _recommendation_external_sync_health_snapshot(),
     }
 
 
@@ -7126,6 +6915,7 @@ def _recommendation_run_maintenance_cycle(
         "model_id": "",
         "source_signature": "",
         "experiment_evaluation": None,
+        "nearline_precompute": None,
     }
     try:
         if force_sync or bool(RECOMMENDATION_SYNC_DATABASE_DSN):
@@ -7180,6 +6970,21 @@ def _recommendation_run_maintenance_cycle(
                         "experiment_last_promoted_at",
                         str(time.time()),
                     )
+        nearline_result = _nearline_run_precompute_cycle(
+            force=bool(force_train),
+        )
+        result["nearline_precompute"] = nearline_result
+        try:
+            _recommendation_sync_state_set(
+                "nearline_last_cycle_at",
+                str(time.time()),
+            )
+            _recommendation_sync_state_set(
+                "nearline_last_cycle_status",
+                _recommendation_trim_text((nearline_result or {}).get("error")) or "success",
+            )
+        except Exception:
+            pass
         _recommendation_sync_state_set("scheduler_last_error", "")
         _recommendation_sync_state_set(
             "scheduler_last_cycle_at",
@@ -7298,210 +7103,47 @@ def run_recommendation_worker_forever():
         _recommendation_worker_heartbeat("external", "stopped")
 
 
+def _recommendation_cache_model_artifact(
+    artifact: Optional[Dict[str, Any]],
+    *,
+    source_signature: str = "",
+) -> None:
+    from auralis_backend.recommend.model_runtime import cache_model_artifact
+
+    return cache_model_artifact(
+        sys.modules[__name__],
+        artifact,
+        source_signature=source_signature,
+    )
+
+
+def _recommendation_schedule_model_refresh(*, force_sync: bool = False) -> bool:
+    from auralis_backend.recommend.model_runtime import schedule_model_refresh
+
+    return schedule_model_refresh(
+        sys.modules[__name__],
+        force_sync=force_sync,
+    )
+
+
 def _recommendation_get_collaborative_model(force_refresh: bool = False, force_sync: bool = False):
-    _recommendation_init_store_db()
-    if force_sync:
-        _recommendation_sync_external_events(force=True)
-    source_signature = _recommendation_model_source_signature()
-    try:
-        source_payload = json.loads(source_signature)
-    except Exception:
-        source_payload = {}
-    if (
-        not force_sync
-        and int(source_payload.get("event_count") or 0) <= 0
-        and RECOMMENDATION_SYNC_DATABASE_DSN
-    ):
-        _recommendation_sync_external_events(force=True)
-        source_signature = _recommendation_model_source_signature()
-    now = time.time()
-    with recommendation_model_lock:
-        cached_artifact = recommendation_model_cache.get("artifact")
-        cached_signature = recommendation_model_cache.get("source_signature") or ""
-        cached_expires_at = float(recommendation_model_cache.get("expires_at") or 0)
-        if (
-            not force_refresh
-            and cached_artifact is not None
-            and cached_signature == source_signature
-            and cached_expires_at > now
-        ):
-            return cached_artifact
+    from auralis_backend.recommend.model_runtime import get_collaborative_model
 
-    connection = _recommendation_store_connection()
-    try:
-        row = connection.execute(
-            """
-            SELECT source_signature, artifact_json
-            FROM recommendation_models
-            WHERE id = ?
-            """,
-            ["global"],
-        ).fetchone()
-    finally:
-        connection.close()
-
-    if (
-        not force_refresh
-        and row is not None
-        and (row["source_signature"] or "") == source_signature
-    ):
-        try:
-            artifact = json.loads(row["artifact_json"] or "{}")
-        except Exception:
-            artifact = None
-        if isinstance(artifact, dict):
-            with recommendation_model_lock:
-                recommendation_model_cache["artifact"] = artifact
-                recommendation_model_cache["source_signature"] = source_signature
-                recommendation_model_cache["expires_at"] = (
-                    now + RECOMMENDATION_MODEL_CACHE_TTL_SECONDS
-                )
-            return artifact
-
-    artifact = _recommendation_train_collaborative_model(source_signature)
-    _recommendation_store_collaborative_model(artifact)
-    with recommendation_model_lock:
-        recommendation_model_cache["artifact"] = artifact
-        recommendation_model_cache["source_signature"] = source_signature
-        recommendation_model_cache["expires_at"] = (
-            now + RECOMMENDATION_MODEL_CACHE_TTL_SECONDS
-        )
-    return artifact
+    return get_collaborative_model(
+        sys.modules[__name__],
+        force_refresh=force_refresh,
+        force_sync=force_sync,
+    )
 
 
 def _recommendation_build_collaborative_profile(profile, *, force_refresh: bool = False):
-    model = _recommendation_get_collaborative_model(
+    from auralis_backend.recommend.profile_runtime import build_collaborative_profile
+
+    return build_collaborative_profile(
+        sys.modules[__name__],
+        profile,
         force_refresh=force_refresh,
-        force_sync=force_refresh,
     )
-    if not isinstance(model, dict) or not model.get("ready"):
-        return {
-            "model_ready": False,
-            "reason": (model or {}).get("reason") if isinstance(model, dict) else "unavailable",
-        }
-
-    item_factors = model.get("item_factors") or {}
-    item_neighbors = model.get("item_neighbors") or {}
-    user_factors = model.get("user_factors") or {}
-    track_artists = model.get("track_artists") or {}
-    item_popularity = model.get("item_popularity") or {}
-    query_track_scores = model.get("query_track_scores") or {}
-    query_artist_scores = model.get("query_artist_scores") or {}
-    user_scope_id = _assistant_safe_scope_id(profile.get("user_scope_id") or "guest")
-    seed_track_ids = _recommendation_unique_track_ids(
-        [
-            *(profile.get("recent_track_ids") or []),
-            *(profile.get("top_track_ids") or []),
-            *(profile.get("library_track_ids") or []),
-        ],
-        16,
-    )
-    session_vector = _vector_weighted_average(
-        [
-            (item_factors.get(track_id) or [], max(1.7 - (index * 0.12), 0.45))
-            for index, track_id in enumerate(seed_track_ids[:10])
-            if item_factors.get(track_id)
-        ]
-    )
-    stored_user_vector = user_factors.get(user_scope_id) or []
-    user_vector = _vector_weighted_average(
-        [
-            (stored_user_vector, 1.4),
-            (session_vector, 1.25),
-        ]
-    ) or stored_user_vector or session_vector
-
-    known_track_ids = {
-        item
-        for item in (
-            list(profile.get("recent_track_ids") or [])
-            + list(profile.get("top_track_ids") or [])
-            + list(profile.get("library_track_ids") or [])
-            + list(profile.get("offline_track_ids") or [])
-            + list((model.get("user_positive_tracks") or {}).get(user_scope_id) or [])
-        )
-        if item
-    }
-
-    candidate_scores = {}
-    for index, track_id in enumerate(seed_track_ids[:8]):
-        decay = max(1.7 - (index * 0.14), 0.45)
-        for neighbor in (item_neighbors.get(track_id) or [])[:RECOMMENDATION_MODEL_NEIGHBOR_LIMIT]:
-            candidate_id = _recommendation_trim_text(neighbor.get("track_id"))
-            if not candidate_id or candidate_id in known_track_ids:
-                continue
-            candidate_scores[candidate_id] = candidate_scores.get(candidate_id, 0.0) + (
-                float(neighbor.get("score") or 0.0) * decay
-            )
-
-    if user_vector:
-        for track_id, item_vector in item_factors.items():
-            if track_id in known_track_ids:
-                continue
-            latent_score = max(0.0, _assistant_cosine_similarity(user_vector, item_vector))
-            if latent_score <= 0.03 and track_id not in candidate_scores:
-                continue
-            candidate_scores[track_id] = candidate_scores.get(track_id, 0.0) + (
-                latent_score * 4.2
-            ) + min(float(item_popularity.get(track_id) or 0.0) * 0.08, 0.8)
-
-    ordered_candidates = sorted(
-        candidate_scores.items(),
-        key=lambda item: item[1],
-        reverse=True,
-    )
-    artist_scores = {}
-    for track_id, score in ordered_candidates[:72]:
-        artist_key = _normalize_text(track_artists.get(track_id) or "")
-        if not artist_key:
-            continue
-        artist_scores[artist_key] = artist_scores.get(artist_key, 0.0) + float(score)
-
-    blended_queries = _recommendation_unique_strings(
-        [
-            *(profile.get("recent_queries") or []),
-            *(profile.get("taste_queries") or []),
-        ],
-        8,
-    )
-    for query in blended_queries:
-        normalized_query = _normalize_text(query)
-        for track_id, score in (query_track_scores.get(normalized_query) or {}).items():
-            if track_id in known_track_ids:
-                continue
-            candidate_scores[track_id] = candidate_scores.get(track_id, 0.0) + float(score)
-        for artist_key, score in (query_artist_scores.get(normalized_query) or {}).items():
-            if not artist_key:
-                continue
-            artist_scores[artist_key] = artist_scores.get(artist_key, 0.0) + float(score)
-
-    ordered_candidates = sorted(
-        candidate_scores.items(),
-        key=lambda item: item[1],
-        reverse=True,
-    )
-
-    return {
-        "model_ready": True,
-        "model_type": model.get("model_type"),
-        "model_id": model.get("model_id"),
-        "source_signature": model.get("source_signature"),
-        "model": model,
-        "user_vector": user_vector,
-        "neighbor_scores": {
-            track_id: round(float(score), 4)
-            for track_id, score in ordered_candidates[:128]
-        },
-        "candidate_track_ids": [track_id for track_id, _score in ordered_candidates[:72]],
-        "artist_scores": {
-            artist_key: round(float(score), 4)
-            for artist_key, score in sorted(
-                artist_scores.items(),
-                key=lambda item: item[1],
-                reverse=True,
-            )[:36]
-        },
-    }
 
 
 def _recommendation_collaborative_neighbor_tracks(track_id: str, limit: int = 12):
@@ -7520,214 +7162,35 @@ def _recommendation_collaborative_neighbor_tracks(track_id: str, limit: int = 12
 
 
 def _recommendation_collaborative_track_scores(track, profile):
-    if not isinstance(track, dict):
-        return {
-            "latent": 0.0,
-            "neighbor": 0.0,
-            "artist": 0.0,
-        }
-    collaborative = profile.get("collaborative") or {}
-    track_id = _recommendation_trim_text(track.get("id"))
-    artist_key = _normalize_text(
-        track.get("channel") or track.get("author") or track.get("artist") or ""
-    )
-    neighbor_score = float((collaborative.get("neighbor_scores") or {}).get(track_id) or 0.0)
-    artist_score = float((collaborative.get("artist_scores") or {}).get(artist_key) or 0.0)
-    latent_score = 0.0
-    user_vector = collaborative.get("user_vector") or []
-    if track_id and user_vector:
-        model = collaborative.get("model") or {}
-        if isinstance(model, dict) and model.get("ready"):
-            item_vector = (model.get("item_factors") or {}).get(track_id) or []
-            latent_score = max(0.0, _assistant_cosine_similarity(user_vector, item_vector))
-    return {
-        "latent": latent_score,
-        "neighbor": neighbor_score,
-        "artist": artist_score,
-    }
+    from auralis_backend.domain.collaborative import track_scores
+    import sys
+
+    return track_scores(sys.modules[__name__], track, profile)
 
 
 def _recommendation_profile_key(req: SearchRequest):
-    recent_snapshot_tracks = _recommendation_unique_snapshot_tracks(
-        [*(req.last_played_tracks or []), *(req.recent_track_snapshots or [])],
-        16,
-    )
-    top_snapshot_tracks = _recommendation_unique_snapshot_tracks(
-        req.top_track_snapshots,
-        16,
-    )
-    payload = {
-        "user_scope_id": _recommendation_trim_text(req.user_scope_id or "guest"),
-        "seed_id": _recommendation_trim_text(req.seed_id),
-        "seed_ids": _recommendation_unique_track_ids(req.seed_ids, 16),
-        "recent_track_ids": _recommendation_unique_track_ids(req.recent_track_ids, 16),
-        "top_track_ids": _recommendation_unique_track_ids(req.top_track_ids, 16),
-        "recent_track_snapshot_ids": [track.get("id") for track in recent_snapshot_tracks],
-        "top_track_snapshot_ids": [track.get("id") for track in top_snapshot_tracks],
-        "artist_hints": _recommendation_unique_strings(req.artist_hints, 12),
-        "album_hints": _recommendation_unique_strings(req.album_hints, 12),
-        "taste_queries": _recommendation_unique_strings(req.taste_queries, 12),
-        "recent_queries": _recommendation_unique_strings(req.recent_queries, 12),
-        "playlist_names": _recommendation_unique_strings(req.playlist_names, 12),
-        "library_track_ids": _recommendation_unique_track_ids(req.library_track_ids, 24),
-        "offline_track_ids": _recommendation_unique_track_ids(req.offline_track_ids, 24),
-        "query": _recommendation_trim_text(req.query),
-    }
-    return hashlib.sha1(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
-    ).hexdigest()
+    from auralis_backend.recommend.profile_runtime import build_profile_key
+
+    return build_profile_key(sys.modules[__name__], req)
 
 
 def _recommendation_build_profile(req: SearchRequest):
-    key = _recommendation_profile_key(req)
-    now = time.time()
-    with recommendation_profile_lock:
-        cached = recommendation_profile_cache.get(key)
-        if cached and cached["expires_at"] > now and not req.force_refresh:
-            return cached["profile"]
+    from auralis_backend.recommend.profile_runtime import build_profile
 
-    recent_track_snapshots = _recommendation_unique_snapshot_tracks(
-        [*(req.last_played_tracks or []), *(req.recent_track_snapshots or [])],
-        16,
-    )
-    top_track_snapshots = _recommendation_unique_snapshot_tracks(
-        req.top_track_snapshots,
-        16,
-    )
-    last_played_tracks = _recommendation_unique_snapshot_tracks(
-        req.last_played_tracks,
-        12,
-    )
-
-    recent_track_ids = _recommendation_unique_track_ids(
-        [
-            req.seed_id,
-            *(track.get("id") for track in recent_track_snapshots),
-            *(req.seed_ids or []),
-            *(req.recent_track_ids or []),
-        ],
-        16,
-    )
-    top_track_ids = _recommendation_unique_track_ids(
-        [
-            *(track.get("id") for track in top_track_snapshots),
-            *(req.top_track_ids or []),
-            *(req.seed_ids or []),
-            req.seed_id,
-        ],
-        16,
-    )
-    recent_queries = _recommendation_unique_strings(
-        [*(req.recent_queries or []), req.query, *(req.taste_queries or [])],
-        12,
-    )
-    snapshot_artist_hints = [
-        track.get("channel")
-        for track in [*top_track_snapshots, *recent_track_snapshots, *last_played_tracks]
-        if track.get("channel")
-    ]
-    snapshot_album_hints = [
-        track.get("album")
-        for track in [*top_track_snapshots, *recent_track_snapshots, *last_played_tracks]
-        if track.get("album")
-    ]
-    artist_hints = _recommendation_unique_strings(
-        [*(req.artist_hints or []), *snapshot_artist_hints],
-        12,
-    )
-    album_hints = _recommendation_unique_strings(
-        [*(req.album_hints or []), *snapshot_album_hints],
-        12,
-    )
-    playlist_names = _recommendation_unique_strings(req.playlist_names, 12)
-    library_track_ids = _recommendation_unique_track_ids(req.library_track_ids, 28)
-    offline_track_ids = _recommendation_unique_track_ids(req.offline_track_ids, 28)
-
-    artist_weights = {}
-    for index, track in enumerate(top_track_snapshots):
-        artist_name = _recommendation_trim_text(track.get("channel"))
-        if not artist_name:
-            continue
-        artist_weights[artist_name] = artist_weights.get(artist_name, 0.0) + max(
-            1.8 - (index * 0.14),
-            0.55,
-        )
-    for index, track in enumerate(recent_track_snapshots):
-        artist_name = _recommendation_trim_text(track.get("channel"))
-        if not artist_name:
-            continue
-        artist_weights[artist_name] = artist_weights.get(artist_name, 0.0) + max(
-            1.25 - (index * 0.1),
-            0.35,
-        )
-    ranked_artist_names = [
-        item[0]
-        for item in sorted(
-            artist_weights.items(),
-            key=lambda item: item[1],
-            reverse=True,
-        )
-    ]
-
-    top_artist_names = (ranked_artist_names + artist_hints)[:6]
-    listened_artist_names = _recommendation_unique_strings(
-        [*ranked_artist_names, *artist_hints],
-        12,
-    )
-    top_album_names = album_hints[:6]
-    repeat_intensity = min(1.0, len(top_track_ids) / 10.0)
-    novelty_tolerance = max(
-        0.25,
-        min(0.75, 0.38 + (len(recent_queries) * 0.04) + (len(artist_hints) * 0.02)),
-    )
-
-    profile = {
-        "profile_key": key,
-        "user_scope_id": _recommendation_trim_text(req.user_scope_id or "guest") or "guest",
-        "recent_track_ids": recent_track_ids,
-        "top_track_ids": top_track_ids,
-        "recent_track_snapshots": recent_track_snapshots,
-        "top_track_snapshots": top_track_snapshots,
-        "last_played_tracks": last_played_tracks,
-        "recent_queries": recent_queries,
-        "taste_queries": _recommendation_unique_strings(req.taste_queries, 12),
-        "artist_hints": artist_hints,
-        "album_hints": album_hints,
-        "playlist_names": playlist_names,
-        "library_track_ids": library_track_ids,
-        "offline_track_ids": offline_track_ids,
-        "top_artists": top_artist_names,
-        "listened_artists": listened_artist_names,
-        "top_albums": top_album_names,
-        "repeat_intensity": repeat_intensity,
-        "novelty_tolerance": novelty_tolerance,
-        "experiment_variant": _recommendation_assignment_for_user(
-            _recommendation_trim_text(req.user_scope_id or "guest") or "guest"
-        ),
-    }
-    profile["vectors"] = _recommendation_build_profile_vectors(profile)
-    profile["collaborative"] = _recommendation_build_collaborative_profile(
-        profile,
-        force_refresh=req.force_refresh,
-    )
-    with recommendation_profile_lock:
-        recommendation_profile_cache[key] = {
-            "profile": profile,
-            "expires_at": now + RECOMMENDATION_PROFILE_CACHE_TTL_SECONDS,
-        }
-    return profile
+    return build_profile(sys.modules[__name__], req)
 
 
 def _recommendation_fetch_tracks_for_ids(track_ids, limit: int = 12):
     ordered_ids = []
     seen = set()
+    lookup_cap = min(max(limit + RECOMMENDATION_TRACK_LOOKUP_EXTRA, limit), 48)
     for raw_id in track_ids or []:
         normalized_id = _recommendation_trim_text(raw_id)
         if not normalized_id or normalized_id in seen:
             continue
         seen.add(normalized_id)
         ordered_ids.append(normalized_id)
-        if len(ordered_ids) >= max(limit * 2, limit):
+        if len(ordered_ids) >= lookup_cap:
             break
 
     if not ordered_ids:
@@ -7735,7 +7198,10 @@ def _recommendation_fetch_tracks_for_ids(track_ids, limit: int = 12):
 
     futures = {}
     resolved = {}
+    deadline = time.time() + RECOMMENDATION_TRACK_FETCH_BUDGET_SECONDS
     for track_id in ordered_ids:
+        if len(resolved) >= limit:
+            break
         cached = _recommendation_cached_track(track_id)
         if cached is not None:
             resolved[track_id] = cached
@@ -7747,149 +7213,39 @@ def _recommendation_fetch_tracks_for_ids(track_ids, limit: int = 12):
 
     tracks = []
     for track_id in ordered_ids:
+        if len(tracks) >= limit:
+            break
+        if time.time() >= deadline:
+            break
         track = resolved.get(track_id)
         if track is None:
             future = futures.get(track_id)
             if future is not None:
                 try:
-                    track = future.result(timeout=8)
+                    remaining = max(deadline - time.time(), 0.0)
+                    if remaining <= 0:
+                        break
+                    track = future.result(
+                        timeout=min(
+                            RECOMMENDATION_TRACK_FETCH_PER_FUTURE_TIMEOUT_SECONDS,
+                            remaining,
+                        )
+                    )
                 except Exception:
                     track = None
         if track is None:
             continue
         tracks.append(track)
-        if len(tracks) >= limit:
-            break
+    for future in futures.values():
+        if not future.done():
+            future.cancel()
     return tracks
 
 
 def _recommendation_build_profile_vectors(profile):
-    short_term_tracks = [
-        *(profile.get("last_played_tracks") or []),
-        *(profile.get("recent_track_snapshots") or [])[:8],
-    ]
-    long_term_tracks = [
-        *(profile.get("top_track_snapshots") or [])[:10],
-    ]
+    from auralis_backend.recommend.profile_runtime import build_profile_vectors
 
-    track_items = []
-    for index, track in enumerate(short_term_tracks):
-        track_items.append(("short", index, track))
-    for index, track in enumerate(long_term_tracks):
-        track_items.append(("long", index, track))
-
-    track_embeddings = _recommendation_track_embeddings(
-        [track for _, _, track in track_items]
-    )
-
-    query_entries = []
-    for index, query in enumerate(profile.get("recent_queries") or []):
-        text = (query or "").strip()
-        if not text:
-            continue
-        key = _recommendation_text_embedding_key("query", text)
-        query_entries.append((key, text, max(1.6 - (index * 0.12), 0.5)))
-    for index, query in enumerate(profile.get("taste_queries") or []):
-        text = (query or "").strip()
-        if not text:
-            continue
-        key = _recommendation_text_embedding_key("taste", text)
-        query_entries.append((key, text, max(1.45 - (index * 0.1), 0.45)))
-    for index, artist_hint in enumerate(profile.get("artist_hints") or []):
-        artist_value = (artist_hint or "").strip()
-        if not artist_value:
-            continue
-        text = f"artist {artist_value}"
-        key = _recommendation_text_embedding_key("artist_hint", text)
-        query_entries.append((key, text, max(1.3 - (index * 0.08), 0.4)))
-    for index, album_hint in enumerate(profile.get("album_hints") or []):
-        album_value = (album_hint or "").strip()
-        if not album_value:
-            continue
-        text = f"album {album_value}"
-        key = _recommendation_text_embedding_key("album_hint", text)
-        query_entries.append((key, text, max(1.15 - (index * 0.08), 0.35)))
-    for index, playlist_name in enumerate(profile.get("playlist_names") or []):
-        playlist_value = (playlist_name or "").strip()
-        if not playlist_value:
-            continue
-        text = f"playlist {playlist_value}"
-        key = _recommendation_text_embedding_key("playlist", text)
-        query_entries.append((key, text, max(0.9 - (index * 0.06), 0.25)))
-
-    text_embeddings = _recommendation_embed_entries(
-        "text",
-        [(key, text) for key, text, _weight in query_entries],
-    )
-
-    short_term_vectors = []
-    long_term_vectors = []
-    for scope, index, track in track_items:
-        key = _recommendation_track_embedding_key(track)
-        vector = track_embeddings.get(key) or []
-        if not vector:
-            continue
-        if scope == "short":
-            short_term_vectors.append((vector, max(2.2 - (index * 0.18), 0.7)))
-        else:
-            long_term_vectors.append((vector, max(1.7 - (index * 0.1), 0.55)))
-
-    query_vectors = []
-    for key, _text, weight in query_entries:
-        vector = text_embeddings.get(key) or []
-        if not vector:
-            continue
-        query_vectors.append((vector, weight))
-
-    artist_entries = []
-    for index, artist_name in enumerate(profile.get("listened_artists") or []):
-        artist_value = (artist_name or "").strip()
-        if not artist_value:
-            continue
-        text = f"artist {artist_value}"
-        key = _recommendation_text_embedding_key("profile_artist", text)
-        artist_entries.append((key, text, max(1.8 - (index * 0.12), 0.55)))
-    artist_embeddings = _recommendation_embed_entries(
-        "text",
-        [(key, text) for key, text, _weight in artist_entries],
-    )
-    artist_vectors = []
-    for key, _text, weight in artist_entries:
-        vector = artist_embeddings.get(key) or []
-        if not vector:
-            continue
-        artist_vectors.append((vector, weight))
-
-    short_term_vector = _vector_weighted_average(short_term_vectors)
-    long_term_vector = _vector_weighted_average(long_term_vectors)
-    query_vector = _vector_weighted_average(query_vectors)
-    artist_vector = _vector_weighted_average(artist_vectors)
-    anchor_track = (
-        (profile.get("last_played_tracks") or [None])[0]
-        or (profile.get("recent_track_snapshots") or [None])[0]
-        or (profile.get("top_track_snapshots") or [None])[0]
-    )
-    anchor_vector = []
-    anchor_key = _recommendation_track_embedding_key(anchor_track)
-    if anchor_key:
-        anchor_vector = track_embeddings.get(anchor_key) or []
-    taste_vector = _vector_weighted_average(
-        [
-            (short_term_vector, 1.65),
-            (long_term_vector, 1.2),
-            (query_vector, 0.9),
-            (artist_vector, 1.15),
-        ]
-    )
-
-    return {
-        "short_term_vector": short_term_vector,
-        "long_term_vector": long_term_vector,
-        "query_vector": query_vector,
-        "artist_vector": artist_vector,
-        "anchor_vector": anchor_vector,
-        "taste_vector": taste_vector,
-    }
+    return build_profile_vectors(sys.modules[__name__], profile)
 
 
 def _recommendation_candidate(track, generator_name: str, generator_score: float, reason: str):
@@ -7909,144 +7265,69 @@ def _recommendation_candidate(track, generator_name: str, generator_score: float
 
 
 def _recommendation_vector_similarities(candidate_vector, profile):
-    vectors = profile.get("vectors") or {}
-    if not candidate_vector:
-        return {
-            "taste": 0.0,
-            "short": 0.0,
-            "long": 0.0,
-            "query": 0.0,
-            "artist": 0.0,
-            "anchor": 0.0,
-        }
-    return {
-        "taste": _assistant_cosine_similarity(candidate_vector, vectors.get("taste_vector") or []),
-        "short": _assistant_cosine_similarity(candidate_vector, vectors.get("short_term_vector") or []),
-        "long": _assistant_cosine_similarity(candidate_vector, vectors.get("long_term_vector") or []),
-        "query": _assistant_cosine_similarity(candidate_vector, vectors.get("query_vector") or []),
-        "artist": _assistant_cosine_similarity(candidate_vector, vectors.get("artist_vector") or []),
-        "anchor": _assistant_cosine_similarity(candidate_vector, vectors.get("anchor_vector") or []),
-    }
+    from auralis_backend.recommend.row_ranking import vector_similarities
+    import sys
+
+    return vector_similarities(sys.modules[__name__], candidate_vector, profile)
 
 
 def _recommendation_track_score(candidate, profile, row_kind: str, candidate_vector=None):
-    track = candidate["track"]
-    track_id = track.get("id") or ""
-    artist_text = _normalize_text(track.get("channel"))
-    album_text = _normalize_text(track.get("album"))
-    title_text = _normalize_text(track.get("title"))
-    similarities = _recommendation_vector_similarities(candidate_vector, profile)
-    collaborative_scores = _recommendation_collaborative_track_scores(track, profile)
-    experiment_variant = _recommendation_trim_text(profile.get("experiment_variant")) or "control"
-    collaborative_multiplier = 1.25 if experiment_variant == "collab_heavy" else 0.85
-    score = float(candidate.get("generator_score") or 0.0) * 0.35
-    score += (similarities["taste"] * 5.8)
-    score += (collaborative_scores["latent"] * 6.0 * collaborative_multiplier)
-    score += min(collaborative_scores["neighbor"], 5.0) * 1.2 * collaborative_multiplier
-    score += min(collaborative_scores["artist"], 6.0) * 0.22 * collaborative_multiplier
+    from auralis_backend.recommend.row_ranking import track_score
+    import sys
 
-    if track_id in profile["offline_track_ids"]:
-        score += 1.5
-    if track_id in profile["library_track_ids"]:
-        score += 0.8
-    if track_id in profile["top_track_ids"]:
-        score += 2.4
-    if track_id in profile["recent_track_ids"]:
-        score += 1.0
-
-    for index, artist_hint in enumerate(profile["artist_hints"][:6]):
-        normalized_hint = _normalize_text(artist_hint)
-        if normalized_hint and normalized_hint in artist_text:
-            score += max(1.6 - (index * 0.18), 0.55)
-
-    for index, album_hint in enumerate(profile["album_hints"][:6]):
-        normalized_hint = _normalize_text(album_hint)
-        if normalized_hint and normalized_hint in album_text:
-            score += max(1.2 - (index * 0.16), 0.4)
-
-    for index, query in enumerate(profile["recent_queries"][:4]):
-        hits = sum(
-            1
-            for token in _query_tokens(query)
-            if token in title_text or token in artist_text or token in album_text
-        )
-        if hits:
-            score += min(hits, 2) * max(0.45 - (index * 0.06), 0.12)
-
-    if row_kind == "frequently_listened":
-        score += (similarities["long"] * 4.8) + (similarities["short"] * 1.6)
-        score += 2.1 if track_id in profile["top_track_ids"] else -1.8
-    elif row_kind == "continue_listening":
-        score += (similarities["anchor"] * 4.8) + (similarities["short"] * 4.2) + (similarities["query"] * 1.6)
-        if track_id in profile["recent_track_ids"]:
-            score -= 0.6
-        score += 0.7
-    elif row_kind == "because_you_played":
-        score += (similarities["anchor"] * 6.2) + (similarities["short"] * 2.4) + (similarities["artist"] * 1.6)
-        if track_id in profile["recent_track_ids"]:
-            score -= 1.4
-        score += 0.4
-    elif row_kind == "rediscover":
-        score += (similarities["long"] * 5.6) + (similarities["artist"] * 1.8) - (similarities["short"] * 2.8)
-        if track_id in profile["top_track_ids"]:
-            score += 1.0
-        if track_id in profile["recent_track_ids"]:
-            score -= 2.4
-    elif row_kind == "deep_cuts":
-        score += (similarities["long"] * 4.8) + (similarities["artist"] * 3.2) - (similarities["short"] * 1.4)
-        if track_id in profile["top_track_ids"]:
-            score -= 1.8
-        score += 0.9
-    elif row_kind == "offline_ready":
-        score += (similarities["taste"] * 1.8) + (similarities["long"] * 1.4)
-        if track_id in profile["offline_track_ids"]:
-            score += 3.0
-        elif track_id in profile["library_track_ids"]:
-            score += 1.0
-        else:
-            score -= 2.5
-    elif row_kind == "search_rebound":
-        score += (similarities["query"] * 6.0) + (similarities["taste"] * 1.8) + 0.8
-    elif row_kind == "quiet_picks":
-        score += (similarities["query"] * 5.2) + (similarities["taste"] * 1.9) + (similarities["short"] * 0.8)
-        if any(
-            keyword in title_text or keyword in album_text
-            for keyword in ["quiet", "acoustic", "night", "calm", "soft", "ambient"]
-        ):
-            score += 1.2
-    elif row_kind == "trending_for_you":
-        score += (similarities["taste"] * 2.5) + (similarities["query"] * 1.0) + 0.4
-
-    candidate["_ml_similarities"] = {
-        name: round(value, 4) for name, value in similarities.items()
-    }
-    candidate["_ml_similarities"].update(
-        {
-            "collab_latent": round(collaborative_scores["latent"], 4),
-            "collab_neighbor": round(collaborative_scores["neighbor"], 4),
-            "collab_artist": round(collaborative_scores["artist"], 4),
-        }
+    return track_score(
+        sys.modules[__name__],
+        candidate,
+        profile,
+        row_kind,
+        candidate_vector,
     )
-
-    return score
 
 
 def _recommendation_quality_floor(row_kind: str) -> float:
-    if row_kind in {"continue_listening", "because_you_played", "quiet_picks", "trending_for_you", "listeners_like_you"}:
-        return 1.0
-    if row_kind in {"rediscover", "deep_cuts", "search_rebound"}:
-        return 1.15
-    if row_kind in {"offline_ready", "frequently_listened"}:
-        return 1.35
-    return 1.5
+    from auralis_backend.recommend.row_ranking import quality_floor
+
+    return quality_floor(row_kind)
+
+
+def _recommendation_track_signature(track) -> str:
+    if not isinstance(track, dict):
+        return ""
+    track_id = _recommendation_trim_text(
+        track.get("id")
+        or track.get("videoId")
+        or track.get("video_id")
+    )
+    if track_id:
+        return f"id:{track_id}"
+    title = _normalize_text(track.get("title") or track.get("name") or "")
+    artist = _normalize_text(
+        track.get("channel")
+        or track.get("author")
+        or track.get("artist")
+        or ""
+    )
+    album = _normalize_text(
+        track.get("album")
+        or track.get("album_title")
+        or ""
+    )
+    if not title and not artist:
+        return ""
+    return f"track:{title}|{artist}|{album}"
 
 
 def _recommendation_min_items(row_kind: str) -> int:
-    if row_kind in {"continue_listening", "because_you_played", "quiet_picks", "trending_for_you", "listeners_like_you"}:
-        return 2
-    if row_kind in {"rediscover", "deep_cuts", "search_rebound"}:
-        return 2
-    return 3
+    from auralis_backend.recommend.row_ranking import min_items
+
+    return min_items(row_kind)
+
+
+def _recommendation_is_query_derived_source(source_name: str) -> bool:
+    from auralis_backend.recommend.row_ranking import is_query_derived_source
+    import sys
+
+    return is_query_derived_source(sys.modules[__name__], source_name)
 
 
 def _recommendation_finalize_row_items(
@@ -8058,85 +7339,18 @@ def _recommendation_finalize_row_items(
     *,
     max_items: int = 18,
 ):
-    if not candidates:
-        return None
+    from auralis_backend.recommend.home_pipeline import finalize_row_items
+    import sys
 
-    candidate_embeddings = _recommendation_track_embeddings(
-        [
-            candidate.get("track")
-            for candidate in candidates
-            if isinstance(candidate, dict)
-        ]
+    return finalize_row_items(
+        server=sys.modules[__name__],
+        row_kind=row_kind,
+        title=title,
+        candidates=candidates,
+        profile=profile,
+        used_track_ids=used_track_ids,
+        max_items=max_items,
     )
-    ranked = []
-    for candidate in candidates:
-        candidate_key = _recommendation_track_embedding_key(candidate.get("track"))
-        candidate_vector = candidate_embeddings.get(candidate_key) or []
-        candidate_score = _recommendation_track_score(
-            candidate,
-            profile,
-            row_kind,
-            candidate_vector,
-        )
-        ranked.append((candidate_score, candidate))
-    ranked.sort(key=lambda item: item[0], reverse=True)
-
-    selected = []
-    artist_counts = {}
-    quality_floor = _recommendation_quality_floor(row_kind)
-    max_same_artist = 3 if row_kind in {"frequently_listened", "offline_ready", "continue_listening"} else 2
-    min_items = _recommendation_min_items(row_kind)
-
-    for candidate_score, candidate in ranked:
-        if candidate_score < quality_floor:
-            continue
-        track = dict(candidate["track"])
-        track_id = track.get("id")
-        if not track_id or track_id in used_track_ids:
-            continue
-        artist_key = _normalize_text(track.get("channel"))
-        if artist_key:
-            current_count = artist_counts.get(artist_key, 0)
-            if current_count >= max_same_artist and len(selected) + 1 < max_items:
-                continue
-            artist_counts[artist_key] = current_count + 1
-        track["generator_score"] = round(candidate_score, 3)
-        track["ml_similarities"] = candidate.get("_ml_similarities") or {}
-        selected.append(track)
-        used_track_ids.add(track_id)
-        if len(selected) >= max_items:
-            break
-
-    if len(selected) < min_items:
-        return None
-
-    incomplete_indexes = [
-        index
-        for index, track in enumerate(selected)
-        if _track_metadata_incomplete(track)
-    ]
-    if incomplete_indexes:
-        futures = {
-            index: recommendation_executor.submit(
-                _recommendation_enrich_track_metadata,
-                selected[index],
-            )
-            for index in incomplete_indexes
-        }
-        for index, future in futures.items():
-            try:
-                enriched = future.result(timeout=8)
-            except Exception:
-                enriched = None
-            if enriched is not None:
-                selected[index] = enriched
-
-    return {
-        "id": row_kind,
-        "kind": row_kind,
-        "title": title,
-        "items": selected,
-    }
 
 
 def _recommendation_candidates_from_tracks(tracks, generator_name: str, base_score: float, reason: str):
@@ -8148,1090 +7362,45 @@ def _recommendation_candidates_from_tracks(tracks, generator_name: str, base_sco
     return candidates
 
 
-def _recommendation_quiet_pick_queries(profile, base_query: str, cycle: int):
-    base = _recommendation_trim_text(base_query)
-    if not base:
-        return []
-    quiet_modifiers = [
-        "acoustic",
-        "ambient",
-        "instrumental",
-        "late night",
-        "soft vocals",
-        "sleep",
-        "focus",
-        "piano",
-        "lofi",
-        "calm evening",
-        "rainy night",
-        "soft rock",
-        "soft pop",
-    ]
-    modifier = quiet_modifiers[cycle % len(quiet_modifiers)]
-    secondary_modifier = quiet_modifiers[(cycle + 5) % len(quiet_modifiers)]
-    quiet_queries = _recommendation_unique_strings(
-        [
-            query
-            for query in [
-                *(profile.get("recent_queries") or []),
-                *(profile.get("taste_queries") or []),
-            ]
-            if any(
-                keyword in _normalize_text(query)
-                for keyword in [
-                    "quiet",
-                    "calm",
-                    "soft",
-                    "night",
-                    "sleep",
-                    "focus",
-                    "ambient",
-                    "chill",
-                ]
-            )
-        ],
-        6,
-    )
-    artist_hints = _recommendation_unique_strings(profile.get("artist_hints") or [], 6)
-    album_hints = _recommendation_unique_strings(profile.get("album_hints") or [], 4)
-    query_candidates = [
-        base,
-        f"{base} {modifier}",
-        f"{base} {secondary_modifier}",
-    ]
-    if quiet_queries:
-        query_candidates.append(quiet_queries[cycle % len(quiet_queries)])
-    if artist_hints:
-        artist_hint = artist_hints[cycle % len(artist_hints)]
-        query_candidates.append(f"{artist_hint} {modifier}")
-        query_candidates.append(f"{artist_hint} calm songs")
-    if album_hints:
-        album_hint = album_hints[cycle % len(album_hints)]
-        query_candidates.append(f"{album_hint} {modifier}")
-    return _recommendation_unique_strings(query_candidates, 6)
+def _recommendation_feed_session_key(session_id: str) -> str:
+    from auralis_backend.recommend.session_runtime import feed_session_key
 
+    return feed_session_key(sys.modules[__name__], session_id)
 
-def _recommendation_should_extend_row(row, offset: int, page_size: int) -> bool:
-    if not isinstance(row, dict):
-        return False
-    if row.get("kind") != "quiet_picks" or not row.get("can_extend"):
-        return False
-    total_items = len(row.get("items") or [])
-    if total_items <= 0:
-        return False
-    requested_end = max(int(offset or 0), 0) + max(1, min(page_size, 12))
-    return requested_end >= max(total_items - page_size, 0)
 
+def _recommendation_store_feed_session(session: Dict[str, Any]) -> None:
+    from auralis_backend.recommend.session_runtime import store_feed_session
 
-def _recommendation_extend_quiet_picks_row(row, profile, *, page_size: int = 10):
-    if not isinstance(row, dict):
-        return row
-    extended_row = dict(row)
-    if extended_row.get("kind") != "quiet_picks":
-        return extended_row
-    base_query = _recommendation_trim_text(extended_row.get("base_query"))
-    if not base_query:
-        extended_row["can_extend"] = False
-        return extended_row
+    return store_feed_session(sys.modules[__name__], session)
 
-    existing_items = list(extended_row.get("items") or [])
-    existing_ids = {
-        _recommendation_trim_text(track.get("id"))
-        for track in existing_items
-        if isinstance(track, dict)
-    }
-    existing_ids.discard("")
 
-    extension_cycle = max(int(extended_row.get("extension_cycle") or 0), 0)
-    target_new_items = max(page_size * 2, 12)
-    collected_new_items = []
-    max_cycles = extension_cycle + 4
-    current_cycle = extension_cycle
+def _recommendation_load_feed_session(session_id: str) -> Optional[Dict[str, Any]]:
+    from auralis_backend.recommend.session_runtime import load_feed_session
 
-    while len(collected_new_items) < target_new_items and current_cycle < max_cycles:
-        quiet_queries = _recommendation_quiet_pick_queries(profile, base_query, current_cycle)
-        candidate_pool = []
-        for query_index, quiet_query in enumerate(quiet_queries):
-            try:
-                tracks = _assistant_tool_search_tracks(quiet_query, 24)
-            except Exception:
-                tracks = []
-            if not tracks:
-                continue
-            candidate_pool.extend(
-                _recommendation_candidates_from_tracks(
-                    tracks,
-                    "quiet_picks_extend",
-                    max(3.1 - (query_index * 0.12), 2.35),
-                    f"Extended around {quiet_query}.",
-                )
-            )
-        if candidate_pool:
-            finalized = _recommendation_finalize_row_items(
-                "quiet_picks",
-                extended_row.get("title") or "Quiet picks",
-                candidate_pool,
-                profile,
-                set(existing_ids),
-                max_items=max(page_size + 4, 12),
-            )
-            for track in (finalized or {}).get("items") or []:
-                track_id = _recommendation_trim_text(track.get("id"))
-                if not track_id or track_id in existing_ids:
-                    continue
-                existing_ids.add(track_id)
-                collected_new_items.append(track)
-                if len(collected_new_items) >= target_new_items:
-                    break
-        current_cycle += 1
-
-    extended_row["extension_cycle"] = current_cycle
-    if collected_new_items:
-        extended_row["items"] = existing_items + collected_new_items
-        extended_row["can_extend"] = True
-    else:
-        extended_row["can_extend"] = False
-    return extended_row
-
-
-def _recommendation_anchor_query(track: Optional[Dict[str, Any]], *, include_album: bool = False) -> str:
-    if not isinstance(track, dict):
-        return ""
-    parts = [
-        _recommendation_trim_text(track.get("title")),
-        _recommendation_trim_text(track.get("channel") or track.get("author") or track.get("artist")),
-    ]
-    if include_album:
-        parts.append(_recommendation_trim_text(track.get("album")))
-    return " ".join([part for part in parts if part]).strip()
-
-
-def _recommendation_album_candidates_for_track(track: Optional[Dict[str, Any]], *, limit: int = 2):
-    if not isinstance(track, dict):
-        return []
-
-    albums = []
-    seen = set()
-
-    def add_album(raw_album: Optional[Dict[str, Any]]):
-        if not isinstance(raw_album, dict):
-            return
-        album_id = _recommendation_trim_text(raw_album.get("id"))
-        title = _recommendation_trim_text(raw_album.get("title"))
-        artist = _recommendation_trim_text(raw_album.get("artist"))
-        key = album_id or f"{_normalize_text(title)}|{_normalize_text(artist)}"
-        if not key or key in seen:
-            return
-        seen.add(key)
-        albums.append(raw_album)
-
-    album_id = _recommendation_trim_text(track.get("album_id"))
-    album_title = _recommendation_trim_text(track.get("album"))
-    if album_id:
-        add_album(
-            {
-                "id": album_id,
-                "title": album_title or "Unknown Album",
-                "artist": track.get("channel") or track.get("artist"),
-                "thumbnail": track.get("thumbnail"),
-            }
-        )
-    elif album_title:
-        add_album(
-            {
-                "id": None,
-                "title": album_title,
-                "artist": track.get("channel") or track.get("artist"),
-                "thumbnail": track.get("thumbnail"),
-            }
-        )
-
-    search_query = _recommendation_anchor_query(track, include_album=True)
-    if search_query:
-        for album in _assistant_tool_search_albums(search_query, max(limit * 2, 4)):
-            add_album(album)
-            if len(albums) >= limit:
-                break
-
-    return albums[:limit]
-
-
-def _recommendation_candidate_sources_for_track(track: Optional[Dict[str, Any]]):
-    if not isinstance(track, dict):
-        return []
-
-    track_id = _recommendation_trim_text(track.get("id"))
-    anchor_query = _recommendation_anchor_query(track)
-    artist_name = _recommendation_trim_text(
-        track.get("channel") or track.get("author") or track.get("artist")
-    )
-    futures = {}
-
-    if track_id:
-        futures["similar"] = recommendation_executor.submit(
-            _assistant_tool_get_similar_tracks,
-            track.get("id"),
-            12,
-        )
-        futures["collaborative"] = recommendation_executor.submit(
-            _recommendation_collaborative_neighbor_tracks,
-            track_id,
-            10,
-        )
-
-    if artist_name:
-        futures["artist_seed"] = recommendation_executor.submit(
-            _search_artist_seed_tracks,
-            artist_name,
-            8,
-        )
-
-    if anchor_query:
-        futures["search_context"] = recommendation_executor.submit(
-            _assistant_tool_search_tracks,
-            anchor_query,
-            10,
-        )
-
-    def fetch_album_context():
-        album_tracks = []
-        for album in _recommendation_album_candidates_for_track(track, limit=2):
-            album_id = _recommendation_trim_text(album.get("id"))
-            if not album_id:
-                continue
-            album_details = _assistant_tool_get_album_details(album_id)
-            album_tracks.extend(album_details.get("tracks") or [])
-        return album_tracks
-
-    futures["album_context"] = recommendation_executor.submit(fetch_album_context)
-
-    source_results = {
-        "similar": [],
-        "collaborative": [],
-        "artist_seed": [],
-        "search_context": [],
-        "album_context": [],
-    }
-    for source_name, future in futures.items():
-        try:
-            source_results[source_name] = future.result(timeout=12) or []
-        except Exception:
-            source_results[source_name] = []
-
-    return [
-        ("similar", source_results["similar"], 4.8),
-        ("collaborative", source_results["collaborative"], 4.6),
-        ("artist_seed", source_results["artist_seed"], 3.7),
-        ("album_context", source_results["album_context"], 3.5),
-        ("search_context", source_results["search_context"], 3.2),
-    ]
-
-
-def _recommendation_continue_listening_row(profile):
-    anchor_tracks = []
-    seen_anchor_ids = set()
-    for track in [
-        *(profile.get("last_played_tracks") or []),
-        *(profile.get("recent_track_snapshots") or []),
-    ]:
-        track_id = _recommendation_trim_text(track.get("id"))
-        if not track_id or track_id in seen_anchor_ids:
-            continue
-        seen_anchor_ids.add(track_id)
-        anchor_tracks.append(track)
-        if len(anchor_tracks) >= 3:
-            break
-
-    if not anchor_tracks:
-        return None
-
-    candidates = []
-    for index, anchor_track in enumerate(anchor_tracks):
-        anchor_title = anchor_track.get("title") or "that song"
-        for source_name, source_tracks, base_score in _recommendation_candidate_sources_for_track(anchor_track):
-            candidates.extend(
-                _recommendation_candidates_from_tracks(
-                    source_tracks,
-                    f"continue_listening:{source_name}",
-                    base_score - (index * 0.22),
-                    f"Continues from {anchor_title}.",
-                )
-            )
-
-    if not candidates:
-        return None
-
-    return {
-        "title": "Continue the vibe",
-        "kind": "continue_listening",
-        "candidates": candidates,
-    }
-
-
-def _recommendation_because_you_played_row(profile):
-    anchor_track = (
-        (profile.get("last_played_tracks") or [None])[0]
-        or (profile.get("recent_track_snapshots") or [None])[0]
-    )
-    anchor_ids = profile["recent_track_ids"][:2] or profile["top_track_ids"][:2]
-    if not anchor_track and not anchor_ids:
-        return None
-    anchor_id = (anchor_track or {}).get("id") or anchor_ids[0]
-    if anchor_track:
-        anchor_title = anchor_track.get("title") or "that song"
-        anchor_artist = anchor_track.get("channel") or ""
-    else:
-        fetched_anchor = _recommendation_fetch_tracks_for_ids([anchor_id], limit=1)
-        anchor_title = fetched_anchor[0]["title"] if fetched_anchor else "that song"
-        anchor_artist = fetched_anchor[0]["channel"] if fetched_anchor else ""
-    title = (
-        f"Because you played {anchor_artist}"
-        if anchor_artist
-        else f"Because you played {anchor_title}"
-    )
-    candidates = []
-    anchor_track_payload = anchor_track or {
-        "id": anchor_id,
-        "title": anchor_title,
-        "channel": anchor_artist,
-        "author": anchor_artist,
-        "artist": anchor_artist,
-    }
-    for source_name, source_tracks, base_score in _recommendation_candidate_sources_for_track(anchor_track_payload):
-        candidates.extend(
-            _recommendation_candidates_from_tracks(
-                source_tracks,
-                f"because_you_played:{source_name}",
-                base_score,
-                f"Shaped from {anchor_title}.",
-            )
-        )
-    return {
-        "title": title,
-        "kind": "because_you_played",
-        "candidates": candidates,
-    }
-
-
-def _recommendation_listeners_like_you_row(profile):
-    collaborative = profile.get("collaborative") or {}
-    candidate_track_ids = collaborative.get("candidate_track_ids") or []
-    if not candidate_track_ids:
-        return None
-    tracks = _recommendation_fetch_tracks_for_ids(candidate_track_ids, limit=18)
-    if not tracks:
-        return None
-    return {
-        "title": "Listeners like you also played",
-        "kind": "listeners_like_you",
-        "candidates": _recommendation_candidates_from_tracks(
-            tracks,
-            "collaborative",
-            5.0,
-            "Learned from collaborative listening patterns and your recent taste.",
-        ),
-    }
-
-
-def _recommendation_frequently_listened_row(profile):
-    tracks = [dict(track) for track in (profile.get("top_track_snapshots") or [])]
-    seen_ids = {
-        track.get("id")
-        for track in tracks
-        if track.get("id")
-    }
-    missing_ids = [
-        track_id
-        for track_id in profile["top_track_ids"]
-        if track_id not in seen_ids
-    ]
-    if len(tracks) < 18 and missing_ids:
-        tracks.extend(
-            _recommendation_fetch_tracks_for_ids(
-                missing_ids,
-                limit=max(0, 18 - len(tracks)),
-            )
-        )
-    if not tracks:
-        return None
-    return {
-        "title": "Frequently listened",
-        "kind": "frequently_listened",
-        "candidates": _recommendation_candidates_from_tracks(
-            tracks,
-            "frequently_listened",
-            5.2,
-            "You keep coming back to this one.",
-        ),
-    }
-
-
-def _recommendation_rediscover_row(profile):
-    older_ids = [
-        track_id
-        for track_id in profile["top_track_ids"]
-        if track_id not in profile["recent_track_ids"]
-    ]
-    tracks = _recommendation_fetch_tracks_for_ids(older_ids, limit=14)
-    candidates = _recommendation_candidates_from_tracks(
-        tracks,
-        "rediscovery",
-        4.1,
-        "A favorite worth bringing back.",
-    )
-
-    if len(candidates) < 6:
-        seen_ids = {
-            _recommendation_trim_text((candidate.get("track") or {}).get("id"))
-            for candidate in candidates
-        }
-        for track in (profile.get("top_track_snapshots") or []) + (profile.get("last_played_tracks") or []):
-            track_id = _recommendation_trim_text(track.get("id"))
-            if not track_id or track_id in profile["recent_track_ids"]:
-                continue
-            if track_id not in seen_ids:
-                candidates.extend(
-                    _recommendation_candidates_from_tracks(
-                        [track],
-                        "rediscovery:history",
-                        3.7,
-                        "A favorite worth bringing back.",
-                    )
-                )
-                seen_ids.add(track_id)
-            for source_name, source_tracks, base_score in _recommendation_candidate_sources_for_track(track):
-                filtered_tracks = [
-                    source_track
-                    for source_track in source_tracks
-                    if _recommendation_trim_text(source_track.get("id")) not in profile["recent_track_ids"]
-                ]
-                candidates.extend(
-                    _recommendation_candidates_from_tracks(
-                        filtered_tracks,
-                        f"rediscovery:{source_name}",
-                        max(base_score - 0.35, 2.6),
-                        "A favorite worth bringing back.",
-                    )
-                )
-            if len(candidates) >= 12:
-                break
-
-    if not candidates and profile["top_track_ids"]:
-        fallback_tracks = _recommendation_fetch_tracks_for_ids(profile["top_track_ids"], limit=10)
-        candidates = _recommendation_candidates_from_tracks(
-            fallback_tracks,
-            "rediscovery:fallback",
-            3.4,
-            "A favorite worth bringing back.",
-        )
-    if not candidates:
-        return None
-    return {
-        "title": "Rediscover these",
-        "kind": "rediscover",
-        "candidates": candidates,
-    }
-
-
-def _recommendation_deep_cuts_row(profile):
-    candidates = []
-    for artist_hint in profile["top_artists"][:3]:
-        artists = _assistant_tool_search_artists(artist_hint, 2)
-        if not artists:
-            continue
-        artist_id = artists[0].get("id")
-        if not artist_id:
-            continue
-        try:
-            artist_payload = _build_artist_details_payload(artist_id)
-        except Exception:
-            artist_payload = {}
-        album_ids = [
-            album.get("id")
-            for album in artist_payload.get("albums", [])[1:5]
-            if album.get("id")
-        ]
-        deep_cut_tracks = []
-        for album_id in album_ids:
-            details = _assistant_tool_get_album_details(album_id)
-            deep_cut_tracks.extend(details.get("tracks") or [])
-        if not deep_cut_tracks:
-            deep_cut_tracks = _assistant_tool_search_tracks(f"{artist_hint} album tracks", 14)
-        if len(deep_cut_tracks) < 6:
-            deep_cut_tracks.extend(_search_artist_seed_tracks(artist_hint, 8))
-        candidates.extend(
-            _recommendation_candidates_from_tracks(
-                deep_cut_tracks,
-                "deep_cuts",
-                3.6,
-                f"Pulled from deeper {artist_hint} territory.",
-            )
-        )
-    if not candidates:
-        return None
-    return {
-        "title": "Deep cuts for you",
-        "kind": "deep_cuts",
-        "candidates": candidates,
-    }
-
-
-def _recommendation_offline_ready_row(profile):
-    track_ids = profile["offline_track_ids"] or profile["library_track_ids"]
-    tracks = _recommendation_fetch_tracks_for_ids(track_ids, limit=18)
-    if not tracks:
-        return None
-    return {
-        "title": "Ready offline",
-        "kind": "offline_ready",
-        "candidates": _recommendation_candidates_from_tracks(
-            tracks,
-            "offline_ready",
-            4.8,
-            "Ready even when you go offline.",
-        ),
-    }
-
-
-def _recommendation_search_rebound_row(profile):
-    candidates = []
-    for query in profile["recent_queries"][:3]:
-        tracks = _assistant_tool_search_tracks(query, 10)
-        candidates.extend(
-            _recommendation_candidates_from_tracks(
-                tracks,
-                "search_rebound",
-                3.9,
-                f"Following up on your search for {query}.",
-            )
-        )
-    if not candidates:
-        return None
-    return {
-        "title": "Search-inspired picks",
-        "kind": "search_rebound",
-        "candidates": candidates,
-    }
-
-
-def _recommendation_quiet_picks_row(profile):
-    quiet_query = next(
-        (
-            query
-            for query in profile["recent_queries"] + profile["taste_queries"]
-            if any(keyword in _normalize_text(query) for keyword in ["quiet", "calm", "soft", "night", "sleep", "focus", "ambient", "chill"])
-        ),
-        None,
-    )
-    if quiet_query is None:
-        return None
-    tracks = _assistant_tool_search_tracks(quiet_query, 72)
-    if not tracks:
-        return None
-    return {
-        "title": "Quiet picks",
-        "kind": "quiet_picks",
-        "quiet_query": quiet_query,
-        "candidates": _recommendation_candidates_from_tracks(
-            tracks,
-            "quiet_picks",
-            3.4,
-            f"Built around {quiet_query}.",
-        ),
-    }
-
-
-def _recommendation_recommended_albums_row(profile):
-    albums = []
-    seen = set()
-
-    def add_album(raw_album, base_score: float):
-        if not isinstance(raw_album, dict):
-            return
-        album_id = _recommendation_trim_text(raw_album.get("id"))
-        title = _recommendation_trim_text(raw_album.get("title"))
-        artist = _recommendation_trim_text(raw_album.get("artist"))
-        key = album_id or f"{_normalize_text(title)}|{_normalize_text(artist)}"
-        if not key or key in seen:
-            return
-        seen.add(key)
-        albums.append(
-            {
-                "id": album_id or None,
-                "title": title or "Unknown Album",
-                "artist": artist or "Unknown Artist",
-                "thumbnail": raw_album.get("thumbnail"),
-                "year": raw_album.get("year") or "",
-                "track_count": raw_album.get("track_count") or raw_album.get("trackCount") or 0,
-                "generator_score": round(base_score, 3),
-            }
-        )
-
-    for index, album_hint in enumerate(profile.get("top_albums") or []):
-        for offset, album in enumerate(_assistant_tool_search_albums(album_hint, 5)):
-            add_album(album, 4.2 - (index * 0.28) - (offset * 0.16))
-            if len(albums) >= 18:
-                break
-        if len(albums) >= 18:
-            break
-
-    if len(albums) < 12:
-        album_queries = []
-        for query in (profile.get("recent_queries") or []) + (profile.get("taste_queries") or []):
-            normalized_query = _recommendation_trim_text(query)
-            if not normalized_query:
-                continue
-            if normalized_query in album_queries:
-                continue
-            album_queries.append(normalized_query)
-            if len(album_queries) >= 4:
-                break
-        for index, album_query in enumerate(album_queries):
-            for offset, album in enumerate(_assistant_tool_search_albums(album_query, 4)):
-                add_album(album, 3.95 - (index * 0.24) - (offset * 0.14))
-                if len(albums) >= 18:
-                    break
-            if len(albums) >= 18:
-                break
-
-    for index, artist_hint in enumerate(profile.get("top_artists") or []):
-        direct_artists = _assistant_tool_search_artists_direct(artist_hint, 1)
-        if direct_artists:
-            artist_id = _recommendation_trim_text(direct_artists[0].get("id"))
-            if artist_id:
-                try:
-                    artist_payload = _build_artist_details_payload(artist_id)
-                except Exception:
-                    artist_payload = {}
-                for offset, album in enumerate(artist_payload.get("albums") or []):
-                    add_album(album, 4.0 - (index * 0.22) - (offset * 0.18))
-                    if len(albums) >= 18:
-                        break
-        if len(albums) < 12:
-            for offset, album in enumerate(_assistant_tool_search_albums(f"{artist_hint} album", 4)):
-                add_album(album, 3.6 - (index * 0.18) - (offset * 0.14))
-                if len(albums) >= 18:
-                    break
-        if len(albums) >= 18:
-            break
-
-    if len(albums) < 12:
-        snapshot_tracks = [
-            *(profile.get("last_played_tracks") or []),
-            *(profile.get("top_track_snapshots") or []),
-            *(profile.get("recent_track_snapshots") or []),
-        ]
-        for index, track in enumerate(snapshot_tracks):
-            album_title = _recommendation_trim_text(track.get("album"))
-            if not album_title:
-                continue
-            add_album(
-                {
-                    "id": track.get("album_id"),
-                    "title": album_title,
-                    "artist": track.get("channel"),
-                    "thumbnail": track.get("thumbnail"),
-                },
-                3.2 - (index * 0.12),
-            )
-            if len(albums) >= 18:
-                break
-
-    if len(albums) < 1:
-        return None
-
-    album_embeddings = _recommendation_album_embeddings(albums)
-    vectors = profile.get("vectors") or {}
-    top_album_names = {
-        _normalize_text(name)
-        for name in (profile.get("top_albums") or [])
-        if _normalize_text(name)
-    }
-    top_artist_names = {
-        _normalize_text(name)
-        for name in (profile.get("top_artists") or [])
-        if _normalize_text(name)
-    }
-    for album in albums:
-        album_key = _recommendation_album_embedding_key(album)
-        album_vector = album_embeddings.get(album_key) or []
-        similarities = {
-            "taste": _assistant_cosine_similarity(
-                album_vector,
-                vectors.get("taste_vector") or [],
-            ),
-            "artist": _assistant_cosine_similarity(
-                album_vector,
-                vectors.get("artist_vector") or [],
-            ),
-            "query": _assistant_cosine_similarity(
-                album_vector,
-                vectors.get("query_vector") or [],
-            ),
-            "long": _assistant_cosine_similarity(
-                album_vector,
-                vectors.get("long_term_vector") or [],
-            ),
-        }
-        ranking_score = (
-            (float(album.get("generator_score") or 0.0) * 0.45)
-            + (similarities["taste"] * 4.8)
-            + (similarities["artist"] * 3.6)
-            + (similarities["query"] * 1.5)
-            + (similarities["long"] * 1.4)
-        )
-        if _normalize_text(album.get("title") or "") in top_album_names:
-            ranking_score += 0.8
-        if _normalize_text(album.get("artist") or "") in top_artist_names:
-            ranking_score += 0.6
-        album["generator_score"] = round(ranking_score, 3)
-        album["ml_similarities"] = {
-            name: round(value, 4)
-            for name, value in similarities.items()
-        }
-
-    albums.sort(key=lambda item: item.get("generator_score", 0), reverse=True)
-    return {
-        "title": "Recommended albums",
-        "kind": "recommended_albums",
-        "item_type": "album",
-        "items": albums[:18],
-    }
-
-
-def _recommendation_trending_row(profile):
-    candidates = []
-    for track, base_score in _fallback_home_candidates(24):
-        candidate = _recommendation_candidate(
-            track,
-            "trending_for_you",
-            2.2 + float(base_score),
-            "Trending, filtered through your taste.",
-        )
-        if candidate is not None:
-            candidates.append(candidate)
-    if not candidates:
-        return None
-    return {
-        "title": "Trending for you",
-        "kind": "trending_for_you",
-        "candidates": candidates,
-    }
-
-
-def _recommendation_build_rows(profile):
-    rows = []
-    used_track_ids = set()
-    generator_timings = {}
-    row_diagnostics = {}
-
-    row_builders = [
-        _recommendation_continue_listening_row,
-        _recommendation_because_you_played_row,
-        _recommendation_listeners_like_you_row,
-        _recommendation_frequently_listened_row,
-        _recommendation_rediscover_row,
-        _recommendation_recommended_albums_row,
-        _recommendation_deep_cuts_row,
-        _recommendation_offline_ready_row,
-        _recommendation_search_rebound_row,
-        _recommendation_trending_row,
-        _recommendation_quiet_picks_row,
-    ]
-
-    for builder in row_builders:
-        started_at = time.perf_counter()
-        row_seed = builder(profile)
-        builder_ms = int((time.perf_counter() - started_at) * 1000)
-        generator_timings[builder.__name__] = builder_ms
-        row_kind = (row_seed or {}).get("kind") or builder.__name__.replace("_recommendation_", "").replace("_row", "")
-        row_diagnostics[row_kind] = {
-            "builder": builder.__name__,
-            "builder_ms": builder_ms,
-            "status": "empty",
-        }
-        if not row_seed:
-            continue
-        if row_seed.get("item_type") == "album":
-            item_count = len(row_seed.get("items") or [])
-            rows.append(
-                {
-                    "id": row_seed["kind"],
-                    "kind": row_seed["kind"],
-                    "title": row_seed["title"],
-                    "item_type": "album",
-                    "items": list(row_seed.get("items") or [])[:18],
-                }
-            )
-            row_diagnostics[row_seed["kind"]] = {
-                "builder": builder.__name__,
-                "builder_ms": builder_ms,
-                "status": "emitted" if item_count > 0 else "empty",
-                "item_count": min(item_count, 18),
-            }
-            continue
-        candidate_count = len(row_seed.get("candidates") or [])
-        row_diagnostics[row_seed["kind"]] = {
-            "builder": builder.__name__,
-            "builder_ms": builder_ms,
-            "status": "seeded",
-            "candidate_count": candidate_count,
-        }
-        max_items = 72 if row_seed["kind"] == "quiet_picks" else 18
-        finalized = _recommendation_finalize_row_items(
-            row_seed["kind"],
-            row_seed["title"],
-            row_seed["candidates"],
-            profile,
-            used_track_ids,
-            max_items=max_items,
-        )
-        if finalized is not None:
-            if row_seed["kind"] == "quiet_picks":
-                finalized["base_query"] = _recommendation_trim_text(
-                    row_seed.get("quiet_query")
-                )
-                finalized["extension_cycle"] = 0
-                finalized["can_extend"] = True
-            rows.append(finalized)
-            row_diagnostics[row_seed["kind"]] = {
-                "builder": builder.__name__,
-                "builder_ms": builder_ms,
-                "status": "emitted",
-                "candidate_count": candidate_count,
-                "item_count": len(finalized.get("items") or []),
-            }
-        else:
-            row_diagnostics[row_seed["kind"]] = {
-                "builder": builder.__name__,
-                "builder_ms": builder_ms,
-                "status": "filtered_out",
-                "candidate_count": candidate_count,
-            }
-
-    return rows, generator_timings, row_diagnostics
-
+    return load_feed_session(sys.modules[__name__], session_id)
 
 def _recommendation_prune_feed_cache():
-    now = time.time()
-    with recommendation_feed_lock:
-        expired_session_ids = [
-            session_id
-            for session_id, payload in recommendation_feed_sessions.items()
-            if payload.get("expires_at", 0) <= now
-        ]
-        for session_id in expired_session_ids:
-            recommendation_feed_sessions.pop(session_id, None)
-        expired_profile_keys = [
-            key
-            for key, payload in recommendation_feed_index.items()
-            if payload.get("expires_at", 0) <= now
-        ]
-        for key in expired_profile_keys:
-            recommendation_feed_index.pop(key, None)
+    from auralis_backend.recommend.session_runtime import prune_feed_cache
+
+    return prune_feed_cache(sys.modules[__name__])
 
 
-def _recommendation_row_slice(row, offset: int, page_size: int):
-    items = list(row.get("items") or [])
-    bounded_offset = max(int(offset or 0), 0)
-    page_limit = max(1, min(page_size, 12))
-    visible = items[bounded_offset: bounded_offset + page_limit]
-    next_offset = bounded_offset + len(visible)
-    can_extend = row.get("kind") == "quiet_picks" and bool(row.get("can_extend"))
-    return {
-        "id": row["id"],
-        "title": row["title"],
-        "kind": row["kind"],
-        "item_type": row.get("item_type") or "track",
-        "items": visible,
-        "next_offset": next_offset,
-        "has_more": next_offset < len(items) or can_extend,
-    }
-
-
-def _recommendation_build_session(req: SearchRequest):
-    _recommendation_prune_feed_cache()
-    started_at = time.perf_counter()
-    profile_started_at = time.perf_counter()
-    profile = _recommendation_build_profile(req)
-    profile_ms = int((time.perf_counter() - profile_started_at) * 1000)
-    profile_key = profile["profile_key"]
-
-    if not req.force_refresh:
-        with recommendation_feed_lock:
-            cached = recommendation_feed_index.get(profile_key)
-            if cached and cached.get("expires_at", 0) > time.time():
-                session = recommendation_feed_sessions.get(cached["session_id"])
-                if session is not None:
-                    session["diagnostics"]["cache_hit"] = True
-                    return session
-
-    row_started_at = time.perf_counter()
-    rows, generator_timings, row_diagnostics = _recommendation_build_rows(profile)
-    row_ms = int((time.perf_counter() - row_started_at) * 1000)
-    session_id = str(uuid.uuid4())
-    now = time.time()
-    session = {
-        "session_id": session_id,
-        "user_scope_id": profile["user_scope_id"],
-        "profile_key": profile_key,
-        "profile": profile,
-        "generated_at": now,
-        "expires_at": now + RECOMMENDATION_FEED_SESSION_TTL_SECONDS,
-        "rows": rows,
-        "diagnostics": {
-            "cache_hit": False,
-            "ranking_backend": "embedding_profile",
-            "embedding_backend": ASSISTANT_EMBED_BACKEND,
-            "collaborative_model_ready": bool((profile.get("collaborative") or {}).get("model_ready")),
-            "collaborative_model_type": (profile.get("collaborative") or {}).get("model_type") or "",
-            "collaborative_model_id": (profile.get("collaborative") or {}).get("model_id") or "",
-            "experiment_key": RECOMMENDATION_EXPERIMENT_KEY,
-            "experiment_variant": profile.get("experiment_variant") or "control",
-            "active_promotion_variant": (_recommendation_active_promotion() or {}).get("promoted_variant") or "",
-            "external_worker_expected": RECOMMENDATION_EXTERNAL_WORKER,
-            "sync_dsn_configured": bool(RECOMMENDATION_SYNC_DATABASE_DSN),
-            "scheduler_enabled": RECOMMENDATION_ENABLE_SCHEDULER,
-            "profile_build_ms": profile_ms,
-            "row_assembly_ms": row_ms,
-            "generator_timings_ms": generator_timings,
-            "row_status": row_diagnostics,
-            "row_order": [row["id"] for row in rows],
-            "row_item_counts": {row["id"]: len(row.get("items") or []) for row in rows},
-            "profile_key": profile_key,
-            "total_build_ms": int((time.perf_counter() - started_at) * 1000),
-        },
-    }
-    with recommendation_feed_lock:
-        recommendation_feed_sessions[session_id] = session
-        recommendation_feed_index[profile_key] = {
-            "session_id": session_id,
-            "expires_at": session["expires_at"],
-        }
-    _recommendation_record_impressions(session, rows)
-    return session
-
-
-def _recommendation_feed_response(session):
-    initial_rows = [
-        _recommendation_row_slice(row, 0, RECOMMENDATION_ROW_PAGE_SIZE)
-        for row in session.get("rows") or []
-    ]
-    flatten_priority = {
-        "continue_listening": 0,
-        "because_you_played": 1,
-        "listeners_like_you": 2,
-        "search_rebound": 3,
-        "rediscover": 4,
-        "deep_cuts": 5,
-        "offline_ready": 6,
-        "trending_for_you": 7,
-        "quiet_picks": 8,
-        "frequently_listened": 9,
-    }
-    flattened = []
-    for row in sorted(
-        initial_rows,
-        key=lambda item: flatten_priority.get(item.get("kind"), 50),
-    ):
-        flattened.extend(row.get("items") or [])
-        if len(flattened) >= 18:
-            break
-    return {
-        "status": "success",
-        "session_id": session["session_id"],
-        "generated_at": session["generated_at"],
-        "expires_at": session["expires_at"],
-        "rows": initial_rows,
-        "recommendations": flattened[:18],
-        "has_more": any(row["has_more"] for row in initial_rows),
-        "next_offset": sum(len(row.get("items") or []) for row in initial_rows),
-        "diagnostics": session.get("diagnostics") or {},
-    }
-
-
-def _recommendation_row_page_response(req: SearchRequest):
-    _recommendation_prune_feed_cache()
-    session_id = _recommendation_trim_text(req.session_id)
-    row_id = _recommendation_trim_text(req.row_id)
-    if not session_id or not row_id:
-        raise HTTPException(status_code=400, detail="session_id and row_id are required")
-    with recommendation_feed_lock:
-        session = recommendation_feed_sessions.get(session_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail="Recommendation session expired")
-    if session.get("user_scope_id") != _recommendation_trim_text(req.user_scope_id or "guest"):
-        raise HTTPException(status_code=403, detail="Recommendation session scope mismatch")
-    stored_rows = list(session.get("rows") or [])
-    for index, row in enumerate(stored_rows):
-        if row.get("id") == row_id:
-            target_row = row
-            if _recommendation_should_extend_row(
-                target_row,
-                req.offset,
-                req.limit or RECOMMENDATION_ROW_PAGE_SIZE,
-            ):
-                extended_row = _recommendation_extend_quiet_picks_row(
-                    target_row,
-                    session.get("profile") or {},
-                    page_size=max(req.limit or RECOMMENDATION_ROW_PAGE_SIZE, 10),
-                )
-                stored_rows[index] = extended_row
-                session["rows"] = stored_rows
-                with recommendation_feed_lock:
-                    recommendation_feed_sessions[session_id] = session
-                target_row = extended_row
-            sliced = _recommendation_row_slice(
-                target_row,
-                req.offset,
-                req.limit or RECOMMENDATION_ROW_PAGE_SIZE,
-            )
-            return {
-                "status": "success",
-                "session_id": session["session_id"],
-                "generated_at": session["generated_at"],
-                "expires_at": session["expires_at"],
-                "row": sliced,
-                "diagnostics": session.get("diagnostics") or {},
-            }
-    raise HTTPException(status_code=404, detail="Recommendation row not found")
-
-@app.post("/recommend")
 def get_recommendations(req: SearchRequest):
-    try:
-        request_started_at = time.perf_counter()
-        if _recommendation_trim_text(req.session_id) and _recommendation_trim_text(req.row_id):
-            response = _recommendation_row_page_response(req)
-        else:
-            session = _recommendation_build_session(req)
-            response = _recommendation_feed_response(session)
+    from auralis_backend.recommend.service import RecommendationService
 
-        diagnostics = response.get("diagnostics")
-        if isinstance(diagnostics, dict):
-            diagnostics.setdefault(
-                "request_ms",
-                int((time.perf_counter() - request_started_at) * 1000),
-            )
-        return response
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return RecommendationService().recommend(req)
 
 
-@app.get("/assistant/sessions")
 def assistant_list_sessions(user_scope_id: str, include_archived: bool = False):
     sessions = _assistant_list_sessions(user_scope_id, include_archived=include_archived)
     return {"status": "success", "sessions": sessions}
 
 
-@app.post("/assistant/sessions")
 def assistant_create_session(req: AssistantSessionCreateRequest):
     session = _assistant_create_session(req.user_scope_id, title=req.title)
     return {"status": "success", "session": session}
 
 
-@app.get("/assistant/sessions/{session_id}")
 def assistant_get_session(session_id: str, user_scope_id: str):
     detail = _assistant_get_session_detail(session_id, user_scope_id)
     if detail is None:
@@ -9239,7 +7408,6 @@ def assistant_get_session(session_id: str, user_scope_id: str):
     return {"status": "success", **detail}
 
 
-@app.patch("/assistant/sessions/{session_id}")
 def assistant_update_session(session_id: str, req: AssistantSessionUpdateRequest):
     session = _assistant_update_session(
         session_id,
@@ -9253,7 +7421,6 @@ def assistant_update_session(session_id: str, req: AssistantSessionUpdateRequest
     return {"status": "success", "session": session}
 
 
-@app.delete("/assistant/sessions/{session_id}")
 def assistant_delete_session(session_id: str, user_scope_id: str):
     deleted = _assistant_delete_session(session_id, user_scope_id)
     if not deleted:
@@ -9261,7 +7428,6 @@ def assistant_delete_session(session_id: str, user_scope_id: str):
     return {"status": "success"}
 
 
-@app.post("/assistant/chat")
 def assistant_chat(req: AssistantChatRequest):
     session = None
     scope_id = _assistant_safe_scope_id(req.user_scope_id)
@@ -9408,7 +7574,6 @@ def assistant_chat(req: AssistantChatRequest):
             }
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/warm_streams")
 def warm_streams(req: WarmStreamRequest):
     prepared, failed = _prepare_streams_with_failures(
         req.video_ids,
@@ -9423,7 +7588,6 @@ def warm_streams(req: WarmStreamRequest):
         "failed_ids": list(failed.keys()),
     }
 
-@app.post("/download")
 def download_audio(req: DownloadRequest):
     out_path = os.path.join(DOWNLOAD_DIR, f"{req.video_id}.mp3")
     json_cache = os.path.join(DOWNLOAD_DIR, f"{req.video_id}.json")
@@ -9525,7 +7689,6 @@ def download_audio(req: DownloadRequest):
             pass
         return meta
 
-@app.get("/stream/{video_id}")
 def stream_audio(video_id: str):
     file_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.mp3")
     if not os.path.exists(file_path):
@@ -9534,7 +7697,6 @@ def stream_audio(video_id: str):
     return FileResponse(file_path, media_type="audio/mpeg", filename=f"{video_id}.mp3")
 
 
-@app.get("/proxy_stream/{video_id}")
 def proxy_stream(video_id: str, request: Request):
     try:
         stream_info = get_stream_info(video_id)
@@ -9644,7 +7806,6 @@ def proxy_stream(video_id: str, request: Request):
             },
         )
 
-@app.get("/direct_url/{video_id}")
 def direct_stream_url(video_id: str):
     try:
         stream_info = get_stream_info(video_id)

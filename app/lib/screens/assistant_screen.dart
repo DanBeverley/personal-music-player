@@ -6,6 +6,7 @@ import 'package:url_launcher/url_launcher.dart';
 
 import '../logic/assistant_provider.dart';
 import '../logic/audio_provider.dart';
+import '../logic/audio_provider_queue.dart';
 import '../logic/auth_provider.dart';
 import '../logic/download_provider.dart';
 import '../logic/playlist_provider.dart';

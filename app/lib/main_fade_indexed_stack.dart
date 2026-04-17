@@ -19,10 +19,15 @@ class FadeIndexedStack extends StatefulWidget {
 class _FadeIndexedStackState extends State<FadeIndexedStack>
     with SingleTickerProviderStateMixin {
   late final AnimationController _controller;
+  late Animation<Offset> _slideAnimation;
 
   @override
   void initState() {
     _controller = AnimationController(vsync: this, duration: widget.duration);
+    _slideAnimation = Tween<Offset>(
+      begin: Offset.zero,
+      end: Offset.zero,
+    ).animate(CurvedAnimation(parent: _controller, curve: Curves.easeOutCubic));
     _controller.forward();
     super.initState();
   }
@@ -30,6 +35,13 @@ class _FadeIndexedStackState extends State<FadeIndexedStack>
   @override
   void didUpdateWidget(FadeIndexedStack oldWidget) {
     if (widget.index != oldWidget.index) {
+      final movingForward = widget.index > oldWidget.index;
+      _slideAnimation = Tween<Offset>(
+        begin: Offset(movingForward ? 0.08 : -0.08, 0),
+        end: Offset.zero,
+      ).animate(
+        CurvedAnimation(parent: _controller, curve: Curves.easeOutCubic),
+      );
       _controller.forward(from: 0.0);
     }
     super.didUpdateWidget(oldWidget);
@@ -44,10 +56,13 @@ class _FadeIndexedStackState extends State<FadeIndexedStack>
   @override
   Widget build(BuildContext context) {
     return FadeTransition(
-      opacity: _controller,
-      child: IndexedStack(
-        index: widget.index,
-        children: widget.children,
+      opacity: CurvedAnimation(parent: _controller, curve: Curves.easeOut),
+      child: SlideTransition(
+        position: _slideAnimation,
+        child: IndexedStack(
+          index: widget.index,
+          children: widget.children,
+        ),
       ),
     );
   }

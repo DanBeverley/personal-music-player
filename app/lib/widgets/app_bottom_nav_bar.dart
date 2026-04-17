@@ -19,43 +19,63 @@ class AppBottomNavBar extends StatelessWidget {
         ? mediaQuery.padding.bottom
         : mediaQuery.viewPadding.bottom;
     return Padding(
-      padding: EdgeInsets.fromLTRB(18, 0, 18, bottomInset > 0 ? bottomInset + 10 : 18),
+      padding: EdgeInsets.fromLTRB(
+        18,
+        0,
+        18,
+        bottomInset > 0 ? bottomInset : 6,
+      ),
       child: ClipRRect(
-        borderRadius: BorderRadius.circular(12),
+        borderRadius: BorderRadius.circular(10),
         child: BackdropFilter(
-          filter: ImageFilter.blur(sigmaX: 18, sigmaY: 18),
+          filter: ImageFilter.blur(sigmaX: 22, sigmaY: 22),
           child: Container(
-            height: 72,
+            height: 58,
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
             decoration: BoxDecoration(
-              color: Colors.white.withValues(alpha: 0.05),
-              borderRadius: BorderRadius.circular(12),
+              borderRadius: BorderRadius.circular(10),
+              color: const Color(0xFF111111).withValues(alpha: 0.92),
               border: Border.all(
                 color: Colors.white.withValues(alpha: 0.08),
               ),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withValues(alpha: 0.34),
+                  blurRadius: 28,
+                  offset: const Offset(0, 12),
+                ),
+              ],
             ),
             child: Row(
-              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
               children: [
-                _NavButton(
-                  isSelected: currentIndex == 0,
-                  onTap: () => onSelected(0),
-                  child: Icon(
-                    currentIndex == 0
-                        ? Icons.explore_rounded
-                        : Icons.explore_outlined,
-                    color: Colors.white,
-                    size: 24,
+                Expanded(
+                  child: _NavButton(
+                    index: 0,
+                    label: 'Home',
+                    selectedIcon: Icons.home_rounded,
+                    icon: Icons.home_outlined,
+                    currentIndex: currentIndex,
+                    onSelected: onSelected,
                   ),
                 ),
-                _NavButton(
-                  isSelected: currentIndex == 1,
-                  onTap: () => onSelected(1),
-                  child: Icon(
-                    currentIndex == 1
-                        ? Icons.queue_music_rounded
-                        : Icons.queue_music_outlined,
-                    color: Colors.white,
-                    size: 24,
+                Expanded(
+                  child: _NavButton(
+                    index: 1,
+                    label: 'Search',
+                    selectedIcon: Icons.search_rounded,
+                    icon: Icons.search_rounded,
+                    currentIndex: currentIndex,
+                    onSelected: onSelected,
+                  ),
+                ),
+                Expanded(
+                  child: _NavButton(
+                    index: 2,
+                    label: 'Library',
+                    selectedIcon: Icons.library_music_rounded,
+                    icon: Icons.library_music_outlined,
+                    currentIndex: currentIndex,
+                    onSelected: onSelected,
                   ),
                 ),
               ],
@@ -68,32 +88,82 @@ class AppBottomNavBar extends StatelessWidget {
 }
 
 class _NavButton extends StatelessWidget {
-  final bool isSelected;
-  final VoidCallback onTap;
-  final Widget child;
+  final int index;
+  final int currentIndex;
+  final String label;
+  final IconData icon;
+  final IconData selectedIcon;
+  final ValueChanged<int> onSelected;
 
   const _NavButton({
-    required this.isSelected,
-    required this.onTap,
-    required this.child,
+    required this.index,
+    required this.currentIndex,
+    required this.label,
+    required this.icon,
+    required this.selectedIcon,
+    required this.onSelected,
   });
 
   @override
   Widget build(BuildContext context) {
+    final isSelected = currentIndex == index;
+    const activeColor = Color(0xFF7A8088);
+
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
-      onTap: onTap,
+      onTap: () => onSelected(index),
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 220),
         curve: Curves.easeOutCubic,
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
         decoration: BoxDecoration(
-          color: isSelected
-              ? Colors.white.withValues(alpha: 0.12)
-              : Colors.transparent,
-          borderRadius: BorderRadius.circular(10),
+          borderRadius: BorderRadius.circular(8),
+          gradient: isSelected
+              ? LinearGradient(
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                  colors: [
+                    activeColor.withValues(alpha: 0.20),
+                    activeColor.withValues(alpha: 0.06),
+                  ],
+                )
+              : null,
         ),
-        child: child,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            AnimatedContainer(
+              duration: const Duration(milliseconds: 220),
+              curve: Curves.easeOutCubic,
+              width: 28,
+              height: 28,
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(6),
+                color: isSelected
+                    ? Colors.white.withValues(alpha: 0.10)
+                    : Colors.transparent,
+              ),
+              child: Icon(
+                isSelected ? selectedIcon : icon,
+                color:
+                    isSelected ? Colors.white : Colors.white.withValues(alpha: 0.62),
+                size: 16,
+              ),
+            ),
+            const SizedBox(height: 1),
+            Text(
+              label,
+              style: TextStyle(
+                color:
+                    isSelected ? Colors.white : Colors.white.withValues(alpha: 0.52),
+                fontSize: 9.5,
+                fontWeight: isSelected ? FontWeight.w700 : FontWeight.w500,
+                letterSpacing: 0.2,
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }

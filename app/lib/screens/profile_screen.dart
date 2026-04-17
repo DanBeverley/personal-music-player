@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:google_fonts/google_fonts.dart';
 
 import '../logic/audio_provider.dart';
+import '../logic/audio_provider_queue.dart';
 import '../logic/auth_provider.dart';
 
 const double _profileRadiusLarge = 12;

@@ -178,6 +178,25 @@ class _MainLayoutState extends ConsumerState<MainLayout> {
   final GlobalKey<_HomeScreenState> _legacyHomeKey =
       GlobalKey<_HomeScreenState>();
 
+  void _handleBottomSelection(int index) {
+    if (index == 1) {
+      if (_currentIndex != 1) {
+        setState(() => _currentIndex = 1);
+      }
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || _currentIndex != 1) {
+          return;
+        }
+        _legacyHomeKey.currentState?.focusSearch();
+      });
+      return;
+    }
+    if (index == 0) {
+      _legacyHomeKey.currentState?.showHomeFeed();
+    }
+    setState(() => _currentIndex = index);
+  }
+
   Widget _buildBottomArea(bool hasActiveTrack) {
     final viewBottomInset = MediaQuery.of(context).viewPadding.bottom;
     return Column(
@@ -208,7 +227,7 @@ class _MainLayoutState extends ConsumerState<MainLayout> {
                     18,
                     0,
                     18,
-                    viewBottomInset > 0 ? 10 : 8,
+                    viewBottomInset > 0 ? 8 : 6,
                   ),
                   child: const MiniPlayer(),
                 )
@@ -216,7 +235,7 @@ class _MainLayoutState extends ConsumerState<MainLayout> {
         ),
         AppBottomNavBar(
           currentIndex: _currentIndex,
-          onSelected: (index) => setState(() => _currentIndex = index),
+          onSelected: _handleBottomSelection,
         ),
       ],
     );
@@ -230,8 +249,18 @@ class _MainLayoutState extends ConsumerState<MainLayout> {
       ),
     );
     final viewBottomInset = MediaQuery.of(context).viewPadding.bottom;
+    final pageIndex = _currentIndex == 2 ? 1 : 0;
     final pages = <Widget>[
-      HomeScreen(key: _legacyHomeKey),
+      HomeScreen(
+        key: _legacyHomeKey,
+        onSearchModeChanged: (isSearching) {
+          if (!mounted || _currentIndex == 2) return;
+          final targetIndex = isSearching ? 1 : 0;
+          if (_currentIndex != targetIndex) {
+            setState(() => _currentIndex = targetIndex);
+          }
+        },
+      ),
       const LibraryScreen(),
     ];
 
@@ -241,7 +270,7 @@ class _MainLayoutState extends ConsumerState<MainLayout> {
         if (didPop) return;
         final handledByHome =
             (_legacyHomeKey.currentState?.handleSystemBack() ?? false);
-        if (_currentIndex == 0 && handledByHome) {
+        if (pageIndex == 0 && handledByHome) {
           return;
         }
         if (_currentIndex != 0) {
@@ -258,7 +287,7 @@ class _MainLayoutState extends ConsumerState<MainLayout> {
           children: [
             const Positioned.fill(child: ColoredBox(color: _voidBlack)),
             FadeIndexedStack(
-              index: _currentIndex,
+              index: pageIndex,
               children: pages,
             ),
             Positioned(

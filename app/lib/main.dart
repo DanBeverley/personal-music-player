@@ -11,13 +11,25 @@ import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'logic/audio_provider.dart';
+import 'logic/audio_provider_history.dart';
+import 'logic/audio_provider_queue.dart';
+import 'logic/audio_provider_recommendation.dart';
 import 'logic/auth_provider.dart';
+import 'logic/cloud_search_queries.dart';
+import 'logic/details_provider.dart';
 import 'logic/download_provider.dart';
 import 'logic/playlist_provider.dart';
+import 'logic/search_provider.dart';
 import 'screens/assistant_screen.dart';
+import 'screens/personal_mix_detail_screen.dart';
+import 'screens/recommendation_row_detail_screen.dart';
+import 'ui/app_theme_tokens.dart';
 import 'widgets/app_artwork.dart';
 import 'widgets/app_bottom_nav_bar.dart';
 import 'widgets/download_hud.dart';
+import 'widgets/home/genre_widgets.dart';
+import 'widgets/home/track_menu_button.dart';
+import 'widgets/playlist/add_to_playlist_dialog.dart';
 import 'widgets/track_list_skeleton.dart';
 
 part 'main_dialogs.dart';
@@ -28,20 +40,13 @@ part 'main_home.dart';
 part 'main_player.dart';
 part 'main_shell.dart';
 
-const _accentGrey = Color(0xFFD0D5D8);
-const _surfaceGrey = Color(0xFF363C40);
-const _surfaceGreyAlt = Color(0xFF2C3135);
-const _voidBlack = Color(0xFF252A2D);
-const double _radiusLarge = 12;
-const double _radiusMedium = 10;
-const List<Color> _playlistCoverPalette = <Color>[
-  Color(0xFF4A5155),
-  Color(0xFF41484C),
-  Color(0xFF383E42),
-  Color(0xFF50575C),
-  Color(0xFF444B4F),
-  Color(0xFF565D62),
-];
+const _accentGrey = appAccentGrey;
+const _surfaceGrey = appSurfaceGrey;
+const _surfaceGreyAlt = appSurfaceGreyAlt;
+const _voidBlack = appVoidBlack;
+const double _radiusLarge = appRadiusLarge;
+const double _radiusMedium = appRadiusMedium;
+const List<Color> _playlistCoverPalette = appPlaylistCoverPalette;
 const List<String> _quipOpeners = <String>[
   'Today\'s sonic forecast',
   'Current music goblin memo',
@@ -67,8 +72,8 @@ const List<String> _quipClosers = <String>[
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await initSupabase();
-  await initAudioService();
   runApp(const ProviderScope(child: AuralisApp()));
+  unawaited(initAudioService());
 }
 
 class AuralisApp extends ConsumerStatefulWidget {
@@ -152,8 +157,9 @@ class _AuralisAppState extends ConsumerState<AuralisApp>
           surface: _surfaceGrey,
           onSurface: Colors.white,
         ),
-        textTheme: GoogleFonts.spaceGroteskTextTheme(Theme.of(context).textTheme)
-            .apply(bodyColor: Colors.white, displayColor: Colors.white),
+        textTheme:
+            GoogleFonts.spaceGroteskTextTheme(Theme.of(context).textTheme)
+                .apply(bodyColor: Colors.white, displayColor: Colors.white),
         appBarTheme: const AppBarTheme(
           backgroundColor: Colors.transparent,
           elevation: 0,
@@ -193,5 +199,3 @@ class _AuralisAppState extends ConsumerState<AuralisApp>
     );
   }
 }
-
-

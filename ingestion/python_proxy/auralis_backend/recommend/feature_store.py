@@ -10,6 +10,11 @@ from threading import Lock
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from ..domain.catalog import (
+    canonical_album_identity,
+    canonical_artist_identity,
+    canonical_title_artist_identity,
+)
 from ..storage.postgres import db_available, get_connection
 from .store_runtime import open_recommendation_store_connection
 
@@ -538,25 +543,20 @@ def _scene_clusters(primary_genre: str, subgenre: str, era: str, region: str) ->
 
 def _track_entity_key(server: Any, track: Dict[str, Any]) -> str:
     track_id = server._recommendation_trim_text(track.get("id"))
-    return track_id or server._recommendation_track_signature(track)
+    return track_id or canonical_title_artist_identity(track) or server._recommendation_track_signature(track)
 
 
 def _artist_entity_key(server: Any, artist: Dict[str, Any] | str) -> str:
     payload = dict(artist) if isinstance(artist, dict) else {"name": str(artist or "")}
     artist_id = server._recommendation_trim_text(payload.get("id"))
-    return artist_id or server._normalize_text(payload.get("name") or "")
+    return artist_id or canonical_artist_identity(payload)
 
 
 def _album_entity_key(server: Any, album: Dict[str, Any]) -> str:
     album_id = server._recommendation_trim_text(album.get("id"))
     if album_id:
         return album_id
-    return "|".join(
-        [
-            server._normalize_text(album.get("title") or ""),
-            server._normalize_text(album.get("artist") or ""),
-        ]
-    )
+    return canonical_album_identity(album)
 
 
 def derive_track_feature(server: Any, track: Dict[str, Any]) -> Dict[str, Any]:

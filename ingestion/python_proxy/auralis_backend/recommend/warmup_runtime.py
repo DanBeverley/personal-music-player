@@ -1,0 +1,220 @@
+from __future__ import annotations
+
+from threading import Lock
+from typing import Any, Dict, List
+import os
+import time
+
+from ..runtime_context import resolve_server
+from .taste_runtime import warm_profile_feature_artifacts
+
+
+_PRECOMPUTE_ENABLED = (
+    os.environ.get("AURALIS_PRECOMPUTE_ENABLED", "1").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+_PROFILE_FEATURE_WARMUP_COOLDOWN_SECONDS = max(
+    60,
+    int(os.environ.get("AURALIS_PROFILE_FEATURE_WARMUP_COOLDOWN_SECONDS", "900")),
+)
+
+_warmup_lock = Lock()
+_inflight_warmups: set[str] = set()
+_recent_profile_feature_warmups: Dict[str, float] = {}
+
+
+def _precompute_executor(server: Any):
+    return getattr(server, "precompute_executor", None) or getattr(
+        server,
+        "recommendation_executor",
+    )
+
+
+def _search_executor(server: Any):
+    return getattr(server, "search_executor", None) or getattr(
+        server,
+        "recommendation_executor",
+    )
+
+
+def _begin_warmup(warmup_key: str) -> bool:
+    if not _PRECOMPUTE_ENABLED:
+        return False
+    with _warmup_lock:
+        if warmup_key in _inflight_warmups:
+            return False
+        _inflight_warmups.add(warmup_key)
+    return True
+
+
+def _finish_warmup(warmup_key: str) -> None:
+    with _warmup_lock:
+        _inflight_warmups.discard(warmup_key)
+
+
+def _mark_profile_feature_warmup_started(warmup_key: str) -> bool:
+    with _warmup_lock:
+        now = time.monotonic()
+        last_started_at = float(_recent_profile_feature_warmups.get(warmup_key) or 0.0)
+        if last_started_at > 0.0 and (
+            now - last_started_at
+        ) < _PROFILE_FEATURE_WARMUP_COOLDOWN_SECONDS:
+            return False
+        _recent_profile_feature_warmups[warmup_key] = now
+        if len(_recent_profile_feature_warmups) > 1024:
+            cutoff = now - (_PROFILE_FEATURE_WARMUP_COOLDOWN_SECONDS * 4)
+            stale_keys = [
+                key
+                for key, started_at in _recent_profile_feature_warmups.items()
+                if float(started_at or 0.0) < cutoff
+            ]
+            for stale_key in stale_keys[:512]:
+                _recent_profile_feature_warmups.pop(stale_key, None)
+    return True
+
+
+def schedule_profile_feature_warmup(
+    *,
+    server: Any,
+    warmup_key: str,
+    profile: Dict[str, Any],
+    extra_tracks: List[Dict[str, Any]] | None = None,
+    extra_artists: List[Dict[str, Any]] | None = None,
+    extra_albums: List[Dict[str, Any]] | None = None,
+) -> bool:
+    if not _begin_warmup(warmup_key):
+        return False
+    if not _mark_profile_feature_warmup_started(warmup_key):
+        _finish_warmup(warmup_key)
+        return False
+
+    def _warm() -> None:
+        try:
+            warm_profile_feature_artifacts(
+                server,
+                profile,
+                extra_tracks=list(extra_tracks or []),
+                extra_artists=list(extra_artists or []),
+                extra_albums=list(extra_albums or []),
+            )
+        except Exception:
+            return
+        finally:
+            _finish_warmup(warmup_key)
+
+    try:
+        _precompute_executor(server).submit(_warm)
+        return True
+    except Exception:
+        _finish_warmup(warmup_key)
+        return False
+
+
+def schedule_search_warmup(
+    *,
+    user_scope_id: str,
+    query: str,
+    server: Any | None = None,
+) -> bool:
+    srv = resolve_server(server)
+    normalized_scope = srv._assistant_safe_scope_id(user_scope_id or "guest")
+    normalized_query = srv._recommendation_trim_text(query)
+    if not normalized_query:
+        return False
+    warmup_key = f"search:{normalized_scope}:{normalized_query.lower()}"
+    if not _begin_warmup(warmup_key):
+        return False
+
+    def _warm() -> None:
+        try:
+            from .precompute import build_search_snapshot
+
+            build_search_snapshot(
+                server=srv,
+                user_scope_id=normalized_scope,
+                query=normalized_query,
+                force=False,
+            )
+        except Exception:
+            return
+        finally:
+            _finish_warmup(warmup_key)
+
+    try:
+        _search_executor(srv).submit(_warm)
+        return True
+    except Exception:
+        _finish_warmup(warmup_key)
+        return False
+
+
+def schedule_home_warmup(
+    *,
+    user_scope_id: str,
+    profile: Dict[str, Any] | None = None,
+    force: bool = False,
+    server: Any | None = None,
+) -> bool:
+    srv = resolve_server(server)
+    normalized_scope = srv._assistant_safe_scope_id(user_scope_id or "guest")
+    warmup_key = f"home:{normalized_scope}"
+    if not _begin_warmup(warmup_key):
+        return False
+
+    def _warm() -> None:
+        try:
+            from .precompute import build_home_snapshot
+
+            build_home_snapshot(
+                server=srv,
+                user_scope_id=normalized_scope,
+                force=bool(force),
+                profile=profile if isinstance(profile, dict) and profile else None,
+            )
+        except Exception:
+            return
+        finally:
+            _finish_warmup(warmup_key)
+
+    try:
+        _precompute_executor(srv).submit(_warm)
+        return True
+    except Exception:
+        _finish_warmup(warmup_key)
+        return False
+
+
+def schedule_home_artifact_warmup(
+    *,
+    user_scope_id: str,
+    profile: Dict[str, Any] | None = None,
+    force: bool = False,
+    server: Any | None = None,
+) -> bool:
+    srv = resolve_server(server)
+    normalized_scope = srv._assistant_safe_scope_id(user_scope_id or "guest")
+    warmup_key = f"home_artifact:{normalized_scope}"
+    if not _begin_warmup(warmup_key):
+        return False
+
+    def _warm() -> None:
+        try:
+            from .precompute import build_home_launch_artifacts
+
+            build_home_launch_artifacts(
+                server=srv,
+                user_scope_id=normalized_scope,
+                force=bool(force),
+                profile=profile if isinstance(profile, dict) and profile else None,
+            )
+        except Exception:
+            return
+        finally:
+            _finish_warmup(warmup_key)
+
+    try:
+        _precompute_executor(srv).submit(_warm)
+        return True
+    except Exception:
+        _finish_warmup(warmup_key)
+        return False

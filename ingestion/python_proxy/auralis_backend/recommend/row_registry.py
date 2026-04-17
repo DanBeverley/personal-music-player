@@ -4,10 +4,33 @@ from typing import Any, Dict, List
 
 
 ROW_DEFINITIONS: Dict[str, Dict[str, Any]] = {
+    "todays_pick": {
+        "title": "Hot for you",
+        "order": -20,
+        "required_default": False,
+        "row_tier": "launch",
+        "allocator": {},
+        "ranking": {
+            "quality_floor": 1.0,
+            "min_items": 1,
+            "max_same_artist": 1,
+            "max_feed_same_artist": 1,
+        },
+    },
+    "mixed_for_you": {
+        "title": "Mixed for you",
+        "order": -10,
+        "required_default": False,
+        "row_tier": "launch",
+        "allocator": {},
+        "ranking": {},
+    },
     "continue_listening": {
         "title": "Continue the vibe",
         "order": 0,
         "required_default": True,
+        "row_tier": "launch",
+        "live_refreshable": True,
         "allocator": {
             "candidate_limit": 64,
             "max_pools": 4,
@@ -33,6 +56,7 @@ ROW_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "title": "Because you played recently",
         "order": 1,
         "required_default": True,
+        "row_tier": "launch",
         "allocator": {
             "candidate_limit": 64,
             "max_pools": 4,
@@ -67,6 +91,7 @@ ROW_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "title": "Listeners like you also played",
         "order": 2,
         "required_default": False,
+        "row_tier": "deferred",
         "allocator": {
             "candidate_limit": 48,
             "max_pools": 4,
@@ -98,6 +123,7 @@ ROW_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "title": "Frequently listened",
         "order": 3,
         "required_default": False,
+        "row_tier": "deferred",
         "allocator": {
             "candidate_limit": 40,
             "max_pools": 3,
@@ -125,6 +151,7 @@ ROW_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "title": "Rediscover these",
         "order": 4,
         "required_default": False,
+        "row_tier": "launch",
         "allocator": {
             "candidate_limit": 56,
             "max_pools": 4,
@@ -157,10 +184,19 @@ ROW_DEFINITIONS: Dict[str, Dict[str, Any]] = {
             },
         },
     },
-    "recommended_albums": {
-        "title": "Recommended albums",
+    "trending_by_genre": {
+        "title": "Trending by genre",
         "order": 5,
         "required_default": False,
+        "row_tier": "deferred",
+        "allocator": {},
+        "ranking": {},
+    },
+    "recommended_albums": {
+        "title": "Recommended albums",
+        "order": 6,
+        "required_default": False,
+        "row_tier": "launch",
         "allocator": {
             "candidate_limit": 18,
             "max_pools": 0,
@@ -176,8 +212,9 @@ ROW_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     },
     "recommended_artists": {
         "title": "Recommended artists",
-        "order": 6,
+        "order": 7,
         "required_default": False,
+        "row_tier": "launch",
         "allocator": {
             "candidate_limit": 12,
             "max_pools": 0,
@@ -193,8 +230,9 @@ ROW_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     },
     "deep_cuts": {
         "title": "Deep cuts for you",
-        "order": 7,
+        "order": 8,
         "required_default": False,
+        "row_tier": "deferred",
         "allocator": {
             "candidate_limit": 56,
             "max_pools": 4,
@@ -229,8 +267,9 @@ ROW_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     },
     "offline_ready": {
         "title": "Ready offline",
-        "order": 8,
+        "order": 9,
         "required_default": False,
+        "row_tier": "deferred",
         "allocator": {
             "candidate_limit": 40,
             "max_pools": 3,
@@ -255,11 +294,12 @@ ROW_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     },
     "trending_for_you": {
         "title": "Trending for you",
-        "order": 9,
+        "order": 10,
         "required_default": True,
+        "row_tier": "deferred",
         "allocator": {
-            "candidate_limit": 56,
-            "max_pools": 4,
+            "candidate_limit": 72,
+            "max_pools": 6,
             "model_key": "home_row_allocator_trending_v1",
         },
         "ranking": {
@@ -289,8 +329,9 @@ ROW_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     },
     "quiet_picks": {
         "title": "Quiet picks",
-        "order": 10,
+        "order": 11,
         "required_default": True,
+        "row_tier": "deferred",
         "allocator": {
             "candidate_limit": 120,
             "max_pools": 7,
@@ -375,3 +416,57 @@ def default_required_row_kinds() -> List[str]:
         for row_kind in ordered_row_kinds()
         if bool((ROW_DEFINITIONS.get(row_kind) or {}).get("required_default"))
     ]
+
+
+def row_tier(row_kind: str) -> str:
+    return str((ROW_DEFINITIONS.get(row_kind) or {}).get("row_tier") or "deferred")
+
+
+def launch_row_kinds() -> List[str]:
+    return [
+        row_kind
+        for row_kind in ordered_row_kinds()
+        if row_tier(row_kind) == "launch"
+    ]
+
+
+def deferred_row_kinds() -> List[str]:
+    return [
+        row_kind
+        for row_kind in ordered_row_kinds()
+        if row_tier(row_kind) == "deferred"
+    ]
+
+
+def live_refreshable_row_kinds() -> List[str]:
+    return [
+        row_kind
+        for row_kind in ordered_row_kinds()
+        if bool((ROW_DEFINITIONS.get(row_kind) or {}).get("live_refreshable"))
+    ]
+
+
+_THIN_SNAPSHOT_ROW_KINDS = {
+    "mixed_for_you",
+    "continue_listening",
+    "because_you_played",
+    "frequently_listened",
+    "recommended_albums",
+    "recommended_artists",
+}
+
+
+def supports_thin_snapshot(row_kind: str) -> bool:
+    return row_kind in _THIN_SNAPSHOT_ROW_KINDS
+
+
+def thin_snapshot_row_kinds() -> List[str]:
+    return [
+        row_kind
+        for row_kind in ordered_row_kinds()
+        if supports_thin_snapshot(row_kind)
+    ]
+
+
+def rich_snapshot_row_kinds() -> List[str]:
+    return ordered_row_kinds()

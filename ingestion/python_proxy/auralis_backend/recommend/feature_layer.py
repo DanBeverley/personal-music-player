@@ -32,6 +32,29 @@ def _normalize_weight_map(values: Dict[str, Any] | None) -> Dict[str, float]:
     return output
 
 
+def _merge_weight_maps(
+    primary: Dict[str, Any] | None,
+    secondary: Dict[str, Any] | None,
+    *,
+    secondary_scale: float = 0.6,
+    limit: int = 12,
+) -> Dict[str, float]:
+    merged: Dict[str, float] = {}
+    for key, value in _normalize_weight_map(primary).items():
+        merged[key] = float(merged.get(key) or 0.0) + float(value or 0.0)
+    for key, value in _normalize_weight_map(secondary).items():
+        merged[key] = float(merged.get(key) or 0.0) + (float(value or 0.0) * float(secondary_scale))
+    ordered = sorted(
+        merged.items(),
+        key=lambda item: (-float(item[1] or 0.0), str(item[0] or "")),
+    )[: max(int(limit or 0), 1)]
+    return {
+        str(key): round(float(value or 0.0), 4)
+        for key, value in ordered
+        if str(key or "").strip() and float(value or 0.0) > 0.0
+    }
+
+
 def build_catalog_feature_profile(server: Any, profile: Dict[str, Any]) -> Dict[str, Any]:
     cached = profile.get("_catalog_feature_profile")
     if isinstance(cached, dict) and cached:
@@ -78,6 +101,24 @@ def build_catalog_feature_profile(server: Any, profile: Dict[str, Any]) -> Dict[
         "supported_type_tags": _as_set(taste_profile.get("supported_type_tags") or []),
         "preferred_genres": _as_set(taste_profile.get("preferred_genres") or []),
         "preferred_subgenres": _as_set(taste_profile.get("preferred_subgenres") or []),
+        "genre_scores": _merge_weight_maps(
+            ((taste_profile.get("long_term") or {}).get("genres") or {}),
+            ((taste_profile.get("session") or {}).get("genres") or {}),
+            secondary_scale=0.72,
+            limit=10,
+        ),
+        "subgenre_scores": _merge_weight_maps(
+            ((taste_profile.get("long_term") or {}).get("subgenres") or {}),
+            ((taste_profile.get("session") or {}).get("subgenres") or {}),
+            secondary_scale=0.72,
+            limit=10,
+        ),
+        "era_scores": _merge_weight_maps(
+            ((taste_profile.get("long_term") or {}).get("eras") or {}),
+            ((taste_profile.get("session") or {}).get("eras") or {}),
+            secondary_scale=0.64,
+            limit=10,
+        ),
         "dominant_artist_keys": dominant_artist_keys,
         "scene_artist_scores": merged_scene_artist_scores,
         "scene_cluster_scores": scene_cluster_scores,

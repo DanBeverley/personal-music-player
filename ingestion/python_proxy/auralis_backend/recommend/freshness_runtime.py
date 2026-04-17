@@ -11,6 +11,12 @@ _HOME_ROW_REPEAT_LOOKBACK_SECONDS = 604800
 _HOME_ROW_REPEAT_LIMIT = 24
 
 _ROW_FRESHNESS_CONFIG: Dict[str, Dict[str, float | int]] = {
+    "todays_pick": {
+        "impression_penalty": 4.2,
+        "recent_track_penalty": 0.45,
+        "rotation_bonus": 0.34,
+        "cadence_seconds": 2700,
+    },
     "because_you_played": {
         "impression_penalty": 3.1,
         "recent_track_penalty": 0.35,

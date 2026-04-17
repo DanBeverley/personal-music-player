@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
+from ..domain.catalog import canonical_artist_identity, canonical_title_artist_identity
+
 
 def row_status_name(diagnostics: Dict[str, Any] | None) -> str:
     if not isinstance(diagnostics, dict):
@@ -36,13 +38,16 @@ def snapshot_quality_reasons(
         status = row_status_name(diag)
         if status == "emitted":
             emitted_count += 1
-        if status == "filtered_out":
+        if status in {"filtered_out", "finalize_filtered_out"}:
             filtered_count += 1
         if status.startswith("fallback_"):
             reasons.append(f"{row_kind}:{status}")
         elif row_kind in critical and status in {
             "filtered_out",
+            "finalize_filtered_out",
             "empty",
+            "seed_pool_empty",
+            "post_filter_empty",
             "missing_no_fallback",
             "fallback_unavailable",
         }:
@@ -60,11 +65,20 @@ def artifact_quality_score(
 ) -> float:
     emitted = sum(1 for status in row_status.values() if status == "emitted")
     fallback = sum(1 for status in row_status.values() if status.startswith("fallback_"))
-    filtered = sum(1 for status in row_status.values() if status == "filtered_out")
+    filtered = sum(
+        1
+        for status in row_status.values()
+        if status in {"filtered_out", "finalize_filtered_out"}
+    )
     missing = sum(
         1
         for status in row_status.values()
-        if status in {"missing_no_fallback", "fallback_unavailable"}
+        if status in {
+            "missing_no_fallback",
+            "fallback_unavailable",
+            "seed_pool_empty",
+            "post_filter_empty",
+        }
     )
     score = 1.0
     score += emitted * 0.08
@@ -82,7 +96,7 @@ def artifact_repetition_reasons(
     max_visible_same_artist: int = 4,
 ) -> List[str]:
     reasons: List[str] = []
-    visible_track_ids: set[str] = set()
+    visible_track_keys: set[str] = set()
     duplicate_tracks = 0
     artist_counts: Dict[str, int] = {}
     for row in list(rows or []):
@@ -91,15 +105,20 @@ def artifact_repetition_reasons(
         for item in list(row.get("items") or [])[:max(int(visible_items_per_row or 0), 1)]:
             if not isinstance(item, dict):
                 continue
-            track_id = str(item.get("id") or "").strip()
-            if track_id:
-                if track_id in visible_track_ids:
+            track_key = canonical_title_artist_identity(item)
+            if not track_key:
+                track_key = str(item.get("id") or "").strip()
+            if track_key:
+                if track_key in visible_track_keys:
                     duplicate_tracks += 1
                 else:
-                    visible_track_ids.add(track_id)
-            artist_key = str(
-                item.get("channel") or item.get("artist") or item.get("author") or ""
-            ).strip().lower()
+                    visible_track_keys.add(track_key)
+            artist_key = canonical_artist_identity(
+                {
+                    "id": item.get("artist_id"),
+                    "name": item.get("channel") or item.get("artist") or item.get("author"),
+                }
+            )
             if artist_key:
                 artist_counts[artist_key] = int(artist_counts.get(artist_key) or 0) + 1
     if duplicate_tracks > 0:
@@ -134,9 +153,17 @@ def promote_artifact_status(
     quality_reasons: List[str],
     *,
     primary_row_kinds: Iterable[str],
+    builder_mode: str = "",
 ) -> str:
     if not list(launch_rows or []):
         return "rejected"
+    if "thin_core" in str(builder_mode or ""):
+        thin_minimal_ok = (
+            row_status.get("continue_listening") == "emitted"
+            and row_status.get("because_you_played") == "emitted"
+            and len(list(launch_rows or [])) >= 4
+        )
+        return "usable" if thin_minimal_ok else "rejected"
     primary_ok = all(
         row_status.get(str(row_kind or "")) == "emitted"
         for row_kind in primary_row_kinds
@@ -157,8 +184,31 @@ def acceptable_launch_artifact(
     row_status: Dict[str, str],
     launch_rows: Sequence[Dict[str, Any]] | None,
     quality_reasons: List[str],
+    *,
+    builder_mode: str = "",
 ) -> bool:
     rows = list(launch_rows or [])
+    if "thin_core" in str(builder_mode or ""):
+        if len(rows) < 4:
+            return False
+        if row_status.get("continue_listening") != "emitted":
+            return False
+        if row_status.get("because_you_played") not in {"emitted", "fallback_emitted"}:
+            return False
+        support_rows = (
+            "mixed_for_you",
+            "recommended_artists",
+            "recommended_albums",
+            "frequently_listened",
+        )
+        support_ready = sum(
+            1
+            for row_kind in support_rows
+            if row_status.get(row_kind) in {"emitted", "fallback_emitted"}
+        )
+        if support_ready < 1:
+            return False
+        return artifact_quality_score(row_status, quality_reasons) >= 0.18
     if len(rows) < 5:
         return False
     if row_status.get("continue_listening") != "emitted":
@@ -180,7 +230,14 @@ def acceptable_launch_artifact(
     if supportive_ready < 2:
         return False
 
-    hard_missing = {"missing_no_fallback", "fallback_unavailable", "empty"}
+    hard_missing = {
+        "missing_no_fallback",
+        "fallback_unavailable",
+        "empty",
+        "seed_pool_empty",
+        "post_filter_empty",
+        "finalize_filtered_out",
+    }
     if (
         row_status.get("trending_for_you") in hard_missing
         and row_status.get("quiet_picks") in hard_missing

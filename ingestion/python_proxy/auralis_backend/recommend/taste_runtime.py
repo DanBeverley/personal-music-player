@@ -72,6 +72,24 @@ def _track_groups(profile: Dict[str, Any]) -> List[Tuple[str, List[Dict[str, Any
     ]
 
 
+def _query_groups(profile: Dict[str, Any]) -> List[Tuple[str, List[str], float]]:
+    return [
+        ("session", list(profile.get("recent_queries") or [])[:8], 1.05),
+        ("long_term", list(profile.get("recent_queries") or [])[:8], 0.82),
+        ("long_term", list(profile.get("taste_queries") or [])[:8], 1.18),
+    ]
+
+
+def _query_feature_payload(query: str) -> Dict[str, Any]:
+    text = str(query or "").strip()
+    return {
+        "id": f"query::{text.lower()}",
+        "title": text,
+        "channel": "",
+        "album": "",
+    }
+
+
 def _feedback_signature(feedback_rows: Dict[str, Dict[str, Dict[str, Any]]]) -> str:
     flattened: List[Tuple[str, str, float, int]] = []
     for feedback_type, entries in sorted((feedback_rows or {}).items()):
@@ -296,6 +314,52 @@ def _derive_taste_profile(server: Any, profile: Dict[str, Any], feedback_rows: D
                 title_artist_keys[title_key].add(artist_key)
             if album_key and artist_key:
                 album_title_artist_keys[album_key].add(artist_key)
+
+    for group_name, queries, base_weight in _query_groups(profile):
+        for index, query in enumerate(queries):
+            text = str(query or "").strip()
+            if not text:
+                continue
+            weight = max(base_weight - (index * 0.08), 0.28)
+            feature = get_track_feature(
+                server,
+                _query_feature_payload(text),
+            )
+            if group_name == "session":
+                _accumulate_feature_counters(
+                    feature=feature,
+                    weight=weight,
+                    genre_counts=short_genres,
+                    subgenre_counts=short_subgenres,
+                    era_counts=short_eras,
+                    language_counts=short_languages,
+                    script_counts=short_scripts,
+                    scene_counts=short_scenes,
+                    artist_counts=short_artists,
+                    album_counts=short_albums,
+                    title_counts=short_titles,
+                    type_counts=short_types,
+                    mood_values=mood_values,
+                    popularity_values=popularity_values,
+                    freshness_values=freshness_values,
+                )
+            _accumulate_feature_counters(
+                feature=feature,
+                weight=max(weight * (0.92 if group_name == "session" else 1.0), 0.22),
+                genre_counts=long_genres,
+                subgenre_counts=long_subgenres,
+                era_counts=long_eras,
+                language_counts=long_languages,
+                script_counts=long_scripts,
+                scene_counts=long_scenes,
+                artist_counts=long_artists,
+                album_counts=long_albums,
+                title_counts=long_titles,
+                type_counts=long_types,
+                mood_values=mood_values,
+                popularity_values=popularity_values,
+                freshness_values=freshness_values,
+            )
 
     peer_artist_counter: Counter[str] = Counter()
     for index, artist_name in enumerate(

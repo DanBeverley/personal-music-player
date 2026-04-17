@@ -2,17 +2,23 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from ..legacy import get_server
-from ..search.runtime import search_artist_seed_tracks
+from ..domain.candidate_expansion import (
+    album_candidates_for_track as _shared_album_candidates_for_track,
+    anchor_query as _shared_anchor_query,
+    candidate_sources_for_track as _shared_candidate_sources_for_track,
+)
+from ..runtime_context import resolve_server
+from ..search.runtime import search_artist_seed_tracks  # compatibility import for tests
+from ..search.upstream_runtime import search_artists_direct
 from .feature_layer import album_catalog_alignment, build_catalog_feature_profile
 
 
-def _server():
-    return get_server()
+def _server(server: Any | None = None):
+    return resolve_server(server)
 
 
-def _recommendation_quiet_base_query(profile) -> str:
-    server = _server()
+def _recommendation_quiet_base_query(profile, *, server: Any | None = None) -> str:
+    server = _server(server)
     top_artists = server._recommendation_unique_strings(
         [
             *(profile.get("top_artists") or []),
@@ -39,118 +45,37 @@ def _recommendation_anchor_query(
     track: Optional[Dict[str, Any]],
     *,
     include_album: bool = False,
+    server: Any | None = None,
 ) -> str:
-    server = _server()
-    if not isinstance(track, dict):
-        return ""
-    parts = [
-        server._recommendation_trim_text(track.get("title")),
-        server._recommendation_trim_text(
-            track.get("channel") or track.get("author") or track.get("artist")
-        ),
-    ]
-    if include_album:
-        parts.append(server._recommendation_trim_text(track.get("album")))
-    return " ".join([part for part in parts if part]).strip()
+    return _shared_anchor_query(track, include_album=include_album)
 
 
 def _recommendation_album_candidates_for_track(
     track: Optional[Dict[str, Any]],
     *,
     limit: int = 2,
+    server: Any | None = None,
 ):
-    server = _server()
+    return _shared_album_candidates_for_track(
+        track,
+        limit=limit,
+        include_search=True,
+        server=_server(server),
+    )
+
+
+def _recommendation_candidate_sources_for_track(
+    track: Optional[Dict[str, Any]],
+    *,
+    server: Any | None = None,
+):
+    server = _server(server)
     if not isinstance(track, dict):
         return []
 
-    albums = []
-    seen = set()
-
-    def add_album(raw_album: Optional[Dict[str, Any]]):
-        if not isinstance(raw_album, dict):
-            return
-        album_id = server._recommendation_trim_text(raw_album.get("id"))
-        title = server._recommendation_trim_text(raw_album.get("title"))
-        artist = server._recommendation_trim_text(raw_album.get("artist"))
-        key = album_id or f"{server._normalize_text(title)}|{server._normalize_text(artist)}"
-        if not key or key in seen:
-            return
-        seen.add(key)
-        albums.append(raw_album)
-
-    album_id = server._recommendation_trim_text(track.get("album_id"))
-    album_title = server._recommendation_trim_text(track.get("album"))
-    if album_id:
-        add_album(
-            {
-                "id": album_id,
-                "title": album_title or "Unknown Album",
-                "artist": track.get("channel") or track.get("artist"),
-                "thumbnail": track.get("thumbnail"),
-            }
-        )
-    elif album_title:
-        add_album(
-            {
-                "id": None,
-                "title": album_title,
-                "artist": track.get("channel") or track.get("artist"),
-                "thumbnail": track.get("thumbnail"),
-            }
-        )
-
-    search_query = _recommendation_anchor_query(track, include_album=True)
-    if search_query:
-        for album in server._assistant_tool_search_albums(search_query, max(limit * 2, 4)):
-            add_album(album)
-            if len(albums) >= limit:
-                break
-
-    return albums[:limit]
-
-
-def _recommendation_candidate_sources_for_track(track: Optional[Dict[str, Any]]):
-    server = _server()
-    if not isinstance(track, dict):
-        return []
-
-    track_id = server._recommendation_trim_text(track.get("id"))
     artist_name = server._recommendation_trim_text(
         track.get("channel") or track.get("author") or track.get("artist")
     )
-    futures = {}
-
-    if track_id:
-        futures["similar"] = server.recommendation_executor.submit(
-            server._assistant_tool_get_similar_tracks,
-            track.get("id"),
-            12,
-        )
-        futures["collaborative"] = server.recommendation_executor.submit(
-            server._recommendation_collaborative_neighbor_tracks,
-            track_id,
-            10,
-        )
-
-    if artist_name:
-        futures["artist_seed"] = server.recommendation_executor.submit(
-            search_artist_seed_tracks,
-            artist_name,
-            8,
-        )
-
-    def fetch_album_context():
-        album_tracks = []
-        for album in _recommendation_album_candidates_for_track(track, limit=2):
-            album_id = server._recommendation_trim_text(album.get("id"))
-            if not album_id:
-                continue
-            album_details = server._assistant_tool_get_album_details(album_id)
-            album_tracks.extend(album_details.get("tracks") or [])
-        return album_tracks
-
-    futures["album_context"] = server.recommendation_executor.submit(fetch_album_context)
-
     source_results = {
         "similar": [],
         "collaborative": [],
@@ -158,13 +83,12 @@ def _recommendation_candidate_sources_for_track(track: Optional[Dict[str, Any]])
         "album_context": [],
         "fallback_context": [],
     }
-    for source_name, future in futures.items():
-        try:
-            source_results[source_name] = future.result(
-                timeout=server.RECOMMENDATION_CANDIDATE_SOURCE_TIMEOUT_SECONDS
-            ) or []
-        except Exception:
-            source_results[source_name] = []
+    for source_name, source_tracks, _base_score in _shared_candidate_sources_for_track(
+        track,
+        server=server,
+    ):
+        if source_name in source_results:
+            source_results[source_name] = list(source_tracks or [])
 
     if not (
         source_results["similar"]
@@ -200,8 +124,9 @@ def _recommendation_anchor_fallback_tracks(
     track: Optional[Dict[str, Any]],
     *,
     limit: int,
+    server: Any | None = None,
 ):
-    server = _server()
+    server = _server(server)
     if not isinstance(track, dict):
         return []
 
@@ -261,8 +186,13 @@ def _recommendation_anchor_fallback_tracks(
     return [track_item for _score, track_item in ranked_tracks[: max(1, limit)]]
 
 
-def _recommendation_home_fallback_tracks(profile, *, limit: int):
-    server = _server()
+def _recommendation_home_fallback_tracks(
+    profile,
+    *,
+    limit: int,
+    server: Any | None = None,
+):
+    server = _server(server)
     profile = dict(profile or {})
     candidate_tracks = []
 
@@ -317,11 +247,12 @@ def _recommendation_home_fallback_tracks(profile, *, limit: int):
         deduped_candidates,
         profile,
         limit=limit,
+        server=server,
     )
 
 
-def _recommendation_recommended_albums_row(profile):
-    server = _server()
+def _recommendation_recommended_albums_row(profile, *, server: Any | None = None):
+    server = _server(server)
     albums = []
     seen = set()
     catalog_profile = build_catalog_feature_profile(server, profile)
@@ -398,7 +329,7 @@ def _recommendation_recommended_albums_row(profile):
             break
 
     for index, artist_hint in enumerate(profile.get("top_artists") or []):
-        direct_artists = server._assistant_tool_search_artists_direct(artist_hint, 1)
+        direct_artists = search_artists_direct(server, artist_hint, 1)
         if direct_artists:
             artist_id = server._recommendation_trim_text(direct_artists[0].get("id"))
             if artist_id:
@@ -538,8 +469,14 @@ def _recommendation_recommended_albums_row(profile):
     }
 
 
-def _recommendation_taste_filtered_tracks(tracks, profile, *, limit: int):
-    server = _server()
+def _recommendation_taste_filtered_tracks(
+    tracks,
+    profile,
+    *,
+    limit: int,
+    server: Any | None = None,
+):
+    server = _server(server)
     ranked = []
     artist_hints = {
         server._normalize_text(item)

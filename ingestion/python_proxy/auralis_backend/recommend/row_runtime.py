@@ -3,15 +3,16 @@ from __future__ import annotations
 import os
 from typing import Any, Dict, List, Tuple
 
+from .candidate_pipeline import execute_candidate_pipeline, resolve_candidate_snapshot
 from .home_pipeline import (
+    _artist_family_identity,
+    _track_authenticity_penalty,
     apply_track_row_runtime_fields,
     apply_quiet_row_runtime_fields,
-    build_home_candidate_snapshot,
-    build_home_candidate_snapshot_fallback,
-    build_required_fallback_seed,
     build_row_seed,
     finalize_row_items,
 )
+from .row_finalization_pipeline import finalize_row_seed_execution
 from .policy import is_required_row, required_row_kinds, row_kinds as policy_row_kinds
 
 
@@ -138,6 +139,50 @@ def merge_home_rows(
     return merged
 
 
+def _filter_prebuilt_track_items(
+    *,
+    server: Any,
+    items: List[Dict[str, Any]],
+    used_track_ids: set[str],
+    used_artist_counts: Dict[str, int],
+    limit: int = 18,
+) -> List[Dict[str, Any]]:
+    filtered: List[Dict[str, Any]] = []
+    artist_family_counts: Dict[str, int] = {}
+    for track in list(items or []):
+        if not isinstance(track, dict):
+            continue
+        signature = server._recommendation_track_signature(track)
+        if not signature or signature in used_track_ids:
+            continue
+        if _track_authenticity_penalty(track) >= 0.75:
+            continue
+        artist_key = server._normalize_text(
+            track.get("channel") or track.get("artist") or track.get("author") or ""
+        )
+        artist_family_key = _artist_family_identity(
+            track.get("channel") or track.get("artist") or track.get("author") or ""
+        )
+        if artist_key and int(used_artist_counts.get(artist_key) or 0) >= 3:
+            continue
+        if (
+            artist_family_key
+            and int(artist_family_counts.get(artist_family_key) or 0) >= 2
+        ):
+            continue
+        filtered.append(dict(track))
+        used_track_ids.add(signature)
+        if artist_key:
+            used_artist_counts[artist_key] = int(used_artist_counts.get(artist_key) or 0) + 1
+        if artist_family_key:
+            artist_family_counts[artist_family_key] = (
+                int(artist_family_counts.get(artist_family_key) or 0) + 1
+            )
+        if len(filtered) >= limit:
+            break
+    return filtered
+
+
 def _finalize_row_seed(
     *,
     server: Any,
@@ -149,122 +194,23 @@ def _finalize_row_seed(
     metadata_enrich_limit: int | None = None,
     enforce_feed_artist_cap: bool = True,
 ) -> Tuple[Dict[str, Any] | None, Dict[str, Any]]:
-    row_kind = row_seed["kind"]
-    row_strategy = row_seed.get("row_strategy") or "personalized"
-    fallback_reason = row_seed.get("fallback_reason") or ""
-    source_pool_counts = dict(row_seed.get("source_pool_counts") or {})
-    allocator_ms = int(row_seed.get("allocator_ms") or 0)
-
-    if row_seed.get("item_type") in {"album", "artist"}:
-        row = {
-            "id": row_kind,
-            "kind": row_kind,
-            "title": row_seed["title"],
-            "item_type": row_seed.get("item_type") or "track",
-            "items": list(row_seed.get("items") or [])[:18],
-            "row_strategy": row_strategy,
-            "fallback_reason": fallback_reason,
-        }
-        diagnostics = {
-            "builder": f"candidate_snapshot:{row_kind}",
-            "builder_ms": allocator_ms,
-            "status": "emitted" if row.get("items") else "empty",
-            "required": is_required_row(server, row_kind),
-            "item_count": len(row.get("items") or []),
-            "row_strategy": row_strategy,
-            "fallback_reason": fallback_reason,
-            "source_pool_counts": source_pool_counts,
-        }
-        return row, diagnostics
-
-    max_items = (
-        RECOMMEND_INITIAL_QUIET_ITEMS
-        if row_kind == "quiet_picks"
-        else RECOMMEND_INITIAL_TRACK_BANK_ITEMS
-    )
-    finalized = finalize_row_items(
+    return finalize_row_seed_execution(
         server=server,
-        row_kind=row_kind,
-        title=row_seed["title"],
-        candidates=row_seed.get("candidates") or [],
         profile=profile,
+        row_seed=row_seed,
         used_track_ids=used_track_ids,
         used_artist_counts=used_artist_counts,
+        embedding_lookup=embedding_lookup,
+        metadata_enrich_limit=metadata_enrich_limit,
         enforce_feed_artist_cap=enforce_feed_artist_cap,
-        max_items=max_items,
-        embedding_lookup=embedding_lookup,
-        metadata_enrich_limit=metadata_enrich_limit,
+        initial_quiet_items=RECOMMEND_INITIAL_QUIET_ITEMS,
+        initial_track_bank_items=RECOMMEND_INITIAL_TRACK_BANK_ITEMS,
+        filter_prebuilt_track_items_fn=_filter_prebuilt_track_items,
+        finalize_row_items_fn=finalize_row_items,
+        expand_row_bank_fn=_expand_row_bank,
+        apply_track_row_runtime_fields_fn=apply_track_row_runtime_fields,
+        apply_quiet_row_runtime_fields_fn=apply_quiet_row_runtime_fields,
     )
-    if finalized is None:
-        diagnostics = {
-            "builder": f"candidate_snapshot:{row_kind}",
-            "builder_ms": allocator_ms,
-            "status": "filtered_out",
-            "required": is_required_row(server, row_kind),
-            "candidate_count": len(row_seed.get("candidates") or []),
-            "row_strategy": row_strategy,
-            "fallback_reason": fallback_reason,
-            "source_pool_counts": source_pool_counts,
-        }
-        return None, diagnostics
-
-    finalized = _expand_row_bank(
-        server=server,
-        row_kind=row_kind,
-        finalized=finalized,
-        row_seed=row_seed,
-        profile=profile,
-        embedding_lookup=embedding_lookup,
-        metadata_enrich_limit=metadata_enrich_limit,
-    )
-    finalize_diagnostics = {}
-    if isinstance(finalized.get("_diagnostics"), dict):
-        finalize_diagnostics = dict(finalized.pop("_diagnostics"))
-        finalized["diagnostics"] = dict(finalize_diagnostics)
-    finalized = apply_track_row_runtime_fields(
-        server=server,
-        finalized=finalized,
-        row_seed=row_seed,
-    )
-    if row_kind == "quiet_picks":
-        finalized = apply_quiet_row_runtime_fields(
-            server=server,
-            finalized=finalized,
-            row_seed=row_seed,
-        )
-    finalized["row_strategy"] = row_strategy
-    finalized["fallback_reason"] = fallback_reason
-    diagnostics = {
-        "builder": f"candidate_snapshot:{row_kind}",
-        "builder_ms": allocator_ms,
-        "status": "emitted",
-        "required": is_required_row(server, row_kind),
-        "candidate_count": len(row_seed.get("candidates") or []),
-        "item_count": len(finalized.get("items") or []),
-        "row_strategy": row_strategy,
-        "fallback_reason": fallback_reason,
-        "source_pool_counts": source_pool_counts,
-    }
-    if finalize_diagnostics:
-        diagnostics["candidate_count_merged"] = int(
-            finalize_diagnostics.get("candidate_count_merged") or 0
-        )
-        diagnostics["source_counts"] = dict(
-            finalize_diagnostics.get("source_counts") or {}
-        )
-        diagnostics["selected_source_counts"] = dict(
-            finalize_diagnostics.get("selected_source_counts") or {}
-        )
-        diagnostics["ranking_model_key"] = (
-            finalize_diagnostics.get("model_key") or ""
-        )
-        diagnostics["ranking_model_version"] = (
-            finalize_diagnostics.get("model_version") or ""
-        )
-        diagnostics["row_feature_mix"] = dict(
-            finalize_diagnostics.get("row_feature_mix") or {}
-        )
-    return finalized, diagnostics
 
 
 def _prepare_candidate_embeddings(
@@ -312,142 +258,39 @@ def _build_rows_from_candidate_snapshot(
     candidate_snapshot: Dict[str, Any],
     precompute_hit: bool,
     allow_required_fallback: bool,
+    force_rich_rows: bool = False,
+    launch_tier_only: bool = False,
     trace: Dict[str, Any] | None = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int], Dict[str, Dict[str, Any]], Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    used_track_ids: set[str] = set()
-    used_artist_counts: Dict[str, int] = {}
-    generator_timings: Dict[str, int] = {}
-    row_diagnostics: Dict[str, Dict[str, Any]] = {}
-    row_seeds: Dict[str, Dict[str, Any]] = {}
-
-    for row_kind in policy_row_kinds():
-        row_seed = build_row_seed(
-            server=server,
-            row_kind=row_kind,
-            profile=profile,
-            snapshot=candidate_snapshot,
-        )
-        if not isinstance(row_seed, dict):
-            row_diagnostics[row_kind] = {
-                "builder": f"candidate_snapshot:{row_kind}",
-                "builder_ms": 0,
-                "status": "empty",
-                "required": is_required_row(server, row_kind),
-                "row_strategy": "personalized",
-                "fallback_reason": "",
-            }
-            continue
-        row_seeds[row_kind] = row_seed
-        generator_timings[f"candidate_snapshot:{row_kind}"] = int(
-            row_seed.get("allocator_ms") or 0
-        )
-
-    resolved_from = candidate_snapshot.get("resolved_from") or ""
-    metadata_enrich_limit = None
-    if not precompute_hit and "fallback" in resolved_from:
-        metadata_enrich_limit = 0
-    elif not precompute_hit:
-        metadata_enrich_limit = 2
-    embedding_lookup = _prepare_candidate_embeddings(
+    resolution = resolve_candidate_snapshot(
         server=server,
-        row_seeds=list(row_seeds.values()),
+        profile=profile,
+        precompute_snapshot={"candidate_snapshot": dict(candidate_snapshot or {})}
+        if isinstance(candidate_snapshot, dict)
+        else None,
+        allow_live_snapshot_build=False,
+        force_rich_rows=force_rich_rows,
+        launch_tier_only=launch_tier_only,
+        trace=trace,
     )
-
-    for row_kind in policy_row_kinds():
-        row_seed = row_seeds.get(row_kind)
-        if not isinstance(row_seed, dict):
-            continue
-        row, diagnostics = _finalize_row_seed(
-            server=server,
-            profile=profile,
-            row_seed=row_seed,
-            used_track_ids=used_track_ids,
-            used_artist_counts=used_artist_counts,
-            embedding_lookup=embedding_lookup,
-            metadata_enrich_limit=metadata_enrich_limit,
-        )
-        row_diagnostics[row_kind] = diagnostics
-        if row is not None:
-            rows.append(row)
-
-    existing_row_ids = {
-        row.get("id")
-        for row in rows
-        if isinstance(row, dict)
-    }
-    for required_row_kind in required_row_kinds(server):
-        if required_row_kind in existing_row_ids:
-            continue
-        if not allow_required_fallback:
-            row_diagnostics[required_row_kind] = {
-                "builder": "required_row_policy",
-                "builder_ms": 0,
-                "status": "missing_no_fallback",
-                "required": True,
-                "row_strategy": "quality_first",
-                "fallback_reason": "required_row_missing",
-            }
-            continue
-        fallback_seed = build_required_fallback_seed(
-            server=server,
-            row_kind=required_row_kind,
-            profile=profile,
-            snapshot=candidate_snapshot,
-        )
-        if not isinstance(fallback_seed, dict):
-            row_diagnostics[required_row_kind] = {
-                "builder": "required_row_policy",
-                "builder_ms": 0,
-                "status": "fallback_unavailable",
-                "required": True,
-                "row_strategy": "fallback",
-                "fallback_reason": "required_row_missing",
-            }
-            continue
-        fallback_row, fallback_diag = _finalize_row_seed(
-            server=server,
-            profile=profile,
-            row_seed=fallback_seed,
-            used_track_ids=used_track_ids,
-            used_artist_counts=used_artist_counts,
-            embedding_lookup=embedding_lookup,
-            metadata_enrich_limit=metadata_enrich_limit,
-            enforce_feed_artist_cap=False,
-        )
-        if fallback_row is None:
-            fallback_diag["status"] = "fallback_filtered_out"
-            row_diagnostics[required_row_kind] = fallback_diag
-            continue
-        fallback_diag["builder"] = "required_row_policy"
-        fallback_diag["status"] = "fallback_emitted"
-        row_diagnostics[required_row_kind] = fallback_diag
-        rows.append(fallback_row)
-        existing_row_ids.add(required_row_kind)
-
-    rows.sort(key=lambda row: ROW_KIND_ORDER.get(row.get("kind"), 100))
-    row_builder_mode = candidate_snapshot.get("row_mode") or "candidate_snapshot_v42"
-    server._trace_put(
-        trace,
-        "ranking_meta",
-        "recommend.row_builder_mode",
-        row_builder_mode,
+    resolution = type(resolution)(
+        candidate_snapshot=dict(candidate_snapshot or {}),
+        precompute_hit=precompute_hit,
+        allow_required_fallback=allow_required_fallback,
+        substrate_mode=resolution.substrate_mode,
+        selected_row_kinds=resolution.selected_row_kinds,
+        deferred_row_kinds=resolution.deferred_row_kinds,
+        row_builder_mode=resolution.row_builder_mode,
+        launch_tier_only=resolution.launch_tier_only,
     )
-    builder_meta = {
-        "row_builder_mode": row_builder_mode,
-        "candidate_snapshot_source": candidate_snapshot.get("resolved_from") or "",
-        "candidate_pool_counts": dict(candidate_snapshot.get("pool_counts") or {}),
-        "candidate_stage_timings_ms": dict(candidate_snapshot.get("stage_timings_ms") or {}),
-        "candidate_snapshot_generated_at": float(candidate_snapshot.get("generated_at") or 0.0),
-        "candidate_snapshot_build_ms": int(candidate_snapshot.get("build_ms") or 0),
-        "candidate_snapshot_albums_count": int(candidate_snapshot.get("albums_count") or 0),
-        "candidate_snapshot_hit": bool(precompute_hit),
-        "metadata_enrich_limit": (
-            metadata_enrich_limit if metadata_enrich_limit is not None else -1
-        ),
-        "candidate_snapshot": dict(candidate_snapshot),
-    }
-    return rows, generator_timings, row_diagnostics, builder_meta
+    return execute_candidate_pipeline(
+        server=server,
+        profile=profile,
+        resolution=resolution,
+        trace=trace,
+        prepare_embeddings=_prepare_candidate_embeddings,
+        finalize_row_seed=_finalize_row_seed,
+    ).as_legacy_tuple()
 
 
 def build_rows_v41(
@@ -457,62 +300,27 @@ def build_rows_v41(
     precompute_snapshot: Dict[str, Any] | None = None,
     trace: Dict[str, Any] | None = None,
     allow_live_snapshot_build: bool = False,
+    force_rich_rows: bool = False,
+    launch_tier_only: bool = False,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int], Dict[str, Dict[str, Any]], Dict[str, Any]]:
-    candidate_snapshot = None
-    precompute_hit = False
-    if isinstance(precompute_snapshot, dict):
-        candidate_snapshot = precompute_snapshot.get("candidate_snapshot")
-        precompute_hit = isinstance(candidate_snapshot, dict) and bool(candidate_snapshot)
-        if precompute_hit:
-            candidate_snapshot = dict(candidate_snapshot or {})
-            candidate_snapshot["resolved_from"] = (
-                precompute_snapshot.get("resolved_from")
-                or candidate_snapshot.get("resolved_from")
-                or "nearline"
-            )
-    if not isinstance(candidate_snapshot, dict) or not candidate_snapshot:
-        if allow_live_snapshot_build:
-            try:
-                candidate_snapshot = build_home_candidate_snapshot(
-                    server=server,
-                    profile=profile,
-                )
-                candidate_snapshot["resolved_from"] = "request_live"
-            except Exception as exc:
-                server._trace_put(
-                    trace,
-                    "errors",
-                    "recommend.live_snapshot_error",
-                    str(exc)[:240],
-                )
-                candidate_snapshot = build_home_candidate_snapshot_fallback(
-                    server=server,
-                    profile=profile,
-                )
-                candidate_snapshot["resolved_from"] = "request_fallback_after_live_error"
-        else:
-            server._trace_put(
-                trace,
-                "ranking_meta",
-                "recommend.live_snapshot_deferred",
-                True,
-            )
-            candidate_snapshot = build_home_candidate_snapshot_fallback(
-                server=server,
-                profile=profile,
-            )
-            candidate_snapshot["resolved_from"] = "request_fallback_deferred"
-    resolved_from = str(candidate_snapshot.get("resolved_from") or "")
-    allow_required_fallback = "fallback" in resolved_from or "error" in resolved_from
+    resolution = resolve_candidate_snapshot(
+        server=server,
+        profile=profile,
+        precompute_snapshot=precompute_snapshot,
+        allow_live_snapshot_build=allow_live_snapshot_build,
+        force_rich_rows=force_rich_rows,
+        launch_tier_only=launch_tier_only,
+        trace=trace,
+    )
     try:
-        return _build_rows_from_candidate_snapshot(
+        return execute_candidate_pipeline(
             server=server,
             profile=profile,
-            candidate_snapshot=candidate_snapshot,
-            precompute_hit=precompute_hit,
-            allow_required_fallback=allow_required_fallback,
+            resolution=resolution,
             trace=trace,
-        )
+            prepare_embeddings=_prepare_candidate_embeddings,
+            finalize_row_seed=_finalize_row_seed,
+        ).as_legacy_tuple()
     except Exception as exc:
         server._trace_put(
             trace,
@@ -520,16 +328,32 @@ def build_rows_v41(
             "recommend.candidate_snapshot_error",
             str(exc)[:240],
         )
-        degraded_snapshot = build_home_candidate_snapshot_fallback(
+        degraded_resolution = resolve_candidate_snapshot(
             server=server,
             profile=profile,
+            precompute_snapshot=None,
+            allow_live_snapshot_build=False,
+            force_rich_rows=False,
+            launch_tier_only=launch_tier_only,
+            trace=trace,
         )
+        degraded_snapshot = dict(degraded_resolution.candidate_snapshot or {})
         degraded_snapshot["resolved_from"] = "request_fallback_error"
-        return _build_rows_from_candidate_snapshot(
-            server=server,
-            profile=profile,
+        degraded_resolution = type(degraded_resolution)(
             candidate_snapshot=degraded_snapshot,
             precompute_hit=False,
             allow_required_fallback=True,
-            trace=trace,
+            substrate_mode=degraded_resolution.substrate_mode,
+            selected_row_kinds=degraded_resolution.selected_row_kinds,
+            deferred_row_kinds=degraded_resolution.deferred_row_kinds,
+            row_builder_mode=degraded_resolution.row_builder_mode,
+            launch_tier_only=degraded_resolution.launch_tier_only,
         )
+        return execute_candidate_pipeline(
+            server=server,
+            profile=profile,
+            resolution=degraded_resolution,
+            trace=trace,
+            prepare_embeddings=_prepare_candidate_embeddings,
+            finalize_row_seed=_finalize_row_seed,
+        ).as_legacy_tuple()

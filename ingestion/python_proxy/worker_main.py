@@ -4,12 +4,15 @@ import sys
 import time
 import traceback
 
-from auralis_backend.legacy import get_server
+from auralis_backend.recommend.maintenance_runtime import (
+    run_recommendation_worker_forever,
+)
+from auralis_backend.runtime_context import resolve_server
 from auralis_backend.storage.postgres import ensure_backend_schema
 
 
 def main() -> int:
-    server = get_server()
+    server = resolve_server()
     ensure_backend_schema()
     print("Auralis Recommendation Worker")
     print(
@@ -21,7 +24,7 @@ def main() -> int:
         f"eval={server.RECOMMENDATION_EXPERIMENT_EVAL_INTERVAL_SECONDS}s"
     )
     try:
-        server.run_recommendation_worker_forever()
+        run_recommendation_worker_forever()
     except KeyboardInterrupt:
         print("Recommendation worker stopped")
         return 0

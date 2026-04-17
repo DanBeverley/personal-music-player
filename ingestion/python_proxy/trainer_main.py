@@ -14,7 +14,7 @@ from auralis_backend.domain.ranking import (
     SEARCH_ARTIST_DEFAULT_WEIGHTS,
     SEARCH_TRACK_DEFAULT_WEIGHTS,
 )
-from auralis_backend.legacy import get_server
+from auralis_backend.runtime_context import resolve_server
 from auralis_backend.recommend.allocator import (
     ROW_ALLOCATOR_DEFAULTS_BY_KEY,
     ROW_ALLOCATOR_MODEL_KEYS,
@@ -123,7 +123,7 @@ def main() -> int:
     args = parser.parse_args()
 
     ensure_backend_schema()
-    server = get_server()
+    server = resolve_server()
     if args.force_sync:
         server._recommendation_sync_external_events(force=True)
     model = server._recommendation_get_collaborative_model(force_refresh=True)

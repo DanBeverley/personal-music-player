@@ -14,6 +14,7 @@ from ..recommend.feature_layer import (
     build_catalog_feature_profile,
     candidate_catalog_alignment,
 )
+from .server_adapter import adapt_search_server
 from .runtime import (
     semantic_search_lexical_score,
     semantic_search_vector_similarities,
@@ -27,9 +28,10 @@ def build_search_ranking_runtime(
     profile: Dict[str, Any],
     retrieval_payload: Dict[str, Any],
 ) -> Dict[str, Any]:
+    server = adapt_search_server(server)
     return {
-        "query": server._recommendation_trim_text(req.query),
-        "search_vectors": semantic_search_vectors(req, profile),
+        "query": server.trim_text(req.query),
+        "search_vectors": semantic_search_vectors(req, profile, server=server),
         "catalog_profile": build_catalog_feature_profile(server, profile),
         "normalized_anchor_artists": retrieval_payload.get("normalized_anchor_artists")
         or set(),
@@ -45,6 +47,7 @@ def _finalize_ranked_tracks(
     *,
     limit: int,
 ) -> List[Dict[str, Any]]:
+    server = adapt_search_server(server)
     ranked.sort(
         key=lambda item: (
             float(item.get("score") or 0.0),
@@ -57,19 +60,19 @@ def _finalize_ranked_tracks(
     title_counts: Dict[str, int] = {}
     source_counts: Dict[str, int] = {}
     for track in ranked:
-        artist_key = server._normalize_text(
+        artist_key = server.normalize_text(
             track.get("channel") or track.get("artist") or ""
         )
         if artist_key:
             artist_count = artist_counts.get(artist_key, 0)
             if artist_count >= 2 and len(results) + 1 < limit:
                 continue
-        title_key = server._normalize_text(track.get("title") or "")
+        title_key = server.normalize_text(track.get("title") or "")
         if title_key:
             title_count = title_counts.get(title_key, 0)
             if title_count >= 2 and len(results) + 1 < limit:
                 continue
-        source_name = server._recommendation_trim_text(track.get("search_source"))
+        source_name = server.trim_text(track.get("search_source"))
         if source_name:
             source_count = source_counts.get(source_name, 0)
             if source_count >= max(2, int(limit * 0.45)) and len(results) + 1 < limit:
@@ -93,38 +96,39 @@ def rank_track_candidates_fast_path(
     *,
     limit: int,
 ) -> List[Dict[str, Any]]:
-    query = server._recommendation_trim_text(req.query)
+    server = adapt_search_server(server)
+    query = server.trim_text(req.query)
     track_candidates = retrieval_payload.get("track_candidates") or {}
     if not track_candidates:
         return []
-    normalized_query = server._normalize_text(query)
+    normalized_query = server.normalize_text(query)
     normalized_anchor_artists = retrieval_payload.get("normalized_anchor_artists") or set()
     ranked: List[Dict[str, Any]] = []
     for entry in track_candidates.values():
         payload = (entry or {}).get("payload")
         if not isinstance(payload, dict):
             continue
-        track = server.normalize_recommendation_track(payload)
+        track = server.normalize_track(payload)
         if track is None:
             continue
         source_scores = dict((entry or {}).get("source_scores") or {})
         source_names = sorted(
             source_name
             for source_name in source_scores.keys()
-            if server._recommendation_trim_text(source_name)
+            if server.trim_text(source_name)
         )
         source_score = max(source_scores.values(), default=0.0)
         retrieval_votes = max(len(source_names), 1)
         title = track.get("title")
         artist = track.get("channel") or track.get("artist")
         album = track.get("album")
-        lexical_score = semantic_search_lexical_score(query, title, artist, album)
-        title_lexical = semantic_search_lexical_score(query, title)
-        normalized_title = server._normalize_text(title or "")
+        lexical_score = semantic_search_lexical_score(query, title, artist, album, server=server)
+        title_lexical = semantic_search_lexical_score(query, title, server=server)
+        normalized_title = server.normalize_text(title or "")
         exact_title_match = 1.0 if normalized_title and normalized_title == normalized_query else 0.0
         anchor_artist_match = (
             1.0
-            if server._normalize_text(artist or "") in normalized_anchor_artists
+            if server.normalize_text(artist or "") in normalized_anchor_artists
             else 0.0
         )
         ranking_score = (
@@ -169,6 +173,7 @@ def rank_track_candidates(
     limit: int,
     ranking_runtime: Dict[str, Any] | None = None,
 ) -> List[Dict[str, Any]]:
+    server = adapt_search_server(server)
     runtime = ranking_runtime or build_search_ranking_runtime(
         server,
         req,
@@ -185,7 +190,7 @@ def rank_track_candidates(
         for entry in track_candidates.values()
         if isinstance(entry, dict) and isinstance(entry.get("payload"), dict)
     ]
-    candidate_embeddings = server._recommendation_track_embeddings(candidate_items)
+    candidate_embeddings = server.recommendation_track_embeddings(candidate_items)
     search_vectors = runtime.get("search_vectors") or {}
     normalized_anchor_artists = runtime.get("normalized_anchor_artists") or set()
     catalog_profile = runtime.get("catalog_profile") or {}
@@ -194,27 +199,28 @@ def rank_track_candidates(
         payload = (entry or {}).get("payload")
         if not isinstance(payload, dict):
             continue
-        track = server.normalize_recommendation_track(payload)
+        track = server.normalize_track(payload)
         if track is None:
             continue
         source_scores = dict((entry or {}).get("source_scores") or {})
         source_names = sorted(
             source_name
             for source_name in source_scores.keys()
-            if server._recommendation_trim_text(source_name)
+            if server.trim_text(source_name)
         )
         source_score = max(source_scores.values(), default=0.0)
         retrieval_votes = max(len(source_names), 1)
-        track_id = server._recommendation_trim_text(track.get("id"))
-        track_artist_key = server._normalize_text(
+        track_id = server.trim_text(track.get("id"))
+        track_artist_key = server.normalize_text(
             track.get("channel") or track.get("artist") or ""
         )
-        track_key = server._recommendation_track_embedding_key(track)
+        track_key = server.recommendation_track_embedding_key(track)
         track_vector = candidate_embeddings.get(track_key) or []
         similarities = semantic_search_vector_similarities(
             track_vector,
             search_vectors,
             profile,
+            server=server,
         )
         collaborative_scores = collaborative_track_scores(server, track, profile)
         lexical_score = semantic_search_lexical_score(
@@ -222,10 +228,12 @@ def rank_track_candidates(
             track.get("title"),
             track.get("channel"),
             track.get("album"),
+            server=server,
         )
         title_lexical = semantic_search_lexical_score(
             query,
             track.get("title"),
+            server=server,
         )
         popularity = min(float(collaborative_scores["neighbor"]) / 5.0, 1.0)
         if track_id in (profile.get("top_track_ids") or []):
@@ -271,7 +279,7 @@ def rank_track_candidates(
             "same_title_ambiguity_penalty": float(catalog_alignment.get("same_title_ambiguity_penalty") or 0.0),
             "overexposed_artist_penalty": float(overexposed_artist_penalty),
         }
-        ranking_score = server._ranking_score_features(
+        ranking_score = server.ranking_score_features(
             model_key="search_track_reranker_v2",
             defaults=server.SEARCH_TRACK_DEFAULT_WEIGHTS,
             features=ranking_features,
@@ -322,6 +330,7 @@ def rank_artist_candidates(
     limit: int,
     ranking_runtime: Dict[str, Any] | None = None,
 ) -> List[Dict[str, Any]]:
+    server = adapt_search_server(server)
     runtime = ranking_runtime or build_search_ranking_runtime(
         server,
         req,
@@ -337,45 +346,47 @@ def rank_artist_candidates(
         for entry in artist_candidates.values()
         if isinstance(entry, dict) and isinstance(entry.get("payload"), dict)
     ]
-    artist_embeddings = server._recommendation_artist_embeddings(candidate_items)
+    artist_embeddings = server.recommendation_artist_embeddings(candidate_items)
     search_vectors = runtime.get("search_vectors") or {}
     collaborative_artist_scores = runtime.get("collaborative_artist_scores") or {}
     catalog_profile = runtime.get("catalog_profile") or {}
     ranked: List[Dict[str, Any]] = []
     for entry in artist_candidates.values():
         artist = dict((entry or {}).get("payload") or {})
-        artist_name = server._recommendation_trim_text(artist.get("name"))
+        artist_name = server.trim_text(artist.get("name"))
         if not artist_name:
             continue
         source_scores = dict((entry or {}).get("source_scores") or {})
         source_names = sorted(
             source_name
             for source_name in source_scores.keys()
-            if server._recommendation_trim_text(source_name)
+            if server.trim_text(source_name)
         )
         source_score = max(source_scores.values(), default=0.0)
         retrieval_votes = max(len(source_names), 1)
-        artist_key = server._recommendation_artist_embedding_key(artist)
+        artist_key = server.recommendation_artist_embedding_key(artist)
         artist_vector = artist_embeddings.get(artist_key) or []
         similarities = semantic_search_vector_similarities(
             artist_vector,
             search_vectors,
             profile,
+            server=server,
         )
         lexical_score = semantic_search_lexical_score(
             query,
             artist.get("name"),
             artist.get("description"),
+            server=server,
         )
         catalog_alignment = artist_catalog_alignment(server, artist, profile)
         overexposed_artist_penalty = (
             1.0
-            if server._normalize_text(artist_name or "") in set(catalog_profile.get("dominant_artist_keys") or set())
+            if server.normalize_text(artist_name or "") in set(catalog_profile.get("dominant_artist_keys") or set())
             else 0.0
         )
         collaborative_artist_score = float(
             collaborative_artist_scores.get(
-                server._normalize_text(artist_name)
+                server.normalize_text(artist_name)
             )
             or 0.0
         )
@@ -402,7 +413,7 @@ def rank_artist_candidates(
             "negative_feedback_penalty": float(catalog_alignment.get("negative_feedback_penalty") or 0.0),
             "overexposed_artist_penalty": float(overexposed_artist_penalty),
         }
-        ranking_score = server._ranking_score_features(
+        ranking_score = server.ranking_score_features(
             model_key="search_artist_reranker_v2",
             defaults=server.SEARCH_ARTIST_DEFAULT_WEIGHTS,
             features=ranking_features,
@@ -439,8 +450,8 @@ def rank_artist_candidates(
     results: List[Dict[str, Any]] = []
     for artist in ranked:
         if any(
-            server._normalize_text(existing.get("name") or "")
-            == server._normalize_text(artist.get("name") or "")
+            server.normalize_text(existing.get("name") or "")
+            == server.normalize_text(artist.get("name") or "")
             for existing in results
         ):
             continue
@@ -459,6 +470,7 @@ def rank_album_candidates(
     limit: int,
     ranking_runtime: Dict[str, Any] | None = None,
 ) -> List[Dict[str, Any]]:
+    server = adapt_search_server(server)
     runtime = ranking_runtime or build_search_ranking_runtime(
         server,
         req,
@@ -474,45 +486,47 @@ def rank_album_candidates(
         for entry in album_candidates.values()
         if isinstance(entry, dict) and isinstance(entry.get("payload"), dict)
     ]
-    album_embeddings = server._recommendation_album_embeddings(candidate_items)
+    album_embeddings = server.recommendation_album_embeddings(candidate_items)
     search_vectors = runtime.get("search_vectors") or {}
     collaborative_artist_scores = runtime.get("collaborative_artist_scores") or {}
     catalog_profile = runtime.get("catalog_profile") or {}
     ranked: List[Dict[str, Any]] = []
     for entry in album_candidates.values():
         album = dict((entry or {}).get("payload") or {})
-        album_title = server._recommendation_trim_text(album.get("title"))
+        album_title = server.trim_text(album.get("title"))
         if not album_title:
             continue
         source_scores = dict((entry or {}).get("source_scores") or {})
         source_names = sorted(
             source_name
             for source_name in source_scores.keys()
-            if server._recommendation_trim_text(source_name)
+            if server.trim_text(source_name)
         )
         source_score = max(source_scores.values(), default=0.0)
         retrieval_votes = max(len(source_names), 1)
-        album_key = server._recommendation_album_embedding_key(album)
+        album_key = server.recommendation_album_embedding_key(album)
         album_vector = album_embeddings.get(album_key) or []
         similarities = semantic_search_vector_similarities(
             album_vector,
             search_vectors,
             profile,
+            server=server,
         )
         lexical_score = semantic_search_lexical_score(
             query,
             album.get("title"),
             album.get("artist"),
+            server=server,
         )
         catalog_alignment = album_catalog_alignment(server, album, profile)
         overexposed_artist_penalty = (
             1.0
-            if server._normalize_text(album.get("artist") or "") in set(catalog_profile.get("dominant_artist_keys") or set())
+            if server.normalize_text(album.get("artist") or "") in set(catalog_profile.get("dominant_artist_keys") or set())
             else 0.0
         )
         collaborative_artist_score = float(
             collaborative_artist_scores.get(
-                server._normalize_text(album.get("artist") or "")
+                server.normalize_text(album.get("artist") or "")
             )
             or 0.0
         )
@@ -539,7 +553,7 @@ def rank_album_candidates(
             "same_title_ambiguity_penalty": float(catalog_alignment.get("same_title_ambiguity_penalty") or 0.0),
             "overexposed_artist_penalty": float(overexposed_artist_penalty),
         }
-        ranking_score = server._ranking_score_features(
+        ranking_score = server.ranking_score_features(
             model_key="search_album_reranker_v2",
             defaults=server.SEARCH_ALBUM_DEFAULT_WEIGHTS,
             features=ranking_features,
@@ -577,7 +591,7 @@ def rank_album_candidates(
     results: List[Dict[str, Any]] = []
     artist_counts: Dict[str, int] = {}
     for album in ranked:
-        artist_key = server._normalize_text(album.get("artist") or "")
+        artist_key = server.normalize_text(album.get("artist") or "")
         if artist_key:
             artist_count = artist_counts.get(artist_key, 0)
             if artist_count >= 2 and len(results) + 1 < limit:
@@ -596,13 +610,14 @@ def summarize_ranked_results(
     artists: List[Dict[str, Any]],
     albums: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
+    server = adapt_search_server(server)
     track_sources: Dict[str, int] = {}
     artist_sources: Dict[str, int] = {}
     album_sources: Dict[str, int] = {}
     unique_track_artists = {
-        server._normalize_text(track.get("channel") or track.get("artist") or "")
+        server.normalize_text(track.get("channel") or track.get("artist") or "")
         for track in tracks or []
-        if server._normalize_text(track.get("channel") or track.get("artist") or "")
+        if server.normalize_text(track.get("channel") or track.get("artist") or "")
     }
     for track in tracks or []:
         for source_name in track.get("search_sources") or []:

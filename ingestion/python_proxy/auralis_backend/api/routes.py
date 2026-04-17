@@ -2,95 +2,161 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Request
 
-from ..legacy import get_server
+from .media_runtime import (
+    MediaService,
+)
+from .assistant_runtime import AssistantService
+from .stream_runtime import (
+    direct_stream_url as direct_stream_url_runtime,
+    download_audio as download_audio_runtime,
+    proxy_stream as proxy_stream_runtime,
+    stream_audio as stream_audio_runtime,
+    warm_streams as warm_streams_runtime,
+)
 from ..recommend.service import RecommendationService
 from ..search.service import SearchService
+from ..contracts import (
+    AssistantChatRequest,
+    AssistantSessionCreateRequest,
+    AssistantSessionUpdateRequest,
+    DownloadRequest,
+    RecommendationInteractionEventRequest,
+    RecommendationModelTrainRequest,
+    RecommendationSearchEventRequest,
+    SearchRequest,
+    WarmStreamRequest,
+)
 
 router = APIRouter()
 
-_server = get_server()
-_search_service = SearchService(_server)
-_recommendation_service = RecommendationService(_server)
+_server = None
+_search_service = None
+_recommendation_service = None
+_assistant_service = None
+_media_service = None
+
+
+def configure_router(server) -> None:
+    global _server
+    global _search_service
+    global _recommendation_service
+    global _assistant_service
+    global _media_service
+    _server = server
+    _search_service = SearchService(server)
+    _recommendation_service = RecommendationService(server)
+    _assistant_service = AssistantService(server)
+    _media_service = MediaService(server)
+
+
+def _require_server():
+    if _server is None:
+        raise RuntimeError("Router server runtime has not been configured")
+    return _server
+
+
+def _require_search_service() -> SearchService:
+    if _search_service is None:
+        raise RuntimeError("Search service has not been configured")
+    return _search_service
+
+
+def _require_recommendation_service() -> RecommendationService:
+    if _recommendation_service is None:
+        raise RuntimeError("Recommendation service has not been configured")
+    return _recommendation_service
+
+
+def _require_assistant_service() -> AssistantService:
+    if _assistant_service is None:
+        raise RuntimeError("Assistant service has not been configured")
+    return _assistant_service
+
+
+def _require_media_service() -> MediaService:
+    if _media_service is None:
+        raise RuntimeError("Media service has not been configured")
+    return _media_service
 
 
 @router.get("/")
 def health_check():
-    return _server.health_check()
+    return _require_media_service().health_check()
 
 
 @router.get("/latency_summary")
 def latency_summary():
-    return _server.latency_summary()
+    return _require_media_service().latency_summary()
 
 
 @router.post("/prepare_session")
-def prepare_session(req: _server.WarmStreamRequest):
-    return _server.prepare_session(req)
+def prepare_session(req: WarmStreamRequest):
+    return _require_media_service().prepare_session(req)
 
 
 @router.post("/track_details")
-def get_track_details(req: _server.DownloadRequest):
-    return _server.get_track_details(req)
+def get_track_details(req: DownloadRequest):
+    return _require_media_service().get_track_details(req)
 
 
 @router.get("/lyrics/{video_id}")
 def get_track_lyrics(video_id: str):
-    return _server.get_track_lyrics(video_id)
+    return _require_media_service().get_track_lyrics(video_id)
 
 
 @router.post("/search")
-def search(req: _server.SearchRequest):
-    return _search_service.search(req)
+def search(req: SearchRequest):
+    return _require_search_service().search(req)
 
 
 @router.post("/search_albums")
-def search_albums(req: _server.SearchRequest):
-    return _search_service.search_albums(req)
+def search_albums(req: SearchRequest):
+    return _require_search_service().search_albums(req)
 
 
 @router.post("/search_artists")
-def search_artists(req: _server.SearchRequest):
-    return _search_service.search_artists(req)
+def search_artists(req: SearchRequest):
+    return _require_search_service().search_artists(req)
 
 
 @router.post("/recommended_artists")
-def recommended_artists(req: _server.SearchRequest):
-    return _recommendation_service.recommended_artists(req)
+def recommended_artists(req: SearchRequest):
+    return _require_recommendation_service().recommended_artists(req)
 
 
 @router.post("/suggest")
-def get_suggestions(req: _server.SearchRequest):
-    return _search_service.suggest(req)
+def get_suggestions(req: SearchRequest):
+    return _require_search_service().suggest(req)
 
 
 @router.post("/recommend")
-def recommend(req: _server.SearchRequest):
-    return _recommendation_service.recommend(req)
+def recommend(req: SearchRequest):
+    return _require_recommendation_service().recommend(req)
 
 
 @router.post("/interaction_event")
-def recommendation_interaction_event(req: _server.RecommendationInteractionEventRequest):
-    return _recommendation_service.interaction_event(req)
+def recommendation_interaction_event(req: RecommendationInteractionEventRequest):
+    return _require_recommendation_service().interaction_event(req)
 
 
 @router.post("/search_interaction")
-def recommendation_search_interaction(req: _server.RecommendationSearchEventRequest):
-    return _recommendation_service.search_interaction(req)
+def recommendation_search_interaction(req: RecommendationSearchEventRequest):
+    return _require_recommendation_service().search_interaction(req)
 
 
 @router.get("/recommendation_model")
 def recommendation_model_status():
-    return _recommendation_service.model_status()
+    return _require_recommendation_service().model_status()
 
 
 @router.get("/recommendation_model/versions")
 def recommendation_model_versions():
-    return _recommendation_service.model_versions()
+    return _require_recommendation_service().model_versions()
 
 
 @router.get("/model_registry/{model_key}/versions")
 def model_registry_versions(model_key: str, limit: int = 20):
-    return _recommendation_service.model_registry_versions(
+    return _require_recommendation_service().model_registry_versions(
         model_key=model_key,
         limit=limit,
     )
@@ -103,7 +169,7 @@ def model_registry_activate(
     actor: str = "system",
     reason: str = "",
 ):
-    return _recommendation_service.model_registry_activate(
+    return _require_recommendation_service().model_registry_activate(
         model_key=model_key,
         version=version,
         actor=actor,
@@ -118,7 +184,7 @@ def model_registry_rollback(
     actor: str = "system",
     reason: str = "",
 ):
-    return _recommendation_service.model_registry_rollback(
+    return _require_recommendation_service().model_registry_rollback(
         model_key=model_key,
         target_version=target_version,
         actor=actor,
@@ -128,93 +194,104 @@ def model_registry_rollback(
 
 @router.get("/model_registry/rollouts")
 def model_registry_rollouts(model_key: str = "", limit: int = 50):
-    return _recommendation_service.model_rollout_events(
+    return _require_recommendation_service().model_rollout_events(
         model_key=model_key,
         limit=limit,
     )
 
 
 @router.get("/recommendation_experiments")
-def recommendation_experiments(window_hours: int = _server.RECOMMENDATION_EXPERIMENT_EVAL_WINDOW_HOURS):
-    return _recommendation_service.experiments(window_hours=window_hours)
+def recommendation_experiments(window_hours: int | None = None):
+    server = _require_server()
+    resolved_window_hours = int(
+        window_hours or server.RECOMMENDATION_EXPERIMENT_EVAL_WINDOW_HOURS
+    )
+    return _require_recommendation_service().experiments(window_hours=resolved_window_hours)
 
 
 @router.post("/recommendation_experiments/evaluate")
 def recommendation_experiments_evaluate(
     force_promote: bool = False,
-    window_hours: int = _server.RECOMMENDATION_EXPERIMENT_EVAL_WINDOW_HOURS,
+    window_hours: int | None = None,
 ):
-    return _recommendation_service.evaluate_experiments(
+    server = _require_server()
+    resolved_window_hours = int(
+        window_hours or server.RECOMMENDATION_EXPERIMENT_EVAL_WINDOW_HOURS
+    )
+    return _require_recommendation_service().evaluate_experiments(
         force_promote=force_promote,
-        window_hours=window_hours,
+        window_hours=resolved_window_hours,
     )
 
 
 @router.post("/recommendation_model/train")
-def recommendation_model_train(req: _server.RecommendationModelTrainRequest):
-    return _recommendation_service.train_model(req)
+def recommendation_model_train(req: RecommendationModelTrainRequest):
+    return _require_recommendation_service().train_model(req)
 
 
 @router.get("/album/{album_id}")
 def get_album_details(album_id: str):
-    return _server.get_album_details(album_id)
+    return _require_media_service().get_album_details(album_id)
 
 
 @router.get("/artist/{artist_id}")
 def get_artist_details(artist_id: str):
-    return _server.get_artist_details(artist_id)
+    return _require_media_service().get_artist_details(artist_id)
 
 
 @router.get("/assistant/sessions")
 def assistant_list_sessions(user_scope_id: str, include_archived: bool = False):
-    return _server.assistant_list_sessions(user_scope_id, include_archived=include_archived)
+    return _require_assistant_service().list_sessions(
+        user_scope_id,
+        include_archived=include_archived,
+    )
 
 
 @router.post("/assistant/sessions")
-def assistant_create_session(req: _server.AssistantSessionCreateRequest):
-    return _server.assistant_create_session(req)
+def assistant_create_session(req: AssistantSessionCreateRequest):
+    return _require_assistant_service().create_session(req)
 
 
 @router.get("/assistant/sessions/{session_id}")
 def assistant_get_session(session_id: str, user_scope_id: str):
-    return _server.assistant_get_session(session_id, user_scope_id)
+    return _require_assistant_service().get_session(session_id, user_scope_id)
 
 
 @router.patch("/assistant/sessions/{session_id}")
-def assistant_update_session(session_id: str, req: _server.AssistantSessionUpdateRequest):
-    return _server.assistant_update_session(session_id, req)
+def assistant_update_session(session_id: str, req: AssistantSessionUpdateRequest):
+    return _require_assistant_service().update_session(session_id, req)
 
 
 @router.delete("/assistant/sessions/{session_id}")
 def assistant_delete_session(session_id: str, user_scope_id: str):
-    return _server.assistant_delete_session(session_id, user_scope_id)
+    return _require_assistant_service().delete_session(session_id, user_scope_id)
 
 
 @router.post("/assistant/chat")
-def assistant_chat(req: _server.AssistantChatRequest):
-    return _server.assistant_chat(req)
+def assistant_chat(req: AssistantChatRequest):
+    return _require_assistant_service().chat(req)
 
 
 @router.post("/warm_streams")
-def warm_streams(req: _server.WarmStreamRequest):
-    return _server.warm_streams(req)
+def warm_streams(req: WarmStreamRequest):
+    return warm_streams_runtime(_require_server(), req)
 
 
 @router.post("/download")
-def download_audio(req: _server.DownloadRequest):
-    return _server.download_audio(req)
+def download_audio(req: DownloadRequest):
+    return download_audio_runtime(_require_server(), req)
 
 
 @router.get("/stream/{video_id}")
 def stream_audio(video_id: str):
-    return _server.stream_audio(video_id)
+    return stream_audio_runtime(_require_server(), video_id)
 
 
 @router.get("/proxy_stream/{video_id}")
 def proxy_stream(video_id: str, request: Request):
-    return _server.proxy_stream(video_id, request)
+    return proxy_stream_runtime(_require_server(), video_id, request)
 
 
 @router.get("/direct_url/{video_id}")
 def direct_stream_url(video_id: str):
-    return _server.direct_stream_url(video_id)
+    return direct_stream_url_runtime(_require_server(), video_id)

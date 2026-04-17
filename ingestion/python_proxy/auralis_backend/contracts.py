@@ -25,6 +25,7 @@ class SearchV2Request(BaseModel):
     recent_tracks: List[Dict[str, Any]] = Field(default_factory=list)
     context_surface: str = "search"
     force_refresh: bool = False
+    defer_side_surfaces: bool = False
 
 
 class SuggestV2Request(BaseModel):
@@ -41,6 +42,7 @@ class RecommendationHomeV2Request(BaseModel):
     user_scope_id: str = "guest"
     session_id: Optional[str] = None
     force_refresh: bool = False
+    prepare_next_session: bool = False
     prefer_fresh_rows: bool = False
     refresh_token: str = ""
     hydrate_heavy_rows: bool = False
@@ -64,6 +66,7 @@ class RecommendationRowPageV2Request(BaseModel):
     user_scope_id: str = "guest"
     session_id: str
     row_id: str
+    row_context: Optional[str] = None
     offset: int = 0
     limit: int = 8
 
@@ -104,6 +107,118 @@ class RecommendationRowPageV3Request(RecommendationRowPageV2Request):
 
 class SimilarArtistsV3Request(SimilarArtistsV2Request):
     pass
+
+
+class SearchRequest(SearchV3Request):
+    surface: str = "home_feed"
+    seed_id: Optional[str] = None
+    seed_ids: List[str] = Field(default_factory=list)
+    anchor_artist_hints: List[str] = Field(default_factory=list)
+    avoid_ids: List[str] = Field(default_factory=list)
+    offset: int = 0
+    row_id: Optional[str] = None
+    row_context: Optional[str] = None
+    prepare_next_session: bool = False
+    prefer_fresh_rows: bool = False
+    refresh_token: str = ""
+    hydrate_heavy_rows: bool = False
+    defer_side_surfaces: bool = False
+    recent_track_snapshots: List[Dict[str, Any]] = Field(default_factory=list)
+    top_track_snapshots: List[Dict[str, Any]] = Field(default_factory=list)
+    anchor_track_snapshots: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class RecommendationInteractionEventRequest(BaseModel):
+    user_scope_id: str = "guest"
+    track_id: str
+    event_type: str = "play"
+    artist_name: Optional[str] = None
+    source: str = "app"
+    occurred_at: Optional[float] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class RecommendationSearchEventRequest(BaseModel):
+    user_scope_id: str = "guest"
+    query: str
+    result_count: int = 0
+    source: str = "app"
+    occurred_at: Optional[float] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class RecommendationModelTrainRequest(BaseModel):
+    force_sync: bool = False
+
+
+class DownloadRequest(BaseModel):
+    video_id: str
+    title: str = ""
+
+
+class WarmStreamRequest(BaseModel):
+    video_ids: List[str] = Field(default_factory=list)
+    current_video_id: Optional[str] = None
+    active_queue: bool = False
+    lookahead: int = 0
+
+
+class AssistantConversationMessage(BaseModel):
+    role: str
+    content: str
+
+
+class AssistantPlaylistSummary(BaseModel):
+    id: str
+    name: str
+    track_count: int = 0
+
+
+class AssistantLibraryTrack(BaseModel):
+    id: Optional[str] = None
+    title: str = ""
+    artist: str = ""
+    album: Optional[str] = None
+
+
+class AssistantContextTrack(BaseModel):
+    id: Optional[str] = None
+    title: str = ""
+    artist: str = ""
+    channel: Optional[str] = None
+    album: Optional[str] = None
+    thumbnail: Optional[str] = None
+    duration: int = 0
+    reason: Optional[str] = None
+
+
+class AssistantChatRequest(BaseModel):
+    message: str
+    user_scope_id: str = "guest"
+    session_id: Optional[str] = None
+    thinking_mode: bool = True
+    force_refresh: bool = False
+    conversation: List[AssistantConversationMessage] = Field(default_factory=list)
+    last_assistant_tracks: List[AssistantContextTrack] = Field(default_factory=list)
+    last_playlist_draft_tracks: List[AssistantContextTrack] = Field(default_factory=list)
+    recent_assistant_tracks: List[AssistantContextTrack] = Field(default_factory=list)
+    playlist_summaries: List[AssistantPlaylistSummary] = Field(default_factory=list)
+    recent_track_ids: List[str] = Field(default_factory=list)
+    recent_queries: List[str] = Field(default_factory=list)
+    library_tracks: List[AssistantLibraryTrack] = Field(default_factory=list)
+    limit: int = 10
+
+
+class AssistantSessionCreateRequest(BaseModel):
+    user_scope_id: str = "guest"
+    title: Optional[str] = None
+
+
+class AssistantSessionUpdateRequest(BaseModel):
+    user_scope_id: str = "guest"
+    title: Optional[str] = None
+    archived: Optional[bool] = None
+    pinned: Optional[bool] = None
 
 
 class SearchTopResult(BaseModel):

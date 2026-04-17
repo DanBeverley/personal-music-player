@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable
 
+from .server_adapter import adapt_domain_server
+
 
 _HARD_REJECT_TERMS = (
     "tribute",
@@ -26,7 +28,7 @@ _SOFT_PENALTY_TERMS = (
 
 
 def _normalize(server, value: Any) -> str:
-    return server._normalize_text(value or "")
+    return adapt_domain_server(server).normalize_text(value or "")
 
 
 def _combined_text(server, values: Iterable[Any]) -> str:

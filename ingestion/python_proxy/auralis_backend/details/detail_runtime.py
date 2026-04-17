@@ -1,0 +1,203 @@
+from __future__ import annotations
+
+from typing import Any, Dict
+
+from .server_adapter import adapt_detail_server
+
+
+def build_artist_details_payload(
+    server: Any,
+    artist_id: str,
+    *,
+    enrich_related: bool = True,
+) -> Dict[str, Any]:
+    server = adapt_detail_server(server)
+    cache_key = server.trim_text(artist_id)
+    if cache_key:
+        cache_key = f"{cache_key}:{'expanded' if enrich_related else 'basic'}"
+    if cache_key:
+        cached = server.cache_lookup("artist", cache_key)
+        if cached is not None:
+            return dict(cached)
+
+    artist = server.ytmusic.get_artist(artist_id)
+    name = artist.get("name") or "Unknown Artist"
+    songs_section = artist.get("songs") or {}
+    album_section = artist.get("albums") or {}
+    related_section = artist.get("related") or {}
+
+    top_songs = server.normalize_artist_song_entries(
+        songs_section.get("results") or [],
+        fallback_artist=name,
+    )
+
+    albums = server.normalize_artist_album_entries(
+        album_section.get("results") or [],
+        fallback_artist=name,
+    )
+    album_browse_id = album_section.get("browseId")
+    album_params = album_section.get("params")
+    if album_browse_id and album_params:
+        try:
+            more_albums = server.ytmusic.get_artist_albums(
+                album_browse_id,
+                album_params,
+                limit=12,
+            )
+        except Exception:
+            more_albums = []
+        for album in server.normalize_artist_album_entries(
+            more_albums,
+            fallback_artist=name,
+        ):
+            album_id = album.get("id")
+            if album_id and any(existing.get("id") == album_id for existing in albums):
+                continue
+            albums.append(album)
+            if len(albums) >= 12:
+                break
+
+    related_artists = server.rank_artist_detail_related_artists(
+        {
+            "id": artist_id,
+            "name": name,
+            "description": artist.get("description") or "",
+            "thumbnail": server.extract_thumbnail(artist),
+        },
+        top_songs,
+        server.normalize_artist_results(related_section.get("results") or []),
+        enrich_related=enrich_related,
+    )
+
+    payload = {
+        "status": "success",
+        "id": artist_id,
+        "name": name,
+        "description": server.summarize_artist_description(artist.get("description") or ""),
+        "full_description": artist.get("description") or "",
+        "thumbnail": server.extract_thumbnail(artist),
+        "stats": server.normalize_artist_stats(artist),
+        "top_songs": top_songs[:12],
+        "albums": albums[:12],
+        "related_artists": related_artists[:12],
+    }
+    if cache_key:
+        server.cache_store("artist", cache_key, payload)
+    return payload
+
+
+def build_track_details_payload(server: Any, video_id: str) -> Dict[str, Any]:
+    server = adapt_detail_server(server)
+    cache_key = server.trim_text(video_id)
+    if cache_key:
+        cached = server.cache_lookup("track", cache_key)
+        if cached is not None:
+            return dict(cached)
+
+    release_date = ""
+    artist = ""
+    album_title = ""
+    album_id = None
+
+    try:
+        song = server.ytmusic.get_song(video_id)
+        if "microformat" in song and "microformatDataRenderer" in song["microformat"]:
+            release_date = song["microformat"]["microformatDataRenderer"].get("publishDate", "")
+        vd = song.get("videoDetails", {})
+        artist = vd.get("author", "")
+        song_album = server.extract_album_info(song) or server.extract_album_info(vd)
+        if song_album:
+            album_title = song_album.get("title") or ""
+            album_id = song_album.get("id")
+    except Exception:
+        pass
+
+    watch = server.ytmusic.get_watch_playlist(videoId=video_id)
+    video_details = watch.get("videoDetails", {})
+    track_title = video_details.get("title") or ""
+    if not artist:
+        artist = server.extract_artist(video_details)
+    if not album_title:
+        looked_up_album = server.lookup_album_for_song(video_id, track_title, artist)
+        if looked_up_album:
+            album_title = looked_up_album.get("title") or ""
+            album_id = looked_up_album.get("id")
+
+    similar_tracks = []
+    for track in watch.get("tracks", []):
+        if track.get("videoId") == video_id or not track.get("videoId"):
+            continue
+        similar_tracks.append({
+            "id": track["videoId"],
+            "title": track.get("title"),
+            "duration": track.get("length") or track.get("duration_seconds") or 0,
+            "thumbnail": server.extract_thumbnail(track),
+            "channel": server.extract_artist(track),
+            "album": (server.extract_album_info(track) or {}).get("title"),
+            "album_id": (server.extract_album_info(track) or {}).get("id"),
+        })
+    payload = {
+        "status": "success",
+        "video_id": video_id,
+        "title": track_title,
+        "author": artist,
+        "thumbnail": server.extract_thumbnail(video_details),
+        "duration": video_details.get("lengthSeconds"),
+        "release_date": release_date,
+        "album": album_title,
+        "album_title": album_title,
+        "album_id": album_id,
+        "lyrics_available": bool(watch.get("lyrics")),
+        "similar_tracks": similar_tracks,
+    }
+    if cache_key:
+        server.cache_store("track", cache_key, payload)
+    return payload
+
+
+def build_album_details_payload(server: Any, album_id: str) -> Dict[str, Any]:
+    server = adapt_detail_server(server)
+    cache_key = server.trim_text(album_id)
+    if cache_key:
+        cached = server.cache_lookup("album", cache_key)
+        if cached is not None:
+            return dict(cached)
+
+    album = server.ytmusic.get_album(album_id)
+    album_thumbnail = server.extract_thumbnail(album)
+    album_artist = server.extract_artist(album)
+    tracks = []
+
+    for entry in album.get("tracks", []):
+        video_id = entry.get("videoId")
+        if not video_id:
+            continue
+        tracks.append({
+            "id": video_id,
+            "title": entry.get("title"),
+            "duration": server.parse_duration_seconds(
+                entry.get("duration_seconds")
+                or entry.get("duration")
+                or entry.get("length")
+            ),
+            "thumbnail": server.extract_thumbnail(entry) or album_thumbnail,
+            "channel": server.extract_artist(entry) or album_artist,
+            "album": album.get("title"),
+            "album_title": album.get("title"),
+            "album_id": album_id,
+            "year": album.get("year") or "",
+        })
+
+    payload = {
+        "status": "success",
+        "id": album_id,
+        "title": album.get("title"),
+        "artist": album_artist,
+        "thumbnail": album_thumbnail,
+        "year": album.get("year") or "",
+        "track_count": len(tracks),
+        "tracks": tracks,
+    }
+    if cache_key:
+        server.cache_store("album", cache_key, payload)
+    return payload

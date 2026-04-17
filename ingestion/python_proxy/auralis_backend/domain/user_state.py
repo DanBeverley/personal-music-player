@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections import defaultdict
+import json
 from typing import Any, Dict, List, Tuple, TypedDict
 
 from ..contracts import (
@@ -8,8 +10,9 @@ from ..contracts import (
     SimilarArtistsV3Request,
     SuggestV2Request,
 )
-from ..legacy import build_search_request, get_server, trim_text, unique_snapshot_tracks, unique_strings
+from .server_adapter import DomainServerAdapter, adapt_domain_server
 from ..recommend.profile_runtime import build_profile_key, hydrate_state_profile
+from ..recommend.store_runtime import open_recommendation_store_connection
 
 
 _NOISY_QUERY_PHRASES = (
@@ -72,6 +75,25 @@ class UserStateSnapshot(TypedDict, total=False):
     profile_runtime: Dict[str, Any]
 
 
+def trim_text(value: str | None) -> str:
+    return adapt_domain_server().trim_text(value)
+
+
+def unique_strings(values, limit: int | None = None) -> List[str]:
+    return adapt_domain_server().unique_strings(values, limit)
+
+
+def unique_snapshot_tracks(values, limit: int = 16) -> List[Dict[str, Any]]:
+    return [
+        dict(track)
+        for track in adapt_domain_server().unique_snapshot_tracks(values or [], limit)
+    ]
+
+
+def build_search_request(**kwargs):
+    return adapt_domain_server().build_search_request(**kwargs)
+
+
 def _normalize_track_snapshots(raw_tracks, limit: int) -> List[Dict[str, Any]]:
     return unique_snapshot_tracks(raw_tracks or [], limit)
 
@@ -113,26 +135,285 @@ def _snapshot_artist_hints(server, tracks: List[Dict[str, Any]]) -> List[str]:
     return unique_strings(hints, 16)
 
 
-def _build_state_snapshot(legacy_req) -> UserStateSnapshot:
-    server = get_server()
-    recent_track_snapshots = server._recommendation_unique_snapshot_tracks(
+def _sparse_home_request(
+    *,
+    recent_track_snapshots: List[Dict[str, Any]],
+    top_track_snapshots: List[Dict[str, Any]],
+    recent_queries: List[str],
+    artist_hints: List[str],
+    library_track_ids: List[str],
+) -> bool:
+    if len(recent_track_snapshots) >= 4 and len(top_track_snapshots) >= 4:
+        return False
+    signal_score = 0
+    if recent_track_snapshots:
+        signal_score += 2
+    if len(recent_track_snapshots) >= 4:
+        signal_score += 1
+    if top_track_snapshots:
+        signal_score += 2
+    if len(top_track_snapshots) >= 4:
+        signal_score += 1
+    if len(artist_hints) >= 3:
+        signal_score += 2
+    elif artist_hints:
+        signal_score += 1
+    if len(recent_queries) >= 2:
+        signal_score += 1
+    if len(library_track_ids) >= 8:
+        signal_score += 1
+    return signal_score < 5
+
+
+def _metadata_thumbnail_url(payload: Dict[str, Any]) -> str:
+    thumbnail = payload.get("thumbnail")
+    if isinstance(thumbnail, str) and thumbnail.strip():
+        return thumbnail.strip()
+    thumbnails = payload.get("thumbnails")
+    if isinstance(thumbnails, list):
+        for item in thumbnails:
+            if isinstance(item, dict):
+                url = trim_text(item.get("url"))
+                if url:
+                    return url
+    return ""
+
+
+def _metadata_duration(payload: Dict[str, Any]) -> int | None:
+    raw_value = (
+        payload.get("duration")
+        or payload.get("duration_seconds")
+        or payload.get("durationSeconds")
+        or payload.get("lengthSeconds")
+    )
+    try:
+        value = int(raw_value)
+    except Exception:
+        return None
+    return value if value > 0 else None
+
+
+def _snapshot_from_event_payload(
+    *,
+    track_id: str,
+    artist_name: str,
+    payload: Dict[str, Any],
+) -> Dict[str, Any] | None:
+    normalized_track_id = trim_text(track_id)
+    if not normalized_track_id:
+        return None
+    snapshot = {
+        "id": normalized_track_id,
+        "title": trim_text(payload.get("title") or payload.get("name")),
+        "channel": trim_text(
+            payload.get("channel")
+            or payload.get("artist")
+            or payload.get("author")
+            or artist_name
+        ),
+        "artist": trim_text(payload.get("artist") or payload.get("author") or artist_name),
+        "album": trim_text(payload.get("album")),
+        "album_id": trim_text(payload.get("album_id") or payload.get("albumId")),
+        "thumbnail": _metadata_thumbnail_url(payload),
+        "duration": _metadata_duration(payload),
+    }
+    if not snapshot["title"] and not snapshot["channel"] and not snapshot["artist"]:
+        return None
+    return snapshot
+
+
+def _load_scope_history_seed(
+    server: DomainServerAdapter,
+    user_scope_id: str,
+) -> Dict[str, Any]:
+    normalized_scope = trim_text(user_scope_id or "guest") or "guest"
+    if normalized_scope == "guest":
+        return {}
+    try:
+        connection = open_recommendation_store_connection(server)
+    except Exception:
+        return {}
+    event_rows = []
+    search_rows = []
+    try:
+        event_rows = connection.execute(
+            """
+            SELECT track_id, COALESCE(artist_name, '') AS artist_name,
+                   COALESCE(event_type, 'play') AS event_type,
+                   COALESCE(weight, 0) AS weight,
+                   COALESCE(metadata_json, '{}') AS metadata_json,
+                   occurred_at
+            FROM recommendation_events
+            WHERE user_scope_id = ?
+            ORDER BY occurred_at DESC
+            LIMIT 180
+            """,
+            [normalized_scope],
+        ).fetchall()
+        search_rows = connection.execute(
+            """
+            SELECT query, COALESCE(result_count, 0) AS result_count, occurred_at
+            FROM recommendation_search_events
+            WHERE user_scope_id = ?
+            ORDER BY occurred_at DESC
+            LIMIT 40
+            """,
+            [normalized_scope],
+        ).fetchall()
+    except Exception:
+        return {}
+    finally:
+        connection.close()
+
+    recent_track_ids: List[str] = []
+    top_track_scores: Dict[str, float] = defaultdict(float)
+    library_track_ids: List[str] = []
+    artist_hints: List[str] = []
+    track_payload_by_id: Dict[str, Dict[str, Any]] = {}
+    recent_track_snapshots: List[Dict[str, Any]] = []
+    seen_recent_ids = set()
+    seen_library_ids = set()
+    now = max(
+        [float(row["occurred_at"] or 0.0) for row in list(event_rows or [])] or [0.0]
+    )
+    for index, row in enumerate(list(event_rows or [])):
+        track_id = trim_text(row["track_id"])
+        if not track_id:
+            continue
+        try:
+            payload = json.loads(row["metadata_json"] or "{}")
+        except Exception:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        artist_name = trim_text(row["artist_name"])
+        event_type = trim_text(row["event_type"]).lower() or "play"
+        occurred_at = float(row["occurred_at"] or 0.0)
+        age_days = max(0.0, (now - occurred_at) / 86400.0) if now > 0.0 else float(index) / 18.0
+        recency_bonus = max(0.35, 1.45 - (age_days * 0.08))
+        try:
+            base_weight = float(row["weight"] or 0.0)
+        except Exception:
+            base_weight = 0.0
+        if base_weight <= 0.0:
+            base_weight = 1.0
+        top_track_scores[track_id] += base_weight * recency_bonus
+        if track_id not in seen_recent_ids:
+            seen_recent_ids.add(track_id)
+            recent_track_ids.append(track_id)
+        if artist_name:
+            artist_hints.append(artist_name)
+        snapshot = _snapshot_from_event_payload(
+            track_id=track_id,
+            artist_name=artist_name,
+            payload=payload,
+        )
+        if snapshot is not None:
+            track_payload_by_id[track_id] = snapshot
+            recent_track_snapshots.append(snapshot)
+            if snapshot.get("album"):
+                artist_hints.extend(server.extract_artist_names(snapshot))
+        if event_type in {"library", "download", "save"} and track_id not in seen_library_ids:
+            seen_library_ids.add(track_id)
+            library_track_ids.append(track_id)
+
+    recent_track_ids = server.unique_track_ids(recent_track_ids, 16)
+    top_track_ids = [
+        track_id
+        for track_id, _score in sorted(
+            top_track_scores.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )[:16]
+    ]
+
+    fetch_ids = [
+        track_id
+        for track_id in server.unique_track_ids(
+            [*recent_track_ids, *top_track_ids],
+            24,
+        )
+        if track_id not in track_payload_by_id
+    ]
+    if fetch_ids:
+        try:
+            fetched_tracks = server.recommendation_fetch_tracks_for_ids(fetch_ids, limit=len(fetch_ids))
+        except Exception:
+            fetched_tracks = []
+        for track in list(fetched_tracks or []):
+            if not isinstance(track, dict):
+                continue
+            track_id = trim_text(track.get("id"))
+            if not track_id or track_id in track_payload_by_id:
+                continue
+            normalized = server.normalize_recommendation_track(track)
+            if normalized is None:
+                continue
+            track_payload_by_id[track_id] = server.merge_track_metadata(track, normalized)
+
+    recent_track_snapshots = unique_snapshot_tracks(
+        [
+            track_payload_by_id.get(track_id) or {}
+            for track_id in recent_track_ids
+            if track_payload_by_id.get(track_id)
+        ],
+        16,
+    )
+    top_track_snapshots = unique_snapshot_tracks(
+        [
+            track_payload_by_id.get(track_id) or {}
+            for track_id in top_track_ids
+            if track_payload_by_id.get(track_id)
+        ],
+        16,
+    )
+    last_played_tracks = unique_snapshot_tracks(recent_track_snapshots[:12], 12)
+    anchor_track_snapshots = unique_snapshot_tracks(
+        [*last_played_tracks[:4], *top_track_snapshots[:4]],
+        8,
+    )
+    recent_queries = _clean_query_values(
+        [row["query"] for row in list(search_rows or []) if int(row["result_count"] or 0) >= 0],
+        limit=12,
+    )
+    taste_queries = _clean_query_values(
+        [row["query"] for row in list(search_rows or []) if int(row["result_count"] or 0) > 0],
+        limit=8,
+    )
+    return {
+        "recent_track_ids": recent_track_ids,
+        "top_track_ids": top_track_ids,
+        "recent_track_snapshots": recent_track_snapshots,
+        "top_track_snapshots": top_track_snapshots,
+        "last_played_tracks": last_played_tracks,
+        "anchor_track_snapshots": anchor_track_snapshots,
+        "recent_queries": recent_queries,
+        "taste_queries": taste_queries,
+        "artist_hints": unique_strings(artist_hints, 12),
+        "library_track_ids": server.unique_track_ids(library_track_ids, 28),
+    }
+
+
+def _build_state_snapshot(legacy_req, *, server: Any | None = None) -> UserStateSnapshot:
+    server = adapt_domain_server(server)
+    recent_track_snapshots = server.unique_snapshot_tracks(
         [*(legacy_req.last_played_tracks or []), *(legacy_req.recent_track_snapshots or [])],
         16,
     )
-    top_track_snapshots = server._recommendation_unique_snapshot_tracks(
+    top_track_snapshots = server.unique_snapshot_tracks(
         legacy_req.top_track_snapshots,
         16,
     )
-    last_played_tracks = server._recommendation_unique_snapshot_tracks(
+    last_played_tracks = server.unique_snapshot_tracks(
         legacy_req.last_played_tracks,
         12,
     )
-    anchor_track_snapshots = server._recommendation_unique_snapshot_tracks(
+    anchor_track_snapshots = server.unique_snapshot_tracks(
         legacy_req.anchor_track_snapshots,
         8,
     )
 
-    recent_track_ids = server._recommendation_unique_track_ids(
+    recent_track_ids = server.unique_track_ids(
         [
             legacy_req.seed_id,
             *(track.get("id") for track in recent_track_snapshots),
@@ -141,7 +422,7 @@ def _build_state_snapshot(legacy_req) -> UserStateSnapshot:
         ],
         16,
     )
-    top_track_ids = server._recommendation_unique_track_ids(
+    top_track_ids = server.unique_track_ids(
         [
             *(track.get("id") for track in top_track_snapshots),
             *(legacy_req.top_track_ids or []),
@@ -155,6 +436,93 @@ def _build_state_snapshot(legacy_req) -> UserStateSnapshot:
         [*(legacy_req.recent_queries or []), legacy_req.query, *taste_queries],
         limit=12,
     )
+    explicit_artist_hints = unique_strings(legacy_req.artist_hints, 12)
+    library_track_ids = server.unique_track_ids(
+        legacy_req.library_track_ids,
+        28,
+    )
+    if _sparse_home_request(
+        recent_track_snapshots=recent_track_snapshots,
+        top_track_snapshots=top_track_snapshots,
+        recent_queries=recent_queries,
+        artist_hints=explicit_artist_hints,
+        library_track_ids=library_track_ids,
+    ):
+        persisted = _load_scope_history_seed(
+            server,
+            trim_text(legacy_req.user_scope_id or "guest") or "guest",
+        )
+        if persisted:
+            recent_track_snapshots = server.unique_snapshot_tracks(
+                [
+                    *recent_track_snapshots,
+                    *(persisted.get("recent_track_snapshots") or []),
+                ],
+                16,
+            )
+            top_track_snapshots = server.unique_snapshot_tracks(
+                [
+                    *top_track_snapshots,
+                    *(persisted.get("top_track_snapshots") or []),
+                ],
+                16,
+            )
+            last_played_tracks = server.unique_snapshot_tracks(
+                [
+                    *last_played_tracks,
+                    *(persisted.get("last_played_tracks") or []),
+                ],
+                12,
+            )
+            anchor_track_snapshots = server.unique_snapshot_tracks(
+                [
+                    *anchor_track_snapshots,
+                    *(persisted.get("anchor_track_snapshots") or []),
+                ],
+                8,
+            )
+            recent_track_ids = server.unique_track_ids(
+                [
+                    *(recent_track_ids or []),
+                    *(persisted.get("recent_track_ids") or []),
+                ],
+                16,
+            )
+            top_track_ids = server.unique_track_ids(
+                [
+                    *(top_track_ids or []),
+                    *(persisted.get("top_track_ids") or []),
+                ],
+                16,
+            )
+            recent_queries = _clean_query_values(
+                [
+                    *recent_queries,
+                    *(persisted.get("recent_queries") or []),
+                ],
+                limit=12,
+            )
+            taste_queries = _clean_query_values(
+                [
+                    *taste_queries,
+                    *(persisted.get("taste_queries") or []),
+                ],
+                limit=12,
+            )
+            explicit_artist_hints = unique_strings(
+                [
+                    *explicit_artist_hints,
+                    *(persisted.get("artist_hints") or []),
+                ],
+                12,
+            )
+            library_track_ids = server.unique_track_ids(
+                [
+                    *library_track_ids,
+                    *(persisted.get("library_track_ids") or []),
+                ],
+                28,
+            )
     anchor_artist_hints = unique_strings(
         [
             *(legacy_req.anchor_artist_hints or []),
@@ -171,7 +539,7 @@ def _build_state_snapshot(legacy_req) -> UserStateSnapshot:
     artist_hints = unique_strings(
         [
             *anchor_artist_hints,
-            *(legacy_req.artist_hints or []),
+            *explicit_artist_hints,
             *_snapshot_artist_hints(server, combined_tracks),
         ],
         12,
@@ -188,11 +556,7 @@ def _build_state_snapshot(legacy_req) -> UserStateSnapshot:
         12,
     )
     playlist_names = unique_strings(legacy_req.playlist_names, 12)
-    library_track_ids = server._recommendation_unique_track_ids(
-        legacy_req.library_track_ids,
-        28,
-    )
-    offline_track_ids = server._recommendation_unique_track_ids(
+    offline_track_ids = server.unique_track_ids(
         legacy_req.offline_track_ids,
         28,
     )
@@ -253,7 +617,7 @@ def _build_state_snapshot(legacy_req) -> UserStateSnapshot:
         "novelty_tolerance": novelty_tolerance,
         "novelty_preference": novelty_tolerance,
         "repeat_tolerance": max(0.0, 1.0 - repeat_intensity),
-        "experiment_variant": server._recommendation_assignment_for_user(
+        "experiment_variant": server.recommendation_assignment_for_user(
             trim_text(legacy_req.user_scope_id or "guest") or "guest"
         ),
     }
@@ -266,6 +630,8 @@ def _build_state_snapshot(legacy_req) -> UserStateSnapshot:
 
 def build_search_state(
     req: SearchV3Request | SuggestV2Request,
+    *,
+    server: Any | None = None,
 ) -> Tuple[Any, UserStateSnapshot]:
     raw_recent_tracks = (
         getattr(req, "recent_tracks", None)
@@ -317,11 +683,13 @@ def build_search_state(
         library_track_ids=list(getattr(req, "library_track_ids", []) or []),
         offline_track_ids=list(getattr(req, "offline_track_ids", []) or []),
     )
-    return legacy_req, _build_state_snapshot(legacy_req)
+    return legacy_req, _build_state_snapshot(legacy_req, server=server)
 
 
 def build_home_state(
     req: RecommendationHomeV3Request,
+    *,
+    server: Any | None = None,
 ) -> Tuple[Any, UserStateSnapshot]:
     raw_recent_tracks = (
         getattr(req, "recent_tracks", None)
@@ -366,25 +734,27 @@ def build_home_state(
         library_track_ids=list(req.library_track_ids or []),
         offline_track_ids=list(req.offline_track_ids or []),
     )
-    return legacy_req, _build_state_snapshot(legacy_req)
+    return legacy_req, _build_state_snapshot(legacy_req, server=server)
 
 
 def build_similar_artists_state(
     req: SimilarArtistsV3Request,
+    *,
+    server: Any | None = None,
 ) -> Tuple[Any, UserStateSnapshot]:
-    server = get_server()
+    server = adapt_domain_server(server)
     recent_tracks = _normalize_track_snapshots(req.recent_tracks, 12)
     anchor_track_snapshots = _normalize_track_snapshots(
         [req.anchor_track_snapshot] if req.anchor_track_snapshot else [],
         4,
     )
     if not anchor_track_snapshots and req.anchor_track_id:
-        fetched = server._recommendation_fetch_tracks_for_ids([req.anchor_track_id], limit=1)
+        fetched = server.recommendation_fetch_tracks_for_ids([req.anchor_track_id], limit=1)
         anchor_track_snapshots = _normalize_track_snapshots(fetched, 1)
     anchor_artist_hints: List[str] = []
     if req.anchor_artist_id:
         try:
-            artist_payload = server._build_artist_details_payload(req.anchor_artist_id)
+            artist_payload = server.build_artist_details_payload(req.anchor_artist_id)
         except Exception:
             artist_payload = {}
         artist_name = trim_text((artist_payload.get("artist") or {}).get("name"))
@@ -405,4 +775,4 @@ def build_similar_artists_state(
         anchor_track_snapshots=anchor_track_snapshots,
         anchor_artist_hints=anchor_artist_hints,
     )
-    return legacy_req, _build_state_snapshot(legacy_req)
+    return legacy_req, _build_state_snapshot(legacy_req, server=server)

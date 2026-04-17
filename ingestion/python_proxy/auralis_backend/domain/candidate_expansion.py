@@ -2,13 +2,17 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 
-from ..legacy import get_server, trim_text
+from .server_adapter import adapt_domain_server
 from ..search.runtime import search_artist_seed_tracks
 
 
-def track_signature(track: Optional[Dict[str, Any]]) -> str:
-    server = get_server()
-    return server._recommendation_track_signature(track)
+def trim_text(value: Optional[str]) -> str:
+    return adapt_domain_server().trim_text(value)
+
+
+def track_signature(track: Optional[Dict[str, Any]], *, server: Any | None = None) -> str:
+    server = adapt_domain_server(server)
+    return server.recommendation_track_signature(track)
 
 
 def anchor_query(track: Optional[Dict[str, Any]], *, include_album: bool = False) -> str:
@@ -28,8 +32,9 @@ def album_candidates_for_track(
     *,
     limit: int = 2,
     include_search: bool = True,
+    server: Any | None = None,
 ) -> List[Dict[str, Any]]:
-    server = get_server()
+    server = adapt_domain_server(server)
     if not isinstance(track, dict):
         return []
     albums: List[Dict[str, Any]] = []
@@ -41,7 +46,7 @@ def album_candidates_for_track(
         album_id = trim_text(raw_album.get("id"))
         title = trim_text(raw_album.get("title"))
         artist = trim_text(raw_album.get("artist"))
-        key = album_id or f"{server._normalize_text(title)}|{server._normalize_text(artist)}"
+        key = album_id or f"{server.normalize_text(title)}|{server.normalize_text(artist)}"
         if not key or key in seen:
             return
         seen.add(key)
@@ -70,49 +75,58 @@ def album_candidates_for_track(
 
     search_query = anchor_query(track, include_album=True)
     if include_search and search_query:
-        for album in server._assistant_tool_search_albums(search_query, max(limit * 2, 4)):
+        for album in server.assistant_tool_search_albums(search_query, max(limit * 2, 4)):
             add_album(album)
             if len(albums) >= limit:
                 break
     return albums[:limit]
 
 
-def candidate_sources_for_track(track: Optional[Dict[str, Any]]) -> List[Tuple[str, List[Dict[str, Any]], float]]:
-    server = get_server()
+def candidate_sources_for_track(
+    track: Optional[Dict[str, Any]],
+    *,
+    server: Any | None = None,
+) -> List[Tuple[str, List[Dict[str, Any]], float]]:
+    server = adapt_domain_server(server)
     if not isinstance(track, dict):
         return []
+    executor = getattr(server, "recommendation_row_executor", None) or getattr(
+        server,
+        "recommendation_executor",
+    )
     track_id = trim_text(track.get("id"))
     artist_name = trim_text(track.get("channel") or track.get("author") or track.get("artist"))
     futures = {}
     if track_id:
-        futures["similar"] = server.recommendation_executor.submit(
-            server._assistant_tool_get_similar_tracks,
+        futures["similar"] = executor.submit(
+            server.assistant_tool_get_similar_tracks,
             track_id,
             12,
         )
-        futures["collaborative"] = server.recommendation_executor.submit(
-            server._recommendation_collaborative_neighbor_tracks,
+        futures["collaborative"] = executor.submit(
+            server.recommendation_collaborative_neighbor_tracks,
             track_id,
             10,
         )
     if artist_name:
-        futures["artist_seed"] = server.recommendation_executor.submit(
+        futures["artist_seed"] = executor.submit(
             search_artist_seed_tracks,
             artist_name,
             8,
+            server=server,
         )
 
     def fetch_album_context() -> List[Dict[str, Any]]:
         album_tracks: List[Dict[str, Any]] = []
-        for album in album_candidates_for_track(track, limit=2):
+        for album in album_candidates_for_track(track, limit=2, server=server):
             album_id = trim_text(album.get("id"))
             if not album_id:
                 continue
-            album_details = server._assistant_tool_get_album_details(album_id)
+            album_details = server.assistant_tool_get_album_details(album_id)
             album_tracks.extend(album_details.get("tracks") or [])
         return album_tracks
 
-    futures["album_context"] = server.recommendation_executor.submit(fetch_album_context)
+    futures["album_context"] = executor.submit(fetch_album_context)
     source_results = {
         "similar": [],
         "collaborative": [],

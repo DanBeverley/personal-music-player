@@ -8,9 +8,13 @@ from ..contracts import (
     SimilarArtistsV2Request,
     SuggestV2Request,
 )
-from ..legacy import trim_text
+from .server_adapter import adapt_domain_server
 from .ranking import model_version
 from .user_state import build_home_state, build_search_state, build_similar_artists_state
+
+
+def trim_text(value: str | None) -> str:
+    return adapt_domain_server().trim_text(value)
 
 
 def build_search_profile(

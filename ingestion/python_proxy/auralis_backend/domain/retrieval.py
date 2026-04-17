@@ -8,7 +8,7 @@ import time
 from typing import Any, Dict, Iterable, List
 
 from .candidate_expansion import album_candidates_for_track, candidate_sources_for_track
-from ..legacy import get_server, trim_text, unique_strings
+from .server_adapter import adapt_domain_server
 from ..search.runtime import (
     search_albums_blended,
     search_albums_direct,
@@ -20,6 +20,19 @@ from ..search.runtime import (
     semantic_search_anchor_tracks,
     semantic_search_lexical_score,
 )
+from ..search.upstream_runtime import (
+    artist_names_from_track_query as resolve_artist_names_from_track_query,
+    search_artists as resolve_search_artists,
+    search_artists_direct as resolve_search_artists_direct,
+    ytmusic_song_search as resolve_ytmusic_song_search,
+)
+
+def trim_text(value: str | None) -> str:
+    return adapt_domain_server().trim_text(value)
+
+
+def unique_strings(values, limit: int | None = None) -> List[str]:
+    return adapt_domain_server().unique_strings(values, limit)
 
 
 _SEARCH_RETRIEVAL_CACHE_TTL_SECONDS = max(
@@ -71,18 +84,18 @@ def _upsert_entity_candidate(
 def _collect_track_candidates(
     combined: Dict[str, Dict[str, Any]],
     *,
+    server,
     tracks: Iterable[Dict[str, Any]],
     source_name: str,
     base_score: float,
 ) -> None:
-    server = get_server()
     for index, raw_track in enumerate(tracks or []):
-        normalized = server.normalize_recommendation_track(raw_track)
+        normalized = server.normalize_track(raw_track)
         if normalized is None:
             continue
         entity_id = trim_text(normalized.get("id"))
         if not entity_id:
-            entity_id = server._recommendation_track_signature(normalized)
+            entity_id = server.recommendation_track_signature(normalized)
         _upsert_entity_candidate(
             combined,
             entity_id=entity_id,
@@ -134,12 +147,12 @@ def _collect_album_candidates(
 
 def classify_query_intent(
     *,
+    server,
     query: str,
     tracks: List[Dict[str, Any]],
     artists: List[Dict[str, Any]],
     albums: List[Dict[str, Any]],
 ) -> str:
-    server = get_server()
     normalized_query = trim_text(query).lower()
     if not normalized_query:
         return "mixed"
@@ -155,7 +168,7 @@ def classify_query_intent(
 
     def lexical(item: Dict[str, Any], *fields: str) -> float:
         values = [item.get(field) for field in fields if item.get(field)]
-        return semantic_search_lexical_score(query, *values)
+        return semantic_search_lexical_score(query, *values, server=server)
 
     top_track_score = lexical(tracks[0], "title", "channel", "album") if tracks else 0.0
     top_artist_score = lexical(artists[0], "name", "description") if artists else 0.0
@@ -170,8 +183,14 @@ def classify_query_intent(
     return "mixed"
 
 
-def _retrieval_cache_key(legacy_req, profile, limit: int) -> str:
-    server = get_server()
+def _retrieval_cache_key(
+    legacy_req,
+    profile,
+    limit: int,
+    *,
+    server: Any | None = None,
+) -> str:
+    server = adapt_domain_server(server)
     recent_query_key = "|".join((profile.get("recent_queries") or [])[:4])
     recent_track_key = "|".join(
         trim_text(track.get("id"))
@@ -229,8 +248,21 @@ def _retrieval_cache_set(cache_key: str, payload: Dict[str, Any]) -> None:
                 _search_retrieval_cache.pop(oldest_key, None)
 
 
-def retrieve_search_candidates_fast(legacy_req, profile, *, limit: int) -> Dict[str, Any]:
-    server = get_server()
+def _search_executor(server: Any):
+    return getattr(server, "search_executor", None) or getattr(
+        server,
+        "recommendation_executor",
+    )
+
+
+def retrieve_search_candidates_fast(
+    legacy_req,
+    profile,
+    *,
+    limit: int,
+    server: Any | None = None,
+) -> Dict[str, Any]:
+    server = adapt_domain_server(server)
     query = trim_text(legacy_req.query)
     if not query:
         return {
@@ -252,7 +284,7 @@ def retrieve_search_candidates_fast(legacy_req, profile, *, limit: int) -> Dict[
 
     cache_key = ""
     if not bool(getattr(legacy_req, "force_refresh", False)):
-        cache_key = f"fast::{_retrieval_cache_key(legacy_req, profile, limit)}"
+        cache_key = f"fast::{_retrieval_cache_key(legacy_req, profile, limit, server=server)}"
         cached_payload = _retrieval_cache_get(cache_key)
         if cached_payload is not None:
             diagnostics = dict(cached_payload.get("retrieval_diagnostics") or {})
@@ -260,7 +292,7 @@ def retrieve_search_candidates_fast(legacy_req, profile, *, limit: int) -> Dict[
             cached_payload["retrieval_diagnostics"] = diagnostics
             return cached_payload
 
-    executor = getattr(server, "search_executor", server.recommendation_executor)
+    executor = _search_executor(server)
     retrieval_started_at = time.perf_counter()
     deadline = retrieval_started_at + min(_SEARCH_RETRIEVAL_TOTAL_BUDGET_SECONDS, 3.2)
     track_candidates: Dict[str, Dict[str, Any]] = {}
@@ -298,16 +330,19 @@ def retrieve_search_candidates_fast(legacy_req, profile, *, limit: int) -> Dict[
         search_tracks_direct,
         query,
         max(limit * 2, 18),
+        server=server,
     )
     fast_artist_future = executor.submit(
         search_artists_direct_cached,
         query,
         max(limit, 8),
+        server=server,
     )
     fast_album_future = executor.submit(
         search_albums_direct,
         query,
         max(limit, 8),
+        server=server,
     )
 
     fast_tracks = resolve_future(fast_track_future, [], "tracks.fast")
@@ -316,6 +351,7 @@ def retrieve_search_candidates_fast(legacy_req, profile, *, limit: int) -> Dict[
 
     _collect_track_candidates(
         track_candidates,
+        server=server,
         tracks=fast_tracks,
         source_name="fast_query",
         base_score=4.3,
@@ -338,16 +374,18 @@ def retrieve_search_candidates_fast(legacy_req, profile, *, limit: int) -> Dict[
         fast_tracks,
         fast_tracks,
         limit=4,
+        server=server,
     )
-    anchor_artist_names = semantic_search_anchor_artist_names(anchor_tracks, 6)
+    anchor_artist_names = semantic_search_anchor_artist_names(anchor_tracks, 6, server=server)
     normalized_anchor_artists = {
-        server._normalize_text(name)
+        server.normalize_text(name)
         for name in anchor_artist_names
-        if server._normalize_text(name)
+        if server.normalize_text(name)
     }
 
     payload = {
         "query_intent": classify_query_intent(
+            server=server,
             query=query,
             tracks=fast_tracks[:6],
             artists=fast_artists[:6],
@@ -382,12 +420,18 @@ def retrieve_search_candidates_fast(legacy_req, profile, *, limit: int) -> Dict[
     return payload
 
 
-def retrieve_search_candidates(legacy_req, profile, *, limit: int) -> Dict[str, Any]:
-    server = get_server()
+def retrieve_search_candidates(
+    legacy_req,
+    profile,
+    *,
+    limit: int,
+    server: Any | None = None,
+) -> Dict[str, Any]:
+    server = adapt_domain_server(server)
     query = trim_text(legacy_req.query)
     cache_key = ""
     if not bool(getattr(legacy_req, "force_refresh", False)):
-        cache_key = _retrieval_cache_key(legacy_req, profile, limit)
+        cache_key = _retrieval_cache_key(legacy_req, profile, limit, server=server)
         cached_payload = _retrieval_cache_get(cache_key)
         if cached_payload is not None:
             diagnostics = dict(cached_payload.get("retrieval_diagnostics") or {})
@@ -395,7 +439,7 @@ def retrieve_search_candidates(legacy_req, profile, *, limit: int) -> Dict[str, 
             cached_payload["retrieval_diagnostics"] = diagnostics
             return cached_payload
     collaborative = profile.get("collaborative") or {}
-    executor = server.recommendation_executor
+    executor = _search_executor(server)
     retrieval_started_at = time.perf_counter()
     deadline = retrieval_started_at + _SEARCH_RETRIEVAL_TOTAL_BUDGET_SECONDS
 
@@ -431,7 +475,8 @@ def retrieve_search_candidates(legacy_req, profile, *, limit: int) -> Dict[str, 
             return default
 
     lexical_tracks_future = executor.submit(
-        server._ytmusic_song_search,
+        resolve_ytmusic_song_search,
+        server,
         query,
         max(limit * 2, 24),
     )
@@ -439,6 +484,7 @@ def retrieve_search_candidates(legacy_req, profile, *, limit: int) -> Dict[str, 
         search_tracks_blended,
         query,
         max(limit * 2, 24),
+        server=server,
     )
     lexical_tracks = resolve_future(lexical_tracks_future, [], "tracks.lexical")
     blended_tracks = resolve_future(blended_tracks_future, [], "tracks.blended")
@@ -447,22 +493,25 @@ def retrieve_search_candidates(legacy_req, profile, *, limit: int) -> Dict[str, 
         lexical_tracks,
         blended_tracks,
         limit=4,
+        server=server,
     )
-    anchor_artist_names = semantic_search_anchor_artist_names(anchor_tracks, 6)
+    anchor_artist_names = semantic_search_anchor_artist_names(anchor_tracks, 6, server=server)
     normalized_anchor_artists = {
-        server._normalize_text(name)
+        server.normalize_text(name)
         for name in anchor_artist_names
-        if server._normalize_text(name)
+        if server.normalize_text(name)
     }
 
     _collect_track_candidates(
         track_candidates,
+        server=server,
         tracks=lexical_tracks,
         source_name="lexical",
         base_score=4.2,
     )
     _collect_track_candidates(
         track_candidates,
+        server=server,
         tracks=blended_tracks,
         source_name="blended",
         base_score=4.8,
@@ -470,13 +519,14 @@ def retrieve_search_candidates(legacy_req, profile, *, limit: int) -> Dict[str, 
 
     graph_track_ids = list(collaborative.get("candidate_track_ids") or [])[: max(limit * 2, 24)]
     graph_tracks_future = executor.submit(
-        server._recommendation_fetch_tracks_for_ids,
+        server.recommendation_fetch_tracks_for_ids,
         graph_track_ids,
         min(len(graph_track_ids), 32),
     )
     graph_tracks = resolve_future(graph_tracks_future, [], "tracks.graph")
     _collect_track_candidates(
         track_candidates,
+        server=server,
         tracks=graph_tracks,
         source_name="graph",
         base_score=3.6,
@@ -484,11 +534,11 @@ def retrieve_search_candidates(legacy_req, profile, *, limit: int) -> Dict[str, 
 
     context_tracks: List[Dict[str, Any]] = []
     context_query_futures = {
-        recent_query: executor.submit(search_tracks_blended, recent_query, 6)
+        recent_query: executor.submit(search_tracks_blended, recent_query, 6, server=server)
         for recent_query in (profile.get("recent_queries") or [])[:2]
     }
     context_track_source_futures = {
-        index: executor.submit(candidate_sources_for_track, track)
+        index: executor.submit(candidate_sources_for_track, track, server=server)
         for index, track in enumerate((profile.get("last_played_tracks") or [])[:2])
     }
     for recent_query in (profile.get("recent_queries") or [])[:2]:
@@ -509,6 +559,7 @@ def retrieve_search_candidates(legacy_req, profile, *, limit: int) -> Dict[str, 
                 context_tracks.extend(source_tracks[:4])
     _collect_track_candidates(
         track_candidates,
+        server=server,
         tracks=context_tracks,
         source_name="context",
         base_score=3.0,
@@ -520,7 +571,7 @@ def retrieve_search_candidates(legacy_req, profile, *, limit: int) -> Dict[str, 
         if not anchor_track_id:
             continue
         anchor_similar_futures[anchor_index] = executor.submit(
-            server._assistant_tool_get_similar_tracks,
+            server.assistant_tool_get_similar_tracks,
             anchor_track_id,
             8,
         )
@@ -532,6 +583,7 @@ def retrieve_search_candidates(legacy_req, profile, *, limit: int) -> Dict[str, 
         )
         _collect_track_candidates(
             track_candidates,
+            server=server,
             tracks=similar_tracks,
             source_name="anchor_neighbor",
             base_score=4.6,
@@ -543,14 +595,14 @@ def retrieve_search_candidates(legacy_req, profile, *, limit: int) -> Dict[str, 
             *anchor_artist_names,
             *[
                 artist_name
-                for artist_name, _score in server._artist_names_from_track_query(query, 4)
+                for artist_name, _score in resolve_artist_names_from_track_query(server, query, 4)
             ],
             *(profile.get("top_artists") or [])[:2],
         ],
         8,
     )
     artist_seed_futures = {
-        artist_name: executor.submit(search_artist_seed_tracks, artist_name, 6)
+        artist_name: executor.submit(search_artist_seed_tracks, artist_name, 6, server=server)
         for artist_name in artist_seed_names[:4]
     }
     for artist_name in artist_seed_names[:4]:
@@ -563,18 +615,21 @@ def retrieve_search_candidates(legacy_req, profile, *, limit: int) -> Dict[str, 
         )
     _collect_track_candidates(
         track_candidates,
+        server=server,
         tracks=artist_seed_tracks,
         source_name="artist_seed",
         base_score=3.7,
     )
 
     lexical_artists_future = executor.submit(
-        server._assistant_tool_search_artists_direct,
+        resolve_search_artists_direct,
+        server,
         query,
         max(limit, 12),
     )
     broad_artists_future = executor.submit(
-        server._assistant_tool_search_artists,
+        resolve_search_artists,
+        server,
         query,
         max(limit, 12),
     )
@@ -586,13 +641,13 @@ def retrieve_search_candidates(legacy_req, profile, *, limit: int) -> Dict[str, 
             *anchor_artist_names,
             *[
                 artist_name
-                for artist_name, _score in server._artist_names_from_track_query(query, 4)
+                for artist_name, _score in resolve_artist_names_from_track_query(server, query, 4)
             ],
         ],
         6,
     )
     query_anchor_artist_futures = {
-        artist_name: executor.submit(server._assistant_tool_search_artists_direct, artist_name, 2)
+        artist_name: executor.submit(resolve_search_artists_direct, server, artist_name, 2)
         for artist_name in query_anchor_artist_names
     }
     for artist_name in query_anchor_artist_names:
@@ -633,7 +688,7 @@ def retrieve_search_candidates(legacy_req, profile, *, limit: int) -> Dict[str, 
     ]
     graph_artists = []
     graph_artist_futures = {
-        artist_name: executor.submit(server._assistant_tool_search_artists_direct, artist_name, 1)
+        artist_name: executor.submit(resolve_search_artists_direct, server, artist_name, 1)
         for artist_name in graph_artist_names
     }
     for artist_name in graph_artist_names:
@@ -657,7 +712,7 @@ def retrieve_search_candidates(legacy_req, profile, *, limit: int) -> Dict[str, 
         8,
     )
     context_artist_futures = {
-        artist_name: executor.submit(server._assistant_tool_search_artists, artist_name, 2)
+        artist_name: executor.submit(resolve_search_artists, server, artist_name, 2)
         for artist_name in context_artist_names
     }
     for artist_name in context_artist_names:
@@ -677,7 +732,7 @@ def retrieve_search_candidates(legacy_req, profile, *, limit: int) -> Dict[str, 
 
     related_artists = []
     related_artist_direct_futures = {
-        artist_name: executor.submit(server._assistant_tool_search_artists_direct, artist_name, 1)
+        artist_name: executor.submit(resolve_search_artists_direct, server, artist_name, 1)
         for artist_name in anchor_artist_names[:3]
     }
     related_artist_detail_futures = {}
@@ -693,7 +748,7 @@ def retrieve_search_candidates(legacy_req, profile, *, limit: int) -> Dict[str, 
         if not artist_id:
             continue
         related_artist_detail_futures[artist_name] = executor.submit(
-            server._build_artist_details_payload,
+            server.build_artist_details_payload,
             artist_id,
             enrich_related=True,
         )
@@ -715,9 +770,10 @@ def retrieve_search_candidates(legacy_req, profile, *, limit: int) -> Dict[str, 
         search_albums_blended,
         query,
         max(limit, 12),
+        server=server,
     )
     broad_albums_future = executor.submit(
-        server._assistant_tool_search_albums,
+        server.assistant_tool_search_albums,
         query,
         max(limit, 12),
     )
@@ -738,7 +794,14 @@ def retrieve_search_candidates(legacy_req, profile, *, limit: int) -> Dict[str, 
 
     anchor_album_hints = []
     for track in anchor_tracks[:3]:
-        anchor_album_hints.extend(album_candidates_for_track(track, limit=1, include_search=False))
+        anchor_album_hints.extend(
+            album_candidates_for_track(
+                track,
+                limit=1,
+                include_search=False,
+                server=server,
+            )
+        )
     _collect_album_candidates(
         album_candidates,
         albums=anchor_album_hints,
@@ -748,11 +811,11 @@ def retrieve_search_candidates(legacy_req, profile, *, limit: int) -> Dict[str, 
 
     context_albums = []
     context_album_track_futures = {
-        index: executor.submit(album_candidates_for_track, track, limit=2)
+        index: executor.submit(album_candidates_for_track, track, limit=2, server=server)
         for index, track in enumerate(anchor_tracks[:2])
     }
     context_album_artist_futures = {
-        artist_name: executor.submit(server._assistant_tool_search_albums, f"{artist_name} album", 3)
+        artist_name: executor.submit(server.assistant_tool_search_albums, f"{artist_name} album", 3)
         for artist_name in (profile.get("top_artists") or [])[:3]
     }
     for index in range(len(anchor_tracks[:2])):

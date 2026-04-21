@@ -361,7 +361,11 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
     );
   }
 
-  void _primeRecommendationResults(Iterable<dynamic> tracks) {
+  void _primeRecommendationResults(
+    Iterable<dynamic> tracks, {
+    int maxIds = 6,
+    int lookahead = 18,
+  }) {
     final ids = <String>[];
     for (final track in tracks) {
       final id = extractTrackId(track);
@@ -369,7 +373,7 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
         continue;
       }
       ids.add(id);
-      if (ids.length >= 6) {
+      if (ids.length >= maxIds) {
         break;
       }
     }
@@ -380,7 +384,12 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
             .take(_prewarmedRecommendationIds.length - 80),
       );
     }
-    unawaited(ref.read(audioPlayerProvider.notifier).prewarmStreams(ids));
+    unawaited(
+      ref.read(audioPlayerProvider.notifier).prewarmStreams(
+            ids,
+            lookahead: lookahead,
+          ),
+    );
   }
 
   void _primeRecommendationRows(List<RecommendationFeedRowState> rows) {
@@ -393,7 +402,11 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
       }
     }
     if (visibleTracks.isEmpty) return;
-    _primeRecommendationResults(visibleTracks);
+    _primeRecommendationResults(
+      visibleTracks,
+      maxIds: 4,
+      lookahead: 8,
+    );
   }
 
   bool _diagnosticFlag(
@@ -860,6 +873,10 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
     }
     try {
       final pageLimit = targetRow.kind == 'quiet_picks' ? 10 : 8;
+      logProxyDiagnostic(
+        'recommend',
+        'row page start row=$rowId kind=${targetRow.kind} offset=${targetRow.nextOffset} session=${state.sessionId} hasMore=${targetRow.hasMore}',
+      );
       final body = await buildRecommendationRequestBody(
         ref,
         null,
@@ -907,7 +924,30 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
               )
               .toList(growable: false);
           state = state.copyWith(rows: updatedRows);
-          _primeRecommendationResults(newRow.items);
+          logProxyDiagnostic(
+            'recommend',
+            'row page success row=$rowId appended=${mergedItems.length - currentRow.items.length} nextOffset=${progressed ? newRow.nextOffset : currentRow.nextOffset} hasMore=${progressed ? newRow.hasMore : false}',
+          );
+          _primeRecommendationResults(
+            newRow.items.take(3),
+            maxIds: 2,
+            lookahead: 4,
+          );
+        }
+      } else {
+        logProxyDiagnostic(
+          'recommend',
+          'row page status=${res.statusCode} row=$rowId session=${state.sessionId} body=${res.body}',
+        );
+        if (res.statusCode == 404) {
+          final updatedRows = state.rows
+              .map(
+                (row) => row.id == rowId
+                    ? row.copyWith(hasMore: false)
+                    : row,
+              )
+              .toList(growable: false);
+          state = state.copyWith(rows: updatedRows, clearError: true);
         }
       }
     } on TimeoutException {

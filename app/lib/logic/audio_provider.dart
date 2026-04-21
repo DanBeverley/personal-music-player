@@ -2498,8 +2498,11 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     }
   }
 
-  Future<void> prewarmStreams(Iterable<String?> videoIds) async {
-    await _prepareQueueSession(videoIds, lookahead: 18);
+  Future<void> prewarmStreams(
+    Iterable<String?> videoIds, {
+    int lookahead = 18,
+  }) async {
+    await _prepareQueueSession(videoIds, lookahead: lookahead);
   }
 
   bool _hasValidDownloadedAudio(String path) {

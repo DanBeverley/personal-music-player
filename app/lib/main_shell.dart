@@ -175,26 +175,33 @@ class MainLayout extends ConsumerStatefulWidget {
 
 class _MainLayoutState extends ConsumerState<MainLayout> {
   int _currentIndex = 0;
-  final GlobalKey<_HomeScreenState> _legacyHomeKey =
+  final GlobalKey<_HomeScreenState> _homeKey =
+      GlobalKey<_HomeScreenState>();
+  final GlobalKey<_HomeScreenState> _searchKey =
       GlobalKey<_HomeScreenState>();
 
   void _handleBottomSelection(int index) {
-    if (index == 1) {
-      if (_currentIndex != 1) {
-        setState(() => _currentIndex = 1);
+    if (_currentIndex != index) {
+      setState(() => _currentIndex = index);
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      if (index == 0) {
+        _homeKey.currentState?.showHomeFeed();
+      } else if (index == 1) {
+        _searchKey.currentState?.focusSearch();
       }
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!mounted || _currentIndex != 1) {
-          return;
-        }
-        _legacyHomeKey.currentState?.focusSearch();
-      });
-      return;
+    });
+  }
+
+  bool _handleBackForCurrentTab() {
+    if (_currentIndex == 1) {
+      return _searchKey.currentState?.handleSystemBack() ?? false;
     }
-    if (index == 0) {
-      _legacyHomeKey.currentState?.showHomeFeed();
+    if (_currentIndex == 0) {
+      return _homeKey.currentState?.handleSystemBack() ?? false;
     }
-    setState(() => _currentIndex = index);
+    return false;
   }
 
   Widget _buildBottomArea(bool hasActiveTrack) {
@@ -249,17 +256,13 @@ class _MainLayoutState extends ConsumerState<MainLayout> {
       ),
     );
     final viewBottomInset = MediaQuery.of(context).viewPadding.bottom;
-    final pageIndex = _currentIndex == 2 ? 1 : 0;
     final pages = <Widget>[
       HomeScreen(
-        key: _legacyHomeKey,
-        onSearchModeChanged: (isSearching) {
-          if (!mounted || _currentIndex == 2) return;
-          final targetIndex = isSearching ? 1 : 0;
-          if (_currentIndex != targetIndex) {
-            setState(() => _currentIndex = targetIndex);
-          }
-        },
+        key: _homeKey,
+      ),
+      HomeScreen(
+        key: _searchKey,
+        searchOnly: true,
       ),
       const LibraryScreen(),
     ];
@@ -268,13 +271,16 @@ class _MainLayoutState extends ConsumerState<MainLayout> {
       canPop: false,
       onPopInvokedWithResult: (didPop, result) {
         if (didPop) return;
-        final handledByHome =
-            (_legacyHomeKey.currentState?.handleSystemBack() ?? false);
-        if (pageIndex == 0 && handledByHome) {
+        final handledByCurrentTab = _handleBackForCurrentTab();
+        if (handledByCurrentTab) {
           return;
         }
         if (_currentIndex != 0) {
           setState(() => _currentIndex = 0);
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (!mounted) return;
+            _homeKey.currentState?.showHomeFeed();
+          });
           return;
         }
         unawaited(ref.read(audioPlayerProvider.notifier).stopPlayback());
@@ -287,7 +293,7 @@ class _MainLayoutState extends ConsumerState<MainLayout> {
           children: [
             const Positioned.fill(child: ColoredBox(color: _voidBlack)),
             FadeIndexedStack(
-              index: pageIndex,
+              index: _currentIndex,
               children: pages,
             ),
             Positioned(

@@ -20,14 +20,14 @@ class MiniPlayer extends ConsumerWidget {
     return GestureDetector(
       onTap: openPlayer,
       child: ClipRRect(
-        borderRadius: BorderRadius.circular(12),
+        borderRadius: BorderRadius.circular(10),
         child: BackdropFilter(
           filter: ImageFilter.blur(sigmaX: 18, sigmaY: 18),
           child: Container(
-            height: 68,
+            height: 64,
             padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
             decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(12),
+              borderRadius: BorderRadius.circular(10),
               color: const Color(0xFF1B1D20).withValues(alpha: 0.96),
               border: Border.all(
                 color: Colors.white.withValues(alpha: 0.08),
@@ -52,10 +52,10 @@ class MiniPlayer extends ConsumerWidget {
                     );
                   },
                   child: Container(
-                    width: 42,
-                    height: 42,
+                    width: 40,
+                    height: 40,
                     decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(10),
+                      borderRadius: BorderRadius.circular(8),
                       border: Border.all(
                         color: const Color(0xFF767D85).withValues(alpha: 0.45),
                         width: 1.4,
@@ -116,7 +116,7 @@ class MiniPlayer extends ConsumerWidget {
                         style: const TextStyle(
                           color: Colors.white,
                           fontWeight: FontWeight.w700,
-                          fontSize: 13,
+                          fontSize: 12.5,
                           letterSpacing: -0.2,
                         ),
                       ),

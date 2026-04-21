@@ -15,7 +15,6 @@ import 'logic/audio_provider_history.dart';
 import 'logic/audio_provider_queue.dart';
 import 'logic/audio_provider_recommendation.dart';
 import 'logic/auth_provider.dart';
-import 'logic/cloud_search_queries.dart';
 import 'logic/details_provider.dart';
 import 'logic/download_provider.dart';
 import 'logic/playlist_provider.dart';

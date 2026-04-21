@@ -30,11 +30,11 @@ class AppBottomNavBar extends StatelessWidget {
         child: BackdropFilter(
           filter: ImageFilter.blur(sigmaX: 22, sigmaY: 22),
           child: Container(
-            height: 58,
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            height: 60,
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
             decoration: BoxDecoration(
               borderRadius: BorderRadius.circular(10),
-              color: const Color(0xFF111111).withValues(alpha: 0.92),
+              color: const Color(0xFF17191C).withValues(alpha: 0.96),
               border: Border.all(
                 color: Colors.white.withValues(alpha: 0.08),
               ),
@@ -107,7 +107,7 @@ class _NavButton extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final isSelected = currentIndex == index;
-    const activeColor = Color(0xFF7A8088);
+    const activeColor = Color(0xFF70757D);
 
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
@@ -115,17 +115,15 @@ class _NavButton extends StatelessWidget {
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 220),
         curve: Curves.easeOutCubic,
-        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
         decoration: BoxDecoration(
           borderRadius: BorderRadius.circular(8),
-          gradient: isSelected
-              ? LinearGradient(
-                  begin: Alignment.topCenter,
-                  end: Alignment.bottomCenter,
-                  colors: [
-                    activeColor.withValues(alpha: 0.20),
-                    activeColor.withValues(alpha: 0.06),
-                  ],
+          color: isSelected
+              ? activeColor.withValues(alpha: 0.20)
+              : Colors.transparent,
+          border: isSelected
+              ? Border.all(
+                  color: Colors.white.withValues(alpha: 0.06),
                 )
               : null,
         ),
@@ -136,10 +134,10 @@ class _NavButton extends StatelessWidget {
             AnimatedContainer(
               duration: const Duration(milliseconds: 220),
               curve: Curves.easeOutCubic,
-              width: 28,
-              height: 28,
+              width: 26,
+              height: 26,
               decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(6),
+                borderRadius: BorderRadius.circular(5),
                 color: isSelected
                     ? Colors.white.withValues(alpha: 0.10)
                     : Colors.transparent,
@@ -148,16 +146,17 @@ class _NavButton extends StatelessWidget {
                 isSelected ? selectedIcon : icon,
                 color:
                     isSelected ? Colors.white : Colors.white.withValues(alpha: 0.62),
-                size: 16,
+                size: 15,
               ),
             ),
             const SizedBox(height: 1),
             Text(
               label,
+              textScaler: TextScaler.noScaling,
               style: TextStyle(
                 color:
                     isSelected ? Colors.white : Colors.white.withValues(alpha: 0.52),
-                fontSize: 9.5,
+                fontSize: 9,
                 fontWeight: isSelected ? FontWeight.w700 : FontWeight.w500,
                 letterSpacing: 0.2,
               ),

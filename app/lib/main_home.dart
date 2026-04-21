@@ -2,8 +2,13 @@ part of 'main.dart';
 
 class HomeScreen extends ConsumerStatefulWidget {
   final ValueChanged<bool>? onSearchModeChanged;
+  final bool searchOnly;
 
-  const HomeScreen({super.key, this.onSearchModeChanged});
+  const HomeScreen({
+    super.key,
+    this.onSearchModeChanged,
+    this.searchOnly = false,
+  });
 
   @override
   ConsumerState<HomeScreen> createState() => _HomeScreenState();
@@ -34,6 +39,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   @override
   void initState() {
     super.initState();
+    _isSearching = widget.searchOnly;
     _heroQuip = _buildHeroQuip();
     _homeScrollController.addListener(_handleHomeScroll);
     unawaited(_loadRecentSearchHistory());
@@ -56,19 +62,30 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         _suggestDebounce?.cancel();
         ref.read(suggestProvider.notifier).clear();
         ref.read(searchPageProvider.notifier).clear();
-        if (!_isSearching) {
-          setState(() => _isSearching = false);
+        if (widget.searchOnly) {
+          _setSearchMode(true);
+        } else if (_isSearching) {
+          _setSearchMode(false);
         }
       }
     });
+    if (widget.searchOnly) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        _searchFocusNode.requestFocus();
+      });
+    }
   }
 
   void _setSearchMode(bool value) {
-    if (_isSearching == value) {
+    final nextValue = widget.searchOnly ? true : value;
+    if (_isSearching == nextValue) {
       return;
     }
-    setState(() => _isSearching = value);
-    widget.onSearchModeChanged?.call(value);
+    setState(() => _isSearching = nextValue);
+    if (!widget.searchOnly) {
+      widget.onSearchModeChanged?.call(nextValue);
+    }
   }
 
   @override
@@ -85,7 +102,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   void _handleHomeScroll() {
     if (_isSearching || !_homeScrollController.hasClients) return;
     final position = _homeScrollController.position;
-    if (position.extentAfter > 900) return;
+    if (position.extentAfter > 1200) return;
     final recState = ref.read(recommendationProvider);
     final nextRow = recState.rows.firstWhere(
       (row) =>
@@ -359,7 +376,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     final q = query ?? _urlController.text.trim();
     if (q.isEmpty) {
       ref.read(searchPageProvider.notifier).clear();
-      _setSearchMode(false);
+      _setSearchMode(widget.searchOnly);
       return;
     }
     _urlController.text = q;
@@ -387,12 +404,17 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     _searchFocusNode.unfocus();
     ref.read(suggestProvider.notifier).clear();
     ref.read(searchPageProvider.notifier).clear();
-    _setSearchMode(false);
-    if (refreshRecommendations && _refreshRecommendationsOnSearchExit) {
+    _setSearchMode(widget.searchOnly);
+    if (!widget.searchOnly &&
+        refreshRecommendations &&
+        _refreshRecommendationsOnSearchExit) {
       _refreshRecommendationsOnSearchExit = false;
       unawaited(_refreshHomeFromSearchContext());
     } else {
       _clearSearchRecommendationContext();
+    }
+    if (widget.searchOnly) {
+      unawaited(_loadRecentSearchHistory());
     }
   }
 
@@ -418,6 +440,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
 
   void showHomeFeed() {
     if (!mounted) return;
+    if (widget.searchOnly) return;
     _refreshRecommendationsOnSearchExit = false;
     _clearSearch(refreshRecommendations: false);
     if (_homeScrollController.hasClients) {
@@ -430,7 +453,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   }
 
   Future<void> _refreshContent() async {
-    if (_isSearching) {
+    if (_isSearching || widget.searchOnly) {
       await _performSearch(ref);
       return;
     }
@@ -492,6 +515,16 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   }
 
   bool handleSystemBack() {
+    if (widget.searchOnly) {
+      final hasSearchContent = _urlController.text.trim().isNotEmpty ||
+          ref.read(searchPageProvider).hasResults ||
+          ref.read(suggestProvider).isNotEmpty;
+      if (hasSearchContent) {
+        _clearSearch(refreshRecommendations: false);
+        return true;
+      }
+      return false;
+    }
     if (hasActiveSearch) {
       _clearSearch();
       return true;
@@ -1484,11 +1517,33 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
           '',
           playlistId: 'row:$rowId',
           playlistName: title,
-          showTrailingLoader: isPaginating || hasMore,
+          showTrailingLoader: isPaginating,
+          nearEndLead: 5,
           onNearEnd: (!hasMore || isPaginating)
               ? null
               : () => ref.read(recommendationProvider.notifier).loadMoreRow(rowId),
         ),
+        if (hasMore || isPaginating)
+          Padding(
+            padding: const EdgeInsets.only(top: 6),
+            child: Center(
+              child: TextButton(
+                onPressed: isPaginating
+                    ? null
+                    : () => ref.read(recommendationProvider.notifier).loadMoreRow(rowId),
+                style: TextButton.styleFrom(
+                  foregroundColor: Colors.white.withValues(alpha: 0.74),
+                ),
+                child: isPaginating
+                    ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Text('Load more'),
+              ),
+            ),
+          ),
       ],
     );
   }
@@ -1919,8 +1974,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
           ),
           child: Text(
             errorMessage,
-            style: TextStyle(
-              color: const Color(0xFFB3BAC1),
+            style: const TextStyle(
+              color: Color(0xFFB3BAC1),
               fontSize: 12,
               fontWeight: FontWeight.w600,
             ),
@@ -2421,6 +2476,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     bool playAsDiscoveryMix = false,
     bool showTrailingLoader = false,
     VoidCallback? onNearEnd,
+    int nearEndLead = 2,
   }) {
     if (isLoading && tracks.isEmpty) {
       return const TrackListSkeleton(count: 5);
@@ -2442,7 +2498,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         if (index >= tracks.length) {
           return const TrackListSkeleton(count: 1);
         }
-        if (onNearEnd != null && index >= tracks.length - 2) {
+        final nearEndIndex = max(0, tracks.length - max(1, nearEndLead));
+        if (onNearEnd != null && index >= nearEndIndex) {
           WidgetsBinding.instance.addPostFrameCallback((_) {
             if (!mounted) return;
             onNearEnd();
@@ -2567,18 +2624,29 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         ? displayAlbums
         : displayAlbums.skip(1).toList(growable: false);
 
-    final recState = ref.watch(recommendationProvider);
-    final isRecLoading = ref.watch(recommendationProvider.notifier).isLoading;
-    final isRecPaginating =
-        ref.watch(recommendationProvider.notifier).isPaginating;
-    final lastPlayedTracks = _visibleLastPlayedTracks(
-      ref.watch(lastPlayedProvider),
-    );
-    final isLastPlayedLoading =
-        ref.watch(lastPlayedProvider.notifier).isLoading;
-    final frequentTracks = ref.watch(frequentlyPlayedProvider);
-    final isFrequentlyLoading =
-        ref.watch(frequentlyPlayedProvider.notifier).isLoading;
+    final recState = widget.searchOnly
+        ? const RecommendationFeedState()
+        : ref.watch(recommendationProvider);
+    final isRecLoading = widget.searchOnly
+        ? false
+        : ref.watch(recommendationProvider.notifier).isLoading;
+    final isRecPaginating = widget.searchOnly
+        ? false
+        : ref.watch(recommendationProvider.notifier).isPaginating;
+    final lastPlayedTracks = widget.searchOnly
+        ? const <Map<String, dynamic>>[]
+        : _visibleLastPlayedTracks(
+            ref.watch(lastPlayedProvider),
+          );
+    final isLastPlayedLoading = widget.searchOnly
+        ? false
+        : ref.watch(lastPlayedProvider.notifier).isLoading;
+    final frequentTracks = widget.searchOnly
+        ? const <Map<String, dynamic>>[]
+        : ref.watch(frequentlyPlayedProvider);
+    final isFrequentlyLoading = widget.searchOnly
+        ? false
+        : ref.watch(frequentlyPlayedProvider.notifier).isLoading;
     final suggestState = ref.watch(suggestProvider);
     final showSearchSuggestions = _isSearching &&
         suggestState.isNotEmpty &&
@@ -2598,11 +2666,13 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       if (!mounted) return;
       _primeLikelyTracks(visibleTracks);
     });
-    _ensureRecommendationPageCanPaginate(
-      recState,
-      isRecLoading,
-      isRecPaginating,
-    );
+    if (!widget.searchOnly) {
+      _ensureRecommendationPageCanPaginate(
+        recState,
+        isRecLoading,
+        isRecPaginating,
+      );
+    }
     return SafeArea(
       child: RefreshIndicator(
         color: _accentGrey,
@@ -2615,18 +2685,25 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
             physics: const BouncingScrollPhysics(
               parent: AlwaysScrollableScrollPhysics(),
             ),
-            padding: const EdgeInsets.all(16.0),
+            padding: EdgeInsets.fromLTRB(
+              16,
+              16,
+              16,
+              widget.searchOnly ? 180 : 220,
+            ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 if (_isSearching) ...[
                   Row(
                     children: [
-                      IconButton(
-                        onPressed: () => _clearSearch(refreshRecommendations: false),
-                        icon: const Icon(Icons.arrow_back_rounded),
-                        color: Colors.white,
-                      ),
+                      if (!widget.searchOnly)
+                        IconButton(
+                          onPressed: () =>
+                              _clearSearch(refreshRecommendations: false),
+                          icon: const Icon(Icons.arrow_back_rounded),
+                          color: Colors.white,
+                        ),
                       Expanded(
                         child: Semantics(
                           label: 'Search music',
@@ -2703,67 +2780,71 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
 
                 if (!_isSearching && !showSearchSuggestions) ...[
                   const SizedBox(height: 8),
-                  Material(
-                    color: Colors.transparent,
-                    child: InkWell(
-                      borderRadius: BorderRadius.circular(_radiusLarge),
-                      onTap: _openAssistant,
-                      child: Container(
-                        width: double.infinity,
-                        padding: const EdgeInsets.all(14),
-                        decoration: BoxDecoration(
-                          color: Colors.white.withValues(alpha: 0.03),
-                          borderRadius: BorderRadius.circular(_radiusLarge),
-                          border: Border.all(
-                            color: Colors.white.withValues(alpha: 0.08),
+                  Tooltip(
+                    message: _heroQuip,
+                    child: Material(
+                      color: Colors.transparent,
+                      child: InkWell(
+                        borderRadius: BorderRadius.circular(_radiusLarge),
+                        onTap: _openAssistant,
+                        child: Container(
+                          width: double.infinity,
+                          padding: const EdgeInsets.all(14),
+                          decoration: BoxDecoration(
+                            color: Colors.white.withValues(alpha: 0.03),
+                            borderRadius: BorderRadius.circular(_radiusLarge),
+                            border: Border.all(
+                              color: Colors.white.withValues(alpha: 0.08),
+                            ),
                           ),
-                        ),
-                        child: Row(
-                          children: [
-                            Container(
-                              width: 42,
-                              height: 42,
-                              decoration: BoxDecoration(
-                                color: Colors.white.withValues(alpha: 0.06),
-                                borderRadius:
-                                    BorderRadius.circular(_radiusMedium),
+                          child: Row(
+                            children: [
+                              Container(
+                                width: 42,
+                                height: 42,
+                                decoration: BoxDecoration(
+                                  color: Colors.white.withValues(alpha: 0.06),
+                                  borderRadius:
+                                      BorderRadius.circular(_radiusMedium),
+                                ),
+                                child: const Icon(
+                                  Icons.auto_awesome_rounded,
+                                  color: Colors.white,
+                                ),
                               ),
-                              child: const Icon(
-                                Icons.auto_awesome_rounded,
-                                color: Colors.white,
-                              ),
-                            ),
-                            const SizedBox(width: 12),
-                            Expanded(
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  const Text(
-                                    'Ask EBB',
-                                    style: TextStyle(
-                                      color: Colors.white,
-                                      fontSize: 15,
-                                      fontWeight: FontWeight.w700,
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    const Text(
+                                      'Ask EBB',
+                                      style: TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 15,
+                                        fontWeight: FontWeight.w700,
+                                      ),
                                     ),
-                                  ),
-                                  const SizedBox(height: 4),
-                                  Text(
-                                    'Describe a mood, artist, era, or playlist idea and get playable picks back.',
-                                    style: TextStyle(
-                                      color:
-                                          Colors.white.withValues(alpha: 0.68),
-                                      fontSize: 12,
-                                      height: 1.4,
+                                    const SizedBox(height: 4),
+                                    Text(
+                                      'Describe a mood, artist, era, or playlist idea and get playable picks back.',
+                                      style: TextStyle(
+                                        color: Colors.white.withValues(
+                                          alpha: 0.68,
+                                        ),
+                                        fontSize: 12,
+                                        height: 1.4,
+                                      ),
                                     ),
-                                  ),
-                                ],
+                                  ],
+                                ),
                               ),
-                            ),
-                            Icon(
-                              Icons.chevron_right_rounded,
-                              color: Colors.white.withValues(alpha: 0.6),
-                            ),
-                          ],
+                              Icon(
+                                Icons.chevron_right_rounded,
+                                color: Colors.white.withValues(alpha: 0.6),
+                              ),
+                            ],
+                          ),
                         ),
                       ),
                     ),

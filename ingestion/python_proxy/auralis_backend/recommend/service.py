@@ -276,6 +276,16 @@ def _launch_artifact_meets_flagship_contract(
     return True
 
 
+def _launch_artifact_is_thin_core(
+    launch_artifact: Dict[str, Any] | None,
+) -> bool:
+    if not isinstance(launch_artifact, dict):
+        return False
+    diagnostics = dict(launch_artifact.get("diagnostics") or {})
+    row_builder_mode = str(diagnostics.get("row_builder_mode") or "").strip().lower()
+    return "thin_core" in row_builder_mode or bool(diagnostics.get("launch_tier_only"))
+
+
 def _build_rich_bootstrap_snapshot(
     *,
     server: Any,
@@ -382,18 +392,11 @@ class RecommendationService:
         should_schedule_refresh = bool(
             prefer_fresh_rows or stale_artifact or acceptable_artifact or thin_launch_artifact
         )
-        should_bypass_artifact = bool(
-            prefer_fresh_rows and (stale_artifact or acceptable_artifact or thin_launch_artifact)
-        )
-        artifact_bypass_reason = (
-            "thin_launch_artifact"
-            if thin_launch_artifact and should_bypass_artifact
-            else (
-                "stale_launch_artifact"
-                if stale_artifact and should_bypass_artifact
-                else ("acceptable_launch_artifact" if acceptable_artifact and should_bypass_artifact else "")
-            )
-        )
+        # Manual refresh should not replace a solid visible artifact with a weaker
+        # request-time thin rebuild. We keep serving the current artifact, but
+        # schedule a fresher artifact in the background and apply row freshness.
+        should_bypass_artifact = False
+        artifact_bypass_reason = ""
         return {
             "resolved_from": resolved_from,
             "stale_artifact": stale_artifact,
@@ -803,7 +806,7 @@ class RecommendationService:
             server=server,
             user_scope_id=profile.get("user_scope_id") or "guest",
             profile=profile,
-            force=True,
+            force=False,
         )
         prepare_ms = int((time.perf_counter() - prepare_started_at) * 1000)
         request_ms = int((time.perf_counter() - started_at) * 1000)
@@ -818,7 +821,7 @@ class RecommendationService:
             "background_refresh_scheduled": bool(prepared),
             "prepare_next_session": True,
             "prepare_only": True,
-            "prepare_force_refresh": True,
+            "prepare_force_refresh": False,
             "promotion_status": "pending",
             "artifact_source": "background_prepare",
             "artifact_bypass_reason": "",
@@ -1007,6 +1010,20 @@ class RecommendationService:
                 server=server,
             )
         if not isinstance(launch_artifact, dict):
+            return None
+        if _launch_artifact_is_thin_core(launch_artifact):
+            invalidate_home_snapshots(
+                user_scope_id=user_scope_id,
+                profile_key=profile_key,
+                include_artifacts=True,
+                server=server,
+            )
+            server._trace_put(
+                trace,
+                "ranking_meta",
+                "recommend.thin_launch_artifact_rejected",
+                True,
+            )
             return None
         if rich_launch_required:
             artifact_rejected = False

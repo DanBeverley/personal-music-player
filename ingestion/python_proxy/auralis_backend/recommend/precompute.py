@@ -33,6 +33,7 @@ from .precompute_store import (
     _search_cache_key,
     _search_profile_cache_key,
     _store_delete,
+    _store_get,
     _store_set,
     configure_precompute_store,
     get_home_heavy_artifact as _store_get_home_heavy_artifact,

@@ -23,6 +23,25 @@ _inflight_warmups: set[str] = set()
 _recent_profile_feature_warmups: Dict[str, float] = {}
 
 
+def _log_warmup_event(
+    warmup_kind: str,
+    warmup_key: str,
+    stage: str,
+    **fields: Any,
+) -> None:
+    suffix = " ".join(
+        f"{key}={value}"
+        for key, value in fields.items()
+        if value is not None and str(value) != ""
+    )
+    print(
+        "[EBB:recommend][warmup] "
+        f"kind={warmup_kind} key={warmup_key} stage={stage}"
+        f"{(' ' + suffix) if suffix else ''}",
+        flush=True,
+    )
+
+
 def _precompute_executor(server: Any):
     return getattr(server, "precompute_executor", None) or getattr(
         server,
@@ -195,19 +214,58 @@ def schedule_home_artifact_warmup(
     normalized_scope = srv._assistant_safe_scope_id(user_scope_id or "guest")
     warmup_key = f"home_artifact:{normalized_scope}"
     if not _begin_warmup(warmup_key):
+        _log_warmup_event(
+            "home_artifact",
+            warmup_key,
+            "skipped",
+            force=bool(force),
+            reason="inflight",
+        )
         return False
 
     def _warm() -> None:
+        started_at = time.perf_counter()
+        _log_warmup_event(
+            "home_artifact",
+            warmup_key,
+            "started",
+            force=bool(force),
+        )
         try:
             from .precompute import build_home_launch_artifacts
 
-            build_home_launch_artifacts(
+            result = build_home_launch_artifacts(
                 server=srv,
                 user_scope_id=normalized_scope,
                 force=bool(force),
                 profile=profile if isinstance(profile, dict) and profile else None,
             )
-        except Exception:
+            duration_ms = int((time.perf_counter() - started_at) * 1000)
+            result_map = dict(result or {})
+            _log_warmup_event(
+                "home_artifact",
+                warmup_key,
+                "completed",
+                force=bool(force),
+                duration_ms=duration_ms,
+                promotion_status=result_map.get("promotion_status") or "",
+                launch_acceptable=bool(result_map.get("launch_acceptable")),
+                row_builder_mode=result_map.get("row_builder_mode") or "",
+                rich_rows_forced=bool(result_map.get("artifact_rich_rows_forced")),
+                force_snapshot_retry=bool(result_map.get("artifact_force_snapshot_retry")),
+                retry_reason=result_map.get("artifact_force_snapshot_retry_reason") or "",
+                launch_rows=int(result_map.get("launch_row_count") or 0),
+            )
+        except Exception as exc:
+            duration_ms = int((time.perf_counter() - started_at) * 1000)
+            _log_warmup_event(
+                "home_artifact",
+                warmup_key,
+                "failed",
+                force=bool(force),
+                duration_ms=duration_ms,
+                error=str(exc)[:240],
+            )
             return
         finally:
             _finish_warmup(warmup_key)

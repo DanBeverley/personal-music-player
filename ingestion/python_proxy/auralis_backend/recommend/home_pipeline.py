@@ -3072,6 +3072,187 @@ def apply_quiet_row_runtime_fields(
     return updated
 
 
+def _quiet_replenishment_query_plan(
+    *,
+    server: Any,
+    row: Dict[str, Any],
+    profile: Dict[str, Any],
+    limit: int | None = None,
+) -> List[str]:
+    normalized_used_queries = {
+        server._recommendation_trim_text(query).lower()
+        for query in (row.get("used_queries") or [])
+        if server._recommendation_trim_text(query)
+    }
+    candidate_queries: List[str] = []
+
+    def _add_query(value: str) -> None:
+        normalized = server._recommendation_trim_text(value)
+        if not normalized:
+            return
+        lowered = normalized.lower()
+        if lowered in normalized_used_queries:
+            return
+        if normalized in candidate_queries:
+            return
+        candidate_queries.append(normalized)
+
+    def _track_artist(track: Dict[str, Any] | None) -> str:
+        if not isinstance(track, dict):
+            return ""
+        return server._recommendation_trim_text(
+            track.get("channel") or track.get("artist") or track.get("author") or ""
+        )
+
+    def _track_album(track: Dict[str, Any] | None) -> str:
+        if not isinstance(track, dict):
+            return ""
+        return server._recommendation_trim_text(
+            track.get("album_title") or track.get("album") or ""
+        )
+
+    def _track_title(track: Dict[str, Any] | None) -> str:
+        if not isinstance(track, dict):
+            return ""
+        return server._recommendation_trim_text(track.get("title") or track.get("name") or "")
+
+    seed_tracks = server._recommendation_unique_snapshot_tracks(
+        [
+            *(row.get("items") or []),
+            *(profile.get("last_played_tracks") or []),
+            *(profile.get("recent_track_snapshots") or []),
+            *(profile.get("top_track_snapshots") or []),
+        ],
+        24,
+    )
+
+    _add_query(server._recommendation_trim_text(row.get("base_query") or ""))
+    for artist_hint in server._recommendation_unique_strings(
+        [
+            *(profile.get("top_artists") or []),
+            *(profile.get("artist_hints") or []),
+            *(profile.get("listened_artists") or []),
+            *[
+                _track_artist(track)
+                for track in seed_tracks
+                if isinstance(track, dict)
+            ],
+        ],
+        16,
+    ):
+        _add_query(artist_hint)
+    for album_hint in server._recommendation_unique_strings(
+        [
+            *(profile.get("top_albums") or []),
+            *(profile.get("album_hints") or []),
+            *[
+                _track_album(track)
+                for track in seed_tracks
+                if isinstance(track, dict)
+            ],
+        ],
+        12,
+    ):
+        _add_query(album_hint)
+    for track in seed_tracks[:18]:
+        artist_name = _track_artist(track)
+        title = _track_title(track)
+        album = _track_album(track)
+        if title and artist_name:
+            _add_query(f"{title} {artist_name}")
+        elif title:
+            _add_query(title)
+        if album and artist_name:
+            _add_query(f"{album} {artist_name}")
+    for query_hint in server._recommendation_unique_strings(
+        list(profile.get("recent_queries") or []),
+        8,
+    ):
+        _add_query(query_hint)
+
+    base_variants = list(candidate_queries)
+    for query in base_variants[:12]:
+        lowered = query.lower()
+        if " acoustic" not in lowered:
+            _add_query(f"{query} acoustic")
+        if " unplugged" not in lowered:
+            _add_query(f"{query} unplugged")
+        if " live acoustic" not in lowered and " live" not in lowered:
+            _add_query(f"{query} live acoustic")
+        if " stripped" not in lowered:
+            _add_query(f"{query} stripped")
+        if " session" not in lowered:
+            _add_query(f"{query} session")
+
+    if isinstance(limit, int) and limit > 0:
+        return candidate_queries[:limit]
+    return candidate_queries
+
+
+def _quiet_replenishment_candidates(
+    *,
+    server: Any,
+    row: Dict[str, Any],
+    profile: Dict[str, Any],
+    page_size: int,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    candidate_queries = _quiet_replenishment_query_plan(
+        server=server,
+        row=row,
+        profile=profile,
+        limit=28,
+    )
+
+    replenishment_tracks: List[Dict[str, Any]] = []
+    used_queries: List[str] = []
+    per_query_limit = max(page_size * 5, 36)
+    for query in candidate_queries:
+        try:
+            result_tracks = server._assistant_tool_search_tracks(query, per_query_limit)
+        except Exception:
+            result_tracks = []
+        if result_tracks:
+            replenishment_tracks.extend(
+                track
+                for track in result_tracks
+                if isinstance(track, dict)
+            )
+            used_queries.append(query)
+        if len(replenishment_tracks) >= max(page_size * 24, 144):
+            break
+
+    if len(replenishment_tracks) < max(page_size * 3, 18):
+        replenishment_tracks.extend(
+            _recommendation_home_fallback_tracks(
+                profile,
+                limit=max(page_size * 6, 30),
+                server=server,
+            )
+        )
+
+    replenishment_candidates = _track_list_to_candidates(
+        server,
+        replenishment_tracks,
+        generator_name="quiet_extension_replenishment",
+        base_score=2.55,
+        reason="Additional quiet picks loaded while you keep scrolling.",
+    )
+    replenishment_candidates = _post_filter_row_candidates(
+        server,
+        "quiet_picks",
+        profile,
+        replenishment_candidates,
+    )
+    return (
+        _trim_candidate_pool(
+            server,
+            replenishment_candidates,
+            limit=max(page_size * 16, 96),
+        ),
+        used_queries,
+    )
+
+
 def extend_row_from_snapshot(
     *,
     server: Any,
@@ -3160,8 +3341,57 @@ def extend_row_from_snapshot(
             continue
         existing_signatures.add(signature)
         new_items.append(track)
+    replenishment_queries: List[str] = []
+    replenishment_candidates: List[Dict[str, Any]] = []
+    if row_kind == "quiet_picks" and not new_items:
+        replenishment_candidates, replenishment_queries = _quiet_replenishment_candidates(
+            server=server,
+            row=extended_row,
+            profile=profile,
+            page_size=page_size,
+        )
+        if replenishment_candidates:
+            replenished = finalize_row_items(
+                server=server,
+                row_kind=row_kind,
+                title=extended_row.get("title")
+                or row_seed.get("title")
+                or row_title(row_kind, profile),
+                candidates=replenishment_candidates,
+                profile=profile,
+                used_track_ids=set(existing_signatures),
+                used_artist_counts=dict(existing_artist_counts),
+                max_items=target_new_items,
+            )
+            if replenished is None:
+                replenished = finalize_row_items(
+                    server=server,
+                    row_kind=row_kind,
+                    title=extended_row.get("title")
+                    or row_seed.get("title")
+                    or row_title(row_kind, profile),
+                    candidates=replenishment_candidates,
+                    profile=profile,
+                    used_track_ids=set(existing_signatures),
+                    used_artist_counts=dict(existing_artist_counts),
+                    enforce_feed_artist_cap=False,
+                    max_items=target_new_items,
+                )
+            for track in (replenished or {}).get("items") or []:
+                signature = server._recommendation_track_signature(track)
+                if not signature or signature in existing_signatures:
+                    continue
+                existing_signatures.add(signature)
+                new_items.append(track)
     extended_row["used_signatures"] = list(existing_signatures)
-    extended_row["used_queries"] = []
+    existing_used_queries = [
+        query
+        for query in (extended_row.get("used_queries") or [])
+        if server._recommendation_trim_text(query)
+    ]
+    extended_row["used_queries"] = list(
+        dict.fromkeys([*existing_used_queries, *replenishment_queries])
+    )
     extended_row["extension_cycle"] = max(int(extended_row.get("extension_cycle") or 0), 0) + 1
     if new_items:
         extended_row["items"] = existing_items + new_items
@@ -3173,7 +3403,22 @@ def extend_row_from_snapshot(
         signature = _candidate_signature(server, candidate)
         if signature and signature not in existing_signatures:
             remaining_available += 1
-    extended_row["can_extend"] = remaining_available > 0
+    if row_kind == "quiet_picks" and replenishment_candidates:
+        for candidate in replenishment_candidates:
+            signature = _candidate_signature(server, candidate)
+            if signature and signature not in existing_signatures:
+                remaining_available += 1
+    quiet_queries_remaining = False
+    if row_kind == "quiet_picks":
+        quiet_queries_remaining = bool(
+            _quiet_replenishment_query_plan(
+                server=server,
+                row=extended_row,
+                profile=profile,
+                limit=8,
+            )
+        )
+    extended_row["can_extend"] = remaining_available > 0 or quiet_queries_remaining
     return extended_row
 
 

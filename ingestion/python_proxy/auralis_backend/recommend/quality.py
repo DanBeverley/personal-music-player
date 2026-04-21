@@ -158,12 +158,9 @@ def promote_artifact_status(
     if not list(launch_rows or []):
         return "rejected"
     if "thin_core" in str(builder_mode or ""):
-        thin_minimal_ok = (
-            row_status.get("continue_listening") == "emitted"
-            and row_status.get("because_you_played") == "emitted"
-            and len(list(launch_rows or [])) >= 4
-        )
-        return "usable" if thin_minimal_ok else "rejected"
+        # Thin-core launch results are allowed as emergency first-paint feeds,
+        # but they must not become reusable launch artifacts across sessions.
+        return "rejected"
     primary_ok = all(
         row_status.get(str(row_kind or "")) == "emitted"
         for row_kind in primary_row_kinds
@@ -189,26 +186,7 @@ def acceptable_launch_artifact(
 ) -> bool:
     rows = list(launch_rows or [])
     if "thin_core" in str(builder_mode or ""):
-        if len(rows) < 4:
-            return False
-        if row_status.get("continue_listening") != "emitted":
-            return False
-        if row_status.get("because_you_played") not in {"emitted", "fallback_emitted"}:
-            return False
-        support_rows = (
-            "mixed_for_you",
-            "recommended_artists",
-            "recommended_albums",
-            "frequently_listened",
-        )
-        support_ready = sum(
-            1
-            for row_kind in support_rows
-            if row_status.get(row_kind) in {"emitted", "fallback_emitted"}
-        )
-        if support_ready < 1:
-            return False
-        return artifact_quality_score(row_status, quality_reasons) >= 0.18
+        return False
     if len(rows) < 5:
         return False
     if row_status.get("continue_listening") != "emitted":

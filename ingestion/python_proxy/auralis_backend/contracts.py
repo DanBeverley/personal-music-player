@@ -95,6 +95,7 @@ class SearchV3Request(SearchV2Request):
     playlist_names: List[str] = Field(default_factory=list)
     library_track_ids: List[str] = Field(default_factory=list)
     offline_track_ids: List[str] = Field(default_factory=list)
+    search_mode: str = ""
 
 
 class RecommendationHomeV3Request(RecommendationHomeV2Request):
@@ -261,4 +262,24 @@ class RecommendationHomeResponse(BaseModel):
     recommendations: List[Dict[str, Any]] = Field(default_factory=list)
     has_more: bool = False
     next_offset: int = 0
+    diagnostics: Dict[str, Any] = Field(default_factory=dict)
+
+
+class RecognitionResolvedTrackCandidate(BaseModel):
+    recognized_metadata: Dict[str, Any] = Field(default_factory=dict)
+    resolved_track: Optional[Dict[str, Any]] = None
+    confidence: float = 0.0
+    resolution_score: float = 0.0
+    window_hits: int = 0
+
+
+class RecognitionAudioResponse(BaseModel):
+    status: str = "success"
+    request_id: str
+    recognition_status: str
+    provider: str = ""
+    confidence: float = 0.0
+    recognized_metadata: Optional[Dict[str, Any]] = None
+    resolved_track: Optional[Dict[str, Any]] = None
+    alternatives: List[Dict[str, Any]] = Field(default_factory=list)
     diagnostics: Dict[str, Any] = Field(default_factory=dict)

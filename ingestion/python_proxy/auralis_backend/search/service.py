@@ -25,6 +25,7 @@ from .pipeline import (
     rank_track_candidates_fast_path,
     summarize_ranked_results,
 )
+from .query_mode import resolve_search_mode
 from .runtime import (
     search_albums_direct,
     search_artists_direct_cached,
@@ -47,6 +48,22 @@ class SearchService:
     def _search_server(self) -> SearchServerAdapter:
         return SearchServerAdapter(self._server)
 
+    def _with_search_mode(self, req: Any, search_mode: str):
+        normalized_mode = str(search_mode or "").strip().lower()
+        if not normalized_mode:
+            return req
+        current_mode = str(getattr(req, "search_mode", "") or "").strip().lower()
+        if current_mode == normalized_mode:
+            return req
+        model_copy = getattr(req, "model_copy", None)
+        if callable(model_copy):
+            return model_copy(update={"search_mode": normalized_mode})
+        try:
+            setattr(req, "search_mode", normalized_mode)
+        except Exception:
+            return req
+        return req
+
     def _should_try_direct_track_path(self, query: str, *, intent_hint: str) -> bool:
         server = self._search_server()
         normalized_query = server.normalize_text(query)
@@ -61,6 +78,20 @@ class SearchService:
             return False
         query_tokens = server.query_tokens(query)
         return 3 <= len(query_tokens) <= 7
+
+    def _resolve_search_mode(
+        self,
+        query: str,
+        *,
+        intent_hint: str,
+        explicit_mode: str = "",
+    ) -> str:
+        return resolve_search_mode(
+            query,
+            normalize_text_fn=self._search_server().normalize_text,
+            intent_hint=intent_hint,
+            explicit_mode=explicit_mode,
+        )
 
     def _direct_track_match_score(
         self,
@@ -85,6 +116,42 @@ class SearchService:
         overlap = len(query_tokens & title_tokens)
         return overlap / max(len(query_tokens), 1)
 
+    def _track_similar_tracks(
+        self,
+        top_track: Dict[str, Any] | None,
+        *,
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        if not isinstance(top_track, dict):
+            return []
+        search = self._search_server()
+        track_id = search.trim_text(top_track.get("id") or top_track.get("videoId"))
+        if not track_id:
+            return []
+        try:
+            raw_tracks = search.assistant_tool_get_similar_tracks(
+                track_id,
+                max(4, min(10, limit)),
+            )
+        except Exception:
+            raw_tracks = []
+        similar_tracks: List[Dict[str, Any]] = []
+        seen = {track_id}
+        for raw_track in raw_tracks or []:
+            normalized = search.normalize_track(raw_track)
+            if not normalized:
+                continue
+            normalized_id = search.trim_text(
+                normalized.get("id") or normalized.get("videoId")
+            )
+            if not normalized_id or normalized_id in seen:
+                continue
+            seen.add(normalized_id)
+            similar_tracks.append(normalized)
+            if len(similar_tracks) >= limit:
+                break
+        return similar_tracks
+
     def _build_direct_track_response(
         self,
         *,
@@ -102,17 +169,22 @@ class SearchService:
         top_track = dict(tracks[0])
         artists: List[Dict[str, Any]] = []
         albums: List[Dict[str, Any]] = []
+        similar_artists: List[Dict[str, Any]] = []
+        similar_tracks: List[Dict[str, Any]] = []
         defer_side_surfaces = bool(getattr(req, "defer_side_surfaces", False))
         if not defer_side_surfaces:
-            artist_name = search.trim_text(top_track.get("channel") or top_track.get("artist"))
-            album_title = search.trim_text(top_track.get("album"))
-            if artist_name:
-                artists = search_artists_direct_cached(artist_name, 1, server=server)
-            if album_title:
-                albums = search_albums_direct(album_title, 1, server=server)
+            artists, albums, similar_artists = self._derive_track_anchored_side_surfaces(
+                top_track,
+                limit=max(4, min(8, limit)),
+            )
+            similar_tracks = self._track_similar_tracks(
+                top_track,
+                limit=max(4, min(8, limit)),
+            )
         search.trace_put(trace, "candidate_counts", "search.tracks", len(tracks))
         search.trace_put(trace, "candidate_counts", "search.artists", len(artists))
         search.trace_put(trace, "candidate_counts", "search.albums", len(albums))
+        search.trace_put(trace, "candidate_counts", "search.similar_tracks", len(similar_tracks))
         response = {
             "status": "success",
             "request_id": trace["request_id"],
@@ -126,9 +198,15 @@ class SearchService:
             "tracks": tracks[:limit],
             "artists": artists[:1],
             "albums": albums[:1],
-            "similar_artists": artists[:1],
+            "similar_artists": similar_artists[:4],
+            "similar_tracks": similar_tracks[: max(1, min(8, limit))],
             "diagnostics": {
                 "ranking_backend": "search_service_direct_v1",
+                "query_mode": self._resolve_search_mode(
+                    query,
+                    intent_hint="track",
+                    explicit_mode=str(getattr(req, "search_mode", "") or ""),
+                ),
                 "query_intent": "track",
                 "direct_track_fast_path": True,
                 "direct_lookup_ms": direct_lookup_ms,
@@ -163,8 +241,10 @@ class SearchService:
         albums: List[Dict[str, Any]],
         similar_artists: List[Dict[str, Any]],
         direct_lookup_ms: int,
+        similar_tracks: List[Dict[str, Any]] | None = None,
     ) -> Dict[str, Any]:
         search = self._search_server()
+        similar_tracks = list(similar_tracks or [])
         top_result = None
         if tracks:
             top_result = {"entity_type": "track", "item": tracks[0]}
@@ -175,6 +255,7 @@ class SearchService:
         search.trace_put(trace, "candidate_counts", "search.tracks", len(tracks))
         search.trace_put(trace, "candidate_counts", "search.artists", len(artists))
         search.trace_put(trace, "candidate_counts", "search.albums", len(albums))
+        search.trace_put(trace, "candidate_counts", "search.similar_tracks", len(similar_tracks))
         response = {
             "status": "success",
             "request_id": trace["request_id"],
@@ -186,8 +267,14 @@ class SearchService:
             "artists": artists[: max(1, min(8, limit))],
             "albums": albums[: max(1, min(8, limit))],
             "similar_artists": similar_artists[:4],
+            "similar_tracks": similar_tracks[: max(1, min(8, limit))],
             "diagnostics": {
                 "ranking_backend": "search_service_direct_only_v1",
+                "query_mode": self._resolve_search_mode(
+                    req.query,
+                    intent_hint=query_intent,
+                    explicit_mode=str(getattr(req, "search_mode", "") or ""),
+                ),
                 "query_intent": query_intent,
                 "direct_search_only": True,
                 "direct_lookup_ms": direct_lookup_ms,
@@ -235,7 +322,7 @@ class SearchService:
                 try:
                     artist_payload = search.build_artist_details_payload(
                         artist_id,
-                        enrich_related=False,
+                        enrich_related=True,
                     )
                 except Exception:
                     artist_payload = {}
@@ -264,11 +351,13 @@ class SearchService:
         artists: List[Dict[str, Any]] = []
         albums: List[Dict[str, Any]] = []
         similar_artists: List[Dict[str, Any]] = []
+        similar_tracks: List[Dict[str, Any]] = []
         if tracks and not defer_side_surfaces:
             artists, albums, similar_artists = self._derive_track_anchored_side_surfaces(
                 tracks[0],
                 limit=side_limit,
             )
+            similar_tracks = self._track_similar_tracks(tracks[0], limit=side_limit)
         else:
             search_executor = getattr(server, "search_executor", server.recommendation_executor)
             artist_future = search_executor.submit(
@@ -315,6 +404,7 @@ class SearchService:
             albums=albums,
             similar_artists=similar_artists,
             direct_lookup_ms=direct_lookup_ms,
+            similar_tracks=similar_tracks,
         )
         diagnostics = dict(response.get("diagnostics") or {})
         diagnostics["deferred_side_surfaces"] = defer_side_surfaces and bool(tracks)
@@ -532,15 +622,11 @@ class SearchService:
                     return response
 
                 intent_hint = search_query_intent(query, server=server)
-                if SEARCH_DISABLE_RANKING_PIPELINE:
-                    return self._search_without_ranking(
-                        req=req,
-                        trace=trace,
-                        query=query,
-                        limit=limit,
-                        query_intent=intent_hint,
-                        track_model_version=track_model_version,
-                    )
+                search_mode = self._resolve_search_mode(
+                    query,
+                    intent_hint=intent_hint,
+                    explicit_mode=str(getattr(req, "search_mode", "") or ""),
+                )
                 if self._should_try_direct_track_path(query, intent_hint=intent_hint):
                     direct_started_at = time.perf_counter()
                     direct_tracks = search_tracks_direct(
@@ -571,9 +657,24 @@ class SearchService:
                             direct_lookup_ms=direct_lookup_ms,
                             direct_match_score=direct_match_score,
                         )
+                if SEARCH_DISABLE_RANKING_PIPELINE and search_mode == "exact":
+                    response = self._search_without_ranking(
+                        req=req,
+                        trace=trace,
+                        query=query,
+                        limit=limit,
+                        query_intent=intent_hint,
+                        track_model_version=track_model_version,
+                    )
+                    diagnostics = dict(response.get("diagnostics") or {})
+                    diagnostics["query_mode"] = search_mode
+                    diagnostics["ranking_pipeline_mode"] = "direct_only"
+                    response["diagnostics"] = diagnostics
+                    return response
 
                 profile_started_at = time.perf_counter()
                 legacy_req, profile = build_search_profile(req)
+                legacy_req = self._with_search_mode(legacy_req, search_mode)
                 search.trace_stage(trace, "search.profile_build", profile_started_at)
                 print(
                     "[EBB:search][progress] "
@@ -622,6 +723,7 @@ class SearchService:
                                 force=True,
                                 legacy_req=legacy_req,
                                 profile=profile,
+                                search_mode=search_mode,
                             )
                             retrieval_payload = dict(
                                 (precompute_snapshot or {}).get("retrieval_payload") or {}
@@ -641,6 +743,7 @@ class SearchService:
                         server=server,
                         user_scope_id=req.user_scope_id or "guest",
                         query=query,
+                        search_mode=search_mode,
                     )
                 print(
                     "[EBB:search][progress] "
@@ -654,6 +757,11 @@ class SearchService:
                 query,
                 server=server,
             )
+            search_mode = self._resolve_search_mode(
+                query,
+                intent_hint=query_intent,
+                explicit_mode=search_mode,
+            )
             ranked_snapshot = dict((precompute_snapshot or {}).get("ranked_results") or {})
             precomputed_tracks = list(ranked_snapshot.get("tracks") or [])
             precomputed_artists = list(ranked_snapshot.get("artists") or [])
@@ -663,6 +771,7 @@ class SearchService:
             )
             defer_side_surfaces = bool(getattr(req, "defer_side_surfaces", False))
             track_first_mode = False
+            ranking_runtime: dict[str, Any] = {}
             if precomputed_ranked_hit:
                 tracks = precomputed_tracks[:limit]
                 artists = (
@@ -677,7 +786,7 @@ class SearchService:
                 )
                 ranking_summary = dict(ranked_snapshot.get("ranking_summary") or {})
             else:
-                track_first_mode = query_intent == "track"
+                track_first_mode = query_intent == "track" and search_mode == "exact"
                 if track_first_mode:
                     tracks = self._rank_track_candidates_fast_path(
                         req,
@@ -705,7 +814,11 @@ class SearchService:
                         req,
                         profile,
                         retrieval_payload,
+                        search_mode=search_mode,
+                        query_intent=query_intent,
+                        limit=limit,
                     )
+                    ranking_budget = dict(ranking_runtime.get("ranking_budget") or {})
                     tracks = self._rank_track_candidates(
                         req,
                         profile,
@@ -713,23 +826,32 @@ class SearchService:
                         limit=limit,
                         ranking_runtime=ranking_runtime,
                     )
-                    artists = self._rank_artist_candidates(
-                        req,
-                        profile,
-                        retrieval_payload,
-                        limit=max(1, min(12, limit)),
-                        ranking_runtime=ranking_runtime,
-                    )
-                    albums = self._rank_album_candidates(
-                        req,
-                        profile,
-                        retrieval_payload,
-                        limit=max(1, min(12, limit)),
-                        ranking_runtime=ranking_runtime,
-                    )
                     if defer_side_surfaces and tracks:
                         artists = []
                         albums = []
+                    else:
+                        artist_limit = int(
+                            ranking_budget.get("artist_output_limit")
+                            or max(1, min(12, limit))
+                        )
+                        album_limit = int(
+                            ranking_budget.get("album_output_limit")
+                            or max(1, min(12, limit))
+                        )
+                        artists = self._rank_artist_candidates(
+                            req,
+                            profile,
+                            retrieval_payload,
+                            limit=artist_limit,
+                            ranking_runtime=ranking_runtime,
+                        )
+                        albums = self._rank_album_candidates(
+                            req,
+                            profile,
+                            retrieval_payload,
+                            limit=album_limit,
+                            ranking_runtime=ranking_runtime,
+                        )
                 ranking_summary = summarize_ranked_results(
                     server,
                     tracks=tracks[:limit],
@@ -753,9 +875,23 @@ class SearchService:
                 top_result = {"entity_type": "artist", "item": artists[0]}
             elif albums:
                 top_result = {"entity_type": "album", "item": albums[0]}
+            similar_artists: List[Dict[str, Any]] = []
+            similar_tracks: List[Dict[str, Any]] = []
+            if tracks and not defer_side_surfaces:
+                _anchored_artists, _anchored_albums, similar_artists = (
+                    self._derive_track_anchored_side_surfaces(
+                        tracks[0],
+                        limit=max(4, min(8, limit)),
+                    )
+                )
+                similar_tracks = self._track_similar_tracks(
+                    tracks[0],
+                    limit=max(4, min(8, limit)),
+                )
             search.trace_put(trace, "candidate_counts", "search.tracks", len(tracks))
             search.trace_put(trace, "candidate_counts", "search.artists", len(artists))
             search.trace_put(trace, "candidate_counts", "search.albums", len(albums))
+            search.trace_put(trace, "candidate_counts", "search.similar_tracks", len(similar_tracks))
             response = {
                 "status": "success",
                 "request_id": trace["request_id"],
@@ -766,9 +902,11 @@ class SearchService:
                 "tracks": tracks[:limit],
                 "artists": artists[: max(1, min(8, limit))],
                 "albums": albums[: max(1, min(8, limit))],
-                "similar_artists": artists[:4] if tracks else [],
+                "similar_artists": similar_artists[:4] if tracks else [],
+                "similar_tracks": similar_tracks[: max(1, min(8, limit))],
                 "diagnostics": {
                     "ranking_backend": "search_service_v41",
+                    "query_mode": search_mode,
                     "query_intent": query_intent,
                     "precomputed_ranked_hit": precomputed_ranked_hit,
                     "profile_cache_hit": bool((profile.get("profile_runtime") or {}).get("cache_hit")),
@@ -781,6 +919,7 @@ class SearchService:
                     "retriever_counts": retrieval_payload.get("retriever_counts") or {},
                     "retrieval": retrieval_payload.get("retrieval_diagnostics") or {},
                     "ranking_summary": ranking_summary,
+                    "ranking_budget": dict(ranking_runtime.get("ranking_budget") or {}),
                     "deferred_side_surfaces": defer_side_surfaces and bool(tracks),
                     "nearline_precompute": {
                         "hit": precompute_hit,
@@ -798,6 +937,17 @@ class SearchService:
             response["diagnostics"].update(
                 search.success_diagnostics(trace)
             )
+            if (
+                not precomputed_ranked_hit
+                and search_mode in {"entity", "taste"}
+                and len(self._search_server().trim_text(query)) >= 3
+            ):
+                schedule_search_warmup(
+                    server=server,
+                    user_scope_id=req.user_scope_id or "guest",
+                    query=query,
+                    search_mode=search_mode,
+                )
             search.trace_log_request(
                 trace,
                 request_type="search",
@@ -843,11 +993,17 @@ class SearchService:
         try:
             results = semantic_search_suggestions(req, server=server)
             normalized_query = search.trim_text(req.query)
+            suggestion_mode = self._resolve_search_mode(
+                normalized_query,
+                intent_hint=search_query_intent(normalized_query, server=server),
+                explicit_mode="",
+            )
             if len(normalized_query) >= 3:
                 schedule_search_warmup(
                     server=server,
                     user_scope_id=req.user_scope_id or "guest",
                     query=normalized_query,
+                    search_mode=suggestion_mode,
                 )
             return {
                 "status": "success",

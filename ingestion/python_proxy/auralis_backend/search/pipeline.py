@@ -22,15 +22,66 @@ from .runtime import (
 )
 
 
+def _search_ranking_budget_plan(
+    *,
+    search_mode: str,
+    query_intent: str,
+    limit: int,
+) -> Dict[str, Any]:
+    normalized_mode = str(search_mode or "").strip().lower()
+    normalized_intent = str(query_intent or "").strip().lower()
+    safe_limit = max(int(limit or 0), 1)
+    if normalized_mode == "entity":
+        return {
+            "mode": "entity",
+            "query_intent": normalized_intent or "mixed",
+            "track_candidate_cap": max(safe_limit * 2, 20),
+            "artist_candidate_cap": max(safe_limit + 4, 12),
+            "album_candidate_cap": max(safe_limit + 2, 10),
+            "artist_output_limit": max(4, min(8, safe_limit)),
+            "album_output_limit": max(4, min(8, safe_limit)),
+        }
+    if normalized_mode == "taste":
+        return {
+            "mode": "taste",
+            "query_intent": normalized_intent or "mixed",
+            "track_candidate_cap": max(safe_limit * 3, 36),
+            "artist_candidate_cap": max(safe_limit + 6, 14),
+            "album_candidate_cap": max(safe_limit + 4, 12),
+            "artist_output_limit": max(4, min(8, safe_limit)),
+            "album_output_limit": max(4, min(8, safe_limit)),
+        }
+    return {
+        "mode": normalized_mode or "exact",
+        "query_intent": normalized_intent or "mixed",
+        "track_candidate_cap": max(safe_limit * 2, 24),
+        "artist_candidate_cap": max(safe_limit + 2, 10),
+        "album_candidate_cap": max(safe_limit + 2, 8),
+        "artist_output_limit": max(3, min(6, safe_limit)),
+        "album_output_limit": max(3, min(6, safe_limit)),
+    }
+
+
 def build_search_ranking_runtime(
     server: Any,
     req,
     profile: Dict[str, Any],
     retrieval_payload: Dict[str, Any],
+    *,
+    search_mode: str = "",
+    query_intent: str = "",
+    limit: int = 12,
 ) -> Dict[str, Any]:
     server = adapt_search_server(server)
     return {
         "query": server.trim_text(req.query),
+        "search_mode": str(search_mode or "").strip().lower(),
+        "query_intent": str(query_intent or "").strip().lower(),
+        "ranking_budget": _search_ranking_budget_plan(
+            search_mode=search_mode,
+            query_intent=query_intent,
+            limit=limit,
+        ),
         "search_vectors": semantic_search_vectors(req, profile, server=server),
         "catalog_profile": build_catalog_feature_profile(server, profile),
         "normalized_anchor_artists": retrieval_payload.get("normalized_anchor_artists")
@@ -39,6 +90,59 @@ def build_search_ranking_runtime(
             (profile.get("collaborative") or {}).get("artist_scores") or {}
         ),
     }
+
+
+def _candidate_entry_score(
+    server: Any,
+    *,
+    entry: Dict[str, Any],
+    query: str,
+    fields: tuple[str, ...],
+) -> float:
+    payload = dict(entry.get("payload") or {})
+    source_scores = dict(entry.get("source_scores") or {})
+    source_score = max(
+        (float(value or 0.0) for value in source_scores.values()),
+        default=0.0,
+    )
+    retrieval_votes = max(len(source_scores), 1)
+    lexical_score = semantic_search_lexical_score(
+        query,
+        *(payload.get(field) for field in fields),
+        server=server,
+    )
+    return (
+        (source_score * 1.55)
+        + (float(retrieval_votes) * 0.45)
+        + (float(lexical_score) * 4.8)
+    )
+
+
+def _trim_candidate_entries(
+    server: Any,
+    candidates: Dict[str, Dict[str, Any]],
+    *,
+    query: str,
+    cap: int,
+    fields: tuple[str, ...],
+) -> List[Dict[str, Any]]:
+    if cap <= 0:
+        return list(candidates.values())
+    ranked_entries = sorted(
+        (
+            dict(entry)
+            for entry in candidates.values()
+            if isinstance(entry, dict) and isinstance(entry.get("payload"), dict)
+        ),
+        key=lambda entry: _candidate_entry_score(
+            server,
+            entry=entry,
+            query=query,
+            fields=fields,
+        ),
+        reverse=True,
+    )
+    return ranked_entries[:cap]
 
 
 def _finalize_ranked_tracks(
@@ -179,15 +283,24 @@ def rank_track_candidates(
         req,
         profile,
         retrieval_payload,
+        limit=limit,
     )
     query = runtime.get("query") or ""
+    ranking_budget = runtime.get("ranking_budget") or {}
     track_candidates = retrieval_payload.get("track_candidates") or {}
     if not track_candidates:
         return []
 
+    selected_entries = _trim_candidate_entries(
+        server,
+        track_candidates,
+        query=query,
+        cap=int(ranking_budget.get("track_candidate_cap") or 0),
+        fields=("title", "channel", "artist", "album"),
+    )
     candidate_items = [
         entry.get("payload")
-        for entry in track_candidates.values()
+        for entry in selected_entries
         if isinstance(entry, dict) and isinstance(entry.get("payload"), dict)
     ]
     candidate_embeddings = server.recommendation_track_embeddings(candidate_items)
@@ -195,7 +308,7 @@ def rank_track_candidates(
     normalized_anchor_artists = runtime.get("normalized_anchor_artists") or set()
     catalog_profile = runtime.get("catalog_profile") or {}
     ranked: List[Dict[str, Any]] = []
-    for entry in track_candidates.values():
+    for entry in selected_entries:
         payload = (entry or {}).get("payload")
         if not isinstance(payload, dict):
             continue
@@ -336,14 +449,23 @@ def rank_artist_candidates(
         req,
         profile,
         retrieval_payload,
+        limit=limit,
     )
     query = runtime.get("query") or ""
+    ranking_budget = runtime.get("ranking_budget") or {}
     artist_candidates = retrieval_payload.get("artist_candidates") or {}
     if not artist_candidates:
         return []
+    selected_entries = _trim_candidate_entries(
+        server,
+        artist_candidates,
+        query=query,
+        cap=int(ranking_budget.get("artist_candidate_cap") or 0),
+        fields=("name", "description"),
+    )
     candidate_items = [
         entry.get("payload")
-        for entry in artist_candidates.values()
+        for entry in selected_entries
         if isinstance(entry, dict) and isinstance(entry.get("payload"), dict)
     ]
     artist_embeddings = server.recommendation_artist_embeddings(candidate_items)
@@ -351,7 +473,7 @@ def rank_artist_candidates(
     collaborative_artist_scores = runtime.get("collaborative_artist_scores") or {}
     catalog_profile = runtime.get("catalog_profile") or {}
     ranked: List[Dict[str, Any]] = []
-    for entry in artist_candidates.values():
+    for entry in selected_entries:
         artist = dict((entry or {}).get("payload") or {})
         artist_name = server.trim_text(artist.get("name"))
         if not artist_name:
@@ -476,14 +598,23 @@ def rank_album_candidates(
         req,
         profile,
         retrieval_payload,
+        limit=limit,
     )
     query = runtime.get("query") or ""
+    ranking_budget = runtime.get("ranking_budget") or {}
     album_candidates = retrieval_payload.get("album_candidates") or {}
     if not album_candidates:
         return []
+    selected_entries = _trim_candidate_entries(
+        server,
+        album_candidates,
+        query=query,
+        cap=int(ranking_budget.get("album_candidate_cap") or 0),
+        fields=("title", "artist"),
+    )
     candidate_items = [
         entry.get("payload")
-        for entry in album_candidates.values()
+        for entry in selected_entries
         if isinstance(entry, dict) and isinstance(entry.get("payload"), dict)
     ]
     album_embeddings = server.recommendation_album_embeddings(candidate_items)
@@ -491,7 +622,7 @@ def rank_album_candidates(
     collaborative_artist_scores = runtime.get("collaborative_artist_scores") or {}
     catalog_profile = runtime.get("catalog_profile") or {}
     ranked: List[Dict[str, Any]] = []
-    for entry in album_candidates.values():
+    for entry in selected_entries:
         album = dict((entry or {}).get("payload") or {})
         album_title = server.trim_text(album.get("title"))
         if not album_title:

@@ -137,11 +137,15 @@ class SearchServerAdapter:
     def recommendation_text_embedding_key(self, namespace: str, text: str) -> str:
         return self.raw._recommendation_text_embedding_key(namespace, text)
 
-    def recommendation_embed_entries(self, entries):
-        return self.raw._recommendation_embed_entries(entries)
+    def recommendation_embed_entries(self, namespace_or_entries, entries=None):
+        if entries is None:
+            return self.raw._recommendation_embed_entries("text", namespace_or_entries)
+        return self.raw._recommendation_embed_entries(namespace_or_entries, entries)
 
     def vector_weighted_average(self, vectors, weights=None):
-        return self.raw._vector_weighted_average(vectors, weights=weights)
+        if weights is None:
+            return self.raw._vector_weighted_average(vectors)
+        return self.raw._vector_weighted_average(list(zip(vectors, weights)))
 
     def cosine_similarity(self, left, right) -> float:
         return self.raw._assistant_cosine_similarity(left, right)

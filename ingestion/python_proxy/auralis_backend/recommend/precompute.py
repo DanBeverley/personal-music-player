@@ -9,13 +9,15 @@ import time
 from ..contracts import RecommendationHomeV3Request, SearchV3Request
 from ..domain.features import build_home_profile, build_search_profile
 from ..domain.retrieval import retrieve_search_candidates, retrieve_search_candidates_fast
+from ..search.query_mode import resolve_search_mode
+from ..search.runtime import search_query_intent
 from ..search.pipeline import (
     rank_album_candidates,
     rank_artist_candidates,
     rank_track_candidates,
     summarize_ranked_results,
 )
-from .home_pipeline import build_home_candidate_snapshot, trim_home_candidate_snapshot
+from .snapshot_builder import build_home_candidate_snapshot, trim_home_candidate_snapshot
 from .artifact_runtime import (
     build_home_launch_artifacts as _artifact_build_home_launch_artifacts,
     store_home_serving_artifacts as _artifact_store_home_serving_artifacts,
@@ -73,6 +75,15 @@ _PRECOMPUTE_MAX_AGE_SECONDS = max(
     _PRECOMPUTE_TTL_SECONDS,
     int(os.environ.get("AURALIS_PRECOMPUTE_MAX_AGE_SECONDS", "21600")),
 )
+_PRECOMPUTE_HOME_ARTIFACT_SERVE_MAX_AGE_SECONDS = max(
+    _PRECOMPUTE_MAX_AGE_SECONDS,
+    int(
+        os.environ.get(
+            "AURALIS_PRECOMPUTE_HOME_ARTIFACT_SERVE_MAX_AGE_SECONDS",
+            "172800",
+        )
+    ),
+)
 _PRECOMPUTE_SEARCH_LIMIT = max(
     12,
     int(os.environ.get("AURALIS_PRECOMPUTE_SEARCH_LIMIT", "26")),
@@ -85,8 +96,9 @@ _PRECOMPUTE_SEARCH_ENTITY_CAP = max(
     8,
     int(os.environ.get("AURALIS_PRECOMPUTE_SEARCH_ENTITY_CAP", "32")),
 )
+_HOME_SNAPSHOT_VERSION = "home_candidate_snapshot_v1"
 _HOME_ARTIFACT_VERSION = "home_launch_artifact_v4"
-_HOME_HEAVY_ARTIFACT_VERSION = "home_heavy_rows_artifact_v2"
+_HOME_HEAVY_ARTIFACT_VERSION = "home_heavy_rows_artifact_v3"
 _HOME_HEAVY_ROW_KINDS = {"recommended_artists", "recommended_albums"}
 _HOME_ARTIFACT_STORE_NAMESPACE = "precompute_home_artifact_v1"
 _HOME_PRIMARY_ROW_KINDS = {
@@ -103,6 +115,8 @@ _HOME_THIN_PRIMARY_ROW_KINDS = {
 configure_precompute_store(
     ttl_seconds=_PRECOMPUTE_TTL_SECONDS,
     max_age_seconds=_PRECOMPUTE_MAX_AGE_SECONDS,
+    home_artifact_serve_max_age_seconds=_PRECOMPUTE_HOME_ARTIFACT_SERVE_MAX_AGE_SECONDS,
+    home_snapshot_version=_HOME_SNAPSHOT_VERSION,
     home_artifact_version=_HOME_ARTIFACT_VERSION,
     home_heavy_artifact_version=_HOME_HEAVY_ARTIFACT_VERSION,
     artifact_store_namespace=_HOME_ARTIFACT_STORE_NAMESPACE,
@@ -225,6 +239,16 @@ def _active_user_scopes(server: Any, *, limit: int) -> List[str]:
             """,
             [max(limit * 3, 24)],
         ).fetchall()
+        artifact_rows = connection.execute(
+            """
+            SELECT payload_json, updated_at
+            FROM recommendation_feature_store
+            WHERE namespace = ?
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            [_HOME_ARTIFACT_STORE_NAMESPACE, max(limit * 6, 36)],
+        ).fetchall()
     finally:
         connection.close()
     for row in list(event_rows) + list(search_rows):
@@ -235,6 +259,19 @@ def _active_user_scopes(server: Any, *, limit: int) -> List[str]:
         recency_hours = max((now - float(row["last_at"] or 0.0)) / 3600.0, 0.0)
         recency_score = max(0.0, 4.5 - min(recency_hours, 96.0) * 0.05)
         ranked[user_scope_id] = max(ranked.get(user_scope_id, 0.0), count_score + recency_score)
+    for row in artifact_rows:
+        try:
+            payload = json.loads(row["payload_json"] or "{}")
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        user_scope_id = server._assistant_safe_scope_id(payload.get("user_scope_id") or "guest")
+        if not user_scope_id:
+            continue
+        recency_hours = max((now - float(row["updated_at"] or 0.0)) / 3600.0, 0.0)
+        recency_score = max(0.0, 3.5 - min(recency_hours, 168.0) * 0.02)
+        ranked[user_scope_id] = max(ranked.get(user_scope_id, 0.0), 0.6 + recency_score)
     ordered = [
         user_scope_id
         for user_scope_id, _score in sorted(
@@ -321,6 +358,7 @@ def build_home_snapshot(
     now = time.time()
     feature_versions = _profile_feature_versions(profile)
     snapshot = {
+        "snapshot_version": _HOME_SNAPSHOT_VERSION,
         "user_scope_id": normalized_scope,
         "generated_at": now,
         "expires_at": now + _PRECOMPUTE_TTL_SECONDS,
@@ -362,6 +400,7 @@ def build_search_snapshot(
     force: bool = False,
     legacy_req: Any | None = None,
     profile: Dict[str, Any] | None = None,
+    search_mode: str = "",
 ) -> Dict[str, Any] | None:
     normalized_scope = server._assistant_safe_scope_id(user_scope_id or "guest")
     normalized_query = server._recommendation_trim_text(query)
@@ -378,6 +417,7 @@ def build_search_snapshot(
         query=normalized_query,
         user_scope_id=normalized_scope,
         context_surface="search",
+        search_mode=search_mode,
         limit=_PRECOMPUTE_SEARCH_LIMIT,
         force_refresh=bool(force),
     )
@@ -387,7 +427,17 @@ def build_search_snapshot(
         _stats_increment("search_profile_cache_hits")
     else:
         _stats_increment("search_profiles_warmed")
-    if bool(force):
+    effective_search_mode = resolve_search_mode(
+        normalized_query,
+        normalize_text_fn=server._normalize_text,
+        intent_hint=search_query_intent(normalized_query, server=server),
+        explicit_mode=search_mode,
+    )
+    setattr(req, "search_mode", effective_search_mode)
+    if legacy_req is not None:
+        setattr(legacy_req, "search_mode", effective_search_mode)
+    use_rich_retrieval = bool(force) or effective_search_mode in {"entity", "taste"}
+    if use_rich_retrieval:
         payload = retrieve_search_candidates(
             legacy_req,
             profile,
@@ -496,6 +546,7 @@ def build_search_snapshot(
             "scene_graph_version": feature_versions.get("scene_graph_version") or "",
             "feature_source": feature_versions.get("feature_source") or "",
         },
+        "search_mode": effective_search_mode,
         "builder_mode": "nearline_precompute_v2",
         "feature_artifacts": feature_versions,
     }

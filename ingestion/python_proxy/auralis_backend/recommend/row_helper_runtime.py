@@ -203,7 +203,7 @@ def _recommendation_finalize_row_items(
     *,
     max_items: int = 18,
 ):
-    from auralis_backend.recommend.home_pipeline import finalize_row_items
+    from auralis_backend.recommend.row_item_finalizer import finalize_row_items
     import sys
 
     return finalize_row_items(

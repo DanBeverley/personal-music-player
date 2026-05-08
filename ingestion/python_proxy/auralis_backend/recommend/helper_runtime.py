@@ -21,7 +21,7 @@ def _recommendation_required_row_fallback_seed(
     snapshot: Dict[str, Any] | None,
     profile: Dict[str, Any] | None = None,
 ):
-    from auralis_backend.recommend.home_pipeline import (
+    from auralis_backend.recommend.row_seed_builder import (
         build_required_fallback_seed as _home_build_required_fallback_seed,
     )
 
@@ -118,7 +118,7 @@ def _recommendation_required_row_fallback_seed(
 
 @_with_server_globals
 def _recommendation_apply_quiet_row_runtime_fields(finalized, row_seed):
-    from auralis_backend.recommend.home_pipeline import (
+    from auralis_backend.recommend.row_item_finalizer import (
         apply_quiet_row_runtime_fields as _home_apply_quiet_row_runtime_fields,
     )
 

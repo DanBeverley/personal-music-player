@@ -12,8 +12,10 @@ from .store_runtime import open_recommendation_store_connection, resolve_server
 
 _PRECOMPUTE_TTL_SECONDS = 900
 _PRECOMPUTE_MAX_AGE_SECONDS = 21600
+_HOME_ARTIFACT_SERVE_MAX_AGE_SECONDS = 172800
+_HOME_SNAPSHOT_VERSION = "home_candidate_snapshot_v1"
 _HOME_ARTIFACT_VERSION = "home_launch_artifact_v4"
-_HOME_HEAVY_ARTIFACT_VERSION = "home_heavy_rows_artifact_v2"
+_HOME_HEAVY_ARTIFACT_VERSION = "home_heavy_rows_artifact_v3"
 _HOME_ROW_CONTRACT_VERSION = "home_row_contract_v2"
 _HOME_ARTIFACT_STORE_NAMESPACE = "precompute_home_artifact_v1"
 
@@ -22,17 +24,26 @@ def configure_precompute_store(
     *,
     ttl_seconds: int,
     max_age_seconds: int,
+    home_artifact_serve_max_age_seconds: int,
+    home_snapshot_version: str,
     home_artifact_version: str,
     home_heavy_artifact_version: str,
     artifact_store_namespace: str,
 ) -> None:
     global _PRECOMPUTE_TTL_SECONDS
     global _PRECOMPUTE_MAX_AGE_SECONDS
+    global _HOME_ARTIFACT_SERVE_MAX_AGE_SECONDS
+    global _HOME_SNAPSHOT_VERSION
     global _HOME_ARTIFACT_VERSION
     global _HOME_HEAVY_ARTIFACT_VERSION
     global _HOME_ARTIFACT_STORE_NAMESPACE
     _PRECOMPUTE_TTL_SECONDS = int(ttl_seconds)
     _PRECOMPUTE_MAX_AGE_SECONDS = int(max_age_seconds)
+    _HOME_ARTIFACT_SERVE_MAX_AGE_SECONDS = max(
+        _PRECOMPUTE_MAX_AGE_SECONDS,
+        int(home_artifact_serve_max_age_seconds),
+    )
+    _HOME_SNAPSHOT_VERSION = str(home_snapshot_version or _HOME_SNAPSHOT_VERSION)
     _HOME_ARTIFACT_VERSION = str(home_artifact_version or _HOME_ARTIFACT_VERSION)
     _HOME_HEAVY_ARTIFACT_VERSION = str(
         home_heavy_artifact_version or _HOME_HEAVY_ARTIFACT_VERSION
@@ -115,22 +126,32 @@ def _search_profile_cache_key(profile_key: str, query: str) -> str:
     return f"auralis:precompute:search_profile:{digest}"
 
 
+def _is_persistent_home_snapshot_key(key: str) -> bool:
+    normalized = str(key or "")
+    return normalized.startswith(
+        (
+            "auralis:precompute:home:",
+            "auralis:precompute:home_profile:",
+        )
+    )
+
+
 def _store_get(key: str, *, server: Any | None = None) -> Dict[str, Any] | None:
     try:
         payload = get_session_store().get(key)
     except Exception:
         payload = None
     if isinstance(payload, dict):
-        if _is_persistent_artifact_key(key) and not _artifact_version_matches(key, payload):
+        if _is_persistent_store_key(key) and not _stored_payload_version_matches(key, payload):
             _store_delete(key, server=server)
             return None
         return payload
-    if not _is_persistent_artifact_key(key):
+    if not _is_persistent_store_key(key):
         return None
     persisted = _persistent_artifact_get(key, server=server)
     if not isinstance(persisted, dict):
         return None
-    if not _artifact_version_matches(key, persisted):
+    if not _stored_payload_version_matches(key, persisted):
         _persistent_artifact_delete(key, server=server)
         return None
     try:
@@ -151,7 +172,7 @@ def _store_set(
         get_session_store().set(key, payload, ttl_seconds)
     except Exception:
         pass
-    if _is_persistent_artifact_key(key):
+    if _is_persistent_store_key(key):
         _persistent_artifact_set(key, payload, server=server)
 
 
@@ -160,8 +181,12 @@ def _store_delete(key: str, *, server: Any | None = None) -> None:
         get_session_store().delete(key)
     except Exception:
         pass
-    if _is_persistent_artifact_key(key):
+    if _is_persistent_store_key(key):
         _persistent_artifact_delete(key, server=server)
+
+
+def _is_persistent_store_key(key: str) -> bool:
+    return _is_persistent_artifact_key(key) or _is_persistent_home_snapshot_key(key)
 
 
 def _is_persistent_artifact_key(key: str) -> bool:
@@ -184,8 +209,10 @@ def _is_persistent_artifact_key(key: str) -> bool:
     )
 
 
-def _expected_artifact_version_for_key(key: str) -> str:
+def _expected_version_for_key(key: str) -> str:
     normalized = str(key or "")
+    if _is_persistent_home_snapshot_key(normalized):
+        return _HOME_SNAPSHOT_VERSION
     if any(
         normalized.startswith(prefix)
         for prefix in (
@@ -201,12 +228,14 @@ def _expected_artifact_version_for_key(key: str) -> str:
     return ""
 
 
-def _artifact_version_matches(key: str, payload: Dict[str, Any] | None) -> bool:
+def _stored_payload_version_matches(key: str, payload: Dict[str, Any] | None) -> bool:
     if not isinstance(payload, dict):
         return False
-    expected_version = _expected_artifact_version_for_key(key)
+    expected_version = _expected_version_for_key(key)
     if not expected_version:
         return True
+    if _is_persistent_home_snapshot_key(key):
+        return str(payload.get("snapshot_version") or "").strip() == expected_version
     actual_version = str(payload.get("artifact_version") or "").strip()
     if actual_version != expected_version:
         return False
@@ -334,6 +363,19 @@ def _is_stale(snapshot: Dict[str, Any] | None) -> bool:
     return _is_usable(snapshot) and not _is_fresh(snapshot)
 
 
+def _is_artifact_servable(snapshot: Dict[str, Any] | None) -> bool:
+    if not isinstance(snapshot, dict):
+        return False
+    generated_at = _snapshot_generated_at(snapshot)
+    if generated_at <= 0.0:
+        return False
+    return (time.time() - generated_at) <= float(_HOME_ARTIFACT_SERVE_MAX_AGE_SECONDS)
+
+
+def _is_artifact_stale(snapshot: Dict[str, Any] | None) -> bool:
+    return _is_artifact_servable(snapshot) and not _is_fresh(snapshot)
+
+
 def _build_home_artifact_payload(
     *,
     artifact_kind: str,
@@ -354,6 +396,39 @@ def _build_home_artifact_payload(
         if artifact_kind == "heavy"
         else _HOME_ARTIFACT_VERSION
     )
+    compact_heavy_snapshot = {}
+    if artifact_kind == "heavy" and isinstance(candidate_snapshot, dict):
+        compact_heavy_snapshot = {
+            "albums": [
+                dict(album)
+                for album in list(candidate_snapshot.get("albums") or [])
+                if isinstance(album, dict)
+            ],
+            "artists": [
+                dict(artist)
+                for artist in list(candidate_snapshot.get("artists") or [])
+                if isinstance(artist, dict)
+            ],
+            "artist_artifact_meta": dict(
+                candidate_snapshot.get("artist_artifact_meta") or {}
+            ),
+            "mixed_for_you_cache": dict(
+                candidate_snapshot.get("mixed_for_you_cache") or {}
+            ),
+            "recommended_album_candidate_cache": [
+                dict(album)
+                for album in list(
+                    candidate_snapshot.get("recommended_album_candidate_cache") or []
+                )
+                if isinstance(album, dict)
+            ],
+            "resolved_from": str(candidate_snapshot.get("resolved_from") or "").strip(),
+        }
+        compact_heavy_snapshot = {
+            key: value
+            for key, value in compact_heavy_snapshot.items()
+            if value not in ({}, [], "")
+        }
     return {
         "artifact_kind": artifact_kind,
         "artifact_version": version,
@@ -366,7 +441,7 @@ def _build_home_artifact_payload(
         "candidate_snapshot": (
             dict(candidate_snapshot or {})
             if artifact_kind == "launch" and isinstance(candidate_snapshot, dict)
-            else {}
+            else compact_heavy_snapshot
         ),
         "row_status": dict(row_status or {}),
         "diagnostics": dict(diagnostics or {}),
@@ -406,7 +481,7 @@ def _artifact_lookup(
                     payload,
                 )
             )
-        elif _is_stale(snapshot):
+        elif _is_artifact_stale(snapshot):
             payload = dict(snapshot or {})
             payload["stale"] = True
             payload["resolved_from"] = f"{label}_stale"

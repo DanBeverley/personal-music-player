@@ -4,14 +4,14 @@ import os
 from typing import Any, Dict, List, Tuple
 
 from .candidate_pipeline import execute_candidate_pipeline, resolve_candidate_snapshot
-from .home_pipeline import (
+from .row_item_finalizer import (
     _artist_family_identity,
     _track_authenticity_penalty,
     apply_track_row_runtime_fields,
     apply_quiet_row_runtime_fields,
-    build_row_seed,
     finalize_row_items,
 )
+from .row_seed_builder import build_row_seed
 from .row_finalization_pipeline import finalize_row_seed_execution
 from .policy import is_required_row, required_row_kinds, row_kinds as policy_row_kinds
 
@@ -40,7 +40,6 @@ QUALITY_CRITICAL_ROWS = (
     "continue_listening",
     "because_you_played",
     "trending_for_you",
-    "quiet_picks",
 )
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Set
+import time
 
 from ..contracts import RecommendationHomeV3Request
 from ..domain.features import build_home_profile
@@ -293,12 +294,28 @@ def build_home_launch_artifacts(
         force_rich_rows: bool = False,
         retry_reason: str = "",
     ) -> Dict[str, Any]:
+        build_started_at = time.perf_counter()
+        print(
+            "[EBB:recommend][artifact] "
+            f"scope={normalized_scope} stage=snapshot_build_start "
+            f"force_snapshot={bool(force_snapshot)} force_rich_rows={bool(force_rich_rows)} "
+            f"retry_reason={retry_reason or ''}",
+            flush=True,
+        )
         snapshot = snapshot_builder(
             server=server,
             user_scope_id=normalized_scope,
             force=force_snapshot,
             profile=resolved_profile,
         )
+        print(
+            "[EBB:recommend][artifact] "
+            f"scope={normalized_scope} stage=snapshot_build_done "
+            f"elapsed_ms={int((time.perf_counter() - build_started_at) * 1000)} "
+            f"resolved_from={((snapshot or {}).get('resolved_from') or '')}",
+            flush=True,
+        )
+        rows_started_at = time.perf_counter()
         rows, _generator_timings, row_diagnostics, row_builder_meta = rows_builder(
             server=server,
             profile=resolved_profile,
@@ -307,6 +324,14 @@ def build_home_launch_artifacts(
             allow_live_snapshot_build=False,
             force_rich_rows=force_rich_rows,
         )
+        print(
+            "[EBB:recommend][artifact] "
+            f"scope={normalized_scope} stage=rows_build_done "
+            f"elapsed_ms={int((time.perf_counter() - rows_started_at) * 1000)} "
+            f"row_builder_mode={row_builder_meta.get('row_builder_mode') or ''} "
+            f"rows={len(rows or [])}",
+            flush=True,
+        )
         artifact_rich_rows_forced = bool(force_rich_rows)
         if (
             rich_launch_required
@@ -314,6 +339,7 @@ def build_home_launch_artifacts(
             and "thin_core"
             in str(row_builder_meta.get("row_builder_mode") or "").strip().lower()
         ):
+            forced_rows_started_at = time.perf_counter()
             rows, _generator_timings, row_diagnostics, row_builder_meta = rows_builder(
                 server=server,
                 profile=resolved_profile,
@@ -323,6 +349,14 @@ def build_home_launch_artifacts(
                 force_rich_rows=True,
             )
             artifact_rich_rows_forced = True
+            print(
+                "[EBB:recommend][artifact] "
+                f"scope={normalized_scope} stage=rows_build_forced_done "
+                f"elapsed_ms={int((time.perf_counter() - forced_rows_started_at) * 1000)} "
+                f"row_builder_mode={row_builder_meta.get('row_builder_mode') or ''} "
+                f"rows={len(rows or [])}",
+                flush=True,
+            )
         diagnostics = {
             "profile_build_ms": 0,
             "row_assembly_ms": 0,
@@ -343,6 +377,7 @@ def build_home_launch_artifacts(
             "scene_graph_version": resolved_profile.get("scene_graph_version") or "",
             "feature_source": resolved_profile.get("feature_source") or "",
         }
+        store_started_at = time.perf_counter()
         result = dict(
             artifact_store(
                 server=server,
@@ -360,6 +395,14 @@ def build_home_launch_artifacts(
             )
             or {}
         )
+        print(
+            "[EBB:recommend][artifact] "
+            f"scope={normalized_scope} stage=artifact_store_done "
+            f"elapsed_ms={int((time.perf_counter() - store_started_at) * 1000)} "
+            f"promotion_status={result.get('promotion_status') or ''} "
+            f"launch_acceptable={bool(result.get('launch_acceptable'))}",
+            flush=True,
+        )
         result["row_builder_mode"] = diagnostics["row_builder_mode"]
         result["launch_row_count"] = len(rows or [])
         result["artifact_rich_rows_forced"] = diagnostics["artifact_rich_rows_forced"]
@@ -367,6 +410,9 @@ def build_home_launch_artifacts(
         result["artifact_force_snapshot_retry_reason"] = diagnostics[
             "artifact_force_snapshot_retry_reason"
         ]
+        result["artifact_total_build_ms"] = int(
+            (time.perf_counter() - build_started_at) * 1000
+        )
         return result
 
     initial_result = _build_attempt(

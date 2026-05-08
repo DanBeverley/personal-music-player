@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Any, Dict, Optional
 
 from ..domain.candidate_expansion import (
@@ -190,6 +191,7 @@ def _recommendation_home_fallback_tracks(
     profile,
     *,
     limit: int,
+    allow_catalog_fallback: bool = True,
     server: Any | None = None,
 ):
     server = _server(server)
@@ -234,7 +236,7 @@ def _recommendation_home_fallback_tracks(
         max(limit * 3, limit + 10),
     )
 
-    if len(deduped_candidates) < max(6, limit // 2):
+    if allow_catalog_fallback and len(deduped_candidates) < max(6, limit // 2):
         deduped_candidates.extend(
             [item for item, _score in server._fallback_home_candidates(limit + 8)]
         )
@@ -253,8 +255,19 @@ def _recommendation_home_fallback_tracks(
 
 def _recommendation_recommended_albums_row(profile, *, server: Any | None = None):
     server = _server(server)
+    started_at = time.perf_counter()
     albums = []
     seen = set()
+    candidate_cache_entries = []
+    cached_candidate_count = 0
+    source_counts = {
+        "cache": 0,
+        "top_album_hints": 0,
+        "artist_discography": 0,
+        "artist_album_search": 0,
+        "snapshot_albums": 0,
+    }
+    fast_ready_threshold = 8
     catalog_profile = build_catalog_feature_profile(server, profile)
     affinity_artists = {
         server._normalize_text(name)
@@ -281,83 +294,113 @@ def _recommendation_recommended_albums_row(profile, *, server: Any | None = None
             continue
         album_seed_artists.setdefault(album_title, set()).add(artist_name)
 
-    def add_album(raw_album, base_score: float, *, required_artist_keys: Optional[set[str]] = None):
+    def add_album(
+        raw_album,
+        base_score: float,
+        *,
+        required_artist_keys: Optional[set[str]] = None,
+        source_name: str = "",
+    ):
         if not isinstance(raw_album, dict):
-            return
+            return False
         album_id = server._recommendation_trim_text(raw_album.get("id"))
         title = server._recommendation_trim_text(raw_album.get("title"))
         artist = server._recommendation_trim_text(raw_album.get("artist"))
         artist_key = server._normalize_text(artist)
         title_key = server._normalize_text(title)
         if required_artist_keys and artist_key not in required_artist_keys:
-            return
+            return False
         if (
             title_key in album_seed_artists
             and artist_key
             and artist_key not in album_seed_artists[title_key]
             and artist_key not in affinity_artists
         ):
-            return
+            return False
         key = album_id or f"{server._normalize_text(title)}|{server._normalize_text(artist)}"
         if not key or key in seen:
-            return
+            return False
         seen.add(key)
+        normalized_album = {
+            "id": album_id or None,
+            "title": title or "Unknown Album",
+            "artist": artist or "Unknown Artist",
+            "thumbnail": raw_album.get("thumbnail"),
+            "year": raw_album.get("year") or "",
+            "track_count": raw_album.get("track_count") or raw_album.get("trackCount") or 0,
+            "generator_score": round(base_score, 3),
+            "source_name": source_name or "",
+        }
+        candidate_cache_entries.append(dict(normalized_album))
         albums.append(
-            {
-                "id": album_id or None,
-                "title": title or "Unknown Album",
-                "artist": artist or "Unknown Artist",
-                "thumbnail": raw_album.get("thumbnail"),
-                "year": raw_album.get("year") or "",
-                "track_count": raw_album.get("track_count") or raw_album.get("trackCount") or 0,
-                "generator_score": round(base_score, 3),
-            }
+            dict(normalized_album)
         )
+        if source_name:
+            source_counts[source_name] = int(source_counts.get(source_name) or 0) + 1
+        return True
 
-    for index, album_hint in enumerate(profile.get("top_albums") or []):
-        normalized_hint = server._normalize_text(album_hint)
-        required_artist_keys = set(album_seed_artists.get(normalized_hint) or set()) or None
-        for offset, album in enumerate(server._assistant_tool_search_albums(album_hint, 5)):
-            add_album(
-                album,
-                4.2 - (index * 0.28) - (offset * 0.16),
-                required_artist_keys=required_artist_keys,
-            )
-            if len(albums) >= 18:
-                break
-        if len(albums) >= 18:
-            break
+    cached_candidates = list(
+        (dict(profile).get("recommended_album_candidate_cache") or [])
+    )
+    for cached_candidate in cached_candidates:
+        if not isinstance(cached_candidate, dict):
+            continue
+        if add_album(
+            cached_candidate,
+            float(cached_candidate.get("generator_score") or 0.0),
+            source_name="cache",
+        ):
+            cached_candidate_count += 1
 
-    for index, artist_hint in enumerate(profile.get("top_artists") or []):
-        direct_artists = search_artists_direct(server, artist_hint, 1)
-        if direct_artists:
-            artist_id = server._recommendation_trim_text(direct_artists[0].get("id"))
-            if artist_id:
-                try:
-                    artist_payload = server._build_artist_details_payload(artist_id)
-                except Exception:
-                    artist_payload = {}
-                for offset, album in enumerate(artist_payload.get("albums") or []):
-                    add_album(
-                        album,
-                        4.0 - (index * 0.22) - (offset * 0.18),
-                        required_artist_keys={server._normalize_text(artist_hint)},
-                    )
-                    if len(albums) >= 18:
-                        break
-        if len(albums) < 12:
-            for offset, album in enumerate(server._assistant_tool_search_albums(f"{artist_hint} album", 4)):
+    if len(albums) < fast_ready_threshold:
+        for index, album_hint in enumerate(profile.get("top_albums") or []):
+            normalized_hint = server._normalize_text(album_hint)
+            required_artist_keys = set(album_seed_artists.get(normalized_hint) or set()) or None
+            for offset, album in enumerate(server._assistant_tool_search_albums(album_hint, 5)):
                 add_album(
                     album,
-                    3.6 - (index * 0.18) - (offset * 0.14),
-                    required_artist_keys={server._normalize_text(artist_hint)},
+                    4.2 - (index * 0.28) - (offset * 0.16),
+                    required_artist_keys=required_artist_keys,
+                    source_name="top_album_hints",
                 )
                 if len(albums) >= 18:
                     break
-        if len(albums) >= 18:
-            break
+            if len(albums) >= 18:
+                break
 
-    if len(albums) < 12:
+    if len(albums) < fast_ready_threshold:
+        for index, artist_hint in enumerate(profile.get("top_artists") or []):
+            direct_artists = search_artists_direct(server, artist_hint, 1)
+            if direct_artists:
+                artist_id = server._recommendation_trim_text(direct_artists[0].get("id"))
+                if artist_id:
+                    try:
+                        artist_payload = server._build_artist_details_payload(artist_id)
+                    except Exception:
+                        artist_payload = {}
+                    for offset, album in enumerate(artist_payload.get("albums") or []):
+                        add_album(
+                            album,
+                            4.0 - (index * 0.22) - (offset * 0.18),
+                            required_artist_keys={server._normalize_text(artist_hint)},
+                            source_name="artist_discography",
+                        )
+                        if len(albums) >= 18:
+                            break
+            if len(albums) < fast_ready_threshold:
+                for offset, album in enumerate(server._assistant_tool_search_albums(f"{artist_hint} album", 4)):
+                    add_album(
+                        album,
+                        3.6 - (index * 0.18) - (offset * 0.14),
+                        required_artist_keys={server._normalize_text(artist_hint)},
+                        source_name="artist_album_search",
+                    )
+                    if len(albums) >= 18:
+                        break
+            if len(albums) >= 18:
+                break
+
+    if len(albums) < fast_ready_threshold:
         snapshot_tracks = [
             *(profile.get("last_played_tracks") or []),
             *(profile.get("top_track_snapshots") or []),
@@ -380,6 +423,7 @@ def _recommendation_recommended_albums_row(profile, *, server: Any | None = None
                         track.get("channel") or track.get("artist") or track.get("author") or ""
                     )
                 },
+                source_name="snapshot_albums",
             )
             if len(albums) >= 18:
                 break
@@ -466,6 +510,16 @@ def _recommendation_recommended_albums_row(profile, *, server: Any | None = None
         "kind": "recommended_albums",
         "item_type": "album",
         "items": albums[:18],
+        "meta": {
+            "build_ms": int((time.perf_counter() - started_at) * 1000),
+            "source_counts": source_counts,
+            "fast_ready_threshold": fast_ready_threshold,
+            "ready_count": len(albums[:18]),
+            "cached_candidate_count": cached_candidate_count,
+        },
+        "_server_refinement_cache": {
+            "recommended_album_candidate_cache": candidate_cache_entries[:32],
+        },
     }
 
 

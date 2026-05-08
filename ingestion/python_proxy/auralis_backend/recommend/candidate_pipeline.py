@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Tuple
 
-from .home_pipeline import (
+from .snapshot_builder import (
     build_home_candidate_snapshot,
     build_home_candidate_snapshot_fast_fallback,
     build_home_candidate_snapshot_fallback,

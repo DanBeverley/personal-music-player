@@ -1,20 +1,27 @@
 from __future__ import annotations
 
+import json
 import os
 import time
+import traceback
 import uuid
 from typing import Any
 from typing import Dict, List, Tuple
 
 from fastapi import HTTPException
+from fastapi.responses import StreamingResponse
 
 from ..domain.features import build_home_profile
-from .home_pipeline import (
+from .row_extension_runtime import extend_row_from_snapshot
+from .row_seed_builder import (
+    build_row_seed,
     build_continue_listening_row,
+    refresh_trending_by_genre_row,
+)
+from .snapshot_support_runtime import build_album_items, build_artist_artifacts
+from .snapshot_builder import (
     build_home_candidate_snapshot,
     build_home_candidate_snapshot_fast_fallback,
-    extend_row_from_snapshot,
-    refresh_trending_by_genre_row,
     snapshot_substrate_mode,
     trim_home_candidate_snapshot,
 )
@@ -49,7 +56,11 @@ from .row_runtime import (
     build_rows_v41 as build_rows_for_snapshot,
     merge_home_rows,
 )
-from .row_registry import deferred_row_kinds as registry_deferred_row_kinds
+from .row_registry import (
+    deferred_row_kinds as registry_deferred_row_kinds,
+    row_order_index,
+    row_title_template,
+)
 from .session_runtime import load_feed_session, prune_feed_cache, store_feed_session
 from .warmup_runtime import schedule_home_artifact_warmup, schedule_home_warmup
 
@@ -124,6 +135,12 @@ RECOMMEND_TOTAL_ROW_BUILD_BUDGET_SECONDS = max(
         )
     ),
 )
+RECOMMEND_RICH_BOOTSTRAP_ON_LAUNCH_MISS = (
+    os.environ.get("AURALIS_RECOMMEND_RICH_BOOTSTRAP_ON_LAUNCH_MISS", "1")
+    .strip()
+    .lower()
+    in {"1", "true", "yes", "on"}
+)
 RECOMMEND_DISABLE_TIMEOUTS = (
     (os.environ.get("AURALIS_DISABLE_TIMEOUTS", "0").strip().lower() in {"1", "true", "yes", "on"})
     or (os.environ.get("AURALIS_RECOMMEND_DISABLE_TIMEOUTS", "0").strip().lower() in {"1", "true", "yes", "on"})
@@ -133,11 +150,26 @@ RECOMMEND_LIVE_SNAPSHOT_ON_MISS = (
     in {"1", "true", "yes", "on"}
 )
 
+_FLAGSHIP_DEFERRED_ROW_KINDS: tuple[str, ...] = (
+    "quiet_picks",
+    "mixed_for_you",
+    "trending_by_genre",
+    "recommended_albums",
+    "recommended_artists",
+)
+_HEAVY_FLAGSHIP_ROW_KINDS = {"recommended_albums", "recommended_artists"}
+_DEFERRED_ROW_KIND_SET = set(registry_deferred_row_kinds())
+_FLAGSHIP_REFINE_ROW_CONTEXT = "flagship_refine"
+_FLAGSHIP_ROW_STATE_PENDING = "pending"
+_FLAGSHIP_ROW_STATE_PARTIAL_INFLIGHT = "partial_inflight"
+_FLAGSHIP_ROW_STATE_READY = "ready"
+_FLAGSHIP_ROW_STATE_UNAVAILABLE = "unavailable"
+
 
 def _snapshot_quality_is_weak(
     row_diagnostics: Dict[str, Dict[str, Any]] | None,
     *,
-    critical_rows: tuple[str, ...] = ("continue_listening", "because_you_played", "trending_for_you", "quiet_picks"),
+    critical_rows: tuple[str, ...] = ("continue_listening", "because_you_played"),
 ) -> bool:
     return bool(
         compute_snapshot_quality_reasons(
@@ -250,16 +282,8 @@ def _launch_artifact_supports_rich_rows(
     )
 
 
-def _launch_artifact_meets_flagship_contract(
-    launch_artifact: Dict[str, Any] | None,
-) -> bool:
-    if not isinstance(launch_artifact, dict):
-        return False
-    row_status = {
-        str(row_kind or ""): str(status or "").strip().lower()
-        for row_kind, status in dict(launch_artifact.get("row_status") or {}).items()
-    }
-    hard_missing = {
+def _launch_artifact_hard_missing_statuses() -> set[str]:
+    return {
         "empty",
         "missing_no_fallback",
         "fallback_unavailable",
@@ -267,13 +291,47 @@ def _launch_artifact_meets_flagship_contract(
         "post_filter_empty",
         "finalize_filtered_out",
     }
-    if row_status.get("todays_pick") in hard_missing:
-        return False
-    if row_status.get("trending_for_you") in hard_missing:
-        return False
-    if row_status.get("quiet_picks") in hard_missing:
-        return False
-    return True
+
+
+def _launch_artifact_blocking_gap_kinds(
+    launch_artifact: Dict[str, Any] | None,
+) -> List[str]:
+    if not isinstance(launch_artifact, dict):
+        return ["artifact_missing"]
+    row_status = {
+        str(row_kind or ""): str(status or "").strip().lower()
+        for row_kind, status in dict(launch_artifact.get("row_status") or {}).items()
+    }
+    hard_missing = _launch_artifact_hard_missing_statuses()
+    blocking_rows = ("todays_pick",)
+    return [
+        row_kind
+        for row_kind in blocking_rows
+        if row_status.get(row_kind) in hard_missing
+    ]
+
+
+def _launch_artifact_refresh_gap_kinds(
+    launch_artifact: Dict[str, Any] | None,
+) -> List[str]:
+    if not isinstance(launch_artifact, dict):
+        return []
+    row_status = {
+        str(row_kind or ""): str(status or "").strip().lower()
+        for row_kind, status in dict(launch_artifact.get("row_status") or {}).items()
+    }
+    hard_missing = _launch_artifact_hard_missing_statuses()
+    row_kinds = dict.fromkeys(
+        (
+            "trending_for_you",
+            *_FLAGSHIP_DEFERRED_ROW_KINDS,
+        )
+    )
+    return [
+        row_kind
+        for row_kind in row_kinds
+        if row_status.get(row_kind) in hard_missing
+    ]
 
 
 def _launch_artifact_is_thin_core(
@@ -284,6 +342,511 @@ def _launch_artifact_is_thin_core(
     diagnostics = dict(launch_artifact.get("diagnostics") or {})
     row_builder_mode = str(diagnostics.get("row_builder_mode") or "").strip().lower()
     return "thin_core" in row_builder_mode or bool(diagnostics.get("launch_tier_only"))
+
+
+def _flagship_row_shell(row_kind: str) -> Dict[str, Any]:
+    item_type = "track"
+    row_style = ""
+    loading_label = "Preparing"
+    loading_message = "Finding more picks for this lane."
+    if row_kind == "mixed_for_you":
+        item_type = "mix"
+        row_style = "mix_cards"
+        loading_label = "Blending"
+        loading_message = "Building a mix from the corners of your recent taste."
+    elif row_kind == "trending_by_genre":
+        row_style = "genre_tabs"
+        loading_label = "Scanning"
+        loading_message = "Looking for a genre pocket that fits what you have been playing."
+    elif row_kind == "recommended_albums":
+        item_type = "album"
+        loading_label = "Curating"
+        loading_message = "Matching full albums worth settling into."
+    elif row_kind == "recommended_artists":
+        item_type = "artist"
+        loading_label = "Connecting"
+        loading_message = "Finding artists that line up with your current taste."
+    elif row_kind == "quiet_picks":
+        loading_label = "Settling"
+        loading_message = "Lining up a calmer pocket with room to stretch out."
+    return {
+        "id": row_kind,
+        "kind": row_kind,
+        "title": row_title_template(row_kind),
+        "item_type": item_type,
+        "row_style": row_style,
+        "items": [],
+        "next_offset": 0,
+        "has_more": False,
+        "meta": {
+            "loading_state": "pending",
+            "deferred_flagship": True,
+            "loading_label": loading_label,
+            "loading_message": loading_message,
+            "row_state": _FLAGSHIP_ROW_STATE_PENDING,
+            "row_version": 0,
+            "refinement_active": True,
+        },
+    }
+
+
+def _flagship_row_item_key(item_type: str, item: Dict[str, Any]) -> str:
+    if item_type == "album":
+        album_id = str(item.get("id") or "").strip()
+        if album_id:
+            return f"album:{album_id}"
+        title = str(item.get("title") or "").strip().lower()
+        artist = str(item.get("artist") or "").strip().lower()
+        return f"album:{title}|{artist}"
+    if item_type == "artist":
+        artist_id = str(item.get("id") or "").strip()
+        if artist_id:
+            return f"artist:{artist_id}"
+        name = str(item.get("name") or "").strip().lower()
+        return f"artist:{name}"
+    if item_type == "mix":
+        mix_id = str(item.get("id") or "").strip()
+        if mix_id:
+            return f"mix:{mix_id}"
+        title = str(item.get("title") or "").strip().lower()
+        return f"mix:{title}"
+    track_id = str(item.get("id") or item.get("videoId") or item.get("video_id") or "").strip()
+    if track_id:
+        return f"track:{track_id}"
+    title = str(item.get("title") or "").strip().lower()
+    artist = str(item.get("artist") or item.get("author") or item.get("channel") or "").strip().lower()
+    return f"track:{title}|{artist}"
+
+
+def _flagship_row_signature(row: Dict[str, Any] | None) -> tuple[str, tuple[str, ...]]:
+    if not isinstance(row, dict):
+        return ("", ())
+    item_type = str(row.get("item_type") or "").strip().lower()
+    item_keys = tuple(
+        _flagship_row_item_key(item_type, dict(item))
+        for item in list(row.get("items") or [])
+        if isinstance(item, dict)
+    )
+    return (item_type, item_keys)
+
+
+def _flagship_row_progress_signature(
+    row: Dict[str, Any] | None,
+) -> tuple[Any, ...]:
+    if not isinstance(row, dict):
+        return tuple()
+    row_kind = str(row.get("kind") or row.get("id") or "").strip()
+    meta = dict(row.get("meta") or {})
+    items = list(row.get("items") or [])
+    if row_kind == "trending_by_genre":
+        return (
+            int(meta.get("tab_count") or 0),
+            int(meta.get("pending_tab_count") or 0),
+            int(meta.get("total_page_count") or 0),
+            str(meta.get("active_tab_id") or "").strip(),
+            bool(meta.get("refinement_exhausted")),
+        )
+    if row_kind == "mixed_for_you":
+        return (
+            len(items),
+            int(meta.get("pending_blueprint_count") or 0),
+            int(meta.get("partial_mix_count") or 0),
+            bool(meta.get("refinement_exhausted")),
+        )
+    if row_kind == "recommended_albums":
+        return (
+            len(items),
+            int(meta.get("ready_count") or 0),
+            int(meta.get("cached_candidate_count") or 0),
+        )
+    if row_kind == "recommended_artists":
+        return (
+            len(items),
+            int(meta.get("neighbor_seed_count") or 0),
+            int(meta.get("peer_seed_count") or 0),
+        )
+    return (len(items),)
+
+
+def _flagship_row_refine_after_ms(
+    row_kind: str,
+    row: Dict[str, Any] | None,
+) -> int:
+    if not isinstance(row, dict):
+        return 1200
+    meta = dict(row.get("meta") or {})
+    if row_kind == "mixed_for_you":
+        pending_blueprints = int(meta.get("pending_blueprint_count") or 0)
+        return 650 if pending_blueprints > 0 else 900
+    if row_kind == "trending_by_genre":
+        if meta.get("refinement_exhausted") == True:
+            return 1100
+        pending_tabs = int(meta.get("pending_tab_count") or 0)
+        total_pages = int(meta.get("total_page_count") or 0)
+        return 700 if pending_tabs > 0 or total_pages < 2 else 950
+    if row_kind == "quiet_picks":
+        return 700
+    if row_kind in _HEAVY_FLAGSHIP_ROW_KINDS:
+        return 950
+    return 850
+
+
+def _flagship_row_state(
+    row: Dict[str, Any] | None,
+) -> str:
+    if not isinstance(row, dict):
+        return _FLAGSHIP_ROW_STATE_UNAVAILABLE
+    meta = dict(row.get("meta") or {})
+    row_state = str(meta.get("row_state") or "").strip().lower()
+    if row_state:
+        return row_state
+    loading_state = str(meta.get("loading_state") or "").strip().lower()
+    partial_ready = meta.get("partial_ready") == True
+    refinement_active = meta.get("refinement_active") == True
+    items = list(row.get("items") or [])
+    if loading_state == "pending" and not items:
+        return _FLAGSHIP_ROW_STATE_PENDING
+    if partial_ready and refinement_active:
+        return _FLAGSHIP_ROW_STATE_PARTIAL_INFLIGHT
+    if items:
+        return _FLAGSHIP_ROW_STATE_READY
+    return _FLAGSHIP_ROW_STATE_UNAVAILABLE
+
+
+def _stamp_flagship_row_meta(
+    row: Dict[str, Any],
+    *,
+    previous_row: Dict[str, Any] | None = None,
+    refinement_active: bool | None = None,
+) -> Dict[str, Any]:
+    if not isinstance(row, dict):
+        return row
+    row_kind = str(row.get("kind") or row.get("id") or "").strip()
+    if row_kind not in _FLAGSHIP_DEFERRED_ROW_KINDS:
+        return dict(row)
+    updated = dict(row)
+    meta = dict(updated.get("meta") or {})
+    previous_meta = dict((previous_row or {}).get("meta") or {})
+    items = list(updated.get("items") or [])
+    loading_state = str(meta.get("loading_state") or "").strip().lower()
+    pending = loading_state == "pending" and not items
+    partial_ready = meta.get("partial_ready") == True
+    existing_refinement_active = meta.get("refinement_active")
+    if refinement_active is None:
+        if pending:
+            refinement_active_value = (
+                True
+                if existing_refinement_active is None
+                else bool(existing_refinement_active)
+            )
+        elif partial_ready:
+            if existing_refinement_active is not None:
+                refinement_active_value = bool(existing_refinement_active)
+            elif previous_row is None:
+                refinement_active_value = True
+            else:
+                refinement_active_value = bool(
+                    previous_meta.get("refinement_active") == True
+                )
+        else:
+            refinement_active_value = False
+    else:
+        refinement_active_value = bool(refinement_active)
+    if pending:
+        row_state = _FLAGSHIP_ROW_STATE_PENDING
+    elif partial_ready and refinement_active_value:
+        row_state = _FLAGSHIP_ROW_STATE_PARTIAL_INFLIGHT
+    elif items:
+        row_state = _FLAGSHIP_ROW_STATE_READY
+    else:
+        row_state = _FLAGSHIP_ROW_STATE_UNAVAILABLE
+    previous_version = int(
+        previous_meta.get("row_version")
+        or meta.get("row_version")
+        or (0 if pending else 1)
+    )
+    changed = False
+    if isinstance(previous_row, dict):
+        changed = (
+            _flagship_row_signature(previous_row) != _flagship_row_signature(updated)
+            or _flagship_row_progress_signature(previous_row)
+            != _flagship_row_progress_signature(updated)
+            or bool(previous_meta.get("partial_ready") == True) != partial_ready
+            or bool(previous_meta.get("refinement_active") == True) != refinement_active_value
+            or str(previous_meta.get("row_state") or "").strip().lower() != row_state
+        )
+    if isinstance(previous_row, dict):
+        row_version = previous_version + 1 if changed else previous_version
+    else:
+        row_version = max(previous_version, 0 if pending else 1)
+    if row_version <= 0 and items:
+        row_version = 1
+    meta["row_state"] = row_state
+    meta["row_version"] = row_version
+    meta["refinement_active"] = refinement_active_value
+    meta["refine_after_ms"] = _flagship_row_refine_after_ms(row_kind, updated)
+    updated["meta"] = meta
+    return updated
+
+
+def _flagship_row_materially_improves(
+    current_row: Dict[str, Any] | None,
+    candidate_row: Dict[str, Any] | None,
+) -> bool:
+    if not isinstance(candidate_row, dict):
+        return False
+    if not isinstance(current_row, dict):
+        return bool(candidate_row.get("items"))
+    current_rank = _flagship_row_quality_rank(current_row)
+    candidate_rank = _flagship_row_quality_rank(candidate_row)
+    if candidate_rank > current_rank:
+        return True
+    if candidate_rank < current_rank:
+        return False
+    return (
+        _flagship_row_signature(current_row) != _flagship_row_signature(candidate_row)
+        or _flagship_row_progress_signature(current_row)
+        != _flagship_row_progress_signature(candidate_row)
+    )
+
+
+def _flagship_row_should_continue_refinement(
+    row_kind: str,
+    current_row: Dict[str, Any] | None,
+    candidate_row: Dict[str, Any] | None,
+) -> bool:
+    if not isinstance(candidate_row, dict):
+        return False
+    if not _flagship_row_needs_live_refinement(row_kind, candidate_row):
+        return False
+    return _flagship_row_materially_improves(current_row, candidate_row)
+
+
+def _pending_flagship_row_kinds(
+    *,
+    profile: Dict[str, Any],
+    rows: List[Dict[str, Any]],
+    diagnostics: Dict[str, Any],
+) -> List[str]:
+    if not _should_bootstrap_rich_snapshot(profile):
+        return []
+    existing_kinds = {
+        str((row or {}).get("kind") or (row or {}).get("id") or "").strip()
+        for row in list(rows or [])
+        if isinstance(row, dict)
+    }
+    row_status = {
+        str(row_kind or "").strip(): str(
+            ((status or {}).get("status") if isinstance(status, dict) else status) or ""
+        )
+        .strip()
+        .lower()
+        for row_kind, status in dict(diagnostics.get("row_status") or {}).items()
+    }
+    pending: List[str] = []
+    for row_kind in _FLAGSHIP_DEFERRED_ROW_KINDS:
+        if row_kind in existing_kinds:
+            continue
+        if (
+            row_kind in _HEAVY_FLAGSHIP_ROW_KINDS
+            and bool(diagnostics.get("heavy_rows_pending"))
+        ):
+            pending.append(row_kind)
+            continue
+        if row_status.get(row_kind) == "emitted":
+            continue
+        pending.append(row_kind)
+    return pending
+
+
+def _partial_flagship_row_kinds(
+    rows: List[Dict[str, Any]],
+) -> List[str]:
+    partial: List[str] = []
+    seen: set[str] = set()
+    for row in list(rows or []):
+        if not isinstance(row, dict):
+            continue
+        row_kind = str((row.get("kind") or row.get("id") or "")).strip()
+        if row_kind not in _FLAGSHIP_DEFERRED_ROW_KINDS or row_kind in seen:
+            continue
+        meta = dict(row.get("meta") or {})
+        if (
+            meta.get("refinement_active") == True
+            or str(meta.get("row_state") or "").strip().lower()
+            == _FLAGSHIP_ROW_STATE_PARTIAL_INFLIGHT
+        ):
+            partial.append(row_kind)
+            seen.add(row_kind)
+    return partial
+
+
+def _row_by_kind(
+    rows: List[Dict[str, Any]] | None,
+    row_kind: str,
+) -> Dict[str, Any] | None:
+    normalized_kind = str(row_kind or "").strip()
+    if not normalized_kind:
+        return None
+    for row in list(rows or []):
+        if not isinstance(row, dict):
+            continue
+        candidate_kind = str(row.get("kind") or row.get("id") or "").strip()
+        if candidate_kind == normalized_kind:
+            return dict(row)
+    return None
+
+
+def _flagship_row_quality_rank(row: Dict[str, Any] | None) -> tuple[int, int]:
+    if not isinstance(row, dict):
+        return (-1, -1)
+    items = list(row.get("items") or [])
+    row_state = _flagship_row_state(row)
+    if row_state == _FLAGSHIP_ROW_STATE_PENDING or not items:
+        readiness = 0
+    elif row_state == _FLAGSHIP_ROW_STATE_PARTIAL_INFLIGHT:
+        readiness = 1
+    else:
+        readiness = 2
+    return (readiness, len(items))
+
+
+def _flagship_row_needs_live_refinement(
+    row_kind: str,
+    row: Dict[str, Any] | None,
+) -> bool:
+    if not isinstance(row, dict):
+        return True
+    row_state = _flagship_row_state(row)
+    items = list(row.get("items") or [])
+    meta = dict(row.get("meta") or {})
+    if row_state in {_FLAGSHIP_ROW_STATE_PENDING, _FLAGSHIP_ROW_STATE_UNAVAILABLE}:
+        return True
+    if row_kind == "quiet_picks":
+        return row_state == _FLAGSHIP_ROW_STATE_PARTIAL_INFLIGHT or len(items) < 8
+    if row_kind == "mixed_for_you":
+        if bool(meta.get("refinement_exhausted")) and items:
+            return False
+        return (
+            row_state == _FLAGSHIP_ROW_STATE_PARTIAL_INFLIGHT
+            or len(items) < 3
+            or int(meta.get("pending_blueprint_count") or 0) > 0
+        )
+    if row_kind == "trending_by_genre":
+        tabs = [
+            dict(tab)
+            for tab in list(meta.get("tabs") or [])
+            if isinstance(tab, dict)
+        ]
+        refinement_exhausted = bool(meta.get("refinement_exhausted"))
+        if refinement_exhausted:
+            return row_state in {
+                _FLAGSHIP_ROW_STATE_PENDING,
+                _FLAGSHIP_ROW_STATE_UNAVAILABLE,
+            } and not items
+        if row_state == _FLAGSHIP_ROW_STATE_PARTIAL_INFLIGHT:
+            return True
+        if int(meta.get("pending_tab_count") or 0) > 0:
+            return True
+        total_pages = sum(max(int(tab.get("page_count") or 0), 1) for tab in tabs)
+        return total_pages < 2
+    if row_kind in _HEAVY_FLAGSHIP_ROW_KINDS:
+        return row_state != _FLAGSHIP_ROW_STATE_READY or not items
+    return row_state != _FLAGSHIP_ROW_STATE_READY
+
+
+def _clone_flagship_row_identity(
+    target_row: Dict[str, Any],
+    candidate_row: Dict[str, Any],
+    *,
+    row_kind: str,
+) -> Dict[str, Any]:
+    updated = dict(candidate_row or {})
+    updated["id"] = (
+        str(target_row.get("id") or "").strip()
+        or str(updated.get("id") or "").strip()
+        or row_kind
+    )
+    updated["kind"] = (
+        str(target_row.get("kind") or "").strip()
+        or str(updated.get("kind") or "").strip()
+        or row_kind
+    )
+    updated["title"] = (
+        str(target_row.get("title") or "").strip()
+        or str(updated.get("title") or "").strip()
+        or row_title_template(row_kind)
+    )
+    if target_row.get("row_style") and not updated.get("row_style"):
+        updated["row_style"] = target_row.get("row_style")
+    return updated
+
+
+def _rows_with_flagship_shells(
+    *,
+    profile: Dict[str, Any],
+    rows: List[Dict[str, Any]],
+    diagnostics: Dict[str, Any],
+) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    rows_with_shells = [
+        _stamp_flagship_row_meta(dict(row))
+        if isinstance(row, dict)
+        else row
+        for row in list(rows or [])
+    ]
+    next_diagnostics = dict(diagnostics or {})
+    pending_flagship_kinds = _pending_flagship_row_kinds(
+        profile=profile,
+        rows=rows_with_shells,
+        diagnostics=next_diagnostics,
+    )
+    if pending_flagship_kinds:
+        rows_with_shells.extend(
+            _flagship_row_shell(row_kind) for row_kind in pending_flagship_kinds
+        )
+        rows_with_shells.sort(
+            key=lambda row: row_order_index(
+                str((row or {}).get("kind") or (row or {}).get("id") or "")
+            )
+        )
+    partial_flagship_kinds = _partial_flagship_row_kinds(rows_with_shells)
+    next_diagnostics["flagship_deferred_row_kinds"] = list(pending_flagship_kinds)
+    next_diagnostics["flagship_rows_pending"] = bool(pending_flagship_kinds)
+    next_diagnostics["flagship_partial_row_kinds"] = list(partial_flagship_kinds)
+    next_diagnostics["flagship_rows_partial"] = bool(partial_flagship_kinds)
+    next_diagnostics["heavy_rows_pending"] = bool(
+        next_diagnostics.get("heavy_rows_pending")
+    ) or any(row_kind in _HEAVY_FLAGSHIP_ROW_KINDS for row_kind in pending_flagship_kinds)
+    next_diagnostics["heavy_rows_partial"] = any(
+        row_kind in _HEAVY_FLAGSHIP_ROW_KINDS for row_kind in partial_flagship_kinds
+    )
+    deferred_row_kinds = {
+        str(value or "").strip()
+        for value in list(next_diagnostics.get("deferred_row_kinds") or [])
+        if str(value or "").strip()
+    }
+    deferred_row_kinds.update(
+        row_kind for row_kind in pending_flagship_kinds if row_kind in _DEFERRED_ROW_KIND_SET
+    )
+    next_diagnostics["deferred_row_kinds"] = [
+        row_kind for row_kind in registry_deferred_row_kinds() if row_kind in deferred_row_kinds
+    ]
+    next_diagnostics["deferred_rows_pending"] = bool(
+        next_diagnostics["deferred_row_kinds"]
+    )
+    next_diagnostics["row_order"] = [
+        str((row or {}).get("id") or (row or {}).get("kind") or "")
+        for row in rows_with_shells
+        if isinstance(row, dict)
+    ]
+    next_diagnostics["row_item_counts"] = {
+        str((row or {}).get("id") or (row or {}).get("kind") or ""): len(
+            (row or {}).get("items") or []
+        )
+        for row in rows_with_shells
+        if isinstance(row, dict)
+    }
+    return rows_with_shells, next_diagnostics
 
 
 def _build_rich_bootstrap_snapshot(
@@ -511,15 +1074,16 @@ class RecommendationService:
         rich_bootstrap_deferred = False
         rich_bootstrap_attempted = False
         rich_bootstrap_ms = 0
-        allow_request_bootstrap = bool(getattr(req, "force_refresh", False))
+        allow_request_bootstrap = not bool(
+            getattr(req, "prepare_next_session", False)
+        ) and bool(getattr(req, "force_refresh", False))
 
         if (
             rich_launch_required
             and precompute_hit
             and not _precompute_snapshot_supports_rich_rows(precompute_snapshot)
         ):
-            precompute_snapshot = None
-            precompute_hit = False
+            force_rich_rows = True
             if bool(worker_runtime.get("external_worker_unhealthy")):
                 rich_bootstrap_deferred = True
                 runtime_bootstrap_scheduled = _schedule_runtime_bootstrap(server)
@@ -529,12 +1093,22 @@ class RecommendationService:
                     "recommend.precompute_thin_deferred_external_worker_unhealthy",
                     True,
                 )
-            else:
+            elif bool(getattr(req, "force_refresh", False)):
+                precompute_snapshot = None
+                precompute_hit = False
                 force_rich_rows = True
                 server._trace_put(
                     trace,
                     "ranking_meta",
                     "recommend.precompute_thin_rejected",
+                    True,
+                )
+            else:
+                rich_bootstrap_deferred = True
+                server._trace_put(
+                    trace,
+                    "ranking_meta",
+                    "recommend.precompute_thin_deferred_launch_policy",
                     True,
                 )
 
@@ -854,6 +1428,11 @@ class RecommendationService:
         server = self._server
         session_id = str(uuid.uuid4())
         now = time.time()
+        prepared_rows, prepared_diagnostics = _rows_with_flagship_shells(
+            profile=profile,
+            rows=rows,
+            diagnostics=diagnostics,
+        )
         session = {
             "session_id": session_id,
             "user_scope_id": profile["user_scope_id"],
@@ -862,14 +1441,14 @@ class RecommendationService:
             "candidate_snapshot": dict(candidate_snapshot or {}),
             "generated_at": now,
             "expires_at": now + server.RECOMMENDATION_FEED_SESSION_TTL_SECONDS,
-            "rows": list(rows or []),
-            "diagnostics": dict(diagnostics or {}),
+            "rows": list(prepared_rows or []),
+            "diagnostics": dict(prepared_diagnostics or {}),
         }
         store_feed_session(server, session)
         server._recommendation_record_impressions(
             session,
             visible_impression_rows(
-                rows,
+                prepared_rows,
                 page_size=server.RECOMMENDATION_ROW_PAGE_SIZE,
             ),
         )
@@ -1025,12 +1604,33 @@ class RecommendationService:
                 True,
             )
             return None
+        refresh_gap_row_kinds: List[str] = []
         if rich_launch_required:
             artifact_rejected = False
             rejection_reason = ""
-            if _launch_artifact_supports_rich_rows(launch_artifact) and not _launch_artifact_meets_flagship_contract(launch_artifact):
-                artifact_rejected = True
-                rejection_reason = "flagship_contract"
+            if _launch_artifact_supports_rich_rows(launch_artifact):
+                blocking_gap_row_kinds = _launch_artifact_blocking_gap_kinds(
+                    launch_artifact
+                )
+                refresh_gap_row_kinds = _launch_artifact_refresh_gap_kinds(
+                    launch_artifact
+                )
+                if blocking_gap_row_kinds:
+                    artifact_rejected = True
+                    rejection_reason = "blocking_launch_contract"
+                    server._trace_put(
+                        trace,
+                        "ranking_meta",
+                        "recommend.blocking_launch_gap_row_kinds",
+                        list(blocking_gap_row_kinds),
+                    )
+                elif refresh_gap_row_kinds:
+                    server._trace_put(
+                        trace,
+                        "ranking_meta",
+                        "recommend.launch_refresh_gap_row_kinds",
+                        list(refresh_gap_row_kinds),
+                    )
             if artifact_rejected:
                 invalidate_home_snapshots(
                     user_scope_id=user_scope_id,
@@ -1063,6 +1663,8 @@ class RecommendationService:
             launch_artifact=launch_artifact,
             rich_launch_required=rich_launch_required,
         )
+        if refresh_gap_row_kinds:
+            artifact_policy["should_schedule_refresh"] = True
         refresh_scheduled = False
         if artifact_policy["should_schedule_refresh"]:
             refresh_scheduled = schedule_home_artifact_warmup(
@@ -1250,10 +1852,62 @@ class RecommendationService:
         rich_bootstrap_attempted = bool(precompute_state["rich_bootstrap_attempted"])
         rich_bootstrap_ms = int(precompute_state["rich_bootstrap_ms"] or 0)
         precompute_resolution_ms = int(precompute_state["precompute_resolution_ms"] or 0)
+        if (
+            not precompute_hit
+            and not rich_bootstrap_attempted
+            and rich_launch_required
+            and RECOMMEND_RICH_BOOTSTRAP_ON_LAUNCH_MISS
+            and not bool(req.force_refresh)
+            and not bool(getattr(req, "prefer_fresh_rows", False))
+            and not bool(req.hydrate_heavy_rows)
+            and not bool(worker_runtime.get("external_worker_unhealthy"))
+        ):
+            rich_bootstrap_attempted = True
+            force_rich_rows = True
+            try:
+                rich_bootstrap_started_at = time.perf_counter()
+                precompute_snapshot = _build_rich_bootstrap_snapshot(
+                    server=server,
+                    user_scope_id=profile.get("user_scope_id") or "guest",
+                    profile=profile,
+                )
+                rich_bootstrap_ms = int(
+                    (time.perf_counter() - rich_bootstrap_started_at) * 1000
+                )
+                precompute_hit = bool(
+                    (precompute_snapshot or {}).get("candidate_snapshot")
+                )
+                server._trace_stage(
+                    trace,
+                    "recommend.rich_bootstrap",
+                    rich_bootstrap_started_at,
+                )
+                server._trace_put(
+                    trace,
+                    "timings_ms",
+                    "recommend.rich_bootstrap_ms",
+                    rich_bootstrap_ms,
+                )
+                server._trace_put(
+                    trace,
+                    "ranking_meta",
+                    "recommend.rich_bootstrap_snapshot",
+                    bool(precompute_hit),
+                )
+            except Exception as exc:
+                server._trace_put(
+                    trace,
+                    "errors",
+                    "recommend.rich_bootstrap_error",
+                    str(exc)[:240],
+                )
+                precompute_snapshot = None
+                precompute_hit = False
         launch_tier_only = (
             not bool(req.force_refresh)
             and not bool(getattr(req, "prefer_fresh_rows", False))
             and not bool(req.hydrate_heavy_rows)
+            and not rich_bootstrap_attempted
         )
 
         row_started_at = time.perf_counter()
@@ -1420,6 +2074,271 @@ class RecommendationService:
             "diagnostics": session.get("diagnostics") or {},
         }
 
+    def _active_flagship_rows_for_session(
+        self,
+        session: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        rows = [
+            dict(row)
+            for row in list(session.get("rows") or [])
+            if isinstance(row, dict)
+        ]
+        active_rows: List[Dict[str, Any]] = []
+        for row in rows:
+            row_kind = self._server._recommendation_trim_text(
+                row.get("kind") or row.get("id") or ""
+            )
+            if row_kind not in _FLAGSHIP_DEFERRED_ROW_KINDS:
+                continue
+            if _flagship_row_needs_live_refinement(row_kind, row):
+                active_rows.append(row)
+        return active_rows
+
+    def _apply_flagship_row_refresh(
+        self,
+        req,
+        *,
+        session: Dict[str, Any],
+        target_row: Dict[str, Any],
+        trace: Dict[str, Any] | None = None,
+    ) -> tuple[Dict[str, Any] | None, Dict[str, Any], bool, str]:
+        server = self._server
+        stored_rows = list(session.get("rows") or [])
+        target_row_id = server._recommendation_trim_text(
+            target_row.get("id") or target_row.get("kind") or ""
+        )
+        target_index = next(
+            (
+                index
+                for index, row in enumerate(stored_rows)
+                if server._recommendation_trim_text(
+                    row.get("id") or row.get("kind") or ""
+                )
+                == target_row_id
+            ),
+            -1,
+        )
+        if target_index < 0:
+            return None, session, False, ""
+
+        refine_started_at = time.perf_counter()
+        refreshed_row, refreshed_profile, refreshed_snapshot, refresh_source = (
+            self._resolve_flagship_row_for_session(
+                req,
+                session=session,
+                target_row=target_row,
+                trace=trace,
+            )
+        )
+        refine_ms = int((time.perf_counter() - refine_started_at) * 1000)
+
+        if not isinstance(refreshed_row, dict):
+            if bool(getattr(req, "prepare_next_session", False)):
+                schedule_home_artifact_warmup(
+                    server=server,
+                    user_scope_id=session.get("user_scope_id") or "guest",
+                    profile=session.get("profile") or {},
+                    force=bool(getattr(req, "prefer_fresh_rows", False)),
+                )
+            return None, session, False, refresh_source
+
+        stored_rows[target_index] = refreshed_row
+        session["rows"], refreshed_diagnostics = _rows_with_flagship_shells(
+            profile=refreshed_profile,
+            rows=stored_rows,
+            diagnostics={
+                **dict(session.get("diagnostics") or {}),
+                "request_mode": "flagship_row_refresh",
+                "flagship_row_refresh": True,
+                "flagship_row_refresh_ms": refine_ms,
+                "flagship_row_refresh_target": str(
+                    target_row.get("kind") or target_row.get("id") or ""
+                ),
+                "flagship_row_refresh_source": refresh_source,
+            },
+        )
+        session["profile"] = refreshed_profile
+        if refreshed_profile.get("profile_key"):
+            session["profile_key"] = refreshed_profile.get("profile_key") or ""
+        if refreshed_snapshot:
+            session["candidate_snapshot"] = dict(refreshed_snapshot)
+        if bool(getattr(req, "prepare_next_session", False)):
+            refreshed_diagnostics["background_refresh_scheduled"] = bool(
+                schedule_home_artifact_warmup(
+                    server=server,
+                    user_scope_id=refreshed_profile.get("user_scope_id") or "guest",
+                    profile=refreshed_profile,
+                    force=bool(getattr(req, "prefer_fresh_rows", False)),
+                )
+            )
+        session["diagnostics"] = refreshed_diagnostics
+        store_feed_session(server, session)
+        final_row = (
+            _row_by_kind(
+                list(session.get("rows") or []),
+                refreshed_row.get("kind") or "",
+            )
+            or refreshed_row
+        )
+        advanced = _flagship_row_materially_improves(target_row, final_row)
+        return final_row, session, advanced, refresh_source
+
+    def _flagship_row_response_payload(
+        self,
+        *,
+        session: Dict[str, Any],
+        row: Dict[str, Any],
+        limit: int,
+    ) -> Dict[str, Any]:
+        sliced = self._row_slice(
+            row,
+            0,
+            max(
+                len(list(row.get("items") or [])),
+                limit or self._server.RECOMMENDATION_ROW_PAGE_SIZE,
+            ),
+        )
+        sliced["has_more"] = bool(row.get("has_more"))
+        return {
+            "status": "success",
+            "session_id": session["session_id"],
+            "generated_at": session["generated_at"],
+            "expires_at": session["expires_at"],
+            "row": sliced,
+            "diagnostics": session.get("diagnostics") or {},
+        }
+
+    def _flagship_stream_response_v41(
+        self,
+        req,
+    ) -> StreamingResponse:
+        server = self._server
+        prune_feed_cache(server)
+        session_id = server._recommendation_trim_text(req.session_id)
+        if not session_id:
+            raise HTTPException(status_code=400, detail="session_id is required")
+        session = load_feed_session(server, session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="Recommendation session expired")
+        if session.get("user_scope_id") != server._recommendation_trim_text(
+            req.user_scope_id or "guest"
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Recommendation session scope mismatch",
+            )
+
+        def _sse(event_name: str, payload: Dict[str, Any]) -> str:
+            return (
+                f"event: {event_name}\n"
+                f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            )
+
+        def _stream():
+            current_session = dict(session)
+            max_attempts = 8
+            attempt = 0
+            yield _sse(
+                "open",
+                {
+                    "session_id": current_session.get("session_id") or "",
+                    "pending_row_ids": [
+                        str(row.get("id") or row.get("kind") or "").strip()
+                        for row in self._active_flagship_rows_for_session(
+                            current_session
+                        )
+                    ],
+                },
+            )
+            while attempt < max_attempts:
+                active_rows = self._active_flagship_rows_for_session(
+                    current_session
+                )
+                if not active_rows:
+                    yield _sse(
+                        "complete",
+                        {
+                            "session_id": current_session.get("session_id") or "",
+                            "pending_row_ids": [],
+                        },
+                    )
+                    return
+                progressed = False
+                for target_row in active_rows:
+                    refreshed_row, current_session, advanced, refresh_source = (
+                        self._apply_flagship_row_refresh(
+                            req,
+                            session=current_session,
+                            target_row=target_row,
+                            trace=None,
+                        )
+                    )
+                    if not isinstance(refreshed_row, dict):
+                        continue
+                    payload = self._flagship_row_response_payload(
+                        session=current_session,
+                        row=refreshed_row,
+                        limit=req.limit or server.RECOMMENDATION_ROW_PAGE_SIZE,
+                    )
+                    payload["refresh_source"] = refresh_source
+                    yield _sse("row", payload)
+                    progressed = progressed or advanced
+                remaining_rows = self._active_flagship_rows_for_session(
+                    current_session
+                )
+                if not remaining_rows:
+                    yield _sse(
+                        "complete",
+                        {
+                            "session_id": current_session.get("session_id") or "",
+                            "pending_row_ids": [],
+                        },
+                    )
+                    return
+                retry_after_ms = min(
+                    max(
+                        int(dict(row.get("meta") or {}).get("refine_after_ms") or 900),
+                        250,
+                    )
+                    for row in remaining_rows
+                )
+                yield _sse(
+                    "idle",
+                    {
+                        "session_id": current_session.get("session_id") or "",
+                        "pending_row_ids": [
+                            str(row.get("id") or row.get("kind") or "").strip()
+                            for row in remaining_rows
+                        ],
+                        "retry_after_ms": retry_after_ms,
+                        "progressed": progressed,
+                    },
+                )
+                if not progressed and attempt >= max_attempts - 1:
+                    yield _sse(
+                        "complete",
+                        {
+                            "session_id": current_session.get("session_id") or "",
+                            "pending_row_ids": [
+                                str(row.get("id") or row.get("kind") or "").strip()
+                                for row in remaining_rows
+                            ],
+                        },
+                    )
+                    return
+                attempt += 1
+                time.sleep(retry_after_ms / 1000.0)
+
+        return StreamingResponse(
+            _stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     def _row_page_response_v41(
         self,
         req,
@@ -1446,21 +2365,64 @@ class RecommendationService:
             target_row = row
             row_context = server._recommendation_trim_text(getattr(req, "row_context", ""))
             original_item_count = len(list(target_row.get("items") or []))
+            if (
+                row_context == _FLAGSHIP_REFINE_ROW_CONTEXT
+                and str(target_row.get("kind") or "") in _FLAGSHIP_DEFERRED_ROW_KINDS
+            ):
+                refreshed_row, session, _advanced, _refresh_source = (
+                    self._apply_flagship_row_refresh(
+                        req,
+                        session=session,
+                        target_row=target_row,
+                        trace=trace,
+                    )
+                )
+                if isinstance(refreshed_row, dict):
+                    target_row = refreshed_row
+                sliced = self._flagship_row_response_payload(
+                    session=session,
+                    row=target_row,
+                    limit=req.limit or server.RECOMMENDATION_ROW_PAGE_SIZE,
+                )["row"]
+                server._trace_put(
+                    trace,
+                    "candidate_counts",
+                    "recommend.row_page_items",
+                    len(sliced.get("items") or []),
+                )
+                return {
+                    "status": "success",
+                    "session_id": session["session_id"],
+                    "generated_at": session["generated_at"],
+                    "expires_at": session["expires_at"],
+                    "row": sliced,
+                    "diagnostics": session.get("diagnostics") or {},
+                }
             if row_context.startswith("genre_tab:") and str(target_row.get("kind") or "") == "trending_by_genre":
                 candidate_snapshot = self._resolve_candidate_snapshot_for_session(session)
                 if candidate_snapshot:
                     requested_tab_id = row_context.split(":", 1)[1].strip()
-                    refreshed_row = refresh_trending_by_genre_row(
-                        server=server,
-                        row=target_row,
-                        profile=session.get("profile") or {},
-                        snapshot=candidate_snapshot,
-                        tab_id=requested_tab_id,
-                    )
-                    stored_rows[index] = refreshed_row
-                    session["rows"] = stored_rows
-                    store_feed_session(server, session)
-                    target_row = refreshed_row
+                    try:
+                        refreshed_row = refresh_trending_by_genre_row(
+                            server=server,
+                            row=target_row,
+                            profile=session.get("profile") or {},
+                            snapshot=candidate_snapshot,
+                            tab_id=requested_tab_id,
+                        )
+                    except Exception as exc:
+                        server._trace_put(
+                            trace,
+                            "errors",
+                            "recommend.row_context_refresh_error",
+                            str(exc)[:240],
+                        )
+                        refreshed_row = None
+                    if isinstance(refreshed_row, dict):
+                        stored_rows[index] = refreshed_row
+                        session["rows"] = stored_rows
+                        store_feed_session(server, session)
+                        target_row = refreshed_row
                 sliced = self._row_slice(
                     target_row,
                     0,
@@ -1549,13 +2511,23 @@ class RecommendationService:
             ):
                 candidate_snapshot = self._resolve_candidate_snapshot_for_session(session)
                 if candidate_snapshot:
-                    extended_row = extend_row_from_snapshot(
-                        server=server,
-                        row=target_row,
-                        profile=session.get("profile") or {},
-                        snapshot=candidate_snapshot,
-                        page_size=max(req.limit or server.RECOMMENDATION_ROW_PAGE_SIZE, 10),
-                    )
+                    try:
+                        extended_row = extend_row_from_snapshot(
+                            server=server,
+                            row=target_row,
+                            profile=session.get("profile") or {},
+                            snapshot=candidate_snapshot,
+                            page_size=max(req.limit or server.RECOMMENDATION_ROW_PAGE_SIZE, 10),
+                        )
+                    except Exception as exc:
+                        server._trace_put(
+                            trace,
+                            "errors",
+                            "recommend.row_extension_error",
+                            str(exc)[:240],
+                        )
+                        extended_row = dict(target_row)
+                        extended_row["can_extend"] = False
                 else:
                     schedule_home_warmup(
                         user_scope_id=session.get("user_scope_id") or "guest",
@@ -1630,6 +2602,271 @@ class RecommendationService:
                 return candidate_snapshot
         return {}
 
+    def flagship_stream(self, req):
+        return self._flagship_stream_response_v41(req)
+
+    def _resolve_flagship_row_for_session(
+        self,
+        req,
+        *,
+        session: Dict[str, Any],
+        target_row: Dict[str, Any],
+        trace: Dict[str, Any] | None = None,
+    ) -> tuple[Dict[str, Any] | None, Dict[str, Any], Dict[str, Any], str]:
+        server = self._server
+        row_kind = server._recommendation_trim_text(
+            target_row.get("kind") or target_row.get("id") or ""
+        )
+        if row_kind not in _FLAGSHIP_DEFERRED_ROW_KINDS:
+            return None, dict(session.get("profile") or {}), {}, ""
+
+        refreshed_profile = dict(session.get("profile") or {})
+        try:
+            _legacy_req, built_profile = build_home_profile(req)
+            if isinstance(built_profile, dict) and built_profile:
+                refreshed_profile = built_profile
+        except Exception:
+            refreshed_profile = dict(session.get("profile") or {})
+
+        normalized_scope = (
+            refreshed_profile.get("user_scope_id")
+            or session.get("user_scope_id")
+            or "guest"
+        )
+        profile_key = (
+            refreshed_profile.get("profile_key")
+            or session.get("profile_key")
+            or ""
+        )
+        resolution_session = {
+            **dict(session or {}),
+            "user_scope_id": normalized_scope,
+            "profile_key": profile_key,
+            "profile": refreshed_profile,
+        }
+
+        launch_artifact = get_home_launch_artifact(
+            user_scope_id=normalized_scope,
+            include_usable=True,
+            server=server,
+        )
+        if not isinstance(launch_artifact, dict):
+            launch_artifact = get_home_launch_artifact_for_profile(
+                profile_key=profile_key,
+                include_usable=True,
+                server=server,
+            )
+        heavy_artifact = None
+        if row_kind in _HEAVY_FLAGSHIP_ROW_KINDS or bool(
+            getattr(req, "hydrate_heavy_rows", False)
+        ):
+            heavy_artifact = get_home_heavy_artifact(
+                user_scope_id=normalized_scope,
+                include_usable=True,
+                server=server,
+            )
+            if not isinstance(heavy_artifact, dict):
+                heavy_artifact = get_home_heavy_artifact_for_profile(
+                    profile_key=profile_key,
+                    include_usable=True,
+                    server=server,
+                )
+
+        candidates: List[tuple[Dict[str, Any], str]] = []
+        launch_row = _row_by_kind(
+            list((launch_artifact or {}).get("rows") or []),
+            row_kind,
+        )
+        if isinstance(launch_row, dict):
+            candidates.append((launch_row, "launch_artifact"))
+        heavy_row = _row_by_kind(
+            list((heavy_artifact or {}).get("rows") or []),
+            row_kind,
+        )
+        if isinstance(heavy_row, dict):
+            candidates.append((heavy_row, "heavy_artifact"))
+
+        candidate_snapshot = self._resolve_candidate_snapshot_for_session(
+            resolution_session
+        )
+        if not candidate_snapshot and isinstance(launch_artifact, dict):
+            candidate_snapshot = dict(launch_artifact.get("candidate_snapshot") or {})
+        if not candidate_snapshot and isinstance(heavy_artifact, dict):
+            candidate_snapshot = dict(heavy_artifact.get("candidate_snapshot") or {})
+        if candidate_snapshot:
+            rebuilt_row = build_row_seed(
+                server=server,
+                row_kind=row_kind,
+                profile=refreshed_profile,
+                snapshot=candidate_snapshot,
+                relaxed_filter=False,
+                allow_empty_diagnostics=False,
+                launch_tier_only=False,
+                existing_row=target_row,
+            )
+            if isinstance(rebuilt_row, dict):
+                candidates.append(
+                    (
+                        rebuilt_row,
+                        f"candidate_snapshot:{candidate_snapshot.get('resolved_from') or 'session'}",
+                    )
+                )
+                server._trace_put(
+                    trace,
+                    "candidate_counts",
+                    "recommend.flagship_refresh_snapshot_items",
+                    len(list(rebuilt_row.get("items") or [])),
+                )
+        best_existing_row = None
+        best_existing_source = ""
+        if candidates:
+            best_existing_row, best_existing_source = max(
+                candidates,
+                key=lambda entry: _flagship_row_quality_rank(entry[0]),
+            )
+        live_refined_snapshot = dict(candidate_snapshot or {})
+        if (
+            _flagship_row_needs_live_refinement(row_kind, best_existing_row)
+            and not live_refined_snapshot
+        ):
+            try:
+                live_refined_snapshot = trim_home_candidate_snapshot(
+                    server,
+                    build_home_candidate_snapshot_fast_fallback(
+                        server=server,
+                        profile=refreshed_profile,
+                    ),
+                )
+            except Exception:
+                live_refined_snapshot = {}
+        if (
+            _flagship_row_needs_live_refinement(row_kind, best_existing_row)
+            and row_kind == "recommended_artists"
+        ):
+            try:
+                artist_artifacts = build_artist_artifacts(
+                    server,
+                    refreshed_profile,
+                    full_refinement=True,
+                )
+            except Exception:
+                artist_artifacts = {}
+            if isinstance(artist_artifacts, dict):
+                if list(artist_artifacts.get("artists") or []):
+                    live_refined_snapshot["artists"] = list(
+                        artist_artifacts.get("artists") or []
+                    )
+                if isinstance(artist_artifacts.get("meta"), dict):
+                    live_refined_snapshot["artist_artifact_meta"] = dict(
+                        artist_artifacts.get("meta") or {}
+                    )
+        elif (
+            _flagship_row_needs_live_refinement(row_kind, best_existing_row)
+            and row_kind == "recommended_albums"
+        ):
+            try:
+                refined_album_row = build_album_items(
+                    server,
+                    refreshed_profile,
+                    existing_candidate_cache=list(
+                        (live_refined_snapshot.get("recommended_album_candidate_cache") or [])
+                    ),
+                    return_row=True,
+                )
+            except Exception:
+                refined_album_row = {}
+            if isinstance(refined_album_row, dict):
+                refinement_cache = dict(
+                    refined_album_row.pop("_server_refinement_cache", {}) or {}
+                )
+                refined_albums = [
+                    dict(album)
+                    for album in list(refined_album_row.get("items") or [])
+                    if isinstance(album, dict)
+                ]
+                if refined_albums:
+                    live_refined_snapshot["albums"] = list(refined_albums)
+                if list(refinement_cache.get("recommended_album_candidate_cache") or []):
+                    live_refined_snapshot["recommended_album_candidate_cache"] = [
+                        dict(album)
+                        for album in list(
+                            refinement_cache.get("recommended_album_candidate_cache") or []
+                        )
+                        if isinstance(album, dict)
+                    ]
+                candidates.append((refined_album_row, "live_refine"))
+                candidate_snapshot = live_refined_snapshot
+        if (
+            _flagship_row_needs_live_refinement(row_kind, best_existing_row)
+            and live_refined_snapshot
+            and row_kind != "recommended_albums"
+        ):
+            refined_row = build_row_seed(
+                server=server,
+                row_kind=row_kind,
+                profile=refreshed_profile,
+                snapshot=live_refined_snapshot,
+                relaxed_filter=False,
+                allow_empty_diagnostics=False,
+                launch_tier_only=False,
+                full_refinement=True,
+                existing_row=best_existing_row or target_row,
+            )
+            if isinstance(refined_row, dict):
+                candidates.append((refined_row, "live_refine"))
+                candidate_snapshot = live_refined_snapshot
+        if not candidates:
+            return None, refreshed_profile, candidate_snapshot, ""
+
+        source_priority = {
+            "live_refine": 3,
+            "candidate_snapshot:session": 2,
+            "candidate_snapshot:launch_artifact": 2,
+            "candidate_snapshot:heavy_artifact": 2,
+            "heavy_artifact": 1,
+            "launch_artifact": 0,
+        }
+        best_row, best_source = max(
+            candidates,
+            key=lambda entry: (
+                _flagship_row_quality_rank(entry[0]),
+                source_priority.get(str(entry[1] or ""), 0),
+            ),
+        )
+        candidate_row = _clone_flagship_row_identity(
+            target_row,
+            best_row,
+            row_kind=row_kind,
+        )
+        improved = _flagship_row_materially_improves(target_row, candidate_row)
+        candidate_meta = dict(candidate_row.get("meta") or {})
+        if list(candidate_row.get("items") or []):
+            should_continue_refinement = _flagship_row_should_continue_refinement(
+                row_kind,
+                target_row,
+                candidate_row,
+            )
+            if should_continue_refinement:
+                candidate_meta["partial_ready"] = True
+                candidate_meta["refinement_active"] = True
+            else:
+                candidate_meta.pop("loading_label", None)
+                candidate_meta.pop("loading_message", None)
+                candidate_meta["partial_ready"] = False
+                candidate_meta["refinement_active"] = False
+            candidate_row["meta"] = candidate_meta
+        normalized_row = _stamp_flagship_row_meta(
+            candidate_row,
+            previous_row=target_row,
+            refinement_active=bool(candidate_meta.get("refinement_active") == True),
+        )
+        return (
+            normalized_row,
+            refreshed_profile,
+            candidate_snapshot,
+            best_source,
+        )
+
     def recommend(self, req):
         server = self._server
         trace = server._trace_start(
@@ -1638,6 +2875,7 @@ class RecommendationService:
             surface=req.surface or "home_feed",
             query=req.query or "",
         )
+        request_mode = "unknown"
         try:
             request_started_at = time.perf_counter()
             with request_store_runtime(allow_persistent_reads=False):
@@ -1736,6 +2974,19 @@ class RecommendationService:
             )
             raise
         except Exception as exc:
+            print(
+                "[EBB:recommend][error] "
+                f"mode={request_mode} "
+                f"scope={server._recommendation_trim_text(req.user_scope_id or 'guest')} "
+                f"session_id={server._recommendation_trim_text(getattr(req, 'session_id', ''))} "
+                f"row_id={server._recommendation_trim_text(getattr(req, 'row_id', ''))} "
+                f"row_context={server._recommendation_trim_text(getattr(req, 'row_context', ''))} "
+                f"offset={int(getattr(req, 'offset', 0) or 0)} "
+                f"limit={int(getattr(req, 'limit', 0) or 0)} "
+                f"error={str(exc)[:240]}",
+                flush=True,
+            )
+            print(traceback.format_exc(), flush=True)
             server._trace_finalize(trace, status="failed", error=str(exc))
             server._trace_log_request(
                 trace,

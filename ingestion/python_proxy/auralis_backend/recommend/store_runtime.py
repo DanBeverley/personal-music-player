@@ -106,6 +106,28 @@ def init_recommendation_store(server: Any | None = None) -> Any:
             )
             connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS recognition_match_events (
+                    id TEXT PRIMARY KEY,
+                    user_scope_id TEXT NOT NULL,
+                    session_id TEXT,
+                    source_type TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    recognition_status TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    recognized_title TEXT,
+                    recognized_artist TEXT,
+                    resolved_track_id TEXT,
+                    payload_json TEXT,
+                    occurred_at REAL NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_recognition_match_events_user_time "
+                "ON recognition_match_events(user_scope_id, occurred_at DESC)"
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS recommendation_feature_store (
                     namespace TEXT NOT NULL,
                     entity_id TEXT NOT NULL,

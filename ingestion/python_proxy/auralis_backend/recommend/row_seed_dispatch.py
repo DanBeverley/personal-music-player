@@ -39,11 +39,13 @@ def build_specialized_row_seed(
         items = list(snapshot.get("artists") or [])[:home_artist_cap]
         if not items:
             return None
+        artist_meta = dict(snapshot.get("artist_artifact_meta") or {})
         return {
             "title": title,
             "kind": row_kind,
             "item_type": "artist",
             "items": items[:home_artist_cap],
+            "meta": artist_meta,
             "row_strategy": "personalized",
             "fallback_reason": "",
             "source_pool_counts": {"artists": len(items)},

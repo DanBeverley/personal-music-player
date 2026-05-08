@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Sequence, Tuple
 
 
@@ -28,6 +28,7 @@ class SnapshotFetchResults:
     album_items: List[Dict[str, Any]]
     artist_items: List[Dict[str, Any]]
     stage_timings: Dict[str, int]
+    artist_artifact_meta: Dict[str, Any] = field(default_factory=dict)
 
 
 def prepare_snapshot_inputs(
@@ -176,6 +177,7 @@ def resolve_snapshot_fetches(
     offline_tracks: List[Dict[str, Any]] = []
     album_items: List[Dict[str, Any]] = []
     artist_items: List[Dict[str, Any]] = []
+    artist_artifact_meta: Dict[str, Any] = {}
     stage_timings = dict(preparation.stage_timings)
 
     for future_name, future in fetch_futures.items():
@@ -212,6 +214,7 @@ def resolve_snapshot_fetches(
                 artifact_payload.get("neighbor_candidates") or []
             )
             artist_items = list(artifact_payload.get("artists") or [])
+            artist_artifact_meta = dict(artifact_payload.get("meta") or {})
         elif future_name == "rediscovery_tracks":
             rediscovery_tracks = list(result or [])
         elif future_name == "offline_tracks":
@@ -230,6 +233,7 @@ def resolve_snapshot_fetches(
         offline_tracks=offline_tracks,
         album_items=album_items,
         artist_items=artist_items,
+        artist_artifact_meta=artist_artifact_meta,
         stage_timings=stage_timings,
     )
 
@@ -418,4 +422,5 @@ def assemble_snapshot_payload(
         "pools": pools,
         "albums": fetched.album_items,
         "artists": fetched.artist_items,
+        "artist_artifact_meta": dict(fetched.artist_artifact_meta or {}),
     }

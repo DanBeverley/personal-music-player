@@ -17,9 +17,14 @@ _PROFILE_FEATURE_WARMUP_COOLDOWN_SECONDS = max(
     60,
     int(os.environ.get("AURALIS_PROFILE_FEATURE_WARMUP_COOLDOWN_SECONDS", "900")),
 )
+_WARMUP_INFLIGHT_STALE_SECONDS = max(
+    60,
+    int(os.environ.get("AURALIS_WARMUP_INFLIGHT_STALE_SECONDS", "600")),
+)
 
 _warmup_lock = Lock()
 _inflight_warmups: set[str] = set()
+_inflight_warmup_started_at: Dict[str, float] = {}
 _recent_profile_feature_warmups: Dict[str, float] = {}
 
 
@@ -56,19 +61,29 @@ def _search_executor(server: Any):
     )
 
 
-def _begin_warmup(warmup_key: str) -> bool:
+def _begin_warmup(warmup_key: str) -> tuple[bool, bool]:
     if not _PRECOMPUTE_ENABLED:
-        return False
+        return False, False
+    stale_reset = False
     with _warmup_lock:
+        now = time.monotonic()
         if warmup_key in _inflight_warmups:
-            return False
+            started_at = float(_inflight_warmup_started_at.get(warmup_key) or 0.0)
+            if started_at > 0.0 and (now - started_at) >= _WARMUP_INFLIGHT_STALE_SECONDS:
+                _inflight_warmups.discard(warmup_key)
+                _inflight_warmup_started_at.pop(warmup_key, None)
+                stale_reset = True
+            else:
+                return False, False
         _inflight_warmups.add(warmup_key)
-    return True
+        _inflight_warmup_started_at[warmup_key] = now
+    return True, stale_reset
 
 
 def _finish_warmup(warmup_key: str) -> None:
     with _warmup_lock:
         _inflight_warmups.discard(warmup_key)
+        _inflight_warmup_started_at.pop(warmup_key, None)
 
 
 def _mark_profile_feature_warmup_started(warmup_key: str) -> bool:
@@ -101,7 +116,8 @@ def schedule_profile_feature_warmup(
     extra_artists: List[Dict[str, Any]] | None = None,
     extra_albums: List[Dict[str, Any]] | None = None,
 ) -> bool:
-    if not _begin_warmup(warmup_key):
+    started, _stale_reset = _begin_warmup(warmup_key)
+    if not started:
         return False
     if not _mark_profile_feature_warmup_started(warmup_key):
         _finish_warmup(warmup_key)
@@ -133,6 +149,7 @@ def schedule_search_warmup(
     *,
     user_scope_id: str,
     query: str,
+    search_mode: str = "",
     server: Any | None = None,
 ) -> bool:
     srv = resolve_server(server)
@@ -141,7 +158,8 @@ def schedule_search_warmup(
     if not normalized_query:
         return False
     warmup_key = f"search:{normalized_scope}:{normalized_query.lower()}"
-    if not _begin_warmup(warmup_key):
+    started, _stale_reset = _begin_warmup(warmup_key)
+    if not started:
         return False
 
     def _warm() -> None:
@@ -153,6 +171,7 @@ def schedule_search_warmup(
                 user_scope_id=normalized_scope,
                 query=normalized_query,
                 force=False,
+                search_mode=search_mode,
             )
         except Exception:
             return
@@ -177,7 +196,8 @@ def schedule_home_warmup(
     srv = resolve_server(server)
     normalized_scope = srv._assistant_safe_scope_id(user_scope_id or "guest")
     warmup_key = f"home:{normalized_scope}"
-    if not _begin_warmup(warmup_key):
+    started, _stale_reset = _begin_warmup(warmup_key)
+    if not started:
         return False
 
     def _warm() -> None:
@@ -213,7 +233,8 @@ def schedule_home_artifact_warmup(
     srv = resolve_server(server)
     normalized_scope = srv._assistant_safe_scope_id(user_scope_id or "guest")
     warmup_key = f"home_artifact:{normalized_scope}"
-    if not _begin_warmup(warmup_key):
+    started, stale_reset = _begin_warmup(warmup_key)
+    if not started:
         _log_warmup_event(
             "home_artifact",
             warmup_key,
@@ -222,6 +243,14 @@ def schedule_home_artifact_warmup(
             reason="inflight",
         )
         return False
+    if stale_reset:
+        _log_warmup_event(
+            "home_artifact",
+            warmup_key,
+            "stale_reset",
+            force=bool(force),
+            stale_after_seconds=_WARMUP_INFLIGHT_STALE_SECONDS,
+        )
 
     def _warm() -> None:
         started_at = time.perf_counter()
@@ -230,6 +259,7 @@ def schedule_home_artifact_warmup(
             warmup_key,
             "started",
             force=bool(force),
+            stale_reset=stale_reset,
         )
         try:
             from .precompute import build_home_launch_artifacts

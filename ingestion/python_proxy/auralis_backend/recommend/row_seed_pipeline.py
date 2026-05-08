@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Sequence, Tuple
 
-from .home_pipeline import build_required_fallback_seed, build_row_seed
+from .row_seed_builder import build_required_fallback_seed, build_row_seed
 from .policy import is_required_row, required_row_kinds
 
 

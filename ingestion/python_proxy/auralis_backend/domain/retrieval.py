@@ -9,6 +9,7 @@ from typing import Any, Dict, Iterable, List
 
 from .candidate_expansion import album_candidates_for_track, candidate_sources_for_track
 from .server_adapter import adapt_domain_server
+from ..search.query_mode import resolve_search_mode
 from ..search.runtime import (
     search_albums_blended,
     search_albums_direct,
@@ -53,6 +54,78 @@ _SEARCH_DISABLE_TIMEOUTS = (
 )
 _search_retrieval_cache_lock = Lock()
 _search_retrieval_cache: Dict[str, Dict[str, Any]] = {}
+
+
+def _resolve_retrieval_search_mode(legacy_req, *, server: Any) -> str:
+    explicit_mode = trim_text(getattr(legacy_req, "search_mode", "") or "").lower()
+    if explicit_mode in {"exact", "entity", "taste"}:
+        return explicit_mode
+    query = trim_text(getattr(legacy_req, "query", "") or "")
+    if not query:
+        return "exact"
+    return resolve_search_mode(
+        query,
+        normalize_text_fn=server.normalize_text,
+        explicit_mode=explicit_mode,
+    )
+
+
+def _rich_retrieval_budget_plan(
+    search_mode: str,
+    *,
+    limit: int,
+) -> Dict[str, Any]:
+    normalized_mode = str(search_mode or "").strip().lower()
+    if normalized_mode == "entity":
+        return {
+            "mode": "entity",
+            "total_budget_seconds": min(_SEARCH_RETRIEVAL_TOTAL_BUDGET_SECONDS, 5.25),
+            "branch_timeout_seconds": min(_SEARCH_RETRIEVAL_BRANCH_TIMEOUT_SECONDS, 1.25),
+            "graph_track_cap": max(limit * 2, 18),
+            "context_query_count": 1,
+            "context_track_count": 1,
+            "anchor_neighbor_count": 1,
+            "artist_seed_count": 2,
+            "query_anchor_artist_count": 4,
+            "graph_artist_count": 4,
+            "context_artist_count": 4,
+            "related_artist_count": 2,
+            "context_album_artist_count": 2,
+            "context_album_track_count": 1,
+        }
+    if normalized_mode == "taste":
+        return {
+            "mode": "taste",
+            "total_budget_seconds": min(_SEARCH_RETRIEVAL_TOTAL_BUDGET_SECONDS, 6.4),
+            "branch_timeout_seconds": min(_SEARCH_RETRIEVAL_BRANCH_TIMEOUT_SECONDS, 1.65),
+            "graph_track_cap": max(limit * 2, 24),
+            "context_query_count": 2,
+            "context_track_count": 2,
+            "anchor_neighbor_count": 2,
+            "artist_seed_count": 4,
+            "query_anchor_artist_count": 6,
+            "graph_artist_count": 5,
+            "context_artist_count": 6,
+            "related_artist_count": 2,
+            "context_album_artist_count": 2,
+            "context_album_track_count": 2,
+        }
+    return {
+        "mode": normalized_mode or "exact",
+        "total_budget_seconds": min(_SEARCH_RETRIEVAL_TOTAL_BUDGET_SECONDS, 4.6),
+        "branch_timeout_seconds": min(_SEARCH_RETRIEVAL_BRANCH_TIMEOUT_SECONDS, 1.15),
+        "graph_track_cap": max(limit * 2, 18),
+        "context_query_count": 1,
+        "context_track_count": 1,
+        "anchor_neighbor_count": 1,
+        "artist_seed_count": 2,
+        "query_anchor_artist_count": 4,
+        "graph_artist_count": 4,
+        "context_artist_count": 4,
+        "related_artist_count": 1,
+        "context_album_artist_count": 1,
+        "context_album_track_count": 1,
+    }
 
 
 def _upsert_entity_candidate(
@@ -264,6 +337,7 @@ def retrieve_search_candidates_fast(
 ) -> Dict[str, Any]:
     server = adapt_domain_server(server)
     query = trim_text(legacy_req.query)
+    search_mode = _resolve_retrieval_search_mode(legacy_req, server=server)
     if not query:
         return {
             "query_intent": "mixed",
@@ -276,6 +350,7 @@ def retrieve_search_candidates_fast(
             "retriever_counts": {},
             "retrieval_diagnostics": {
                 "mode": "fast_query_fallback",
+                "search_mode": search_mode,
                 "cache_hit": False,
                 "retrieval_ms": 0,
                 "partial_completion": False,
@@ -404,6 +479,7 @@ def retrieve_search_candidates_fast(
         },
         "retrieval_diagnostics": {
             "mode": "fast_query_fallback",
+            "search_mode": search_mode,
             "cache_hit": False,
             "partial_completion": bool(
                 track_candidates or artist_candidates or album_candidates
@@ -429,6 +505,8 @@ def retrieve_search_candidates(
 ) -> Dict[str, Any]:
     server = adapt_domain_server(server)
     query = trim_text(legacy_req.query)
+    search_mode = _resolve_retrieval_search_mode(legacy_req, server=server)
+    budget_plan = _rich_retrieval_budget_plan(search_mode, limit=limit)
     cache_key = ""
     if not bool(getattr(legacy_req, "force_refresh", False)):
         cache_key = _retrieval_cache_key(legacy_req, profile, limit, server=server)
@@ -441,7 +519,7 @@ def retrieve_search_candidates(
     collaborative = profile.get("collaborative") or {}
     executor = _search_executor(server)
     retrieval_started_at = time.perf_counter()
-    deadline = retrieval_started_at + _SEARCH_RETRIEVAL_TOTAL_BUDGET_SECONDS
+    deadline = retrieval_started_at + float(budget_plan.get("total_budget_seconds") or _SEARCH_RETRIEVAL_TOTAL_BUDGET_SECONDS)
 
     track_candidates: Dict[str, Dict[str, Any]] = {}
     artist_candidates: Dict[str, Dict[str, Any]] = {}
@@ -466,7 +544,13 @@ def retrieve_search_candidates(
             return default
         try:
             result = future.result(
-                timeout=min(_SEARCH_RETRIEVAL_BRANCH_TIMEOUT_SECONDS, max(remaining, 0.05))
+                timeout=min(
+                    float(
+                        budget_plan.get("branch_timeout_seconds")
+                        or _SEARCH_RETRIEVAL_BRANCH_TIMEOUT_SECONDS
+                    ),
+                    max(remaining, 0.05),
+                )
             )
             completed_sources.append(source_name)
             return result
@@ -517,7 +601,9 @@ def retrieve_search_candidates(
         base_score=4.8,
     )
 
-    graph_track_ids = list(collaborative.get("candidate_track_ids") or [])[: max(limit * 2, 24)]
+    graph_track_ids = list(collaborative.get("candidate_track_ids") or [])[
+        : int(budget_plan.get("graph_track_cap") or max(limit * 2, 24))
+    ]
     graph_tracks_future = executor.submit(
         server.recommendation_fetch_tracks_for_ids,
         graph_track_ids,
@@ -535,13 +621,21 @@ def retrieve_search_candidates(
     context_tracks: List[Dict[str, Any]] = []
     context_query_futures = {
         recent_query: executor.submit(search_tracks_blended, recent_query, 6, server=server)
-        for recent_query in (profile.get("recent_queries") or [])[:2]
+        for recent_query in (profile.get("recent_queries") or [])[
+            : int(budget_plan.get("context_query_count") or 2)
+        ]
     }
     context_track_source_futures = {
         index: executor.submit(candidate_sources_for_track, track, server=server)
-        for index, track in enumerate((profile.get("last_played_tracks") or [])[:2])
+        for index, track in enumerate(
+            (profile.get("last_played_tracks") or [])[
+                : int(budget_plan.get("context_track_count") or 2)
+            ]
+        )
     }
-    for recent_query in (profile.get("recent_queries") or [])[:2]:
+    for recent_query in (profile.get("recent_queries") or [])[
+        : int(budget_plan.get("context_query_count") or 2)
+    ]:
         context_tracks.extend(
             resolve_future(
                 context_query_futures.get(recent_query),
@@ -549,7 +643,13 @@ def retrieve_search_candidates(
                 f"tracks.context_query:{recent_query}",
             )
         )
-    for index in range(len((profile.get("last_played_tracks") or [])[:2])):
+    for index in range(
+        len(
+            (profile.get("last_played_tracks") or [])[
+                : int(budget_plan.get("context_track_count") or 2)
+            ]
+        )
+    ):
         for source_name, source_tracks, _base_score in resolve_future(
             context_track_source_futures.get(index),
             [],
@@ -566,7 +666,9 @@ def retrieve_search_candidates(
     )
 
     anchor_similar_futures = {}
-    for anchor_index, anchor_track in enumerate(anchor_tracks[:2]):
+    for anchor_index, anchor_track in enumerate(
+        anchor_tracks[: int(budget_plan.get("anchor_neighbor_count") or 2)]
+    ):
         anchor_track_id = trim_text(anchor_track.get("id"))
         if not anchor_track_id:
             continue
@@ -601,11 +703,12 @@ def retrieve_search_candidates(
         ],
         8,
     )
+    artist_seed_cap = int(budget_plan.get("artist_seed_count") or 4)
     artist_seed_futures = {
         artist_name: executor.submit(search_artist_seed_tracks, artist_name, 6, server=server)
-        for artist_name in artist_seed_names[:4]
+        for artist_name in artist_seed_names[:artist_seed_cap]
     }
-    for artist_name in artist_seed_names[:4]:
+    for artist_name in artist_seed_names[:artist_seed_cap]:
         artist_seed_tracks.extend(
             resolve_future(
                 artist_seed_futures.get(artist_name),
@@ -644,7 +747,7 @@ def retrieve_search_candidates(
                 for artist_name, _score in resolve_artist_names_from_track_query(server, query, 4)
             ],
         ],
-        6,
+        int(budget_plan.get("query_anchor_artist_count") or 6),
     )
     query_anchor_artist_futures = {
         artist_name: executor.submit(resolve_search_artists_direct, server, artist_name, 2)
@@ -684,7 +787,7 @@ def retrieve_search_candidates(
             graph_artist_scores.items(),
             key=lambda item: item[1],
             reverse=True,
-        )[:6]
+        )[: int(budget_plan.get("graph_artist_count") or 6)]
     ]
     graph_artists = []
     graph_artist_futures = {
@@ -709,7 +812,7 @@ def retrieve_search_candidates(
     context_artists = []
     context_artist_names = unique_strings(
         [*anchor_artist_names, *(profile.get("top_artists") or []), *(profile.get("artist_hints") or [])],
-        8,
+        int(budget_plan.get("context_artist_count") or 8),
     )
     context_artist_futures = {
         artist_name: executor.submit(resolve_search_artists, server, artist_name, 2)
@@ -733,10 +836,14 @@ def retrieve_search_candidates(
     related_artists = []
     related_artist_direct_futures = {
         artist_name: executor.submit(resolve_search_artists_direct, server, artist_name, 1)
-        for artist_name in anchor_artist_names[:3]
+        for artist_name in anchor_artist_names[
+            : int(budget_plan.get("related_artist_count") or 3)
+        ]
     }
     related_artist_detail_futures = {}
-    for artist_name in anchor_artist_names[:3]:
+    for artist_name in anchor_artist_names[
+        : int(budget_plan.get("related_artist_count") or 3)
+    ]:
         direct = resolve_future(
             related_artist_direct_futures.get(artist_name),
             [],
@@ -752,7 +859,9 @@ def retrieve_search_candidates(
             artist_id,
             enrich_related=True,
         )
-    for artist_name in anchor_artist_names[:3]:
+    for artist_name in anchor_artist_names[
+        : int(budget_plan.get("related_artist_count") or 3)
+    ]:
         payload = resolve_future(
             related_artist_detail_futures.get(artist_name),
             {},
@@ -812,13 +921,21 @@ def retrieve_search_candidates(
     context_albums = []
     context_album_track_futures = {
         index: executor.submit(album_candidates_for_track, track, limit=2, server=server)
-        for index, track in enumerate(anchor_tracks[:2])
+        for index, track in enumerate(
+            anchor_tracks[: int(budget_plan.get("context_album_track_count") or 2)]
+        )
     }
     context_album_artist_futures = {
         artist_name: executor.submit(server.assistant_tool_search_albums, f"{artist_name} album", 3)
-        for artist_name in (profile.get("top_artists") or [])[:3]
+        for artist_name in (profile.get("top_artists") or [])[
+            : int(budget_plan.get("context_album_artist_count") or 3)
+        ]
     }
-    for index in range(len(anchor_tracks[:2])):
+    for index in range(
+        len(
+            anchor_tracks[: int(budget_plan.get("context_album_track_count") or 2)]
+        )
+    ):
         context_albums.extend(
             resolve_future(
                 context_album_track_futures.get(index),
@@ -826,7 +943,9 @@ def retrieve_search_candidates(
                 f"albums.context_track:{index}",
             )
         )
-    for artist_name in (profile.get("top_artists") or [])[:3]:
+    for artist_name in (profile.get("top_artists") or [])[
+        : int(budget_plan.get("context_album_artist_count") or 3)
+    ]:
         context_albums.extend(
             resolve_future(
                 context_album_artist_futures.get(artist_name),
@@ -882,12 +1001,23 @@ def retrieve_search_candidates(
             },
         },
         "retrieval_diagnostics": {
+            "search_mode": search_mode,
             "cache_hit": False,
             "partial_completion": bool(timed_out_sources),
             "timed_out_sources": timed_out_sources,
             "completed_sources": completed_sources,
             "retrieval_ms": int((time.perf_counter() - retrieval_started_at) * 1000),
-            "deadline_ms": 0 if _SEARCH_DISABLE_TIMEOUTS else int(_SEARCH_RETRIEVAL_TOTAL_BUDGET_SECONDS * 1000),
+            "deadline_ms": 0
+            if _SEARCH_DISABLE_TIMEOUTS
+            else int(float(budget_plan.get("total_budget_seconds") or _SEARCH_RETRIEVAL_TOTAL_BUDGET_SECONDS) * 1000),
+            "branch_timeout_ms": int(
+                float(
+                    budget_plan.get("branch_timeout_seconds")
+                    or _SEARCH_RETRIEVAL_BRANCH_TIMEOUT_SECONDS
+                )
+                * 1000
+            ),
+            "budget_mode": str(budget_plan.get("mode") or search_mode),
             "timeouts_disabled": bool(_SEARCH_DISABLE_TIMEOUTS),
         },
     }

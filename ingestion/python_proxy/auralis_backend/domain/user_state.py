@@ -682,6 +682,7 @@ def build_search_state(
         playlist_names=list(getattr(req, "playlist_names", []) or []),
         library_track_ids=list(getattr(req, "library_track_ids", []) or []),
         offline_track_ids=list(getattr(req, "offline_track_ids", []) or []),
+        search_mode=str(getattr(req, "search_mode", "") or ""),
     )
     return legacy_req, _build_state_snapshot(legacy_req, server=server)
 

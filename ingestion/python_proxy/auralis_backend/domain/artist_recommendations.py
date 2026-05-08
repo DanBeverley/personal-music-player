@@ -96,6 +96,7 @@ class ArtistRecommendationService:
         self._server = self._resolved_server()
         request_started_at = time.perf_counter()
         surface = trim_text(getattr(legacy_req, "surface", "") or "home_feed") or "home_feed"
+        home_surface = surface != "search_results"
         profile_vectors = profile.get("vectors") or {}
         collaborative = profile.get("collaborative") or {}
         listened_artist_names = {
@@ -171,7 +172,10 @@ class ArtistRecommendationService:
             add_artist_seed(artist_key, weight)
 
         ranked_seed_names = sorted(weighted_artist_names.items(), key=lambda item: item[1], reverse=True)
-        top_seed_names = ranked_seed_names[: (5 if surface == "search_results" else 4)]
+        top_seed_names = ranked_seed_names[: (5 if surface == "search_results" else 3)]
+        direct_timeout_seconds = 8 if surface == "search_results" else 4
+        related_timeout_seconds = 10 if surface == "search_results" else 5
+        home_fast_ready_artist_target = max(6, min(limit, 8))
 
         artists: List[Dict[str, Any]] = []
         seen_artist_ids = set()
@@ -225,14 +229,18 @@ class ArtistRecommendationService:
         direct_results_by_seed = {}
         for seed_index, future in direct_seed_futures.items():
             try:
-                direct_results_by_seed[seed_index] = future.result(timeout=8)
+                direct_results_by_seed[seed_index] = future.result(
+                    timeout=direct_timeout_seconds
+                )
             except Exception:
                 direct_results_by_seed[seed_index] = []
 
         semantic_results_by_seed = {}
         for seed_index, future in semantic_seed_futures.items():
             try:
-                semantic_results_by_seed[seed_index] = future.result(timeout=8)
+                semantic_results_by_seed[seed_index] = future.result(
+                    timeout=direct_timeout_seconds
+                )
             except Exception:
                 semantic_results_by_seed[seed_index] = []
 
@@ -242,7 +250,7 @@ class ArtistRecommendationService:
                 continue
             if surface == "search_results" and seed_index >= 3:
                 continue
-            if surface != "search_results" and seed_index >= 2:
+            if home_surface and seed_index >= 1:
                 continue
             primary_artist_id = trim_text(direct_results[0].get("id"))
             if not primary_artist_id:
@@ -258,10 +266,12 @@ class ArtistRecommendationService:
                 add_artist_result(artist, seed_weight + max(2.0 - (index * 0.28), 0.7))
             for index, artist in enumerate(semantic_results_by_seed.get(seed_index) or []):
                 add_artist_result(artist, max(seed_weight - 0.35 - (index * 0.18), 0.45))
-            related_future = related_artist_futures.get(seed_index)
+            related_future = None
+            if not (home_surface and len(artists) >= home_fast_ready_artist_target):
+                related_future = related_artist_futures.get(seed_index)
             if related_future is not None:
                 try:
-                    artist_payload = related_future.result(timeout=10)
+                    artist_payload = related_future.result(timeout=related_timeout_seconds)
                 except Exception:
                     artist_payload = {}
                 related_limit = 6 if surface == "search_results" else 4
@@ -342,6 +352,12 @@ class ArtistRecommendationService:
                 "model_version": model_version,
                 "surface": surface,
                 "seed_count": len(top_seed_names),
+                "direct_timeout_seconds": direct_timeout_seconds,
+                "related_timeout_seconds": related_timeout_seconds,
+                "home_fast_ready_artist_target": home_fast_ready_artist_target,
+                "home_related_skipped_after_ready": bool(
+                    home_surface and len(artists) >= home_fast_ready_artist_target
+                ),
             },
             "model_version": model_version,
         }

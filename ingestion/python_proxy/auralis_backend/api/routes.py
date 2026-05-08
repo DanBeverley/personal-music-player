@@ -13,6 +13,7 @@ from .stream_runtime import (
     stream_audio as stream_audio_runtime,
     warm_streams as warm_streams_runtime,
 )
+from ..recognition.service import RecognitionService
 from ..recommend.service import RecommendationService
 from ..search.service import SearchService
 from ..contracts import (
@@ -34,6 +35,7 @@ _search_service = None
 _recommendation_service = None
 _assistant_service = None
 _media_service = None
+_recognition_service = None
 
 
 def configure_router(server) -> None:
@@ -42,11 +44,13 @@ def configure_router(server) -> None:
     global _recommendation_service
     global _assistant_service
     global _media_service
+    global _recognition_service
     _server = server
     _search_service = SearchService(server)
     _recommendation_service = RecommendationService(server)
     _assistant_service = AssistantService(server)
     _media_service = MediaService(server)
+    _recognition_service = RecognitionService(server)
 
 
 def _require_server():
@@ -79,6 +83,12 @@ def _require_media_service() -> MediaService:
     return _media_service
 
 
+def _require_recognition_service() -> RecognitionService:
+    if _recognition_service is None:
+        raise RuntimeError("Recognition service has not been configured")
+    return _recognition_service
+
+
 @router.get("/")
 def health_check():
     return _require_media_service().health_check()
@@ -109,6 +119,11 @@ def search(req: SearchRequest):
     return _require_search_service().search(req)
 
 
+@router.post("/recognize_audio")
+async def recognize_audio(request: Request):
+    return await _require_recognition_service().recognize_audio(request)
+
+
 @router.post("/search_albums")
 def search_albums(req: SearchRequest):
     return _require_search_service().search_albums(req)
@@ -132,6 +147,11 @@ def get_suggestions(req: SearchRequest):
 @router.post("/recommend")
 def recommend(req: SearchRequest):
     return _require_recommendation_service().recommend(req)
+
+
+@router.post("/recommend/flagship_stream")
+def recommend_flagship_stream(req: SearchRequest):
+    return _require_recommendation_service().flagship_stream(req)
 
 
 @router.post("/interaction_event")

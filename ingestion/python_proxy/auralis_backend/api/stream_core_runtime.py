@@ -75,11 +75,11 @@ def store_stream_chunk(server: Any, video_id: str, payload):
 def chunk_target_bytes(server: Any, position: int, active_queue: bool):
     if active_queue:
         if position <= 0:
-            return 2097152
-        if position == 1:
             return 1572864
-        if position == 2:
+        if position == 1:
             return 1048576
+        if position == 2:
+            return 786432
         return server.STREAM_WARM_CHUNK_BYTES
     if position <= 0:
         return 1048576

@@ -1,4 +1,14 @@
-part of 'main.dart';
+import 'dart:async';
+import 'dart:io';
+import 'dart:ui';
+
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:image_picker/image_picker.dart';
+
+import 'logic/auth_provider.dart';
+import 'logic/playlist_provider.dart';
+import 'ui/app_theme_tokens.dart';
 
 void showGlassDialog(
     {required BuildContext context,
@@ -21,7 +31,7 @@ void showGlassDialog(
                 child: AlertDialog(
                   backgroundColor: Colors.grey[900]?.withValues(alpha: 0.7),
                   shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(_radiusLarge),
+                    borderRadius: BorderRadius.circular(appRadiusLarge),
                     side: BorderSide(
                         color: Colors.white.withValues(alpha: 0.1), width: 1),
                   ),
@@ -39,8 +49,8 @@ Color _playlistCoverColor(Playlist playlist) {
   if (value != null) {
     return Color(value);
   }
-  return _playlistCoverPalette[
-      playlist.name.hashCode.abs() % _playlistCoverPalette.length];
+  return appPlaylistCoverPalette[
+      playlist.name.hashCode.abs() % appPlaylistCoverPalette.length];
 }
 
 class PlaylistArtworkView extends StatelessWidget {
@@ -211,7 +221,7 @@ class _PlaylistArtworkDialogState
           padding: const EdgeInsets.fromLTRB(24, 22, 24, 18),
           decoration: BoxDecoration(
             color: Colors.grey[900]?.withValues(alpha: 0.88),
-            borderRadius: BorderRadius.circular(_radiusLarge),
+            borderRadius: BorderRadius.circular(appRadiusLarge),
             border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
           ),
           child: Column(
@@ -246,7 +256,7 @@ class _PlaylistArtworkDialogState
               Wrap(
                 spacing: 10,
                 runSpacing: 10,
-                children: _playlistCoverPalette.map((color) {
+                children: appPlaylistCoverPalette.map((color) {
                   return GestureDetector(
                     onTap: () => _applyColor(color),
                     child: Container(
@@ -305,10 +315,10 @@ class _PlaylistArtworkDialogState
   }
 }
 
-class _LyricsTabClipper extends CustomClipper<Path> {
+class LyricsTabClipper extends CustomClipper<Path> {
   final bool pointLeft;
 
-  const _LyricsTabClipper({required this.pointLeft});
+  const LyricsTabClipper({required this.pointLeft});
 
   @override
   Path getClip(Size size) {
@@ -363,7 +373,7 @@ class _LyricsTabClipper extends CustomClipper<Path> {
   }
 
   @override
-  bool shouldReclip(covariant _LyricsTabClipper oldClipper) {
+  bool shouldReclip(covariant LyricsTabClipper oldClipper) {
     return oldClipper.pointLeft != pointLeft;
   }
 }

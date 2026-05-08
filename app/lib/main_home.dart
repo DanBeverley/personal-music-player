@@ -1,13 +1,69 @@
-part of 'main.dart';
+import 'dart:async';
+import 'dart:math' as math;
+
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import 'home_screen_controller.dart';
+import 'logic/audio_provider.dart';
+import 'logic/audio_provider_history.dart';
+import 'logic/audio_provider_queue.dart';
+import 'logic/audio_provider_recommendation.dart';
+import 'logic/details_provider.dart';
+import 'logic/search_provider.dart';
+import 'logic/song_match_provider.dart';
+import 'main_details.dart';
+import 'main_player.dart';
+import 'screens/assistant_screen.dart';
+import 'screens/personal_mix_detail_screen.dart';
+import 'screens/recommendation_row_detail_screen.dart';
+import 'ui/app_theme_tokens.dart';
+import 'widgets/app_artwork.dart';
+import 'widgets/home/home_collection_widgets.dart';
+import 'widgets/home/genre_widgets.dart';
+import 'widgets/home/home_content_sections.dart';
+import 'widgets/home/recent_search_history_section.dart';
+import 'widgets/home/search_surface_widgets.dart';
+import 'widgets/home/song_match_widgets.dart';
+import 'widgets/home/track_menu_button.dart';
+import 'widgets/playlist/add_to_playlist_dialog.dart';
+import 'widgets/track_list_skeleton.dart';
+
+const _accentGrey = appAccentGrey;
+const _surfaceGrey = appSurfaceGrey;
+const _surfaceGreyAlt = appSurfaceGreyAlt;
+const double _radiusLarge = appRadiusLarge;
+const double _radiusMedium = appRadiusMedium;
+const List<String> _quipOpeners = <String>[
+  'Today\'s sonic forecast',
+  'Current music goblin memo',
+  'Breaking genre news',
+  'The headphone council reports',
+  'Fresh dispatch from the aux cord tribunal',
+];
+const List<String> _quipMiddles = <String>[
+  'your queue is one impulsive click away from becoming a legal issue',
+  'someone out there is still defending their 47-minute bagpipe ambient cut',
+  'the algorithm briefly achieved sentience and immediately asked for one more chorus',
+  'your taste is giving â€œI know a shortcutâ€\u009d right before getting lost in a concept album',
+  'a bassline just kicked the door open and demanded better transitions',
+];
+const List<String> _quipClosers = <String>[
+  'Proceed with swagger.',
+  'Use responsibly near the skip button.',
+  'No moderators were consulted.',
+  'Respectfully: play it too loud.',
+  'The aux has never been safer.',
+];
 
 class HomeScreen extends ConsumerStatefulWidget {
-  final ValueChanged<bool>? onSearchModeChanged;
   final bool searchOnly;
+  final HomeScreenController? controller;
 
   const HomeScreen({
     super.key,
-    this.onSearchModeChanged,
     this.searchOnly = false,
+    this.controller,
   });
 
   @override
@@ -35,11 +91,18 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   bool _isRecentSearchHistoryLoading = false;
   String _lastPrimeSignature = '';
   late final String _heroQuip;
+  int _lastSongMatchPresentationToken = 0;
+  bool _isSongMatchSheetOpen = false;
+  int _lastFocusSearchRequestId = 0;
+  int _lastShowHomeFeedRequestId = 0;
+  int _lastHandleBackRequestId = 0;
+  int _lastOpenSongMatchRequestId = 0;
 
   @override
   void initState() {
     super.initState();
     _isSearching = widget.searchOnly;
+    widget.controller?.addListener(_handleControllerChanged);
     _heroQuip = _buildHeroQuip();
     _homeScrollController.addListener(_handleHomeScroll);
     unawaited(_loadRecentSearchHistory());
@@ -51,6 +114,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       if (mounted) {
         setState(() {});
       }
+      _syncControllerCanHandleBack();
       if (text.isNotEmpty) {
         _suggestDebounce?.cancel();
         _suggestDebounce = Timer(const Duration(milliseconds: 280), () {
@@ -75,6 +139,17 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         _searchFocusNode.requestFocus();
       });
     }
+    _syncControllerCanHandleBack();
+  }
+
+  @override
+  void didUpdateWidget(covariant HomeScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.controller != widget.controller) {
+      oldWidget.controller?.removeListener(_handleControllerChanged);
+      widget.controller?.addListener(_handleControllerChanged);
+      _syncControllerCanHandleBack();
+    }
   }
 
   void _setSearchMode(bool value) {
@@ -83,13 +158,12 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       return;
     }
     setState(() => _isSearching = nextValue);
-    if (!widget.searchOnly) {
-      widget.onSearchModeChanged?.call(nextValue);
-    }
+    _syncControllerCanHandleBack();
   }
 
   @override
   void dispose() {
+    widget.controller?.removeListener(_handleControllerChanged);
     _suggestDebounce?.cancel();
     _homeScrollController
       ..removeListener(_handleHomeScroll)
@@ -97,6 +171,36 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     _urlController.dispose();
     _searchFocusNode.dispose();
     super.dispose();
+  }
+
+  void _handleControllerChanged() {
+    final controllerState = widget.controller?.value;
+    if (controllerState == null || !mounted) return;
+
+    if (controllerState.focusSearchRequestId != _lastFocusSearchRequestId) {
+      _lastFocusSearchRequestId = controllerState.focusSearchRequestId;
+      focusSearch();
+    }
+    if (controllerState.showHomeFeedRequestId != _lastShowHomeFeedRequestId) {
+      _lastShowHomeFeedRequestId = controllerState.showHomeFeedRequestId;
+      showHomeFeed();
+    }
+    if (controllerState.handleBackRequestId != _lastHandleBackRequestId) {
+      _lastHandleBackRequestId = controllerState.handleBackRequestId;
+      handleSystemBack();
+    }
+    if (controllerState.openSongMatchRequestId != _lastOpenSongMatchRequestId) {
+      _lastOpenSongMatchRequestId = controllerState.openSongMatchRequestId;
+      unawaited(
+        openSongMatchSheet(
+          preferPendingShared: controllerState.preferPendingSharedForSongMatch,
+        ),
+      );
+    }
+  }
+
+  void _syncControllerCanHandleBack() {
+    widget.controller?.updateCanHandleBack(handleSystemBackCandidate);
   }
 
   void _handleHomeScroll() {
@@ -416,6 +520,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     if (widget.searchOnly) {
       unawaited(_loadRecentSearchHistory());
     }
+    _syncControllerCanHandleBack();
   }
 
   void focusSearch() {
@@ -429,6 +534,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     }
     _setSearchMode(true);
     unawaited(_loadRecentSearchHistory());
+    _syncControllerCanHandleBack();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       _searchFocusNode.requestFocus();
@@ -436,6 +542,31 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         TextPosition(offset: _urlController.text.length),
       );
     });
+  }
+
+  Future<void> openSongMatchSheet({bool preferPendingShared = false}) async {
+    if (!mounted || _isSongMatchSheetOpen) return;
+    _setSearchMode(true);
+    _isSongMatchSheetOpen = true;
+    final notifier = ref.read(songMatchProvider.notifier);
+    try {
+      await showSongMatchOptionsSheet(
+        context: context,
+        songMatchState: ref.read(songMatchProvider),
+        preferPendingShared: preferPendingShared,
+        onUsePendingShared: () {
+          unawaited(notifier.matchPendingSharedFile());
+        },
+        onRecordSnippet: () {
+          unawaited(notifier.startRecordingSnippet());
+        },
+        onChooseFile: () {
+          unawaited(notifier.pickFileAndMatch());
+        },
+      );
+    } finally {
+      _isSongMatchSheetOpen = false;
+    }
   }
 
   void showHomeFeed() {
@@ -450,6 +581,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         curve: Curves.easeOutCubic,
       );
     }
+    _syncControllerCanHandleBack();
   }
 
   Future<void> _refreshContent() async {
@@ -516,10 +648,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
 
   bool handleSystemBack() {
     if (widget.searchOnly) {
-      final hasSearchContent = _urlController.text.trim().isNotEmpty ||
-          ref.read(searchPageProvider).hasResults ||
-          ref.read(suggestProvider).isNotEmpty;
-      if (hasSearchContent) {
+      if (handleSystemBackCandidate) {
         _clearSearch(refreshRecommendations: false);
         return true;
       }
@@ -530,6 +659,15 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       return true;
     }
     return false;
+  }
+
+  bool get handleSystemBackCandidate {
+    if (widget.searchOnly) {
+      return _urlController.text.trim().isNotEmpty ||
+          ref.read(searchPageProvider).hasResults ||
+          ref.read(suggestProvider).isNotEmpty;
+    }
+    return hasActiveSearch;
   }
 
   bool get hasActiveSearch =>
@@ -547,7 +685,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
 
   void _primeLikelyTracks(List<dynamic> tracks) {
     final idsToWarm = <String>[];
-    for (final track in tracks.take(6)) {
+    for (final track in tracks.take(12)) {
       final id = (track['id'] ?? track['videoId'])?.toString();
       if (id == null || id.isEmpty) continue;
       if (_prewarmedTrackIds.add(id)) {
@@ -560,7 +698,14 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     if (signature == _lastPrimeSignature) return;
     _lastPrimeSignature = signature;
 
-    unawaited(ref.read(audioPlayerProvider.notifier).prewarmStreams(idsToWarm));
+    unawaited(
+      ref.read(audioPlayerProvider.notifier).prewarmStreams(
+            idsToWarm,
+            lookahead: math.max(10, idsToWarm.length),
+            immediatePlayback: true,
+            currentVideoId: idsToWarm.first,
+          ),
+    );
   }
 
   Future<void> _openRecommendationRowDetail({
@@ -842,12 +987,19 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   Widget _buildMixCardsLane({
     required String title,
     required List<Map<String, dynamic>> items,
+    Map<String, dynamic> meta = const <String, dynamic>{},
   }) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        _buildRecommendationLaneHeader(title: title),
-        const SizedBox(height: 16),
+        _buildRecommendationLaneHeader(
+          title: title,
+          statusLabel: _isRefiningFlagshipMeta(meta) ? 'Refining' : null,
+        ),
+        if (_isRefiningFlagshipMeta(meta))
+          _buildPartialReadyFlagshipNote(meta)
+        else
+          const SizedBox(height: 16),
         SizedBox(
           height: 284,
           child: ListView.separated(
@@ -1079,8 +1231,14 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        _buildRecommendationLaneHeader(title: title),
-        const SizedBox(height: 14),
+        _buildRecommendationLaneHeader(
+          title: title,
+          statusLabel: _isRefiningFlagshipMeta(meta) ? 'Refining' : null,
+        ),
+        if (_isRefiningFlagshipMeta(meta))
+          _buildPartialReadyFlagshipNote(meta)
+        else
+          const SizedBox(height: 14),
         SingleChildScrollView(
           scrollDirection: Axis.horizontal,
           physics: const BouncingScrollPhysics(),
@@ -1186,7 +1344,9 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                         ),
                         child: Column(
                           children: [
-                            for (var index = 0; index < page.length; index++) ...[
+                            for (var index = 0;
+                                index < page.length;
+                                index++) ...[
                               GenreTrackTile(
                                 track: page[index],
                                 onPlay: () => _playTrackFromCollection(
@@ -1233,8 +1393,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                             borderRadius: BorderRadius.circular(999),
                           ),
                         ),
-                        if (index != pages.length - 1)
-                          const SizedBox(width: 6),
+                        if (index != pages.length - 1) const SizedBox(width: 6),
                       ],
                     ],
                   ),
@@ -1250,6 +1409,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   Widget _buildRecommendationLaneHeader({
     required String title,
     VoidCallback? onOpenDetail,
+    String? statusLabel,
   }) {
     return Row(
       children: [
@@ -1263,6 +1423,42 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
             ),
           ),
         ),
+        if (statusLabel != null && statusLabel.trim().isNotEmpty) ...[
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+            decoration: BoxDecoration(
+              color: Colors.white.withValues(alpha: 0.05),
+              borderRadius: BorderRadius.circular(999),
+              border: Border.all(
+                color: Colors.white.withValues(alpha: 0.08),
+              ),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                SizedBox(
+                  width: 11,
+                  height: 11,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 1.7,
+                    color: Colors.white.withValues(alpha: 0.72),
+                  ),
+                ),
+                const SizedBox(width: 7),
+                Text(
+                  statusLabel.trim(),
+                  style: TextStyle(
+                    color: Colors.white.withValues(alpha: 0.74),
+                    fontSize: 11,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 0.3,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          if (onOpenDetail != null) const SizedBox(width: 10),
+        ],
         if (onOpenDetail != null)
           Material(
             color: Colors.transparent,
@@ -1291,15 +1487,90 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     );
   }
 
-  Widget _buildRecommendationLaneSkeleton({int count = 3}) {
+  Widget _buildPartialReadyFlagshipNote(Map<String, dynamic> meta) {
+    if (!_isRefiningFlagshipMeta(meta)) {
+      return const SizedBox.shrink();
+    }
+    final label = meta['loading_label']?.toString().trim().isNotEmpty == true
+        ? meta['loading_label'].toString().trim()
+        : 'Refining';
+    final message = meta['loading_message']?.toString().trim().isNotEmpty == true
+        ? meta['loading_message'].toString().trim()
+        : 'This lane is still pulling in stronger picks.';
+    return Padding(
+      padding: const EdgeInsets.only(top: 10, bottom: 14),
+      child: Row(
+        children: [
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+            decoration: BoxDecoration(
+              color: Colors.white.withValues(alpha: 0.045),
+              borderRadius: BorderRadius.circular(999),
+              border: Border.all(
+                color: Colors.white.withValues(alpha: 0.08),
+              ),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                SizedBox(
+                  width: 12,
+                  height: 12,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 1.8,
+                    color: Colors.white.withValues(alpha: 0.72),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  label,
+                  style: TextStyle(
+                    color: Colors.white.withValues(alpha: 0.76),
+                    fontSize: 11,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 0.4,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              message,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                color: Colors.white.withValues(alpha: 0.5),
+                fontSize: 12,
+                fontWeight: FontWeight.w500,
+                height: 1.35,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  bool _isRefiningFlagshipMeta(Map<String, dynamic> meta) {
+    return meta['refinement_active'] == true ||
+        (meta['row_state']?.toString().trim() ?? '') == 'partial_inflight';
+  }
+
+  Widget _buildRecommendationLaneSkeleton({
+    int count = 3,
+    double height = 244,
+    double cardWidth = 182,
+  }) {
     return SizedBox(
-      height: 244,
+      height: height,
       child: ListView.separated(
         scrollDirection: Axis.horizontal,
         itemCount: count,
         separatorBuilder: (_, __) => const SizedBox(width: 14),
         itemBuilder: (context, index) => Container(
-          width: 182,
+          width: cardWidth,
           decoration: BoxDecoration(
             color: Colors.white.withValues(alpha: 0.035),
             borderRadius: BorderRadius.circular(_radiusLarge),
@@ -1307,6 +1578,185 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
           ),
         ),
       ),
+    );
+  }
+
+  Widget _buildDeferredFlagshipHeader(
+    String title, {
+    required Map<String, dynamic> meta,
+  }) {
+    final loadingLabelRaw = meta['loading_label']?.toString().trim() ?? '';
+    final loadingMessageRaw = meta['loading_message']?.toString().trim() ?? '';
+    final loadingLabel =
+        loadingLabelRaw.isEmpty ? 'Preparing' : loadingLabelRaw;
+    final loadingMessage = loadingMessageRaw.isEmpty
+        ? 'Refreshing this lane with more personalized picks.'
+        : loadingMessageRaw;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _buildRecommendationLaneHeader(title: title),
+        const SizedBox(height: 10),
+        Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+              decoration: BoxDecoration(
+                color: Colors.white.withValues(alpha: 0.045),
+                borderRadius: BorderRadius.circular(999),
+                border: Border.all(
+                  color: Colors.white.withValues(alpha: 0.08),
+                ),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  SizedBox(
+                    width: 12,
+                    height: 12,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 1.8,
+                      color: Colors.white.withValues(alpha: 0.72),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    loadingLabel,
+                    style: TextStyle(
+                      color: Colors.white.withValues(alpha: 0.76),
+                      fontSize: 11,
+                      fontWeight: FontWeight.w700,
+                      letterSpacing: 0.4,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                loadingMessage,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  color: Colors.white.withValues(alpha: 0.5),
+                  fontSize: 12,
+                  fontWeight: FontWeight.w500,
+                  height: 1.35,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _buildDeferredFlagshipLaneShell({
+    required String rowKind,
+    required String title,
+    required String itemType,
+    required String rowStyle,
+    required Map<String, dynamic> meta,
+  }) {
+    if (itemType == 'artist') {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _buildDeferredFlagshipHeader(title, meta: meta),
+          const SizedBox(height: 14),
+          HomeArtistRow(
+            artists: const [],
+            title: title,
+            showTitle: false,
+            isLoading: true,
+            onOpenArtist: (_) {},
+          ),
+        ],
+      );
+    }
+
+    if (itemType == 'album') {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _buildDeferredFlagshipHeader(title, meta: meta),
+          const SizedBox(height: 16),
+          _buildRecommendationLaneSkeleton(
+            count: 2,
+            height: 258,
+            cardWidth: 188,
+          ),
+        ],
+      );
+    }
+
+    if (rowStyle == 'mix_cards' || itemType == 'mix') {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _buildDeferredFlagshipHeader(title, meta: meta),
+          const SizedBox(height: 16),
+          _buildRecommendationLaneSkeleton(
+            count: 2,
+            height: 226,
+            cardWidth: 214,
+          ),
+        ],
+      );
+    }
+
+    if (rowStyle == 'genre_tabs') {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _buildDeferredFlagshipHeader(title, meta: meta),
+          const SizedBox(height: 16),
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            physics: const NeverScrollableScrollPhysics(),
+            child: Row(
+              children: List<Widget>.generate(
+                4,
+                (index) => Container(
+                  width: index == 0 ? 96 : 82,
+                  height: 34,
+                  margin: EdgeInsets.only(right: index == 3 ? 0 : 10),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: 0.05),
+                    borderRadius: BorderRadius.circular(999),
+                    border: Border.all(
+                      color: Colors.white.withValues(alpha: 0.08),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(height: 16),
+          const TrackListSkeleton(count: 2),
+        ],
+      );
+    }
+
+    if (rowKind == 'quiet_picks') {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _buildDeferredFlagshipHeader(title, meta: meta),
+          const SizedBox(height: 16),
+          const TrackListSkeleton(count: 3),
+        ],
+      );
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _buildDeferredFlagshipHeader(title, meta: meta),
+        const SizedBox(height: 16),
+        _buildRecommendationLaneSkeleton(),
+      ],
     );
   }
 
@@ -1322,6 +1772,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     bool isPaginating = false,
     bool hasMore = false,
   }) {
+    final isPendingFlagship = meta['deferred_flagship'] == true &&
+        (meta['loading_state']?.toString() ?? '') == 'pending';
     if (isLoading && items.isEmpty) {
       return Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -1340,35 +1792,92 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       );
     }
 
-    if (items.isEmpty) return const SizedBox.shrink();
+    if (items.isEmpty) {
+      if (!isPendingFlagship) {
+        return const SizedBox.shrink();
+      }
+      return AnimatedSwitcher(
+        duration: const Duration(milliseconds: 320),
+        switchInCurve: Curves.easeOutCubic,
+        switchOutCurve: Curves.easeInCubic,
+        transitionBuilder: (child, animation) => FadeTransition(
+          opacity: animation,
+          child: SlideTransition(
+            position: Tween<Offset>(
+              begin: const Offset(0, 0.05),
+              end: Offset.zero,
+            ).animate(animation),
+            child: child,
+          ),
+        ),
+        child: KeyedSubtree(
+          key: ValueKey<String>('$rowId:pending'),
+          child: _buildDeferredFlagshipLaneShell(
+            rowKind: rowId,
+            title: title,
+            itemType: itemType,
+            rowStyle: rowStyle,
+            meta: meta,
+          ),
+        ),
+      );
+    }
+
+    Widget lane;
 
     if (rowStyle == 'featured_track') {
-      return _buildFeaturedTrackLane(
+      lane = _buildFeaturedTrackLane(
         title: title,
         items: items,
         meta: meta,
       );
-    }
-
-    if (rowStyle == 'mix_cards' || itemType == 'mix') {
-      return _buildMixCardsLane(
+    } else if (rowStyle == 'mix_cards' || itemType == 'mix') {
+      lane = _buildMixCardsLane(
         title: title,
         items: items,
+        meta: meta,
       );
-    }
-
-    if (rowStyle == 'genre_tabs') {
-      return _buildGenreTabsLane(
+    } else if (rowStyle == 'genre_tabs') {
+      lane = _buildGenreTabsLane(
         rowId: rowId,
         title: title,
         fallbackItems: items,
         meta: meta,
         isUpdating: isPaginating,
       );
-    }
-
-    if (itemType == 'album') {
-      return _buildAlbumRecommendationLane(
+    } else if (itemType == 'album') {
+      lane = _buildAlbumRecommendationLane(
+        rowId: rowId,
+        title: title,
+        items: items,
+        nextOffset: nextOffset,
+        isPaginating: isPaginating,
+        hasMore: hasMore,
+        meta: meta,
+      );
+    } else if (itemType == 'artist') {
+      lane = Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _buildRecommendationLaneHeader(
+            title: title,
+            statusLabel: _isRefiningFlagshipMeta(meta) ? 'Refining' : null,
+          ),
+          if (_isRefiningFlagshipMeta(meta))
+            _buildPartialReadyFlagshipNote(meta)
+          else
+            const SizedBox(height: 14),
+          HomeArtistRow(
+            artists: items,
+            title: title,
+            showTitle: false,
+            isLoading: isLoading,
+            onOpenArtist: (artist) => unawaited(_openArtist(artist)),
+          ),
+        ],
+      );
+    } else if (rowId == 'quiet_picks') {
+      lane = _buildVerticalRecommendationLane(
         rowId: rowId,
         title: title,
         items: items,
@@ -1376,115 +1885,118 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         isPaginating: isPaginating,
         hasMore: hasMore,
       );
-    }
-
-    if (itemType == 'artist') {
-      return _buildArtistRow(
-        items,
-        title: title,
-        isLoading: isLoading,
-      );
-    }
-
-    if (rowId == 'quiet_picks') {
-      return _buildVerticalRecommendationLane(
-        rowId: rowId,
-        title: title,
-        items: items,
-        nextOffset: nextOffset,
-        isPaginating: isPaginating,
-        hasMore: hasMore,
-      );
-    }
-
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        _buildRecommendationLaneHeader(
-          title: title,
-          onOpenDetail: itemType == 'track'
-              ? () => _openRecommendationRowDetail(
-                    rowId: rowId,
-                    title: title,
-                    itemType: itemType,
-                    rowStyle: rowStyle,
-                    meta: meta,
-                    items: items,
-                    nextOffset: nextOffset,
-                    hasMore: hasMore,
-                  )
-              : null,
-        ),
-        const SizedBox(height: 16),
-        SizedBox(
-          height: 244,
-          child: NotificationListener<ScrollNotification>(
-            onNotification: (notification) {
-              if (_isSearching ||
-                  notification.metrics.axis != Axis.horizontal) {
-                return false;
-              }
-              if (!hasMore ||
-                  isPaginating ||
-                  notification.metrics.extentAfter > 280) {
-                return false;
-              }
-              unawaited(
-                ref.read(recommendationProvider.notifier).loadMoreRow(rowId),
-              );
-              return false;
-            },
-            child: ListView.separated(
-              scrollDirection: Axis.horizontal,
-              physics: const BouncingScrollPhysics(),
-              itemCount: items.length + (hasMore || isPaginating ? 1 : 0),
-              separatorBuilder: (_, __) => const SizedBox(width: 14),
-              itemBuilder: (context, index) {
-                if (index >= items.length) {
-                  return Container(
-                    width: 182,
-                    decoration: BoxDecoration(
-                      color: Colors.white.withValues(alpha: 0.035),
-                      borderRadius: BorderRadius.circular(_radiusLarge),
-                      border: Border.all(
-                        color: Colors.white.withValues(alpha: 0.05),
-                      ),
-                    ),
-                    child: Center(
-                      child: isPaginating
-                          ? const SizedBox(
-                              width: 22,
-                              height: 22,
-                              child: CircularProgressIndicator(
-                                strokeWidth: 2,
-                                color: Colors.white70,
-                              ),
-                            )
-                          : Icon(
-                              Icons.chevron_right_rounded,
-                              color: Colors.white.withValues(alpha: 0.5),
-                              size: 28,
-                            ),
-                    ),
-                  );
+    } else {
+      lane = Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _buildRecommendationLaneHeader(
+            title: title,
+            onOpenDetail: itemType == 'track'
+                ? () => _openRecommendationRowDetail(
+                      rowId: rowId,
+                      title: title,
+                      itemType: itemType,
+                      rowStyle: rowStyle,
+                      meta: meta,
+                      items: items,
+                      nextOffset: nextOffset,
+                      hasMore: hasMore,
+                    )
+                : null,
+          ),
+          const SizedBox(height: 16),
+          SizedBox(
+            height: 244,
+            child: NotificationListener<ScrollNotification>(
+              onNotification: (notification) {
+                if (_isSearching ||
+                    notification.metrics.axis != Axis.horizontal) {
+                  return false;
                 }
-                return _buildRecommendationCard(
-                  items[index],
-                  collectionTracks: items,
-                  playlistId: 'row:$rowId',
-                  playlistName: title,
-                  showDeleteButton: rowId == 'last_played_local',
-                  onDelete: rowId == 'last_played_local'
-                      ? _deleteLastPlayedTrack
-                      : null,
-                  isDeleting: rowId == 'last_played_local' &&
-                      _isLastPlayedDeleting(items[index]),
+                if (!hasMore ||
+                    isPaginating ||
+                    notification.metrics.extentAfter > 280) {
+                  return false;
+                }
+                unawaited(
+                  ref.read(recommendationProvider.notifier).loadMoreRow(rowId),
                 );
+                return false;
               },
+              child: ListView.separated(
+                scrollDirection: Axis.horizontal,
+                physics: const BouncingScrollPhysics(),
+                itemCount: items.length + (hasMore || isPaginating ? 1 : 0),
+                separatorBuilder: (_, __) => const SizedBox(width: 14),
+                itemBuilder: (context, index) {
+                  if (index >= items.length) {
+                    return Container(
+                      width: 182,
+                      decoration: BoxDecoration(
+                        color: Colors.white.withValues(alpha: 0.035),
+                        borderRadius: BorderRadius.circular(_radiusLarge),
+                        border: Border.all(
+                          color: Colors.white.withValues(alpha: 0.05),
+                        ),
+                      ),
+                      child: Center(
+                        child: isPaginating
+                            ? const SizedBox(
+                                width: 22,
+                                height: 22,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                  color: Colors.white70,
+                                ),
+                              )
+                            : Icon(
+                                Icons.chevron_right_rounded,
+                                color: Colors.white.withValues(alpha: 0.5),
+                                size: 28,
+                              ),
+                      ),
+                    );
+                  }
+                  return _buildRecommendationCard(
+                    items[index],
+                    collectionTracks: items,
+                    playlistId: 'row:$rowId',
+                    playlistName: title,
+                    showDeleteButton: rowId == 'last_played_local',
+                    onDelete: rowId == 'last_played_local'
+                        ? _deleteLastPlayedTrack
+                        : null,
+                    isDeleting: rowId == 'last_played_local' &&
+                        _isLastPlayedDeleting(items[index]),
+                  );
+                },
+              ),
             ),
           ),
+        ],
+      );
+    }
+
+    return AnimatedSwitcher(
+      duration: const Duration(milliseconds: 320),
+      switchInCurve: Curves.easeOutCubic,
+      switchOutCurve: Curves.easeInCubic,
+      transitionBuilder: (child, animation) => FadeTransition(
+        opacity: animation,
+        child: SlideTransition(
+          position: Tween<Offset>(
+            begin: const Offset(0, 0.05),
+            end: Offset.zero,
+          ).animate(animation),
+          child: child,
         ),
-      ],
+      ),
+      child: KeyedSubtree(
+        key: ValueKey<String>(
+          '$rowId:${meta['row_state'] ?? (isPendingFlagship ? 'pending' : 'ready')}:${meta['row_version'] ?? 0}:${items.length}:${hasMore ? 'more' : 'done'}',
+        ),
+        child: lane,
+      ),
     );
   }
 
@@ -1521,7 +2033,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
           nearEndLead: 5,
           onNearEnd: (!hasMore || isPaginating)
               ? null
-              : () => ref.read(recommendationProvider.notifier).loadMoreRow(rowId),
+              : () =>
+                  ref.read(recommendationProvider.notifier).loadMoreRow(rowId),
         ),
         if (hasMore || isPaginating)
           Padding(
@@ -1530,7 +2043,9 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
               child: TextButton(
                 onPressed: isPaginating
                     ? null
-                    : () => ref.read(recommendationProvider.notifier).loadMoreRow(rowId),
+                    : () => ref
+                        .read(recommendationProvider.notifier)
+                        .loadMoreRow(rowId),
                 style: TextButton.styleFrom(
                   foregroundColor: Colors.white.withValues(alpha: 0.74),
                 ),
@@ -1548,6 +2063,49 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     );
   }
 
+  Future<void> _openMatchedTrackActions(Map<String, dynamic> track) async {
+    if (!mounted) return;
+    final normalizedTrack = normalizeTrack(track);
+    await showTrackActionSheet(
+      context: context,
+      ref: ref,
+      track: normalizedTrack,
+      onOpenDetails: () =>
+          _openTrackDetails(normalizedTrack, extractTrackId(normalizedTrack)),
+      onAddToPlaylist: _addTrackToPlaylistFromMenu,
+      onStartStation: _startTrackStationFromMenu,
+    );
+  }
+
+  Future<void> _showSongMatchAlternatives(
+    List<Map<String, dynamic>> alternatives,
+  ) async {
+    if (!mounted) return;
+    await showSongMatchAlternativesSheet(
+      context: context,
+      alternatives: alternatives,
+      onSelectAlternative: (track) async {
+        if (!mounted) return;
+        await _openMatchedTrackActions(normalizeTrack(track));
+      },
+    );
+  }
+
+  Widget _buildSongMatchLauncher(SongMatchState songMatchState) {
+    return SongMatchLauncher(
+      songMatchState: songMatchState,
+      onOpen: () => openSongMatchSheet(
+        preferPendingShared: songMatchState.pendingSharedMedia != null,
+      ),
+      onCancelRecording: () {
+        ref.read(songMatchProvider.notifier).cancelRecording();
+      },
+      onStopRecording: () {
+        ref.read(songMatchProvider.notifier).stopRecordingAndMatch();
+      },
+    );
+  }
+
   Widget _buildAlbumRecommendationLane({
     required String rowId,
     required String title,
@@ -1555,12 +2113,19 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     required int nextOffset,
     required bool isPaginating,
     required bool hasMore,
+    Map<String, dynamic> meta = const <String, dynamic>{},
   }) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        _buildRecommendationLaneHeader(title: title),
-        const SizedBox(height: 16),
+        _buildRecommendationLaneHeader(
+          title: title,
+          statusLabel: _isRefiningFlagshipMeta(meta) ? 'Refining' : null,
+        ),
+        if (_isRefiningFlagshipMeta(meta))
+          _buildPartialReadyFlagshipNote(meta)
+        else
+          const SizedBox(height: 16),
         SizedBox(
           height: 258,
           child: NotificationListener<ScrollNotification>(
@@ -1990,14 +2555,17 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   void _warmTrack(String? videoId) {
     if (videoId == null || videoId.isEmpty) return;
     _prewarmedTrackIds.add(videoId);
-    unawaited(ref.read(audioPlayerProvider.notifier).prewarmStream(videoId));
+    unawaited(
+      ref.read(audioPlayerProvider.notifier).prepareImmediatePlayback(videoId),
+    );
   }
 
-  void _openTrackDetails(Map<String, dynamic> track, String? videoId) {
+  Future<void> _openTrackDetails(
+      Map<String, dynamic> track, String? videoId) async {
     if (videoId == null || videoId.isEmpty) return;
     _warmTrack(videoId);
-    ref.read(trackDetailsProvider.notifier).fetchDetails(videoId);
-    Navigator.push(
+    unawaited(ref.read(trackDetailsProvider.notifier).fetchDetails(videoId));
+    await Navigator.push(
       context,
       MaterialPageRoute(builder: (_) => TrackDetailsScreen(track: track)),
     );
@@ -2095,6 +2663,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     );
   }
 
+  // ignore: unused_element
   Widget _buildAlbumList(
     List<Map<String, dynamic>> albums,
     bool isLoading,
@@ -2232,209 +2801,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     );
   }
 
-  Widget _buildArtistRow(
-    List<Map<String, dynamic>> artists, {
-    required String title,
-    bool showTitle = true,
-    bool isLoading = false,
-  }) {
-    if (artists.isEmpty && !isLoading) {
-      return const SizedBox.shrink();
-    }
-
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        if (showTitle) ...[
-          Text(
-            title,
-            style: const TextStyle(
-              fontSize: 18,
-              fontWeight: FontWeight.bold,
-              color: Colors.white,
-            ),
-          ),
-          const SizedBox(height: 14),
-        ],
-        SizedBox(
-          height: 112,
-          child: isLoading && artists.isEmpty
-              ? ListView.separated(
-                  scrollDirection: Axis.horizontal,
-                  itemCount: 5,
-                  separatorBuilder: (_, __) => const SizedBox(width: 14),
-                  itemBuilder: (_, __) => Column(
-                    children: [
-                      Container(
-                        width: 68,
-                        height: 68,
-                        decoration: BoxDecoration(
-                          color: Colors.white.withValues(alpha: 0.06),
-                          shape: BoxShape.circle,
-                        ),
-                      ),
-                      const SizedBox(height: 10),
-                      Container(
-                        width: 58,
-                        height: 10,
-                        decoration: BoxDecoration(
-                          color: Colors.white.withValues(alpha: 0.06),
-                          borderRadius: BorderRadius.circular(999),
-                        ),
-                      ),
-                    ],
-                  ),
-                )
-              : ListView.separated(
-                  scrollDirection: Axis.horizontal,
-                  itemCount: artists.length,
-                  separatorBuilder: (_, __) => const SizedBox(width: 14),
-                  itemBuilder: (context, index) {
-                    final artist = artists[index];
-                    return SizedBox(
-                      width: 82,
-                      child: Material(
-                        color: Colors.transparent,
-                        child: InkWell(
-                          borderRadius: BorderRadius.circular(22),
-                          onTap: () => _openArtist(artist),
-                          child: Column(
-                            children: [
-                              AppArtwork(
-                                thumbnail: artist['thumbnail'],
-                                width: 68,
-                                height: 68,
-                                radius: 999,
-                              ),
-                              const SizedBox(height: 10),
-                              Text(
-                                artist['name']?.toString() ?? 'Artist',
-                                maxLines: 2,
-                                overflow: TextOverflow.ellipsis,
-                                textAlign: TextAlign.center,
-                                style: TextStyle(
-                                  color: Colors.white.withValues(alpha: 0.88),
-                                  fontSize: 12,
-                                  fontWeight: FontWeight.w600,
-                                  height: 1.2,
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                    );
-                  },
-                ),
-        ),
-      ],
-    );
-  }
-
-  Widget _buildFeaturedArtistCard(Map<String, dynamic> artist) {
-    final description = (artist['description'] ?? '').toString().trim();
-    final artistId = artist['id']?.toString().trim() ?? '';
-    return Container(
-      margin: const EdgeInsets.only(bottom: 16),
-      decoration: BoxDecoration(
-        color: Colors.white.withValues(alpha: 0.03),
-        borderRadius: BorderRadius.circular(_radiusLarge),
-        border: Border.all(
-          color: Colors.white.withValues(alpha: 0.08),
-        ),
-      ),
-      child: Material(
-        color: Colors.transparent,
-        child: InkWell(
-          borderRadius: BorderRadius.circular(_radiusLarge),
-          onTap: artistId.isEmpty ? null : () => _openArtist(artist),
-          child: Padding(
-            padding: const EdgeInsets.all(16),
-            child: Row(
-              children: [
-                AppArtwork(
-                  thumbnail: artist['thumbnail'],
-                  width: 88,
-                  height: 88,
-                  radius: 999,
-                ),
-                const SizedBox(width: 16),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 10,
-                          vertical: 5,
-                        ),
-                        decoration: BoxDecoration(
-                          color: Colors.white.withValues(alpha: 0.06),
-                          borderRadius: BorderRadius.circular(999),
-                          border: Border.all(
-                            color: Colors.white.withValues(alpha: 0.08),
-                          ),
-                        ),
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Icon(
-                              Icons.mic_external_on_rounded,
-                              size: 12,
-                              color: Colors.white.withValues(alpha: 0.72),
-                            ),
-                            const SizedBox(width: 6),
-                            Text(
-                              'Artist',
-                              style: TextStyle(
-                                color: Colors.white.withValues(alpha: 0.74),
-                                fontSize: 11,
-                                fontWeight: FontWeight.w700,
-                                letterSpacing: 0.4,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                      const SizedBox(height: 10),
-                      Text(
-                        artist['name']?.toString() ?? 'Unknown Artist',
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 18,
-                          fontWeight: FontWeight.w700,
-                        ),
-                      ),
-                      if (description.isNotEmpty) ...[
-                        const SizedBox(height: 6),
-                        Text(
-                          description,
-                          maxLines: 2,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            color: Colors.white.withValues(alpha: 0.56),
-                            fontSize: 12,
-                            height: 1.35,
-                          ),
-                        ),
-                      ],
-                    ],
-                  ),
-                ),
-                Icon(
-                  Icons.chevron_right_rounded,
-                  color: Colors.white.withValues(alpha: 0.48),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
   List<Map<String, dynamic>> _deriveAlbumsFromTracks(List<dynamic> tracks) {
     final seen = <String>{};
     final albums = <Map<String, dynamic>>[];
@@ -2498,7 +2864,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         if (index >= tracks.length) {
           return const TrackListSkeleton(count: 1);
         }
-        final nearEndIndex = max(0, tracks.length - max(1, nearEndLead));
+        final nearEndIndex =
+            math.max(0, tracks.length - math.max(1, nearEndLead));
         if (onNearEnd != null && index >= nearEndIndex) {
           WidgetsBinding.instance.addPostFrameCallback((_) {
             if (!mounted) return;
@@ -2618,6 +2985,15 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     final similarArtists = _isSearching
         ? searchPage.similarArtists
         : const <Map<String, dynamic>>[];
+    final searchTrackIds = searchPage.tracks
+        .map((track) => extractTrackId(track) ?? '')
+        .where((id) => id.trim().isNotEmpty)
+        .toSet();
+    final similarTracks = _isSearching
+        ? searchPage.similarTracks
+            .where((track) => !searchTrackIds.contains(extractTrackId(track)))
+            .toList(growable: false)
+        : const <Map<String, dynamic>>[];
     final featuredAlbum =
         _isSearching && displayAlbums.isNotEmpty ? displayAlbums.first : null;
     final extraAlbums = featuredAlbum == null
@@ -2656,11 +3032,218 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         !isSearchLoading;
     final visibleTracks =
         _isSearching ? searchPage.tracks : recState.visibleTracks;
+    final songMatchState = ref.watch(songMatchProvider);
     final showRecentSearchHistory = _isSearching &&
         _urlController.text.trim().isEmpty &&
         !isSearchLoading &&
         !searchPage.hasResults &&
         _recentSearchHistory.isNotEmpty;
+    final songMatchLauncher = _buildSongMatchLauncher(songMatchState);
+    final recentSearchHistorySection = RecentSearchHistorySection(
+      queries: _recentSearchHistory,
+      isLoading: _isRecentSearchHistoryLoading,
+      onSelectQuery: (query) => _performSearch(ref, query),
+    );
+    final featuredArtistCard = featuredArtist != null
+        ? HomeFeaturedArtistCard(
+            artist: featuredArtist,
+            onOpenArtist: (artist) => unawaited(_openArtist(artist)),
+          )
+        : null;
+    final artistMatchLoadingCard = featuredArtist == null && isSearchLoading
+        ? Column(
+            children: [
+              HomeArtistRow(
+                artists: const [],
+                title: 'Artist match',
+                isLoading: true,
+                onOpenArtist: (artist) => unawaited(_openArtist(artist)),
+              ),
+              const SizedBox(height: 10),
+            ],
+          )
+        : null;
+    final similarArtistsSection = HomeArtistRow(
+      artists: similarArtists,
+      title: 'Similar artists',
+      isLoading: isSearchLoading,
+      onOpenArtist: (artist) => unawaited(_openArtist(artist)),
+    );
+    final featuredAlbumSection = featuredAlbum != null
+        ? HomeAlbumList(
+            albums: [featuredAlbum],
+            isLoading: false,
+            onOpenAlbum: (album) => unawaited(_openAlbum(album)),
+          )
+        : null;
+    final relatedTracksSection = similarTracks.isNotEmpty
+        ? Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Similar tracks',
+                style: TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.white,
+                ),
+              ),
+              const SizedBox(height: 12),
+              HomeTrackList(
+                tracks: similarTracks,
+                isLoading: false,
+                emptyMessage: '',
+                playlistId:
+                    'search-similar:${_urlController.text.trim().toLowerCase()}',
+                playlistName: _urlController.text.trim().isEmpty
+                    ? 'Similar tracks'
+                    : 'Similar to ${_urlController.text.trim()}',
+                playAsDiscoveryMix: true,
+                onWarmTrack: _warmTrack,
+                onPlayTrack: (
+                  normalizedTracks,
+                  track,
+                  effectivePlaylistId,
+                  effectivePlaylistName,
+                ) =>
+                    _playTrackFromCollection(
+                  tracks: normalizedTracks,
+                  track: track,
+                  playlistId: effectivePlaylistId,
+                  playlistName: effectivePlaylistName,
+                ),
+                onPlayDiscoveryTrack: (track, sessionName) =>
+                    _playTrackAsDiscoveryMix(track, sessionName: sessionName),
+                onOpenDetails: (track, videoId) =>
+                    _openTrackDetails(track, videoId),
+                onAddToPlaylist: _addTrackToPlaylistFromMenu,
+                onStartStation: _startTrackStationFromMenu,
+              ),
+            ],
+          )
+        : null;
+    final trackListSection = HomeTrackList(
+      tracks: searchPage.tracks,
+      isLoading: isSearchLoading,
+      emptyMessage: searchPage.errorMessage?.trim().isNotEmpty == true
+          ? searchPage.errorMessage!.trim()
+          : 'No results found.',
+      playlistId: 'search:${_urlController.text.trim().toLowerCase()}',
+      playlistName: _urlController.text.trim().isEmpty
+          ? 'Search results'
+          : 'Search: ${_urlController.text.trim()}',
+      playAsDiscoveryMix: true,
+      onWarmTrack: _warmTrack,
+      onPlayTrack: (
+        normalizedTracks,
+        track,
+        effectivePlaylistId,
+        effectivePlaylistName,
+      ) =>
+          _playTrackFromCollection(
+        tracks: normalizedTracks,
+        track: track,
+        playlistId: effectivePlaylistId,
+        playlistName: effectivePlaylistName,
+      ),
+      onPlayDiscoveryTrack: (track, sessionName) =>
+          _playTrackAsDiscoveryMix(track, sessionName: sessionName),
+      onOpenDetails: (track, videoId) => _openTrackDetails(track, videoId),
+      onAddToPlaylist: _addTrackToPlaylistFromMenu,
+      onStartStation: _startTrackStationFromMenu,
+    );
+    final moreAlbumsSection = extraAlbums.isNotEmpty || isSearchLoading
+        ? Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'More albums',
+                style: TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.white,
+                ),
+              ),
+              const SizedBox(height: 16),
+              HomeAlbumList(
+                albums: extraAlbums,
+                isLoading: isSearchLoading,
+                onOpenAlbum: (album) => unawaited(_openAlbum(album)),
+              ),
+            ],
+          )
+        : null;
+    final lastPlayedLane = lastPlayedTracks.isNotEmpty
+        ? _buildRecommendationLane(
+            rowId: 'last_played_local',
+            title: 'Last played',
+            itemType: 'track',
+            items: lastPlayedTracks,
+            nextOffset: lastPlayedTracks.length,
+            isLoading: isLastPlayedLoading,
+          )
+        : null;
+    final frequentlyListenedLane = frequentTracks.isNotEmpty
+        ? _buildRecommendationLane(
+            rowId: 'frequently_listened_local',
+            title: 'Frequently listened',
+            itemType: 'track',
+            items: frequentTracks,
+            nextOffset: frequentTracks.length,
+            isLoading: isFrequentlyLoading,
+          )
+        : null;
+    final recommendationRows = AnimatedSwitcher(
+      duration: const Duration(milliseconds: 220),
+      switchInCurve: Curves.easeOutCubic,
+      switchOutCurve: Curves.easeInCubic,
+      child: _buildRecommendationFeedRows(
+        recState,
+        isLoading: isRecLoading,
+        hiddenKinds: (frequentTracks.isNotEmpty &&
+                recState.rows.any(
+                  (row) =>
+                      row.kind != 'frequently_listened' && row.items.isNotEmpty,
+                ))
+            ? const {'frequently_listened'}
+            : const {},
+      ),
+    );
+
+    if (widget.searchOnly) {
+      ref.listen<SongMatchState>(songMatchProvider, (previous, next) {
+        if (!mounted) return;
+        if (next.presentationToken == _lastSongMatchPresentationToken) {
+          return;
+        }
+        _lastSongMatchPresentationToken = next.presentationToken;
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted) return;
+          if (next.phase == SongMatchPhase.resolved &&
+              next.resolvedTrack != null) {
+            unawaited(_openMatchedTrackActions(next.resolvedTrack!));
+            return;
+          }
+          if (next.phase == SongMatchPhase.ambiguous &&
+              next.alternatives.isNotEmpty) {
+            unawaited(_showSongMatchAlternatives(next.alternatives));
+            return;
+          }
+          if (next.phase == SongMatchPhase.failed &&
+              next.errorMessage.trim().isNotEmpty) {
+            final messenger = ScaffoldMessenger.maybeOf(context);
+            messenger
+              ?..hideCurrentSnackBar()
+              ..showSnackBar(
+                SnackBar(
+                  content: Text(next.errorMessage.trim()),
+                  behavior: SnackBarBehavior.floating,
+                ),
+              );
+          }
+        });
+      });
+    }
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
@@ -2695,159 +3278,28 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 if (_isSearching) ...[
-                  Row(
-                    children: [
-                      if (!widget.searchOnly)
-                        IconButton(
-                          onPressed: () =>
-                              _clearSearch(refreshRecommendations: false),
-                          icon: const Icon(Icons.arrow_back_rounded),
-                          color: Colors.white,
-                        ),
-                      Expanded(
-                        child: Semantics(
-                          label: 'Search music',
-                          child: TextField(
-                            controller: _urlController,
-                            focusNode: _searchFocusNode,
-                            textInputAction: TextInputAction.search,
-                            style: const TextStyle(color: Colors.white),
-                            decoration: InputDecoration(
-                              hintText: 'Search tracks, albums, artists',
-                              hintStyle: TextStyle(
-                                color: Colors.white.withValues(alpha: 0.34),
-                              ),
-                              filled: true,
-                              fillColor: Colors.white.withValues(alpha: 0.05),
-                              isDense: true,
-                              contentPadding: const EdgeInsets.symmetric(
-                                vertical: 12,
-                                horizontal: 14,
-                              ),
-                              border: OutlineInputBorder(
-                                borderRadius:
-                                    BorderRadius.circular(_radiusMedium),
-                                borderSide: BorderSide.none,
-                              ),
-                              suffixIcon: _urlController.text.trim().isNotEmpty
-                                  ? IconButton(
-                                      icon: const Icon(
-                                        Icons.close_rounded,
-                                        color: Colors.white70,
-                                      ),
-                                      onPressed: () => _clearSearch(
-                                        refreshRecommendations: false,
-                                      ),
-                                    )
-                                  : null,
-                            ),
-                            onSubmitted: (_) => _performSearch(ref),
-                          ),
-                        ),
-                      ),
-                    ],
+                  SearchHeaderBar(
+                    controller: _urlController,
+                    focusNode: _searchFocusNode,
+                    showBackButton: !widget.searchOnly,
+                    onBack: () => _clearSearch(refreshRecommendations: false),
+                    onClear: () => _clearSearch(refreshRecommendations: false),
+                    onSubmitted: (_) => _performSearch(ref),
                   ),
                   const SizedBox(height: 12),
                 ],
 
                 if (showSearchSuggestions)
-                  Container(
-                    margin: const EdgeInsets.only(bottom: 14),
-                    decoration: BoxDecoration(
-                      color: Colors.white.withValues(alpha: 0.035),
-                      borderRadius: BorderRadius.circular(_radiusMedium),
-                      border: Border.all(
-                        color: Colors.white.withValues(alpha: 0.08),
-                      ),
-                    ),
-                    child: ListView.builder(
-                      shrinkWrap: true,
-                      physics: const NeverScrollableScrollPhysics(),
-                      itemCount: suggestState.length,
-                      itemBuilder: (context, i) {
-                        return ListTile(
-                          leading:
-                              const Icon(Icons.search, color: Colors.white54),
-                          title: Text(
-                            suggestState[i],
-                            style: const TextStyle(color: Colors.white),
-                          ),
-                          onTap: () => _performSearch(ref, suggestState[i]),
-                        );
-                      },
-                    ),
+                  SearchSuggestionPanel(
+                    suggestions: suggestState,
+                    onSelectSuggestion: (query) => _performSearch(ref, query),
                   ),
 
                 if (!_isSearching && !showSearchSuggestions) ...[
                   const SizedBox(height: 8),
-                  Tooltip(
-                    message: _heroQuip,
-                    child: Material(
-                      color: Colors.transparent,
-                      child: InkWell(
-                        borderRadius: BorderRadius.circular(_radiusLarge),
-                        onTap: _openAssistant,
-                        child: Container(
-                          width: double.infinity,
-                          padding: const EdgeInsets.all(14),
-                          decoration: BoxDecoration(
-                            color: Colors.white.withValues(alpha: 0.03),
-                            borderRadius: BorderRadius.circular(_radiusLarge),
-                            border: Border.all(
-                              color: Colors.white.withValues(alpha: 0.08),
-                            ),
-                          ),
-                          child: Row(
-                            children: [
-                              Container(
-                                width: 42,
-                                height: 42,
-                                decoration: BoxDecoration(
-                                  color: Colors.white.withValues(alpha: 0.06),
-                                  borderRadius:
-                                      BorderRadius.circular(_radiusMedium),
-                                ),
-                                child: const Icon(
-                                  Icons.auto_awesome_rounded,
-                                  color: Colors.white,
-                                ),
-                              ),
-                              const SizedBox(width: 12),
-                              Expanded(
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    const Text(
-                                      'Ask EBB',
-                                      style: TextStyle(
-                                        color: Colors.white,
-                                        fontSize: 15,
-                                        fontWeight: FontWeight.w700,
-                                      ),
-                                    ),
-                                    const SizedBox(height: 4),
-                                    Text(
-                                      'Describe a mood, artist, era, or playlist idea and get playable picks back.',
-                                      style: TextStyle(
-                                        color: Colors.white.withValues(
-                                          alpha: 0.68,
-                                        ),
-                                        fontSize: 12,
-                                        height: 1.4,
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              ),
-                              Icon(
-                                Icons.chevron_right_rounded,
-                                color: Colors.white.withValues(alpha: 0.6),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                    ),
+                  AssistantLauncherCard(
+                    tooltip: _heroQuip,
+                    onTap: _openAssistant,
                   ),
                 ],
 
@@ -2855,149 +3307,25 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
 
                 // Content Area (Search vs Recommendations)
                 if (_isSearching) ...[
-                  if (showRecentSearchHistory) ...[
-                    Text(
-                      'Recent searches',
-                      style: TextStyle(
-                        color: Colors.white.withValues(alpha: 0.78),
-                        fontSize: 14,
-                        fontWeight: FontWeight.w700,
-                        letterSpacing: 0.4,
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    ..._recentSearchHistory.map((query) {
-                      return Container(
-                        margin: const EdgeInsets.only(bottom: 10),
-                        decoration: BoxDecoration(
-                          color: Colors.white.withValues(alpha: 0.03),
-                          borderRadius: BorderRadius.circular(_radiusMedium),
-                          border: Border.all(
-                            color: Colors.white.withValues(alpha: 0.08),
-                          ),
-                        ),
-                        child: ListTile(
-                          leading: const Icon(
-                            Icons.history_rounded,
-                            color: Colors.white70,
-                          ),
-                          title: Text(
-                            query,
-                            style: const TextStyle(color: Colors.white),
-                          ),
-                          trailing: Icon(
-                            Icons.north_west_rounded,
-                            color: Colors.white.withValues(alpha: 0.46),
-                          ),
-                          onTap: () => _performSearch(ref, query),
-                        ),
-                      );
-                    }),
-                    if (_isRecentSearchHistoryLoading) ...[
-                      const SizedBox(height: 6),
-                      const Center(
-                        child: SizedBox(
-                          width: 20,
-                          height: 20,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        ),
-                      ),
-                    ],
-                  ] else ...[
-                    const Text('Search Results',
-                        style: TextStyle(
-                            fontSize: 18,
-                            fontWeight: FontWeight.bold,
-                            color: Colors.white)),
-                    const SizedBox(height: 16),
-                  ],
-                  if (featuredArtist != null) ...[
-                    _buildFeaturedArtistCard(featuredArtist),
-                  ] else if (isSearchLoading) ...[
-                    _buildArtistRow(
-                      const [],
-                      title: 'Artist match',
-                      isLoading: true,
-                    ),
-                    const SizedBox(height: 10),
-                  ],
-                  if (similarArtists.isNotEmpty || isSearchLoading) ...[
-                    _buildArtistRow(
-                      similarArtists,
-                      title: 'Similar artists',
-                      isLoading: isSearchLoading,
-                    ),
-                    const SizedBox(height: 8),
-                  ],
-                  if (featuredAlbum != null) ...[
-                    _buildAlbumList([featuredAlbum], false),
-                    const SizedBox(height: 10),
-                  ],
-                  _buildTrackList(
-                    searchPage.tracks,
-                    isSearchLoading,
-                    searchPage.errorMessage?.trim().isNotEmpty == true
-                        ? searchPage.errorMessage!.trim()
-                        : "No results found.",
-                    playlistId:
-                        'search:${_urlController.text.trim().toLowerCase()}',
-                    playlistName: _urlController.text.trim().isEmpty
-                        ? 'Search results'
-                        : 'Search: ${_urlController.text.trim()}',
-                    playAsDiscoveryMix: true,
+                  SearchContentSection(
+                    songMatchLauncher: songMatchLauncher,
+                    showRecentSearchHistory: showRecentSearchHistory,
+                    recentSearchHistorySection: recentSearchHistorySection,
+                    featuredArtistCard: featuredArtistCard,
+                    artistMatchLoadingCard: artistMatchLoadingCard,
+                    showSimilarArtists:
+                        similarArtists.isNotEmpty || isSearchLoading,
+                    similarArtistsSection: similarArtistsSection,
+                    featuredAlbumSection: featuredAlbumSection,
+                    relatedTracksSection: relatedTracksSection,
+                    trackListSection: trackListSection,
+                    moreAlbumsSection: moreAlbumsSection,
                   ),
-                  if (extraAlbums.isNotEmpty || isSearchLoading) ...[
-                    const SizedBox(height: 24),
-                    const Text(
-                      'More albums',
-                      style: TextStyle(
-                        fontSize: 18,
-                        fontWeight: FontWeight.bold,
-                        color: Colors.white,
-                      ),
-                    ),
-                    const SizedBox(height: 16),
-                    _buildAlbumList(extraAlbums, isSearchLoading),
-                  ],
                 ] else ...[
-                  if (lastPlayedTracks.isNotEmpty) ...[
-                    _buildRecommendationLane(
-                      rowId: 'last_played_local',
-                      title: 'Last played',
-                      itemType: 'track',
-                      items: lastPlayedTracks,
-                      nextOffset: lastPlayedTracks.length,
-                      isLoading: isLastPlayedLoading,
-                    ),
-                    const SizedBox(height: 22),
-                  ],
-                  if (frequentTracks.isNotEmpty) ...[
-                    _buildRecommendationLane(
-                      rowId: 'frequently_listened_local',
-                      title: 'Frequently listened',
-                      itemType: 'track',
-                      items: frequentTracks,
-                      nextOffset: frequentTracks.length,
-                      isLoading: isFrequentlyLoading,
-                    ),
-                    const SizedBox(height: 22),
-                  ],
-                  AnimatedSwitcher(
-                    duration: const Duration(milliseconds: 220),
-                    switchInCurve: Curves.easeOutCubic,
-                    switchOutCurve: Curves.easeInCubic,
-                    child: _buildRecommendationFeedRows(
-                      recState,
-                      isLoading: isRecLoading,
-                      hiddenKinds: (frequentTracks.isNotEmpty &&
-                              recState.rows.any(
-                                (row) =>
-                                    row.kind != 'frequently_listened' &&
-                                    row.items.isNotEmpty,
-                              ))
-                          ? const {'frequently_listened'}
-                          : const {},
-                    ),
+                  HomeRecommendationsSection(
+                    lastPlayedLane: lastPlayedLane,
+                    frequentlyListenedLane: frequentlyListenedLane,
+                    recommendationRows: recommendationRows,
                   ),
                 ],
                 const SizedBox(height: 28),

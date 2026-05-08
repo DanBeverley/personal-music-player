@@ -1,4 +1,4 @@
-part of 'main.dart';
+import 'package:flutter/material.dart';
 
 class FadeIndexedStack extends StatefulWidget {
   final int index;

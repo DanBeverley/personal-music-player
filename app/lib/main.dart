@@ -1,72 +1,19 @@
-import 'dart:io';
-import 'dart:ui';
-import 'dart:convert';
 import 'dart:async';
-import 'dart:math' as math;
+import 'dart:io';
+
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:google_fonts/google_fonts.dart';
-import 'package:http/http.dart' as http;
-import 'package:image_picker/image_picker.dart';
 import 'package:permission_handler/permission_handler.dart';
-import 'logic/audio_provider.dart';
-import 'logic/audio_provider_history.dart';
-import 'logic/audio_provider_queue.dart';
-import 'logic/audio_provider_recommendation.dart';
-import 'logic/auth_provider.dart';
-import 'logic/details_provider.dart';
-import 'logic/download_provider.dart';
-import 'logic/playlist_provider.dart';
-import 'logic/search_provider.dart';
-import 'screens/assistant_screen.dart';
-import 'screens/personal_mix_detail_screen.dart';
-import 'screens/recommendation_row_detail_screen.dart';
-import 'ui/app_theme_tokens.dart';
-import 'widgets/app_artwork.dart';
-import 'widgets/app_bottom_nav_bar.dart';
-import 'widgets/download_hud.dart';
-import 'widgets/home/genre_widgets.dart';
-import 'widgets/home/track_menu_button.dart';
-import 'widgets/playlist/add_to_playlist_dialog.dart';
-import 'widgets/track_list_skeleton.dart';
 
-part 'main_dialogs.dart';
-part 'main_library.dart';
-part 'main_details.dart';
-part 'main_fade_indexed_stack.dart';
-part 'main_home.dart';
-part 'main_player.dart';
-part 'main_shell.dart';
+import 'logic/audio_provider.dart';
+import 'logic/auth_provider.dart';
+import 'main_shell.dart';
+import 'ui/app_theme_tokens.dart';
 
 const _accentGrey = appAccentGrey;
 const _surfaceGrey = appSurfaceGrey;
-const _surfaceGreyAlt = appSurfaceGreyAlt;
 const _voidBlack = appVoidBlack;
-const double _radiusLarge = appRadiusLarge;
-const double _radiusMedium = appRadiusMedium;
-const List<Color> _playlistCoverPalette = appPlaylistCoverPalette;
-const List<String> _quipOpeners = <String>[
-  'Today\'s sonic forecast',
-  'Current music goblin memo',
-  'Breaking genre news',
-  'The headphone council reports',
-  'Fresh dispatch from the aux cord tribunal',
-];
-const List<String> _quipMiddles = <String>[
-  'your queue is one impulsive click away from becoming a legal issue',
-  'someone out there is still defending their 47-minute bagpipe ambient cut',
-  'the algorithm briefly achieved sentience and immediately asked for one more chorus',
-  'your taste is giving “I know a shortcut” right before getting lost in a concept album',
-  'a bassline just kicked the door open and demanded better transitions',
-];
-const List<String> _quipClosers = <String>[
-  'Proceed with swagger.',
-  'Use responsibly near the skip button.',
-  'No moderators were consulted.',
-  'Respectfully: play it too loud.',
-  'The aux has never been safer.',
-];
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();

@@ -1,4 +1,27 @@
-part of 'main.dart';
+import 'dart:async';
+
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:google_fonts/google_fonts.dart';
+
+import 'home_screen_controller.dart';
+import 'logic/audio_provider.dart';
+import 'logic/audio_provider_queue.dart';
+import 'logic/auth_provider.dart';
+import 'logic/song_match_provider.dart';
+import 'main_fade_indexed_stack.dart';
+import 'main_home.dart';
+import 'main_library.dart';
+import 'ui/app_theme_tokens.dart';
+import 'widgets/app_bottom_nav_bar.dart';
+import 'widgets/download_hud.dart';
+import 'widgets/player/mini_player.dart';
+
+const _surfaceGreyAlt = appSurfaceGreyAlt;
+const _voidBlack = appVoidBlack;
+const double _radiusLarge = appRadiusLarge;
+const double _radiusMedium = appRadiusMedium;
 
 class AuthGateScreen extends ConsumerStatefulWidget {
   const AuthGateScreen({super.key});
@@ -175,10 +198,33 @@ class MainLayout extends ConsumerStatefulWidget {
 
 class _MainLayoutState extends ConsumerState<MainLayout> {
   int _currentIndex = 0;
-  final GlobalKey<_HomeScreenState> _homeKey =
-      GlobalKey<_HomeScreenState>();
-  final GlobalKey<_HomeScreenState> _searchKey =
-      GlobalKey<_HomeScreenState>();
+  int _lastHandledSongMatchIntentToken = 0;
+  final HomeScreenController _homeController = HomeScreenController();
+  final HomeScreenController _searchController = HomeScreenController();
+
+  @override
+  void dispose() {
+    _homeController.dispose();
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  void _openSearchSongMatchFlow({bool preferPendingShared = false}) {
+    if (!mounted) return;
+    if (_currentIndex != 1) {
+      setState(() => _currentIndex = 1);
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _searchController.requestFocusSearch();
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        _searchController.requestOpenSongMatchSheet(
+          preferPendingShared: preferPendingShared,
+        );
+      });
+    });
+  }
 
   void _handleBottomSelection(int index) {
     if (_currentIndex != index) {
@@ -187,19 +233,23 @@ class _MainLayoutState extends ConsumerState<MainLayout> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       if (index == 0) {
-        _homeKey.currentState?.showHomeFeed();
+        _homeController.requestShowHomeFeed();
       } else if (index == 1) {
-        _searchKey.currentState?.focusSearch();
+        _searchController.requestFocusSearch();
       }
     });
   }
 
   bool _handleBackForCurrentTab() {
     if (_currentIndex == 1) {
-      return _searchKey.currentState?.handleSystemBack() ?? false;
+      if (!_searchController.value.canHandleBack) return false;
+      _searchController.requestHandleBack();
+      return true;
     }
     if (_currentIndex == 0) {
-      return _homeKey.currentState?.handleSystemBack() ?? false;
+      if (!_homeController.value.canHandleBack) return false;
+      _homeController.requestHandleBack();
+      return true;
     }
     return false;
   }
@@ -255,13 +305,21 @@ class _MainLayoutState extends ConsumerState<MainLayout> {
         (state) => state.currentTrackName != 'No track loaded',
       ),
     );
+    final songMatchState = ref.watch(songMatchProvider);
+    if (songMatchState.shareIntentToken > _lastHandledSongMatchIntentToken &&
+        songMatchState.hasPendingSharedMedia) {
+      _lastHandledSongMatchIntentToken = songMatchState.shareIntentToken;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _openSearchSongMatchFlow(preferPendingShared: true);
+      });
+    }
     final viewBottomInset = MediaQuery.of(context).viewPadding.bottom;
     final pages = <Widget>[
       HomeScreen(
-        key: _homeKey,
+        controller: _homeController,
       ),
       HomeScreen(
-        key: _searchKey,
+        controller: _searchController,
         searchOnly: true,
       ),
       const LibraryScreen(),
@@ -279,7 +337,7 @@ class _MainLayoutState extends ConsumerState<MainLayout> {
           setState(() => _currentIndex = 0);
           WidgetsBinding.instance.addPostFrameCallback((_) {
             if (!mounted) return;
-            _homeKey.currentState?.showHomeFeed();
+            _homeController.requestShowHomeFeed();
           });
           return;
         }

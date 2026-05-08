@@ -114,3 +114,23 @@ bool isMetadataHeavyQuery(String query) {
       normalized.split(RegExp(r'\s+')).where(noisyTokens.contains).length;
   return hits >= 2;
 }
+
+String classifySearchQueryMode(String query) {
+  final normalized = query.trim().toLowerCase();
+  if (normalized.isEmpty) return 'exact';
+  if (looksLikeSemanticTasteQuery(normalized)) {
+    return 'taste';
+  }
+  const entityHints = <String>[
+    'album',
+    'artist',
+    'band',
+    'discography',
+    'ost',
+    'soundtrack',
+  ];
+  if (entityHints.any((hint) => normalized.contains(hint))) {
+    return 'entity';
+  }
+  return 'exact';
+}

@@ -3,9 +3,19 @@ import 'dart:convert';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import 'audio_provider.dart';
 import 'audio_provider_recommendation.dart';
 import 'auth_provider.dart';
+import 'audio_provider.dart' show audioPlayerProvider;
+import 'cloud_search_queries.dart';
+import 'history_manager.dart';
+import 'interaction_events.dart';
+import 'library_catalog_provider.dart';
+import 'playback_models.dart';
+import 'proxy_runtime.dart';
+import 'recommendation_feed_models.dart';
+import 'search_semantics.dart';
+import 'search_payload_runtime.dart';
+import 'track_metadata.dart';
 
 class TrackDetailsNotifier extends StateNotifier<Map<String, dynamic>?> {
   final Ref ref;
@@ -58,7 +68,7 @@ class AlbumSearchNotifier extends StateNotifier<List<Map<String, dynamic>>> {
     state = [...state];
     try {
       final body = await buildSemanticSearchRequestBody(
-        ref,
+        ref.read,
         query,
         limit: 12,
       );
@@ -76,9 +86,9 @@ class AlbumSearchNotifier extends StateNotifier<List<Map<String, dynamic>>> {
         state = albums
             .map((album) => Map<String, dynamic>.from(album as Map))
             .toList(growable: false);
-        logProxyDiagnostic(
+        debugProxyLog(
           'search',
-          'album query="$query" status=200 results=${state.length} diagnostics=${compactProxyDiagnosticValue(payload['diagnostics'])}',
+          'album query="$query" status=200 results=${state.length} diagnostics=${compactDiagnosticValue(payload['diagnostics'])}',
         );
         unawaited(
           recordProxySearchEvent(
@@ -88,14 +98,14 @@ class AlbumSearchNotifier extends StateNotifier<List<Map<String, dynamic>>> {
           ),
         );
       } else {
-        logProxyDiagnostic(
+        debugProxyLog(
           'search',
           'album query="$query" status=${res.statusCode} body=${res.body}',
         );
         state = const [];
       }
     } catch (error) {
-      logProxyDiagnostic('search', 'album query="$query" error=$error');
+      debugProxyLog('search', 'album query="$query" error=$error');
       if (requestVersion != _requestVersion) return;
       state = const [];
     } finally {
@@ -198,7 +208,7 @@ class ArtistSearchNotifier extends StateNotifier<List<Map<String, dynamic>>> {
     state = [...state];
     try {
       final body = await buildSemanticSearchRequestBody(
-        ref,
+        ref.read,
         trimmed,
         limit: 12,
       );
@@ -216,9 +226,9 @@ class ArtistSearchNotifier extends StateNotifier<List<Map<String, dynamic>>> {
         state = artists
             .map((artist) => Map<String, dynamic>.from(artist as Map))
             .toList(growable: false);
-        logProxyDiagnostic(
+        debugProxyLog(
           'search',
-          'artist query="$trimmed" status=200 results=${state.length} diagnostics=${compactProxyDiagnosticValue(payload['diagnostics'])}',
+          'artist query="$trimmed" status=200 results=${state.length} diagnostics=${compactDiagnosticValue(payload['diagnostics'])}',
         );
         unawaited(
           recordProxySearchEvent(
@@ -228,14 +238,14 @@ class ArtistSearchNotifier extends StateNotifier<List<Map<String, dynamic>>> {
           ),
         );
       } else {
-        logProxyDiagnostic(
+        debugProxyLog(
           'search',
           'artist query="$trimmed" status=${res.statusCode} body=${res.body}',
         );
         state = const [];
       }
     } catch (error) {
-      logProxyDiagnostic('search', 'artist query="$trimmed" error=$error');
+      debugProxyLog('search', 'artist query="$trimmed" error=$error');
       if (requestVersion != _requestVersion) return;
       state = const [];
     } finally {
@@ -329,7 +339,7 @@ class RecommendedArtistsNotifier
       if (mounted) {
         state = [...state];
       }
-      logProxyDiagnostic(
+      debugProxyLog(
         'artists',
         'bootstrap deferred until auth initialization completes for scope=${authState.storageScopeId}',
       );
@@ -341,7 +351,7 @@ class RecommendedArtistsNotifier
       if (mounted) {
         state = [...state];
       }
-      logProxyDiagnostic(
+      debugProxyLog(
         'artists',
         'bootstrap deferred until recommendation rows are available for scope=${authState.storageScopeId}',
       );
@@ -434,7 +444,7 @@ class RecommendedArtistsNotifier
       if (surface == 'home_feed' &&
           requestArtistHints.isEmpty &&
           normalizedAnchorTracks.isEmpty) {
-        logProxyDiagnostic(
+        debugProxyLog(
           'artists',
           'recommended deferred for home_feed because stable feed seeds are not available yet',
         );
@@ -442,9 +452,9 @@ class RecommendedArtistsNotifier
         state = previousState;
         return;
       }
-      logProxyDiagnostic(
+      debugProxyLog(
         'artists',
-        'recommended start surface=$surface force=$forceRefresh hints=${compactProxyDiagnosticValue(requestArtistHints)} anchors=${normalizedAnchorTracks.length}',
+        'recommended start surface=$surface force=$forceRefresh hints=${compactDiagnosticValue(requestArtistHints)} anchors=${normalizedAnchorTracks.length}',
       );
 
       final res = await proxyControlHttpClient
@@ -475,19 +485,19 @@ class RecommendedArtistsNotifier
         state = artists
             .map((artist) => Map<String, dynamic>.from(artist as Map))
             .toList(growable: false);
-        logProxyDiagnostic(
+        debugProxyLog(
           'artists',
-          'recommended surface=$surface status=200 results=${state.length} diagnostics=${compactProxyDiagnosticValue(payload['diagnostics'])}',
+          'recommended surface=$surface status=200 results=${state.length} diagnostics=${compactDiagnosticValue(payload['diagnostics'])}',
         );
       } else {
-        logProxyDiagnostic(
+        debugProxyLog(
           'artists',
           'recommended surface=$surface status=${res.statusCode} body=${res.body}',
         );
         state = previousState;
       }
     } catch (error) {
-      logProxyDiagnostic('artists', 'recommended surface=$surface error=$error');
+      debugProxyLog('artists', 'recommended surface=$surface error=$error');
       if (!_isRequestCurrent(requestVersion)) return;
       state = previousState;
     } finally {

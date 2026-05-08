@@ -2,8 +2,9 @@ import 'dart:async';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import 'audio_provider.dart' show HistoryManager, audioPlayerProvider;
 import 'auth_provider.dart' show authProvider, storageRefreshTickProvider;
+import 'audio_provider.dart' show audioPlayerProvider;
+import 'history_manager.dart';
 import 'track_hydration.dart';
 import 'track_metadata.dart';
 

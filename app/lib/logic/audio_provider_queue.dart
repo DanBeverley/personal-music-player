@@ -6,15 +6,12 @@ import 'dart:math';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import 'audio_provider.dart'
-    show
-        AuralisAudioHandler,
-        HistoryManager,
-        audioPlayerProvider,
-        globalAudioHandler,
-        recordProxyInteractionEvent;
+import 'audio_provider.dart' show audioPlayerProvider;
 import 'audio_provider_history.dart';
 import 'audio_provider_request_builder.dart';
+import 'audio_service_bridge.dart';
+import 'history_manager.dart';
+import 'interaction_events.dart';
 import 'playlist_provider.dart';
 import 'proxy_runtime.dart';
 import 'track_metadata.dart';

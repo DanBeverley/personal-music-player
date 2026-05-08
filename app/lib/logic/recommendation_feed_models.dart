@@ -84,6 +84,27 @@ class RecommendationFeedRowState {
         'has_more': hasMore,
       };
 
+  bool get isPending => (meta['loading_state']?.toString() ?? '') == 'pending';
+
+  bool get isDeferredFlagship => meta['deferred_flagship'] == true;
+
+  bool get isPartialReady => meta['partial_ready'] == true;
+
+  String get rowState => meta['row_state']?.toString().trim() ?? '';
+
+  int get rowVersion => (meta['row_version'] as num?)?.toInt() ?? 0;
+
+  bool get isRefinementActive =>
+      meta['refinement_active'] == true || rowState == 'partial_inflight';
+
+  bool get isUnavailable => rowState == 'unavailable';
+
+  int get refineAfterMs => (meta['refine_after_ms'] as num?)?.toInt() ?? 0;
+
+  String get loadingLabel => meta['loading_label']?.toString().trim() ?? '';
+
+  String get loadingMessage => meta['loading_message']?.toString().trim() ?? '';
+
   RecommendationFeedRowState copyWith({
     String? id,
     String? title,

@@ -28,7 +28,7 @@ Map<String, dynamic> buildSuggestRequestBody(
 class SuggestNotifier extends StateNotifier<List<String>> {
   final Ref ref;
   int _requestVersion = 0;
-  static const Duration _suggestDebounce = Duration(milliseconds: 160);
+  static const Duration _suggestDebounce = Duration(milliseconds: 220);
 
   SuggestNotifier(this.ref) : super(const <String>[]);
 
@@ -41,8 +41,7 @@ class SuggestNotifier extends StateNotifier<List<String>> {
     try {
       await Future<void>.delayed(_suggestDebounce);
       if (requestVersion != _requestVersion) return;
-      final recentQueries = await getRecentCloudSearchQueries(limit: 4);
-      if (requestVersion != _requestVersion) return;
+      final recentQueries = peekRecentCloudSearchQueries(limit: 4);
       final body = buildSuggestRequestBody(
         ref,
         query,

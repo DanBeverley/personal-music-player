@@ -2,7 +2,7 @@ import 'dart:convert';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import 'audio_provider.dart' show libraryProvider;
+import 'library_catalog_provider.dart';
 import 'proxy_runtime.dart';
 import 'track_metadata.dart';
 

@@ -2,14 +2,10 @@ import 'dart:async';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import 'audio_provider.dart'
-    show
-        audioPlayerProvider,
-        fetchSearchPayload,
-        notifyRecommendationSignal,
-        recordCloudSearchEvent,
-        recordProxySearchEvent;
+import 'audio_provider.dart' show audioPlayerProvider;
+import 'interaction_events.dart';
 import 'proxy_runtime.dart';
+import 'search_payload_runtime.dart';
 import 'track_metadata.dart';
 
 class SearchNotifier extends StateNotifier<List<dynamic>> {
@@ -43,7 +39,7 @@ class SearchNotifier extends StateNotifier<List<dynamic>> {
       if (requestVersion != _requestVersion) return;
       if (requestVersion != _requestVersion) return;
       final fetchResult = await fetchSearchPayload(
-        ref,
+        ref.read,
         normalizedQuery,
         limit: 16,
         timeout: _searchTimeout,
@@ -120,6 +116,7 @@ class SearchPageState {
   final List<Map<String, dynamic>> artists;
   final List<Map<String, dynamic>> albums;
   final List<Map<String, dynamic>> similarArtists;
+  final List<Map<String, dynamic>> similarTracks;
   final Map<String, dynamic> diagnostics;
   final String? errorMessage;
 
@@ -133,6 +130,7 @@ class SearchPageState {
     this.artists = const [],
     this.albums = const [],
     this.similarArtists = const [],
+    this.similarTracks = const [],
     this.diagnostics = const {},
     this.errorMessage,
   });
@@ -142,7 +140,8 @@ class SearchPageState {
       tracks.isNotEmpty ||
       artists.isNotEmpty ||
       albums.isNotEmpty ||
-      similarArtists.isNotEmpty;
+      similarArtists.isNotEmpty ||
+      similarTracks.isNotEmpty;
 
   factory SearchPageState.fromJson(Map<String, dynamic> json) {
     final rawTopResult = json['top_result'];
@@ -165,6 +164,8 @@ class SearchPageState {
     final rawAlbums = (json['albums'] as List<dynamic>? ?? const []);
     final rawSimilarArtists =
         (json['similar_artists'] as List<dynamic>? ?? const []);
+    final rawSimilarTracks =
+        (json['similar_tracks'] as List<dynamic>? ?? const []);
     final normalizedTracks = rawTracks
         .whereType<Map>()
         .map((entry) => normalizeTrack(Map<String, dynamic>.from(entry)))
@@ -210,6 +211,11 @@ class SearchPageState {
               (artist['id']?.toString().trim().isNotEmpty ?? false) ||
               (artist['name']?.toString().trim().isNotEmpty ?? false))
           .toList(growable: false),
+      similarTracks: rawSimilarTracks
+          .whereType<Map>()
+          .map((entry) => normalizeTrack(Map<String, dynamic>.from(entry)))
+          .where((track) => extractTrackId(track)?.isNotEmpty ?? false)
+          .toList(growable: false),
       diagnostics: json['diagnostics'] is Map
           ? Map<String, dynamic>.from(json['diagnostics'] as Map)
           : const {},
@@ -231,6 +237,7 @@ class SearchPageState {
     List<Map<String, dynamic>>? artists,
     List<Map<String, dynamic>>? albums,
     List<Map<String, dynamic>>? similarArtists,
+    List<Map<String, dynamic>>? similarTracks,
     Map<String, dynamic>? diagnostics,
     String? errorMessage,
     bool clearError = false,
@@ -245,6 +252,7 @@ class SearchPageState {
       artists: artists ?? this.artists,
       albums: albums ?? this.albums,
       similarArtists: similarArtists ?? this.similarArtists,
+      similarTracks: similarTracks ?? this.similarTracks,
       diagnostics: diagnostics ?? this.diagnostics,
       errorMessage: clearError ? null : errorMessage ?? this.errorMessage,
     );
@@ -267,7 +275,7 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
   }) async {
     try {
       final fetchResult = await fetchSearchPayload(
-        ref,
+        ref.read,
         normalizedQuery,
         limit: 16,
         timeout: _searchEnrichmentTimeout,
@@ -293,6 +301,7 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
         artists: nextState.artists,
         albums: nextState.albums,
         similarArtists: nextState.similarArtists,
+        similarTracks: nextState.similarTracks,
         diagnostics: <String, dynamic>{
           ...state.diagnostics,
           ...nextState.diagnostics,
@@ -329,7 +338,7 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
       }
       if (requestVersion != _requestVersion) return;
       final fetchResult = await fetchSearchPayload(
-        ref,
+        ref.read,
         normalizedQuery,
         limit: 16,
         timeout: _searchTimeout,
@@ -369,7 +378,8 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
         final needsEnrichment = nextState.tracks.isNotEmpty &&
             nextState.artists.isEmpty &&
             nextState.albums.isEmpty &&
-            nextState.similarArtists.isEmpty;
+            nextState.similarArtists.isEmpty &&
+            nextState.similarTracks.isEmpty;
         if (needsEnrichment) {
           unawaited(
             _enrichSearchPageResults(

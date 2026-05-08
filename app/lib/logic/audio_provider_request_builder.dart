@@ -1,11 +1,65 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import 'audio_provider.dart' show HistoryManager, libraryProvider;
 import 'auth_provider.dart' show authProvider;
 import 'cloud_search_queries.dart';
+import 'history_manager.dart';
+import 'library_catalog_provider.dart';
 import 'playlist_provider.dart';
 import 'search_semantics.dart';
 import 'track_metadata.dart';
+
+enum RecommendationRequestMode {
+  launch,
+  quick,
+  queueSupplemental,
+  pullToRefresh,
+  backgroundPrepare,
+  rowPage,
+  rowContext,
+  liveRowRefresh,
+  flagshipRefine,
+}
+
+class _RecommendationRequestBehavior {
+  final bool forceRefresh;
+  final bool prepareNextSession;
+  final bool preferFreshRows;
+  final bool hydrateHeavyRows;
+
+  const _RecommendationRequestBehavior({
+    this.forceRefresh = false,
+    this.prepareNextSession = false,
+    this.preferFreshRows = false,
+    this.hydrateHeavyRows = false,
+  });
+}
+
+_RecommendationRequestBehavior _recommendationRequestBehavior(
+  RecommendationRequestMode requestMode, {
+  bool preferFreshRows = false,
+}) {
+  switch (requestMode) {
+    case RecommendationRequestMode.pullToRefresh:
+      return const _RecommendationRequestBehavior(forceRefresh: true);
+    case RecommendationRequestMode.backgroundPrepare:
+      return const _RecommendationRequestBehavior(prepareNextSession: true);
+    case RecommendationRequestMode.flagshipRefine:
+      return _RecommendationRequestBehavior(
+        prepareNextSession: true,
+        preferFreshRows: preferFreshRows,
+        hydrateHeavyRows: true,
+      );
+    case RecommendationRequestMode.launch:
+    case RecommendationRequestMode.quick:
+    case RecommendationRequestMode.queueSupplemental:
+    case RecommendationRequestMode.rowPage:
+    case RecommendationRequestMode.rowContext:
+    case RecommendationRequestMode.liveRowRefresh:
+      return _RecommendationRequestBehavior(
+        preferFreshRows: preferFreshRows,
+      );
+  }
+}
 
 bool _looksLikeRecommendationTasteQuery(String query) {
   final normalized = query.trim().toLowerCase();
@@ -29,24 +83,31 @@ Future<Map<String, dynamic>> buildRecommendationRequestBody(
   required int limit,
   int offset = 0,
   Set<String> avoidIds = const <String>{},
-  bool forceRefresh = false,
-  bool prepareNextSession = false,
+  RecommendationRequestMode requestMode = RecommendationRequestMode.launch,
   bool preferFreshRows = false,
-  bool hydrateHeavyRows = false,
   List<String> extraArtistHints = const <String>[],
   List<String> extraTasteQueries = const <String>[],
   List<String> extraSessionQueries = const <String>[],
+  bool allowNetworkCloudQueries = true,
 }) async {
+  final behavior = _recommendationRequestBehavior(
+    requestMode,
+    preferFreshRows: preferFreshRows,
+  );
   final playlists = ref.read(playlistProvider);
   final libraryTracks = ref.read(libraryProvider).valueOrNull ?? const [];
   final storageScopeId = ref.read(authProvider).storageScopeId;
   final requestSignals = await Future.wait<Object?>([
-    HistoryManager.getRecentTrackSnapshots(limit: forceRefresh ? 14 : 10),
+    HistoryManager.getRecentTrackSnapshots(
+      limit: behavior.forceRefresh ? 14 : 10,
+    ),
     HistoryManager.getLastPlayedTrackSnapshots(limit: 8),
     HistoryManager.getFrequentlyPlayedTrackSnapshots(limit: 10),
-    HistoryManager.getRecentSeeds(limit: forceRefresh ? 14 : 10),
+    HistoryManager.getRecentSeeds(limit: behavior.forceRefresh ? 14 : 10),
     HistoryManager.getFrequentlyPlayedTrackIds(limit: 10),
-    getRecentCloudSearchQueries(limit: 8),
+    allowNetworkCloudQueries
+        ? getRecentCloudSearchQueries(limit: 8)
+        : Future<List<String>>.value(peekRecentCloudSearchQueries(limit: 8)),
   ]);
   final recentTrackSnapshots =
       List<Map<String, dynamic>>.from(requestSignals[0] as List);
@@ -125,14 +186,16 @@ Future<Map<String, dynamic>> buildRecommendationRequestBody(
     'limit': limit,
     'offset': offset,
     'user_scope_id': storageScopeId,
-    'force_refresh': forceRefresh,
-    'prepare_next_session': prepareNextSession,
-    'prefer_fresh_rows': preferFreshRows,
-    if (preferFreshRows)
+    'force_refresh': behavior.forceRefresh,
+    'prepare_next_session': behavior.prepareNextSession,
+    'prefer_fresh_rows': behavior.preferFreshRows,
+    if (behavior.preferFreshRows)
       'refresh_token': DateTime.now().millisecondsSinceEpoch.toString(),
-    'hydrate_heavy_rows': hydrateHeavyRows,
+    'hydrate_heavy_rows': behavior.hydrateHeavyRows,
     if (seedIds.isNotEmpty) 'seed_id': seedIds.first,
-    'seed_ids': seedIds.take(forceRefresh ? 6 : 5).toList(growable: false),
+    'seed_ids': seedIds
+        .take(behavior.forceRefresh ? 6 : 5)
+        .toList(growable: false),
     'recent_track_ids': recentTrackIds,
     'top_track_ids': topTrackIds,
     'recent_track_snapshots': recentTrackSnapshots,
@@ -150,5 +213,36 @@ Future<Map<String, dynamic>> buildRecommendationRequestBody(
     if (explicitTasteQueries.isNotEmpty)
       'taste_queries': explicitTasteQueries.take(8).toList(growable: false),
     'avoid_ids': avoidIds.take(40).toList(growable: false),
+  };
+}
+
+Map<String, dynamic> buildRecommendationRowRefreshBody(
+  Ref ref, {
+  required String sessionId,
+  required String rowId,
+  String rowContext = 'flagship_refine',
+  int limit = 8,
+  RecommendationRequestMode requestMode =
+      RecommendationRequestMode.flagshipRefine,
+  bool preferFreshRows = false,
+}) {
+  final behavior = _recommendationRequestBehavior(
+    requestMode,
+    preferFreshRows: preferFreshRows,
+  );
+  final storageScopeId = ref.read(authProvider).storageScopeId;
+  return {
+    'query': '',
+    'user_scope_id': storageScopeId,
+    'session_id': sessionId,
+    'row_id': rowId,
+    'row_context': rowContext,
+    'offset': 0,
+    'limit': limit,
+    'prefer_fresh_rows': behavior.preferFreshRows,
+    if (behavior.preferFreshRows)
+      'refresh_token': DateTime.now().millisecondsSinceEpoch.toString(),
+    'prepare_next_session': behavior.prepareNextSession,
+    'hydrate_heavy_rows': behavior.hydrateHeavyRows,
   };
 }

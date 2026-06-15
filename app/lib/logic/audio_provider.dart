@@ -10,13 +10,16 @@ import '../ffi/audio_ffi.dart';
 import 'audio_media_session_runtime.dart';
 import 'audio_queue_runtime.dart';
 import 'audio_service_bridge.dart';
+import 'audio_sleep_timer_policy.dart';
 import 'audio_stream_runtime.dart';
 import 'auth_provider.dart';
 import 'history_manager.dart';
+import 'interaction_events.dart';
 import 'library_catalog_provider.dart';
 import 'playback_models.dart';
 import 'proxy_runtime.dart';
 import 'remembered_track_store.dart';
+import 'stream_loop_policy.dart';
 import 'track_metadata.dart';
 import 'package:just_audio/just_audio.dart' hide PlayerState;
 
@@ -41,18 +44,7 @@ int _parseInt(dynamic value) {
   return 0;
 }
 
-enum _StreamPlaybackMode {
-  singleStream,
-  managedQueue,
-}
-
-enum _StreamLoopPolicy {
-  off,
-  track,
-}
-
 class AudioPlayerNotifier extends StateNotifier<PlayerState> {
-  static const int _initialQueuePrepareLookahead = 3;
   static const int _historyCommitMinSeconds = 12;
   static const double _historyCommitMinRatio = 0.35;
   final AudioEngineFFI audioEngine;
@@ -61,7 +53,8 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
   Future<void> Function(String? videoId)? onTrackChanged;
   Timer? _playbackTimer;
   final streamPlayer = AudioPlayer(useLazyPreparation: false);
-  final RememberedTrackStore _rememberedTrackStore = const RememberedTrackStore();
+  final RememberedTrackStore _rememberedTrackStore =
+      const RememberedTrackStore();
   final List<AudioPlayer> _prefetchPlayers = List<AudioPlayer>.generate(
     2,
     (_) => AudioPlayer(
@@ -76,15 +69,14 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
   StreamSubscription<Duration>? _streamPositionSub;
   StreamSubscription<Duration?>? _streamDurationSub;
   StreamSubscription<dynamic>? _streamPlaybackSub;
+  StreamSubscription<dynamic>? _streamPlaybackErrorSub;
   StreamSubscription<int?>? _streamCurrentIndexSub;
   Future<void> _streamCommandQueue = Future<void>.value();
-  LockCachingAudioSource? _cachedStreamAudioSource;
   String? _cachedStreamVideoId;
   int _streamLoadVersion = 0;
   bool _desiredStreamPlaying = false;
   String? _completedTrackIdNotified;
   bool _streamTransitionInProgress = false;
-  bool _streamLoopRestartInProgress = false;
   bool _streamSeekRecoveryInProgress = false;
   bool _managedQueueActive = false;
   List<Map<String, dynamic>> _managedQueueTracks = const [];
@@ -92,6 +84,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
   Timer? _sleepTimer;
   DateTime? _sleepTimerEndsAt;
   bool _streamFailureRecoveryInProgress = false;
+  int _lastFailureRecoveryLoadVersion = -1;
   Map<String, dynamic>? _pendingHistorySnapshot;
   String? _historyCommittedTrackId;
 
@@ -110,6 +103,8 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       handler.onFastForward = () => seek(state.currentPosition + 10);
       handler.onRewind = () => seek(state.currentPosition - 10);
       handler.onStop = () => stopPlayback(resetState: true);
+      handler.onSkipToNext = skipManagedQueueNext;
+      handler.onSkipToPrevious = skipManagedQueuePrevious;
     }
     unawaited(_restoreRememberedTrack());
   }
@@ -261,8 +256,9 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         activeTrackId != pendingTrackId) {
       return;
     }
-    final hasStartedPlayback =
-        state.currentPositionMs > 0 || state.currentPosition > 0 || state.isPlaying;
+    final hasStartedPlayback = state.currentPositionMs > 0 ||
+        state.currentPosition > 0 ||
+        state.isPlaying;
     if (!hasStartedPlayback) {
       return;
     }
@@ -376,24 +372,27 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       if (index == null || index < 0 || index >= _managedQueueTracks.length) {
         return;
       }
+      _streamRuntime.markActivePlaybackVideoId(
+        extractTrackId(_managedQueueTracks[index]),
+      );
       _applyManagedTrackMetadata(index, resetPosition: true);
       unawaited(_refreshManagedQueueWarmup());
     });
 
-      _streamPositionSub = streamPlayer.positionStream.listen((position) {
-        if (!_activeStream) return;
-        final seconds = position.inSeconds;
-        final milliseconds = position.inMilliseconds;
-        if (seconds != state.currentPosition ||
-            milliseconds != state.currentPositionMs) {
-          state = state.copyWith(
-            currentPosition: seconds,
-            currentPositionMs: milliseconds,
-          );
-          unawaited(_activatePendingHistorySnapshotIfReady());
-          unawaited(_commitPendingHistoryIfEligible());
-        }
-      });
+    _streamPositionSub = streamPlayer.positionStream.listen((position) {
+      if (!_activeStream) return;
+      final seconds = position.inSeconds;
+      final milliseconds = position.inMilliseconds;
+      if (seconds != state.currentPosition ||
+          milliseconds != state.currentPositionMs) {
+        state = state.copyWith(
+          currentPosition: seconds,
+          currentPositionMs: milliseconds,
+        );
+        unawaited(_activatePendingHistorySnapshotIfReady());
+        unawaited(_commitPendingHistoryIfEligible());
+      }
+    });
 
     _streamPlaybackSub = streamPlayer.playerStateStream.listen(
       (playerState) {
@@ -401,10 +400,6 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
 
         final processingState = playerState.processingState;
         final isCompleted = processingState == ProcessingState.completed;
-        final shouldRestartLoop = isCompleted &&
-            _usesAppOwnedStreamLoopRestart &&
-            !_streamTransitionInProgress &&
-            !_streamLoopRestartInProgress;
         final isBuffering = playerState.playing &&
             (processingState == ProcessingState.loading ||
                 processingState == ProcessingState.buffering);
@@ -430,19 +425,14 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
               .clamp(
                 0,
                 nextDuration > 0 ? nextDurationMs : cappedPositionMs,
-                )
-                .toInt(),
+              )
+              .toInt(),
         );
         if (playerState.playing && !isBuffering && !isCompleted) {
           unawaited(_activatePendingHistorySnapshotIfReady());
         }
-        if (shouldRestartLoop) {
-          _completedTrackIdNotified = null;
-          unawaited(_restartLoopedStreamPlayback());
-          return;
-        }
         final shouldNotifyCompletion = isCompleted &&
-            _streamLoopPolicy == _StreamLoopPolicy.off &&
+            _streamLoopPolicy == StreamLoopPolicy.off &&
             !_streamTransitionInProgress &&
             (!_managedQueueActive || !streamPlayer.hasNext);
 
@@ -453,14 +443,41 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         }
       },
       onError: (Object error, StackTrace stackTrace) {
-        if (!_activeStream) return;
-        state = state.copyWith(
-          isPlaying: false,
-          isDownloading: false,
-          currentTrackName: 'Stream failed: $error',
-        );
-        unawaited(_handleStreamFailure(error));
+        _handleStreamPlaybackError(error);
       },
+    );
+
+    _streamPlaybackErrorSub = streamPlayer.playbackEventStream.listen(
+      (_) {},
+      onError: (Object error, StackTrace stackTrace) {
+        _handleStreamPlaybackError(error);
+      },
+    );
+  }
+
+  void _handleStreamPlaybackError(Object error) {
+    if (!_activeStream) return;
+    final canRecover = state.isLooping || _desiredStreamPlaying;
+    state = state.copyWith(
+      isPlaying: false,
+      isDownloading: canRecover,
+      currentTrackName:
+          canRecover ? state.currentTrackName : 'Stream failed: $error',
+    );
+    unawaited(_handleStreamFailure(error));
+  }
+
+  void _markStreamFailed(
+    Object error, {
+    int? currentPosition,
+    int? currentPositionMs,
+  }) {
+    state = state.copyWith(
+      isPlaying: false,
+      isDownloading: false,
+      currentPosition: currentPosition,
+      currentPositionMs: currentPositionMs,
+      currentTrackName: 'Stream failed: $error',
     );
   }
 
@@ -478,67 +495,30 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     return completer.future;
   }
 
-  _StreamPlaybackMode get _streamPlaybackMode => _managedQueueActive
-      ? _StreamPlaybackMode.managedQueue
-      : _StreamPlaybackMode.singleStream;
+  StreamPlaybackMode get _streamPlaybackMode =>
+      streamPlaybackModeFor(managedQueueActive: _managedQueueActive);
 
-  _StreamLoopPolicy get _streamLoopPolicy =>
-      state.isLooping ? _StreamLoopPolicy.track : _StreamLoopPolicy.off;
+  StreamLoopPolicy get _streamLoopPolicy =>
+      streamLoopPolicyFor(isLooping: state.isLooping);
 
-  bool get _usesAppOwnedStreamLoopRestart =>
-      _streamPlaybackMode == _StreamPlaybackMode.singleStream &&
-      _streamLoopPolicy == _StreamLoopPolicy.track;
-
-  LoopMode _streamLoopModeForState(bool isLooping) =>
-      _streamPlaybackMode == _StreamPlaybackMode.managedQueue &&
-              isLooping
-          ? LoopMode.one
-          : LoopMode.off;
+  LoopMode _streamLoopModeForState(bool isLooping) => justAudioLoopModeFor(
+        playbackMode: _streamPlaybackMode,
+        isLooping: isLooping,
+      );
 
   LoopMode get _streamLoopMode => _streamLoopModeForState(state.isLooping);
 
-  Future<void> _restartLoopedStreamPlayback() async {
-    if (!_activeStream || !state.isLooping || _streamLoopRestartInProgress) {
-      return;
+  Future<void> _stopManagedQueuePrefetchPlayers() async {
+    for (var i = 0; i < _prefetchedTrackIds.length; i++) {
+      _prefetchedTrackIds[i] = null;
     }
-    _streamLoopRestartInProgress = true;
-    try {
-      await _recoverStreamAfterSeekFailure(
-        boundedSeconds: 0,
-        shouldResume: true,
-      );
-      if (!_activeStream || !state.isLooping) return;
-      state = state.copyWith(
-        isPlaying: true,
-        isDownloading: false,
-        currentPosition: 0,
-        currentPositionMs: 0,
-      );
-    } catch (error) {
-      if (!_activeStream || !_desiredStreamPlaying) return;
-      state = state.copyWith(
-        isPlaying: false,
-        isDownloading: false,
-        currentTrackName: 'Stream failed: $error',
-      );
-      unawaited(_handleStreamFailure(error));
-    } finally {
-      _streamLoopRestartInProgress = false;
-    }
-  }
-
-  Future<void> _clearOldCachedStream(LockCachingAudioSource? oldSource) async {
-    if (oldSource == null) return;
-    try {
-      final cacheFile = await oldSource.cacheFile;
-      if (cacheFile.path.contains(
-          '${Platform.pathSeparator}stream_cache${Platform.pathSeparator}')) {
-        return;
-      }
-      await oldSource.clearCache();
-    } catch (_) {
-      // Cache eviction should stay silent.
-    }
+    await Future.wait(
+      _prefetchPlayers.map((player) async {
+        try {
+          await player.stop();
+        } catch (_) {}
+      }),
+    );
   }
 
   void _updateSleepTimerState() {
@@ -548,12 +528,11 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       }
       return;
     }
-    final remaining =
-        _sleepTimerEndsAt!.difference(DateTime.now()).inSeconds.clamp(0, 86400);
+    final remaining = sleepTimerRemainingSeconds(_sleepTimerEndsAt);
     if (remaining != state.sleepTimerRemainingSeconds) {
       state = state.copyWith(sleepTimerRemainingSeconds: remaining);
     }
-    if (remaining <= 0) {
+    if (sleepTimerHasExpired(_sleepTimerEndsAt)) {
       _sleepTimer?.cancel();
       _sleepTimer = null;
       _sleepTimerEndsAt = null;
@@ -576,19 +555,15 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     });
   }
 
-  Future<void> _setStreamSource(
-    String videoId,
-    ResolvedStreamSource source,
-    {Duration? initialPosition}
-  ) async {
-    final previousSource = _cachedStreamAudioSource;
-    final nextSource = await _buildCachingSourceForVideoId(
+  Future<void> _setStreamSource(String videoId, ResolvedStreamSource source,
+      {Duration? initialPosition}) async {
+    _streamRuntime.markActivePlaybackVideoId(videoId);
+    final nextSource = await _buildPlaybackSourceForVideoId(
       videoId,
       headers: source.headers,
       urlOverride: source.url,
     );
 
-    _cachedStreamAudioSource = nextSource;
     _cachedStreamVideoId = videoId;
     await streamPlayer.stop();
     await streamPlayer.setAudioSource(
@@ -596,12 +571,17 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       preload: true,
       initialPosition: initialPosition,
     );
-    if (!identical(previousSource, nextSource)) {
-      unawaited(_clearOldCachedStream(previousSource));
-    }
   }
 
   int _managedQueueRecoveryIndex() {
+    final activeTrackId = state.videoId?.trim();
+    if (state.isLooping && activeTrackId != null && activeTrackId.isNotEmpty) {
+      for (var index = 0; index < _managedQueueTracks.length; index++) {
+        if (extractTrackId(_managedQueueTracks[index]) == activeTrackId) {
+          return index;
+        }
+      }
+    }
     final currentIndex = streamPlayer.currentIndex;
     if (_managedQueueActive &&
         currentIndex != null &&
@@ -609,7 +589,6 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         currentIndex < _managedQueueTracks.length) {
       return currentIndex;
     }
-    final activeTrackId = state.videoId?.trim();
     if (activeTrackId != null && activeTrackId.isNotEmpty) {
       for (var index = 0; index < _managedQueueTracks.length; index++) {
         if (extractTrackId(_managedQueueTracks[index]) == activeTrackId) {
@@ -637,9 +616,8 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       throw StateError('managed_queue_unavailable');
     }
 
-    final previousSource = _cachedStreamAudioSource;
-    _cachedStreamAudioSource = null;
     _cachedStreamVideoId = extractTrackId(playableTracks[resolvedInitialIndex]);
+    _streamRuntime.markActivePlaybackVideoId(_cachedStreamVideoId);
     _managedQueueActive = true;
     _managedQueueTracks = playableTracks;
 
@@ -655,9 +633,6 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       await streamPlayer.setLoopMode(_streamLoopMode);
     });
 
-    if (previousSource != null) {
-      unawaited(_clearOldCachedStream(previousSource));
-    }
     if (!_activeStream) return;
 
     _broadcastManagedQueue();
@@ -679,56 +654,59 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
   }
 
   Future<void> _setLocalSource(String path) async {
-    final previousSource = _cachedStreamAudioSource;
-    _cachedStreamAudioSource = null;
     _cachedStreamVideoId = null;
+    _streamRuntime.markActivePlaybackVideoId(null);
     await streamPlayer.stop();
     await streamPlayer.setFilePath(path, preload: true);
-    if (previousSource != null) {
-      unawaited(_clearOldCachedStream(previousSource));
+  }
+
+  Future<void> _seekActiveStreamPlayer(Duration position) async {
+    final currentIndex = streamPlayer.currentIndex;
+    if (_managedQueueActive &&
+        currentIndex != null &&
+        currentIndex >= 0 &&
+        currentIndex < _managedQueueTracks.length) {
+      await streamPlayer.seek(position, index: currentIndex);
+      return;
     }
+    await streamPlayer.seek(position);
   }
 
   Future<void> _resumeStreamPlayback({
     bool allowCompletedRecovery = true,
   }) async {
     _desiredStreamPlaying = true;
-    _streamLoopRestartInProgress = false;
     if (streamPlayer.audioSource == null) {
       return;
     }
     try {
       await streamPlayer.setLoopMode(_streamLoopMode);
       if (streamPlayer.processingState == ProcessingState.completed) {
-        final prefersRecoveryPath =
-            _managedQueueActive || _cachedStreamAudioSource != null;
-        if (allowCompletedRecovery && prefersRecoveryPath) {
-          await _recoverStreamAfterSeekFailure(
-            boundedSeconds: 0,
-            shouldResume: true,
-          );
-          return;
+        try {
+          await _seekActiveStreamPlayer(Duration.zero);
+        } catch (_) {
+          final prefersRecoveryPath =
+              _managedQueueActive || _cachedStreamVideoId != null;
+          if (allowCompletedRecovery && prefersRecoveryPath) {
+            await _recoverStreamAfterSeekFailure(
+              boundedSeconds: 0,
+              shouldResume: true,
+            );
+            return;
+          }
+          rethrow;
         }
-        await streamPlayer.seek(Duration.zero);
       }
       unawaited(
         streamPlayer.play().catchError((Object error, StackTrace stackTrace) {
           if (!_activeStream || !_desiredStreamPlaying) return;
-          state = state.copyWith(
-            isPlaying: false,
-            isDownloading: false,
-            currentTrackName: 'Stream failed: $error',
-          );
+          _markStreamFailed(error);
           unawaited(_handleStreamFailure(error));
         }),
       );
     } catch (error) {
       if (!_activeStream || !_desiredStreamPlaying) return;
-      state = state.copyWith(
-        isPlaying: false,
-        isDownloading: false,
-        currentTrackName: 'Stream failed: $error',
-      );
+      _markStreamFailed(error);
       unawaited(_handleStreamFailure(error));
     }
   }
@@ -767,7 +745,9 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         });
         if (!_activeStream) return;
         if (shouldResume && !streamPlayer.playing) {
-          await _resumeStreamPlayback(allowCompletedRecovery: false);
+          await _resumeStreamPlayback(
+            allowCompletedRecovery: false,
+          );
         }
         final nextDuration = streamPlayer.duration?.inSeconds ?? state.duration;
         state = state.copyWith(
@@ -792,6 +772,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     _streamPositionSub?.cancel();
     _streamDurationSub?.cancel();
     _streamPlaybackSub?.cancel();
+    _streamPlaybackErrorSub?.cancel();
     _streamCurrentIndexSub?.cancel();
     unawaited(stopPlayback(resetState: false));
     for (final player in _prefetchPlayers) {
@@ -845,26 +826,25 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
 
   Future<void> _handleStreamFailure(Object error) async {
     if (_streamFailureRecoveryInProgress || !_activeStream) return;
+    if (_lastFailureRecoveryLoadVersion == _streamLoadVersion) {
+      _markStreamFailed(error);
+      return;
+    }
+    _lastFailureRecoveryLoadVersion = _streamLoadVersion;
     if (!_managedQueueActive || _managedQueueTracks.isEmpty) {
       if (!_desiredStreamPlaying && !state.isLooping) {
         return;
       }
       _streamFailureRecoveryInProgress = true;
       try {
-        final recoverySeconds = state.isLooping
-            ? 0
-            : max(0, state.currentPositionMs ~/ 1000);
+        final recoverySeconds = max(0, state.currentPositionMs ~/ 1000);
         await _recoverStreamAfterSeekFailure(
           boundedSeconds: recoverySeconds,
           shouldResume: _desiredStreamPlaying || state.isLooping,
         );
       } catch (recoveryError) {
         if (!_activeStream) return;
-        state = state.copyWith(
-          isPlaying: false,
-          isDownloading: false,
-          currentTrackName: 'Stream failed: $recoveryError',
-        );
+        _markStreamFailed(recoveryError);
       } finally {
         _streamFailureRecoveryInProgress = false;
       }
@@ -873,6 +853,16 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
 
     _streamFailureRecoveryInProgress = true;
     try {
+      if (state.isLooping) {
+        _desiredStreamPlaying = true;
+        await _stopManagedQueuePrefetchPlayers();
+        await _restoreManagedQueueAfterSeekFailure(
+          boundedSeconds: max(0, state.currentPositionMs ~/ 1000),
+          shouldResume: true,
+        );
+        return;
+      }
+
       final failedIndex = streamPlayer.currentIndex ?? 0;
       if (failedIndex < 0 || failedIndex >= _managedQueueTracks.length) {
         return;
@@ -907,6 +897,9 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         initialIndex: nextIndex,
         autoplay: _desiredStreamPlaying,
       );
+    } catch (recoveryError) {
+      if (!_activeStream) return;
+      _markStreamFailed(recoveryError);
     } finally {
       _streamFailureRecoveryInProgress = false;
     }
@@ -926,6 +919,20 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     dynamic tag,
   }) async {
     return _streamRuntime.buildCachingSourceForVideoId(
+      videoId,
+      headers: headers,
+      urlOverride: urlOverride,
+      tag: tag,
+    );
+  }
+
+  Future<AudioSource> _buildPlaybackSourceForVideoId(
+    String videoId, {
+    Map<String, String>? headers,
+    String? urlOverride,
+    dynamic tag,
+  }) {
+    return _streamRuntime.buildPlaybackSourceForVideoId(
       videoId,
       headers: headers,
       urlOverride: urlOverride,
@@ -961,6 +968,10 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
   }
 
   Future<void> _prefetchManagedQueueAhead({int lookahead = 2}) async {
+    if (state.isLooping) {
+      await _stopManagedQueuePrefetchPlayers();
+      return;
+    }
     await prefetchManagedQueueAhead(
       managedQueueActive: _managedQueueActive,
       managedQueueTracks: _managedQueueTracks,
@@ -976,6 +987,15 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     if (!_managedQueueActive || _managedQueueTracks.isEmpty) return;
     final currentIndex = currentManagedQueueIndex ?? 0;
     if (currentIndex < 0 || currentIndex >= _managedQueueTracks.length) return;
+    if (state.isLooping) {
+      await _stopManagedQueuePrefetchPlayers();
+      if (!shouldWarmActiveTrackForLoop(
+        playbackMode: _streamPlaybackMode,
+        isLooping: state.isLooping,
+      )) {
+        return;
+      }
+    }
     final ids = <String?>[];
     for (var i = currentIndex; i < _managedQueueTracks.length; i++) {
       final track = _managedQueueTracks[i];
@@ -1034,7 +1054,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
           : reason);
     }
 
-    return _buildCachingSourceForVideoId(videoId, tag: track);
+    return _buildPlaybackSourceForVideoId(videoId, tag: track);
   }
 
   Future<void> configureManagedQueue(
@@ -1046,24 +1066,24 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       return;
     }
 
-    final normalizedTracks =
+    final sourceTracks =
         tracks.map((track) => normalizeTrack(track)).toList(growable: false);
-    final currentTrack = normalizedTracks[initialIndex];
-    final currentTrackId = extractTrackId(currentTrack);
-    final lookaheadIds = <String?>[
-      extractTrackId(currentTrack),
-      ...normalizedTracks
-          .skip(initialIndex + 1)
-          .where((track) => !isTrackHidden(track))
-          .take(_initialQueuePrepareLookahead - 1)
-          .map(extractTrackId),
+    final currentTrack = sourceTracks[initialIndex];
+    final normalizedTracks = <Map<String, dynamic>>[
+      currentTrack,
+      ...sourceTracks.skip(initialIndex + 1),
+      ...sourceTracks.take(initialIndex),
     ];
+    final currentTrackId = extractTrackId(currentTrack);
+    final remainingTracks =
+        normalizedTracks.skip(1).where((track) => !isTrackHidden(track)).toList();
 
     final loadVersion = ++_streamLoadVersion;
     _desiredStreamPlaying = autoplay;
     _activeStream = true;
     _managedQueueActive = true;
     _managedQueueTracks = normalizedTracks;
+    _streamRuntime.markActivePlaybackVideoId(currentTrackId);
     _streamTransitionInProgress = true;
     _playbackTimer?.cancel();
     audioEngine.pause();
@@ -1076,23 +1096,23 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
           currentTrack['title']?.toString() ?? 'Connecting Queue...',
       thumbnail: currentTrack['thumbnail']?.toString(),
       artist: _trackArtist(currentTrack),
-      videoId: null,
+      clearVideoId: true,
       duration: 0,
       currentPosition: 0,
       currentPositionMs: 0,
     );
 
     await _prepareQueueSession(
-      lookaheadIds,
+      [currentTrackId],
       currentVideoId: currentTrackId,
       activeQueue: true,
-      lookahead: _initialQueuePrepareLookahead,
+      lookahead: 1,
     );
     if (loadVersion != _streamLoadVersion) return;
 
     final resolvedQueue = await _resolveManagedQueueSources(
-      normalizedTracks,
-      preferredInitialIndex: initialIndex,
+      [currentTrack],
+      preferredInitialIndex: 0,
     );
     final playableTracks =
         List<Map<String, dynamic>>.from(resolvedQueue['tracks'] as List);
@@ -1106,31 +1126,26 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         isPlaying: false,
         isDownloading: false,
         currentTrackName: 'No playable tracks available',
-        videoId: null,
+        clearVideoId: true,
       );
       _broadcastManagedQueue();
       return;
     }
     if (loadVersion != _streamLoadVersion) return;
 
-    final previousSource = _cachedStreamAudioSource;
-    _cachedStreamAudioSource = null;
     _cachedStreamVideoId = extractTrackId(playableTracks[resolvedInitialIndex]);
     _managedQueueTracks = playableTracks;
 
-      await _runStreamCommand(() async {
-        if (loadVersion != _streamLoadVersion) return;
-        await streamPlayer.stop();
-        await streamPlayer.setAudioSources(
-          sources,
+    await _runStreamCommand(() async {
+      if (loadVersion != _streamLoadVersion) return;
+      await streamPlayer.stop();
+      await streamPlayer.setAudioSources(
+        sources,
         initialIndex: resolvedInitialIndex,
-          preload: true,
-        );
-        await streamPlayer.setLoopMode(_streamLoopMode);
-      });
-    if (previousSource != null) {
-      unawaited(_clearOldCachedStream(previousSource));
-    }
+        preload: true,
+      );
+      await streamPlayer.setLoopMode(_streamLoopMode);
+    });
     if (loadVersion != _streamLoadVersion) return;
 
     _streamTransitionInProgress = false;
@@ -1144,21 +1159,37 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     if (_desiredStreamPlaying) {
       await _resumeStreamPlayback(allowCompletedRecovery: false);
     }
+    if (remainingTracks.isNotEmpty && loadVersion == _streamLoadVersion) {
+      unawaited(
+        appendManagedQueueTracks(
+          remainingTracks,
+          expectedLoadVersion: loadVersion,
+        ),
+      );
+    }
   }
 
   Future<void> appendManagedQueueTracks(
-    List<Map<String, dynamic>> tracks,
-  ) async {
-    if (!_managedQueueActive || tracks.isEmpty) return;
+    List<Map<String, dynamic>> tracks, {
+    int? expectedLoadVersion,
+  }) async {
+    final loadVersion = expectedLoadVersion ?? _streamLoadVersion;
+    if (!_managedQueueActive ||
+        tracks.isEmpty ||
+        loadVersion != _streamLoadVersion) {
+      return;
+    }
     final normalizedTracks =
         tracks.map((track) => normalizeTrack(track)).toList(growable: false);
     await prewarmStreams(
       normalizedTracks.take(3).map(extractTrackId),
     );
+    if (!_managedQueueActive || loadVersion != _streamLoadVersion) return;
     final resolvedQueue = await _resolveManagedQueueSources(
       normalizedTracks,
       preferredInitialIndex: 0,
     );
+    if (!_managedQueueActive || loadVersion != _streamLoadVersion) return;
     final playableTracks =
         List<Map<String, dynamic>>.from(resolvedQueue['tracks'] as List);
     final sources = List<AudioSource>.from(resolvedQueue['sources'] as List);
@@ -1166,8 +1197,10 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       return;
     }
     await _runStreamCommand(() async {
+      if (!_managedQueueActive || loadVersion != _streamLoadVersion) return;
       await streamPlayer.addAudioSources(sources);
     });
+    if (!_managedQueueActive || loadVersion != _streamLoadVersion) return;
     _managedQueueTracks = [..._managedQueueTracks, ...playableTracks];
     _broadcastManagedQueue();
     unawaited(_refreshManagedQueueWarmup());
@@ -1335,83 +1368,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
   }
 
   Future<bool> loadLocalFile(String path, String trackName) async {
-    final loadVersion = ++_streamLoadVersion;
-    _desiredStreamPlaying = false;
-    _activeStream = true;
-    _managedQueueActive = false;
-    _managedQueueTracks = const [];
-    _streamTransitionInProgress = true;
-    _playbackTimer?.cancel();
-    audioEngine.pause();
-
-    if (!_rememberedTrackStore.hasValidDownloadedAudio(path)) {
-      _activeStream = false;
-      _streamTransitionInProgress = false;
-      state = state.copyWith(
-        isPlaying: false,
-        isDownloading: false,
-        currentTrackName: 'Playback failed: downloaded file is invalid',
-        thumbnail: null,
-        artist: null,
-        videoId: null,
-        duration: 0,
-        currentPosition: 0,
-        currentPositionMs: 0,
-      );
-      return false;
-    }
-
-    state = state.copyWith(
-      isPlaying: false,
-      isDownloading: true,
-      currentTrackName: trackName,
-      thumbnail: null,
-      artist: null,
-      videoId: null,
-      duration: 0,
-      currentPosition: 0,
-      currentPositionMs: 0,
-    );
-
-    try {
-      await _runStreamCommand(() async {
-        if (loadVersion != _streamLoadVersion) return;
-        await _setLocalSource(path);
-      });
-      if (loadVersion != _streamLoadVersion) return false;
-      _streamTransitionInProgress = false;
-      state = state.copyWith(
-        isPlaying: false,
-        isDownloading: false,
-        currentTrackName: trackName,
-        thumbnail: null,
-        artist: null,
-        videoId: null,
-        duration: streamPlayer.duration?.inSeconds ?? 0,
-        currentPosition: 0,
-        currentPositionMs: 0,
-      );
-        _rememberTrackMeta({
-          'title': trackName,
-        }, localPath: path);
-        _commitTrackToHistorySoon();
-        return true;
-    } catch (error) {
-      _activeStream = false;
-      _streamTransitionInProgress = false;
-      state = state.copyWith(
-        isPlaying: false,
-        isDownloading: false,
-        currentTrackName: 'Playback failed: $error',
-        thumbnail: null,
-        artist: null,
-        videoId: null,
-        duration: 0,
-        currentPosition: 0,
-        currentPositionMs: 0,
-      );
-      return false;
-    }
+    return loadLocalWithMeta(path, {'title': trackName});
   }
 
   Future<bool> loadLocalWithMeta(String path, Map<String, dynamic> meta) async {
@@ -1474,9 +1431,9 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         currentPosition: 0,
         currentPositionMs: 0,
       );
-        _rememberTrackMeta(meta, localPath: path);
-        _commitTrackToHistorySoon();
-        return true;
+      _rememberTrackMeta(meta, localPath: path);
+      _commitTrackToHistorySoon();
+      return true;
     } catch (error) {
       _activeStream = false;
       _streamTransitionInProgress = false;
@@ -1499,62 +1456,27 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     state = state.copyWith(
         isDownloading: true,
         currentTrackName: 'Initializing Proxy Connection...',
-        thumbnail: null,
-        artist: null,
+        clearThumbnail: true,
+        clearArtist: true,
         duration: 0,
         filesize: 0,
         currentPosition: 0);
-    // print("Initiating Proxy Request for: $videoId");
 
     try {
-      // 1. Ask the Proxy Server to fetch the Video and extract metadata
       final titleStr = outPath.split('/').last.replaceAll('.mp3', '');
-      final res = await appHttpClient.post(_proxyUri('/download'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({"video_id": videoId, "title": titleStr}));
-
-      if (res.statusCode != 200) {
-        throw Exception(
-            "Proxy Refused Connection or Failed to DL: ${res.body}");
-      }
-
-      final meta = Map<String, dynamic>.from(jsonDecode(res.body) as Map);
-      state = state.copyWith(
-        currentTrackName: meta['title'] ?? 'Downloading...',
-        thumbnail: meta['thumbnail'],
-        duration: _parseInt(meta['duration']),
-        filesize: _parseInt(meta['filesize']),
-        artist: meta['author'],
-      );
-      // 2. Stream the byte data back from the proxy to the local flutter device
-      final req = http.Request('GET', _proxyUri('/stream/$videoId'));
-      final streamRes = await appHttpClient.send(req);
-
-      if (streamRes.statusCode != 200) {
-        throw Exception("Stream Error: ${streamRes.statusCode}");
-      }
-
-      final file = File(outPath);
-      final sink = file.openWrite();
-
-      await for (var chunk in streamRes.stream) {
-        sink.add(chunk);
-      }
-      await sink.close();
-
-      if (!_rememberedTrackStore.hasValidDownloadedAudio(outPath)) {
-        throw Exception('Downloaded file is empty or corrupted');
-      }
-
-      final jsonPath = outPath.replaceAll('.mp3', '.json');
-      meta['owner_id'] = currentAuthenticatedUserId ?? 'guest';
-      await File(jsonPath).writeAsString(jsonEncode(meta));
-      unawaited(
-        upsertCloudLibraryTrack({
-          ...Map<String, dynamic>.from(meta as Map),
-          'id': videoId,
-          'videoId': videoId,
-        }),
+      final meta = await _downloadYoutubeAsset(
+        videoId: videoId,
+        outPath: outPath,
+        title: titleStr,
+        onMetadata: (meta) {
+          state = state.copyWith(
+            currentTrackName: meta['title'] ?? 'Downloading...',
+            thumbnail: meta['thumbnail'],
+            duration: _parseInt(meta['duration']),
+            filesize: _parseInt(meta['filesize']),
+            artist: meta['author'],
+          );
+        },
       );
 
       final loaded = await loadLocalWithMeta(outPath, meta);
@@ -1569,12 +1491,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       state = state.copyWith(
           isDownloading: false, currentTrackName: 'Download failed: $e');
 
-      try {
-        final f = File(outPath);
-        if (f.existsSync()) f.deleteSync();
-        final jf = File(outPath.replaceAll('.mp3', '.json'));
-        if (jf.existsSync()) jf.deleteSync();
-      } catch (_) {}
+      _deleteDownloadedAssetFiles(outPath);
       return false;
     }
   }
@@ -1582,54 +1499,77 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
   Future<bool> downloadYoutubeBackground(
       String videoId, String outPath, String titleStr) async {
     try {
-      final res = await appHttpClient.post(_proxyUri('/download'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({"video_id": videoId, "title": titleStr}));
-
-      if (res.statusCode != 200) {
-        throw Exception("Proxy Refused Connection or Failed to DL");
-      }
-
-      final meta = Map<String, dynamic>.from(jsonDecode(res.body) as Map);
-      final req = http.Request('GET', _proxyUri('/stream/$videoId'));
-      final streamRes = await appHttpClient.send(req);
-
-      if (streamRes.statusCode != 200) {
-        throw Exception("Stream Error: ${streamRes.statusCode}");
-      }
-
-      final file = File(outPath);
-      final sink = file.openWrite();
-
-      await for (var chunk in streamRes.stream) {
-        sink.add(chunk);
-      }
-      await sink.close();
-
-      if (!_rememberedTrackStore.hasValidDownloadedAudio(outPath)) {
-        throw Exception('Downloaded file is empty or corrupted');
-      }
-
-      final jsonPath = outPath.replaceAll('.mp3', '.json');
-      meta['owner_id'] = currentAuthenticatedUserId ?? 'guest';
-      await File(jsonPath).writeAsString(jsonEncode(meta));
-      unawaited(
-        upsertCloudLibraryTrack({
-          ...Map<String, dynamic>.from(meta as Map),
-          'id': videoId,
-          'videoId': videoId,
-        }),
+      await _downloadYoutubeAsset(
+        videoId: videoId,
+        outPath: outPath,
+        title: titleStr,
       );
       return true;
     } catch (e) {
-      try {
-        final f = File(outPath);
-        if (f.existsSync()) f.deleteSync();
-        final jf = File(outPath.replaceAll('.mp3', '.json'));
-        if (jf.existsSync()) jf.deleteSync();
-      } catch (_) {}
+      _deleteDownloadedAssetFiles(outPath);
       return false;
     }
+  }
+
+  void _deleteDownloadedAssetFiles(String outPath) {
+    try {
+      final audioFile = File(outPath);
+      if (audioFile.existsSync()) audioFile.deleteSync();
+      final metadataFile = File(outPath.replaceAll('.mp3', '.json'));
+      if (metadataFile.existsSync()) metadataFile.deleteSync();
+    } catch (_) {}
+  }
+
+  Future<Map<String, dynamic>> _downloadYoutubeAsset({
+    required String videoId,
+    required String outPath,
+    required String title,
+    void Function(Map<String, dynamic> meta)? onMetadata,
+  }) async {
+    final res = await appHttpClient.post(
+      _proxyUri('/download'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({"video_id": videoId, "title": title}),
+    );
+
+    if (res.statusCode != 200) {
+      throw Exception("Proxy Refused Connection or Failed to DL: ${res.body}");
+    }
+
+    final meta = Map<String, dynamic>.from(jsonDecode(res.body) as Map);
+    onMetadata?.call(meta);
+    final req = http.Request('GET', _proxyUri('/stream/$videoId'));
+    final streamRes = await appHttpClient.send(req);
+
+    if (streamRes.statusCode != 200) {
+      throw Exception("Stream Error: ${streamRes.statusCode}");
+    }
+
+    final file = File(outPath);
+    final sink = file.openWrite();
+    try {
+      await for (final chunk in streamRes.stream) {
+        sink.add(chunk);
+      }
+    } finally {
+      await sink.close();
+    }
+
+    if (!_rememberedTrackStore.hasValidDownloadedAudio(outPath)) {
+      throw Exception('Downloaded file is empty or corrupted');
+    }
+
+    final jsonPath = outPath.replaceAll('.mp3', '.json');
+    meta['owner_id'] = currentAuthenticatedUserId ?? 'guest';
+    await File(jsonPath).writeAsString(jsonEncode(meta));
+    unawaited(
+      upsertCloudLibraryTrack({
+        ...Map<String, dynamic>.from(meta),
+        'id': videoId,
+        'videoId': videoId,
+      }),
+    );
+    return meta;
   }
 
   Future<void> streamYoutube(
@@ -1639,7 +1579,6 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     final loadVersion = ++_streamLoadVersion;
     final totalStopwatch = Stopwatch()..start();
     _desiredStreamPlaying = true;
-    _streamLoopRestartInProgress = false;
     if (_activeStream &&
         state.videoId == videoId &&
         _cachedStreamVideoId == videoId) {
@@ -1660,14 +1599,15 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         currentTrackName: fallbackMeta['title'] ?? 'Connecting Stream...',
         thumbnail: fallbackMeta['thumbnail'],
         artist: fallbackMeta['channel'] ?? fallbackMeta['author'],
-        videoId: null,
+        clearVideoId: true,
         duration: 0,
         currentPosition: 0);
 
     try {
       final cachedPrepared = _freshStreamSource(videoId);
       final prepareStopwatch = Stopwatch()..start();
-      ResolvedStreamSource source = cachedPrepared ?? _buildProxyStreamSource(videoId);
+      ResolvedStreamSource source =
+          cachedPrepared ?? _buildProxyStreamSource(videoId);
       if (cachedPrepared == null) {
         try {
           await prepareImmediatePlayback(videoId).timeout(
@@ -1707,7 +1647,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       debugProxyLog(
         'stream',
         '$videoId prepared=${cachedPrepared != null} '
-        'prepareMs=$prepareMs attachMs=$attachMs totalMs=${totalStopwatch.elapsedMilliseconds}',
+            'prepareMs=$prepareMs attachMs=$attachMs totalMs=${totalStopwatch.elapsedMilliseconds}',
       );
     } catch (e) {
       if (loadVersion != _streamLoadVersion) return;
@@ -1745,7 +1685,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         state = state.copyWith(
             isDownloading: false,
             currentTrackName: 'Stream failed: $fallbackError',
-            videoId: null);
+            clearVideoId: true);
       }
     }
   }
@@ -1812,7 +1752,6 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
   Future<void> pause() async {
     if (_activeStream) {
       _desiredStreamPlaying = false;
-      _streamLoopRestartInProgress = false;
       try {
         await streamPlayer.pause();
       } catch (_) {}
@@ -1827,7 +1766,6 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
 
   Future<void> stopPlayback({bool resetState = true}) async {
     _desiredStreamPlaying = false;
-    _streamLoopRestartInProgress = false;
     _playbackTimer?.cancel();
     _sleepTimer?.cancel();
     _sleepTimer = null;
@@ -1852,14 +1790,9 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       audioEngine.pause();
     } catch (_) {}
 
-    final previousSource = _cachedStreamAudioSource;
-    _cachedStreamAudioSource = null;
     _cachedStreamVideoId = null;
+    _streamRuntime.markActivePlaybackVideoId(null);
     _activeStream = false;
-    if (previousSource != null) {
-      unawaited(_clearOldCachedStream(previousSource));
-    }
-
     if (resetState) {
       state = PlayerState(isLooping: state.isLooping);
     } else {
@@ -1882,7 +1815,6 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         : (seconds < 0 ? 0 : seconds);
     if (_activeStream) {
       if (_streamTransitionInProgress ||
-          _streamLoopRestartInProgress ||
           _streamSeekRecoveryInProgress) {
         return;
       }
@@ -1890,26 +1822,24 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       final previousPositionMs = state.currentPositionMs;
       final shouldResume =
           _desiredStreamPlaying || streamPlayer.playing || state.isPlaying;
-      final prefersRecoveryPath =
-          _managedQueueActive || _cachedStreamAudioSource != null;
       try {
-        if (prefersRecoveryPath) {
-          await _recoverStreamAfterSeekFailure(
-            boundedSeconds: boundedSeconds,
-            shouldResume: shouldResume,
-          );
-        } else {
+        try {
           await _runStreamCommand(() async {
             if (!_activeStream) return;
             if (streamPlayer.audioSource == null) {
               throw StateError('stream_source_missing');
             }
             await streamPlayer.setLoopMode(_streamLoopMode);
-            await streamPlayer.seek(Duration(seconds: boundedSeconds));
+            await _seekActiveStreamPlayer(Duration(seconds: boundedSeconds));
           });
-          if (shouldResume && !streamPlayer.playing) {
-            await _resumeStreamPlayback();
-          }
+        } catch (_) {
+          await _recoverStreamAfterSeekFailure(
+            boundedSeconds: boundedSeconds,
+            shouldResume: shouldResume,
+          );
+        }
+        if (shouldResume && !streamPlayer.playing) {
+          await _resumeStreamPlayback();
         }
         state = state.copyWith(
           isPlaying: shouldResume || streamPlayer.playing,
@@ -1918,12 +1848,10 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
           currentPositionMs: boundedSeconds * 1000,
         );
       } catch (recoveryError) {
-        state = state.copyWith(
-          isPlaying: false,
-          isDownloading: false,
+        _markStreamFailed(
+          recoveryError,
           currentPosition: previousPosition,
           currentPositionMs: previousPositionMs,
-          currentTrackName: 'Stream failed: $recoveryError',
         );
         unawaited(_handleStreamFailure(recoveryError));
       }
@@ -1940,6 +1868,9 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
   Future<void> toggleLoop(int startMs, int endMs) async {
     final newState = !state.isLooping;
     if (_activeStream) {
+      if (newState) {
+        await _stopManagedQueuePrefetchPlayers();
+      }
       await _runStreamCommand(() async {
         await streamPlayer.setLoopMode(_streamLoopModeForState(newState));
       });
@@ -1947,6 +1878,25 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       audioEngine.setLoop(newState, startMs, endMs);
     }
     state = state.copyWith(isLooping: newState);
+    final activeTrackId = state.videoId?.trim();
+    if (newState && activeTrackId != null && activeTrackId.isNotEmpty) {
+      unawaited(
+        recordProxyInteractionEvent(
+          'repeat',
+          trackId: activeTrackId,
+          rawTrack: {
+            'id': activeTrackId,
+            'title': state.currentTrackName,
+            'artist': state.artist,
+            'thumbnail': state.thumbnail,
+            'duration': state.duration,
+          },
+        ),
+      );
+    }
+    if (!newState) {
+      unawaited(_refreshManagedQueueWarmup());
+    }
   }
 }
 
@@ -1957,5 +1907,3 @@ final audioPlayerProvider =
   final audioE = ref.watch(audioEngineProvider);
   return AudioPlayerNotifier(audioE);
 });
-
-

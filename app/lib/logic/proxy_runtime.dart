@@ -13,6 +13,7 @@ const String searchUnavailableMessage =
 const String searchTimeoutMessage =
     'Search is taking longer than expected. Try again in a moment.';
 const bool disableRecommendationClientTimeouts = true;
+const bool disableSearchClientTimeouts = true;
 const Duration recommendRequestTimeout = Duration(seconds: 45);
 const Duration recommendRowPageTimeout = Duration(seconds: 30);
 const String recommendTimeoutMessage =
@@ -37,7 +38,7 @@ Future<T> runRecommendationRequest<T>(Future<T> future, Duration timeout) {
 }
 
 Future<T> runSearchRequest<T>(Future<T> future, Duration timeout) {
-  if (disableRecommendationClientTimeouts || disableRecommendationTimeouts) {
+  if (disableSearchClientTimeouts) {
     return future;
   }
   return future.timeout(timeout);

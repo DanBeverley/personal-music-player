@@ -117,6 +117,8 @@ class SearchPageState {
   final List<Map<String, dynamic>> albums;
   final List<Map<String, dynamic>> similarArtists;
   final List<Map<String, dynamic>> similarTracks;
+  final List<Map<String, dynamic>> artistTracks;
+  final List<Map<String, dynamic>> relatedAlbums;
   final Map<String, dynamic> diagnostics;
   final String? errorMessage;
 
@@ -131,6 +133,8 @@ class SearchPageState {
     this.albums = const [],
     this.similarArtists = const [],
     this.similarTracks = const [],
+    this.artistTracks = const [],
+    this.relatedAlbums = const [],
     this.diagnostics = const {},
     this.errorMessage,
   });
@@ -141,7 +145,9 @@ class SearchPageState {
       artists.isNotEmpty ||
       albums.isNotEmpty ||
       similarArtists.isNotEmpty ||
-      similarTracks.isNotEmpty;
+      similarTracks.isNotEmpty ||
+      artistTracks.isNotEmpty ||
+      relatedAlbums.isNotEmpty;
 
   factory SearchPageState.fromJson(Map<String, dynamic> json) {
     final rawTopResult = json['top_result'];
@@ -166,6 +172,10 @@ class SearchPageState {
         (json['similar_artists'] as List<dynamic>? ?? const []);
     final rawSimilarTracks =
         (json['similar_tracks'] as List<dynamic>? ?? const []);
+    final rawArtistTracks =
+        (json['artist_tracks'] as List<dynamic>? ?? const []);
+    final rawRelatedAlbums =
+        (json['related_albums'] as List<dynamic>? ?? const []);
     final normalizedTracks = rawTracks
         .whereType<Map>()
         .map((entry) => normalizeTrack(Map<String, dynamic>.from(entry)))
@@ -200,9 +210,7 @@ class SearchPageState {
       albums: rawAlbums
           .whereType<Map>()
           .map((entry) => Map<String, dynamic>.from(entry))
-          .where((album) =>
-              (album['id']?.toString().trim().isNotEmpty ?? false) ||
-              (album['title']?.toString().trim().isNotEmpty ?? false))
+          .where(_hasResolvedSearchAlbumArtist)
           .toList(growable: false),
       similarArtists: rawSimilarArtists
           .whereType<Map>()
@@ -215,6 +223,16 @@ class SearchPageState {
           .whereType<Map>()
           .map((entry) => normalizeTrack(Map<String, dynamic>.from(entry)))
           .where((track) => extractTrackId(track)?.isNotEmpty ?? false)
+          .toList(growable: false),
+      artistTracks: rawArtistTracks
+          .whereType<Map>()
+          .map((entry) => normalizeTrack(Map<String, dynamic>.from(entry)))
+          .where((track) => extractTrackId(track)?.isNotEmpty ?? false)
+          .toList(growable: false),
+      relatedAlbums: rawRelatedAlbums
+          .whereType<Map>()
+          .map((entry) => Map<String, dynamic>.from(entry))
+          .where(_hasResolvedSearchAlbumArtist)
           .toList(growable: false),
       diagnostics: json['diagnostics'] is Map
           ? Map<String, dynamic>.from(json['diagnostics'] as Map)
@@ -238,6 +256,8 @@ class SearchPageState {
     List<Map<String, dynamic>>? albums,
     List<Map<String, dynamic>>? similarArtists,
     List<Map<String, dynamic>>? similarTracks,
+    List<Map<String, dynamic>>? artistTracks,
+    List<Map<String, dynamic>>? relatedAlbums,
     Map<String, dynamic>? diagnostics,
     String? errorMessage,
     bool clearError = false,
@@ -253,10 +273,62 @@ class SearchPageState {
       albums: albums ?? this.albums,
       similarArtists: similarArtists ?? this.similarArtists,
       similarTracks: similarTracks ?? this.similarTracks,
+      artistTracks: artistTracks ?? this.artistTracks,
+      relatedAlbums: relatedAlbums ?? this.relatedAlbums,
       diagnostics: diagnostics ?? this.diagnostics,
       errorMessage: clearError ? null : errorMessage ?? this.errorMessage,
     );
   }
+}
+
+List<Map<String, dynamic>> _mergeSearchEntities(
+  List<Map<String, dynamic>> current,
+  List<Map<String, dynamic>> incoming, {
+  required String Function(Map<String, dynamic>) identity,
+}) {
+  final merged = <Map<String, dynamic>>[];
+  final indexes = <String, int>{};
+  for (final item in [...current, ...incoming]) {
+    final key = identity(item);
+    if (key.isEmpty) continue;
+    final existingIndex = indexes[key];
+    if (existingIndex == null) {
+      indexes[key] = merged.length;
+      merged.add(item);
+      continue;
+    }
+    merged[existingIndex] = <String, dynamic>{
+      ...merged[existingIndex],
+      ...item,
+    };
+  }
+  return merged;
+}
+
+String _trackSearchIdentity(Map<String, dynamic> track) =>
+    extractTrackId(track)?.trim() ?? '';
+
+String _artistSearchIdentity(Map<String, dynamic> artist) {
+  final id = artist['id']?.toString().trim() ?? '';
+  if (id.isNotEmpty) return id;
+  return artist['name']?.toString().trim().toLowerCase() ?? '';
+}
+
+String _albumSearchIdentity(Map<String, dynamic> album) {
+  final id = album['id']?.toString().trim() ?? '';
+  if (id.isNotEmpty) return id;
+  final title = album['title']?.toString().trim().toLowerCase() ?? '';
+  final artist = album['artist']?.toString().trim().toLowerCase() ?? '';
+  return title.isEmpty ? '' : '$title|$artist';
+}
+
+bool _hasResolvedSearchAlbumArtist(Map<String, dynamic> album) {
+  final title = album['title']?.toString().trim() ?? '';
+  final artist = album['artist']?.toString().trim().toLowerCase() ?? '';
+  return title.isNotEmpty &&
+      artist.isNotEmpty &&
+      artist != 'unknown' &&
+      artist != 'unknown artist';
 }
 
 class SearchPageNotifier extends StateNotifier<SearchPageState> {
@@ -286,10 +358,10 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
       final nextState = SearchPageState.fromJson(fetchResult.payload!);
       final currentTracks = state.tracks;
       final nextTracks = nextState.tracks;
-      if (currentTracks.isEmpty || nextTracks.isEmpty) {
-        return;
-      }
-      if ((currentTracks.first['id'] ?? '') != (nextTracks.first['id'] ?? '')) {
+      if (currentTracks.isNotEmpty &&
+          nextTracks.isNotEmpty &&
+          _trackSearchIdentity(currentTracks.first) !=
+              _trackSearchIdentity(nextTracks.first)) {
         return;
       }
       state = state.copyWith(
@@ -297,11 +369,41 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
         modelVersion: nextState.modelVersion,
         queryIntent: nextState.queryIntent,
         topResult: nextState.topResult,
-        tracks: nextState.tracks,
-        artists: nextState.artists,
-        albums: nextState.albums,
-        similarArtists: nextState.similarArtists,
-        similarTracks: nextState.similarTracks,
+        tracks: _mergeSearchEntities(
+          state.tracks,
+          nextState.tracks,
+          identity: _trackSearchIdentity,
+        ),
+        artists: _mergeSearchEntities(
+          state.artists,
+          nextState.artists,
+          identity: _artistSearchIdentity,
+        ),
+        albums: _mergeSearchEntities(
+          state.albums,
+          nextState.albums,
+          identity: _albumSearchIdentity,
+        ),
+        similarArtists: _mergeSearchEntities(
+          state.similarArtists,
+          nextState.similarArtists,
+          identity: _artistSearchIdentity,
+        ),
+        similarTracks: _mergeSearchEntities(
+          state.similarTracks,
+          nextState.similarTracks,
+          identity: _trackSearchIdentity,
+        ),
+        artistTracks: _mergeSearchEntities(
+          state.artistTracks,
+          nextState.artistTracks,
+          identity: _trackSearchIdentity,
+        ),
+        relatedAlbums: _mergeSearchEntities(
+          state.relatedAlbums,
+          nextState.relatedAlbums,
+          identity: _albumSearchIdentity,
+        ),
         diagnostics: <String, dynamic>{
           ...state.diagnostics,
           ...nextState.diagnostics,
@@ -376,10 +478,12 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
         );
         notifyRecommendationSignal(normalizedQuery);
         final needsEnrichment = nextState.tracks.isNotEmpty &&
-            nextState.artists.isEmpty &&
-            nextState.albums.isEmpty &&
-            nextState.similarArtists.isEmpty &&
-            nextState.similarTracks.isEmpty;
+            (nextState.artists.isEmpty ||
+                nextState.albums.isEmpty ||
+                nextState.similarArtists.length < 4 ||
+                nextState.similarTracks.length < 6 ||
+                nextState.artistTracks.length < 4 ||
+                nextState.relatedAlbums.length < 4);
         if (needsEnrichment) {
           unawaited(
             _enrichSearchPageResults(

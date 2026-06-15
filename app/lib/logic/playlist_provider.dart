@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'auth_provider.dart';
+import 'interaction_events.dart';
 
 class Playlist {
   final String id;
@@ -306,6 +307,17 @@ class PlaylistNotifier extends StateNotifier<List<Playlist>> {
 
   void addTrackToPlaylist(String playlistId, dynamic track) {
     final normalizedTrack = _normalizePlaylistTrack(track);
+    final targetPlaylist = state.where((playlist) => playlist.id == playlistId);
+    final playlistName =
+        targetPlaylist.isEmpty ? '' : targetPlaylist.first.name.trim();
+    final trackId =
+        (normalizedTrack['id'] ?? normalizedTrack['videoId'])?.toString();
+    final isNewAddition = targetPlaylist.isNotEmpty &&
+        !targetPlaylist.first.tracks.any(
+          (entry) =>
+              (entry['id'] ?? entry['videoId']) ==
+              (normalizedTrack['id'] ?? normalizedTrack['videoId']),
+        );
     state = state.map((playlist) {
       if (playlist.id != playlistId) return playlist;
       final exists = playlist.tracks.any(
@@ -315,6 +327,19 @@ class PlaylistNotifier extends StateNotifier<List<Playlist>> {
       return playlist.copyWith(tracks: [...playlist.tracks, normalizedTrack]);
     }).toList(growable: false);
     _persistState();
+    if (isNewAddition && trackId != null && trackId.isNotEmpty) {
+      unawaited(
+        recordProxyInteractionEvent(
+          'playlist_add',
+          trackId: trackId,
+          rawTrack: normalizedTrack,
+          metadata: {
+            'playlist_id': playlistId,
+            if (playlistName.isNotEmpty) 'playlist_name': playlistName,
+          },
+        ),
+      );
+    }
   }
 
   void removeTrackFromPlaylist(String playlistId, String trackId) {

@@ -7,6 +7,7 @@ import 'package:flutter/foundation.dart';
 
 import 'auth_provider.dart';
 import 'interaction_events.dart';
+import 'proxy_runtime.dart';
 import 'track_metadata.dart';
 
 int _historyParseInt(dynamic value) {
@@ -54,7 +55,10 @@ class HistoryManager {
   static const int _historyEntryLimit = 180;
   static const Duration _duplicateSuppressWindow = Duration(seconds: 24);
   static const int _historySchemaVersion = 2;
-  static Future<void>? _historySchemaFuture;
+  static final Map<String, Future<void>> _historySchemaFutures =
+      <String, Future<void>>{};
+  static final Map<String, Future<bool>> _persistedHydrationFutures =
+      <String, Future<bool>>{};
 
   static Future<File> get _file async {
     return getScopedDataFile('history.json');
@@ -68,8 +72,50 @@ class HistoryManager {
     return getScopedDataFile('history_schema.json');
   }
 
+  static String get _currentScopeId => activeStorageScopeId;
+
+  static Future<List<dynamic>> _readJsonListFile(File file) async {
+    if (!file.existsSync()) return const [];
+    try {
+      final raw = (await file.readAsString()).trim();
+      if (raw.isEmpty) return const [];
+      final decoded = jsonDecode(raw);
+      return decoded is List ? decoded : const [];
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  static Future<void> _migrateLegacyHistoryToEntriesIfNeeded() async {
+    final historyFile = await _file;
+    final entriesFile = await _entriesFile;
+    final existingEntries = await _readJsonListFile(entriesFile);
+    if (existingEntries.isNotEmpty) return;
+
+    final legacyIds = (await _readJsonListFile(historyFile))
+        .map((entry) => entry?.toString().trim() ?? '')
+        .where((entry) => entry.isNotEmpty)
+        .toList(growable: false);
+    if (legacyIds.isEmpty) return;
+
+    final now = DateTime.now().toUtc();
+    final migratedEntries = <Map<String, dynamic>>[];
+    for (var index = 0; index < legacyIds.length; index++) {
+      final videoId = legacyIds[index];
+      migratedEntries.add({
+        'id': videoId,
+        'videoId': videoId,
+        'title': 'Unknown Track',
+        'played_at': now.subtract(Duration(minutes: index)).toIso8601String(),
+      });
+      if (migratedEntries.length >= _historyEntryLimit) break;
+    }
+    await _writeLocalHistoryEntries(migratedEntries);
+  }
+
   static Future<void> _ensureHistorySchema() {
-    return _historySchemaFuture ??= () async {
+    final scopeId = _currentScopeId;
+    return _historySchemaFutures[scopeId] ??= () async {
       try {
         final schemaFile = await _schemaFile;
         var currentVersion = 0;
@@ -85,7 +131,7 @@ class HistoryManager {
         }
 
         if (currentVersion < _historySchemaVersion) {
-          await clearLocalListeningHistory();
+          await _migrateLegacyHistoryToEntriesIfNeeded();
           await schemaFile.writeAsString(
             jsonEncode({'version': _historySchemaVersion}),
           );
@@ -124,7 +170,7 @@ class HistoryManager {
       return decoded
           .map((entry) => entry?.toString() ?? '')
           .where((entry) => entry.isNotEmpty)
-          .toList(growable: false);
+          .toList();
     } catch (error) {
       debugPrint('History cache parse failed, resetting local history: $error');
       try {
@@ -175,7 +221,7 @@ class HistoryManager {
       return decoded
           .map(_normalizeHistoryEntry)
           .whereType<Map<String, dynamic>>()
-          .toList(growable: false);
+          .toList();
     } catch (error) {
       debugPrint('History entry cache parse failed, resetting entries: $error');
       try {
@@ -189,7 +235,11 @@ class HistoryManager {
     List<Map<String, dynamic>> entries,
   ) async {
     final file = await _entriesFile;
-    await file.writeAsString(jsonEncode(entries));
+    final ownedEntries = [
+      for (final entry in entries.take(_historyEntryLimit))
+        Map<String, dynamic>.from(entry),
+    ];
+    await file.writeAsString(jsonEncode(ownedEntries));
   }
 
   static Map<String, dynamic> _mergeSnapshotWithExisting(
@@ -230,7 +280,7 @@ class HistoryManager {
 
   static Future<void> _writeLegacySeedHistory(String videoId) async {
     final f = await _file;
-    List<String> history = await _readLocalHistory();
+    List<String> history = List<String>.from(await _readLocalHistory());
     history.remove(videoId);
     history.insert(0, videoId);
     if (history.length > _legacyHistoryLimit) {
@@ -252,6 +302,110 @@ class HistoryManager {
     } catch (e) {
       debugPrint('Cloud history write error: $e');
     }
+  }
+
+  static Map<String, dynamic>? _historyTrackFromPayload(dynamic rawTrack) {
+    if (rawTrack is! Map) return null;
+    final normalized = normalizeTrack(Map<String, dynamic>.from(rawTrack));
+    final trackId = extractTrackId(normalized);
+    if (trackId == null || trackId.isEmpty) return null;
+    return normalized;
+  }
+
+  static Future<bool> hydrateFromPersistedHistoryIfNeeded({
+    bool force = false,
+    int limit = 24,
+  }) {
+    final scopeId = _currentScopeId;
+    if (scopeId.trim().isEmpty || scopeId == 'guest') {
+      return Future<bool>.value(false);
+    }
+    return _persistedHydrationFutures[scopeId] ??= () async {
+      try {
+        final existingEntries = await _readLocalHistoryEntries();
+        if (!force && existingEntries.isNotEmpty) return false;
+
+        final response = await proxyControlHttpClient
+            .post(
+              buildProxyUri('/history_seed'),
+              headers: {'Content-Type': 'application/json'},
+              body: jsonEncode({
+                'user_scope_id': scopeId,
+                'limit': limit,
+              }),
+            )
+            .timeout(const Duration(seconds: 3));
+        if (response.statusCode < 200 || response.statusCode >= 300) {
+          debugPrint(
+            'Persisted history hydrate failed: status=${response.statusCode}',
+          );
+          return false;
+        }
+        final decoded = jsonDecode(response.body);
+        if (decoded is! Map) return false;
+
+        final now = DateTime.now().toUtc();
+        final entries = <Map<String, dynamic>>[];
+
+        void addTracks(dynamic rawTracks, {required String source}) {
+          if (rawTracks is! List) return;
+          for (final rawTrack in rawTracks) {
+            final track = _historyTrackFromPayload(rawTrack);
+            if (track == null) continue;
+            final trackId = extractTrackId(track);
+            if (trackId == null || trackId.isEmpty) {
+              continue;
+            }
+            final entryIndex = entries.length;
+            entries.add({
+              ...track,
+              'played_at': now
+                  .subtract(Duration(minutes: entryIndex))
+                  .toIso8601String(),
+              'history_source': source,
+            });
+            if (entries.length >= _historyEntryLimit) return;
+          }
+        }
+
+        addTracks(decoded['last_played_tracks'], source: 'persisted_last');
+        addTracks(decoded['recent_track_snapshots'], source: 'persisted_recent');
+        addTracks(decoded['top_track_snapshots'], source: 'persisted_top');
+        if (entries.isEmpty) return false;
+
+        await _writeLocalHistoryEntries(
+          entries.take(_historyEntryLimit).toList(),
+        );
+        final legacySeeds = <String>[];
+        final seen = <String>{};
+        for (final entry in entries) {
+          final trackId = extractTrackId(entry);
+          if (trackId == null || trackId.isEmpty || !seen.add(trackId)) {
+            continue;
+          }
+          legacySeeds.add(trackId);
+          if (legacySeeds.length >= _legacyHistoryLimit) break;
+        }
+        await (await _file).writeAsString(jsonEncode(legacySeeds));
+        final firstTrackId = extractTrackId(entries.first);
+        if (firstTrackId != null && firstTrackId.isNotEmpty) {
+          _seedController.add(firstTrackId);
+        }
+        if (!_trackController.isClosed) {
+          _trackController.add(Map<String, dynamic>.from(entries.first));
+        }
+        debugPrint(
+          '[EBB:history] hydrated persisted history scope=$scopeId '
+          'entries=${entries.length}',
+        );
+        return true;
+      } catch (error) {
+        debugPrint('Persisted history hydrate failed: $error');
+        return false;
+      } finally {
+        _persistedHydrationFutures.remove(scopeId);
+      }
+    }();
   }
 
   static Future<void> addHistory(String? videoId) async {
@@ -283,9 +437,6 @@ class HistoryManager {
           now.difference(_lastRecordedAt!) < _duplicateSuppressWindow) {
         return;
       }
-      _lastRecordedTrackId = videoId;
-      _lastRecordedAt = now;
-
       final existingEntries = await _readLocalHistoryEntries();
       Map<String, dynamic>? previous;
       for (final entry in existingEntries) {
@@ -301,16 +452,23 @@ class HistoryManager {
       };
       final nextEntries = <Map<String, dynamic>>[
         entry,
-        ...existingEntries,
-      ];
-      if (nextEntries.length > _historyEntryLimit) {
-        nextEntries.removeRange(_historyEntryLimit, nextEntries.length);
+        for (final existingEntry in existingEntries)
+          if (extractTrackId(existingEntry) != videoId) existingEntry,
+      ].take(_historyEntryLimit).toList();
+
+      try {
+        await _writeLocalHistoryEntries(nextEntries);
+      } catch (error) {
+        debugPrint('History entry write failed: $error');
+      }
+      try {
+        await _writeLegacySeedHistory(videoId);
+      } catch (error) {
+        debugPrint('Legacy history seed write failed: $error');
       }
 
-      await Future.wait([
-        _writeLegacySeedHistory(videoId),
-        _writeLocalHistoryEntries(nextEntries),
-      ]);
+      _lastRecordedTrackId = videoId;
+      _lastRecordedAt = now;
       _seedController.add(videoId);
       if (!_trackController.isClosed) {
         _trackController.add(Map<String, dynamic>.from(entry));

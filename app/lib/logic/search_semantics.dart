@@ -33,7 +33,6 @@ const List<String> sharedTasteKeywords = <String>[
   'mood',
   'party',
   'romantic',
-  'rain',
   'night',
   'morning',
   'road trip',
@@ -78,7 +77,14 @@ bool looksLikeSemanticTasteQuery(String query) {
       normalized.contains(' music')) {
     return true;
   }
-  return sharedTasteKeywords.any((keyword) => normalized.contains(keyword));
+  return sharedTasteKeywords.any((keyword) {
+    if (keyword.contains(' ')) {
+      return normalized.contains(keyword);
+    }
+    return RegExp(
+      '(^|\\s)${RegExp.escape(keyword)}(\\s|\$)',
+    ).hasMatch(normalized);
+  });
 }
 
 bool isMetadataHeavyQuery(String query) {

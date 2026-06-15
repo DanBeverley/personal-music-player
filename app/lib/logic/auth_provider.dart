@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
@@ -12,11 +13,13 @@ const String supabaseAnonKey =
     String.fromEnvironment('SUPABASE_ANON_KEY', defaultValue: '');
 const String supabaseRedirectScheme =
     String.fromEnvironment('SUPABASE_REDIRECT_SCHEME', defaultValue: 'ebb');
-const String supabaseRedirectHost =
-    String.fromEnvironment('SUPABASE_REDIRECT_HOST', defaultValue: 'login-callback');
+const String supabaseRedirectHost = String.fromEnvironment(
+    'SUPABASE_REDIRECT_HOST',
+    defaultValue: 'login-callback');
 
 bool _supabaseInitialized = false;
 const Object _authStateUnset = Object();
+String? _rememberedStorageScopeId;
 
 bool get isSupabaseConfigured =>
     supabaseUrl.trim().isNotEmpty && supabaseAnonKey.trim().isNotEmpty;
@@ -36,7 +39,14 @@ SupabaseClient? get supabaseClientOrNull {
 String? get currentAuthenticatedUserId =>
     supabaseClientOrNull?.auth.currentUser?.id;
 
+String? get rememberedStorageScopeId => _rememberedStorageScopeId;
+
+String get activeStorageScopeId => _sanitizeScopeSegment(
+      currentAuthenticatedUserId ?? 'guest',
+    );
+
 Future<void> initSupabase() async {
+  await _loadRememberedStorageScope();
   await migrateLegacyStorageIfNeeded();
   if (!isSupabaseConfigured || _supabaseInitialized) return;
   await Supabase.initialize(
@@ -50,11 +60,121 @@ String _sanitizeScopeSegment(String value) {
   return value.replaceAll(RegExp(r'[^A-Za-z0-9_\-]'), '_');
 }
 
+Future<File> _rememberedScopeFile() async {
+  final dir = await getApplicationDocumentsDirectory();
+  return File('${dir.path}/users/.active_auth_scope.json');
+}
+
+Future<File> _explicitSignOutFile() async {
+  final dir = await getApplicationDocumentsDirectory();
+  return File('${dir.path}/users/.explicit_sign_out');
+}
+
+Future<bool> _hasExplicitSignOutMarker() async {
+  try {
+    return (await _explicitSignOutFile()).existsSync();
+  } catch (_) {
+    return false;
+  }
+}
+
+Future<void> _setExplicitSignOutMarker(bool signedOut) async {
+  try {
+    final file = await _explicitSignOutFile();
+    if (signedOut) {
+      if (!file.parent.existsSync()) {
+        file.parent.createSync(recursive: true);
+      }
+      await file.writeAsString(DateTime.now().toUtc().toIso8601String());
+      return;
+    }
+    if (file.existsSync()) {
+      await file.delete();
+    }
+  } catch (error) {
+    debugPrint('Explicit sign-out marker update failed: $error');
+  }
+}
+
+Future<String?> _recoverRememberedStorageScope() async {
+  // Do not infer identity from whichever local folder has the richest history.
+  // That recovery path made Account B able to inherit Account A's local signals
+  // after dev reinstalls or missing Supabase sessions. Kept as a no-op shim so
+  // older callers remain harmless while auth becomes the only identity source.
+  return null;
+}
+
+Future<void> _loadRememberedStorageScope() async {
+  try {
+    final file = await _rememberedScopeFile();
+    if (!file.existsSync()) {
+      if (!await _hasExplicitSignOutMarker()) {
+        _rememberedStorageScopeId = await _recoverRememberedStorageScope();
+      } else {
+        debugPrint('[EBB:auth] remembered scope skipped explicit_sign_out');
+      }
+      return;
+    }
+    final raw = (await file.readAsString()).trim();
+    if (raw.isEmpty) {
+      if (!await _hasExplicitSignOutMarker()) {
+        _rememberedStorageScopeId = await _recoverRememberedStorageScope();
+      }
+      return;
+    }
+    final decoded = jsonDecode(raw);
+    final userId = decoded is Map ? decoded['user_id']?.toString().trim() : '';
+    if (userId != null && userId.isNotEmpty) {
+      _rememberedStorageScopeId = _sanitizeScopeSegment(userId);
+      await _setExplicitSignOutMarker(false);
+      debugPrint('[EBB:auth] remembered scope loaded=$_rememberedStorageScopeId');
+    } else if (!await _hasExplicitSignOutMarker()) {
+      _rememberedStorageScopeId = await _recoverRememberedStorageScope();
+    }
+  } catch (error) {
+    debugPrint('Remembered auth scope restore failed: $error');
+    if (!await _hasExplicitSignOutMarker()) {
+      _rememberedStorageScopeId = await _recoverRememberedStorageScope();
+    }
+  }
+}
+
+Future<void> _rememberStorageScope(String? userId) async {
+  final normalized = userId?.trim();
+  final file = await _rememberedScopeFile();
+  if (normalized == null || normalized.isEmpty) {
+    _rememberedStorageScopeId = null;
+    try {
+      if (file.existsSync()) {
+        await file.delete();
+      }
+    } catch (error) {
+      debugPrint('Remembered auth scope clear failed: $error');
+    }
+    return;
+  }
+
+  final scopeId = _sanitizeScopeSegment(normalized);
+  _rememberedStorageScopeId = scopeId;
+  try {
+    await _setExplicitSignOutMarker(false);
+    if (!file.parent.existsSync()) {
+      file.parent.createSync(recursive: true);
+    }
+    await file.writeAsString(jsonEncode({
+      'user_id': scopeId,
+      'updated_at': DateTime.now().toUtc().toIso8601String(),
+    }));
+  } catch (error) {
+    debugPrint('Remembered auth scope write failed: $error');
+  }
+}
+
 Future<Directory> getScopedUserDirectory([String? scopeId]) async {
   final dir = await getApplicationDocumentsDirectory();
-  final resolvedScope = _sanitizeScopeSegment(
-    scopeId ?? currentAuthenticatedUserId ?? 'guest',
-  );
+  final resolvedScope = scopeId == null
+      ? activeStorageScopeId
+      : _sanitizeScopeSegment(scopeId);
   final userDir = Directory('${dir.path}/users/$resolvedScope');
   if (!userDir.existsSync()) {
     userDir.createSync(recursive: true);
@@ -102,9 +222,8 @@ Future<void> _copyDirectoryRecursively(
     destination.createSync(recursive: true);
   }
   for (final entity in source.listSync(followLinks: false)) {
-    final name = entity.uri.pathSegments.isEmpty
-        ? ''
-        : entity.uri.pathSegments.last;
+    final name =
+        entity.uri.pathSegments.isEmpty ? '' : entity.uri.pathSegments.last;
     if (name.isEmpty) continue;
     if (entity is File) {
       await _copyFileIfMissing(entity, File('${destination.path}/$name'));
@@ -152,7 +271,8 @@ Future<void> migrateLegacyStorageIfNeeded() async {
   for (final entity in docsDir.listSync(followLinks: false)) {
     if (entity is! File || !entity.path.endsWith('.mp3')) continue;
     final fileName = entity.uri.pathSegments.last;
-    await _copyFileIfMissing(entity, File('${guestDownloadsDir.path}/$fileName'));
+    await _copyFileIfMissing(
+        entity, File('${guestDownloadsDir.path}/$fileName'));
     final jsonCompanion = File(entity.path.replaceAll('.mp3', '.json'));
     await _copyFileIfMissing(
       jsonCompanion,
@@ -193,6 +313,7 @@ class AppAuthState {
   final bool isInitialized;
   final Session? session;
   final User? user;
+  final String? rememberedScopeId;
   final bool isBusy;
   final String? error;
 
@@ -201,11 +322,17 @@ class AppAuthState {
     this.isInitialized = false,
     this.session,
     this.user,
+    this.rememberedScopeId,
     this.isBusy = false,
     this.error,
   });
 
   bool get isAuthenticated => user != null;
+  bool get isRestoring => isConfigured && !isInitialized;
+  bool get hasRememberedScope =>
+      rememberedScopeId?.trim().isNotEmpty == true;
+  bool get canUseApp => user != null || !isConfigured;
+  bool get requiresAuthGate => isConfigured && isInitialized && !canUseApp;
   String get storageScopeId => user?.id ?? 'guest';
 
   AppAuthState copyWith({
@@ -213,6 +340,7 @@ class AppAuthState {
     bool? isInitialized,
     Object? session = _authStateUnset,
     Object? user = _authStateUnset,
+    Object? rememberedScopeId = _authStateUnset,
     bool? isBusy,
     Object? error = _authStateUnset,
     bool clearError = false,
@@ -224,6 +352,9 @@ class AppAuthState {
           ? this.session
           : session as Session?,
       user: identical(user, _authStateUnset) ? this.user : user as User?,
+      rememberedScopeId: identical(rememberedScopeId, _authStateUnset)
+          ? this.rememberedScopeId
+          : rememberedScopeId as String?,
       isBusy: isBusy ?? this.isBusy,
       error: clearError
           ? null
@@ -237,14 +368,16 @@ class AppAuthState {
 class AuthNotifier extends StateNotifier<AppAuthState> {
   final Ref ref;
   StreamSubscription<AuthState>? _authSubscription;
+  bool _sawInitialAuthSignal = false;
 
   AuthNotifier(this.ref)
       : super(
           AppAuthState(
             isConfigured: isSupabaseConfigured,
-            isInitialized: !isSupabaseConfigured || _supabaseInitialized,
+            isInitialized: !isSupabaseConfigured,
             session: supabaseClientOrNull?.auth.currentSession,
             user: supabaseClientOrNull?.auth.currentUser,
+            rememberedScopeId: _rememberedStorageScopeId,
           ),
         ) {
     final client = supabaseClientOrNull;
@@ -253,33 +386,74 @@ class AuthNotifier extends StateNotifier<AppAuthState> {
       return;
     }
 
-    state = state.copyWith(
-      isInitialized: true,
-      session: client.auth.currentSession,
-      user: client.auth.currentUser,
-    );
-    final currentUser = client.auth.currentUser;
-    if (currentUser != null) {
-      unawaited(_handleSignedInUser(currentUser));
-    }
-
     _authSubscription = client.auth.onAuthStateChange.listen((authState) {
+      _sawInitialAuthSignal = true;
+      final user = authState.session?.user;
+      if (user != null) {
+        unawaited(_rememberStorageScope(user.id));
+      }
+      final rememberedScope = user?.id ?? state.rememberedScopeId;
+      debugPrint(
+        '[EBB:auth] auth event user=${user?.id ?? ''} '
+        'remembered=${rememberedScope ?? ''}',
+      );
       state = state.copyWith(
         session: authState.session,
-        user: authState.session?.user,
-        isInitialized: true,
+        user: user,
+        rememberedScopeId: rememberedScope,
+        isInitialized: user != null ? true : state.isInitialized,
         isBusy: false,
         clearError: true,
       );
-      final user = authState.session?.user;
       if (user != null) {
         unawaited(_handleSignedInUser(user));
       }
     });
+    unawaited(_restoreInitialSession(client));
+  }
+
+  Future<void> _restoreInitialSession(SupabaseClient client) async {
+    // Wait for either the persisted session or Supabase's initial auth event
+    // before deciding whether to show the auth gate.
+    for (var attempt = 0; attempt < 20; attempt++) {
+      if (!mounted || state.isInitialized) return;
+      if (client.auth.currentSession != null ||
+          (_sawInitialAuthSignal && state.hasRememberedScope)) {
+        break;
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    }
+    if (!mounted) return;
+    if (state.rememberedScopeId?.trim().isEmpty != false) {
+      await _loadRememberedStorageScope();
+    }
+    final session = client.auth.currentSession;
+    final user = client.auth.currentUser ?? session?.user;
+    final rememberedScope = user?.id ?? state.rememberedScopeId;
+    if (user != null) {
+      unawaited(_rememberStorageScope(user.id));
+    }
+    state = state.copyWith(
+      isInitialized: true,
+      session: session,
+      user: user,
+      rememberedScopeId: rememberedScope,
+      isBusy: false,
+      clearError: true,
+    );
+    if (user != null) {
+      unawaited(_handleSignedInUser(user));
+    }
+    debugPrint(
+      '[EBB:auth] restore complete user=${user?.id ?? ''} '
+      'remembered=${state.rememberedScopeId ?? ''} '
+      'gate=${state.requiresAuthGate}',
+    );
   }
 
   Future<void> _handleSignedInUser(User user) async {
     try {
+      await _rememberStorageScope(user.id);
       await migrateLegacyStorageIfNeeded();
       await migrateGuestScopeToUser(user.id);
       await _ensureProfile(user);
@@ -296,9 +470,9 @@ class AuthNotifier extends StateNotifier<AppAuthState> {
     final displayName = metadata['full_name']?.toString() ??
         metadata['name']?.toString() ??
         user.email?.split('@').first ??
-        'EBB Listener';
-    final avatarUrl = metadata['avatar_url']?.toString() ??
-        metadata['picture']?.toString();
+        'Neatie Listener';
+    final avatarUrl =
+        metadata['avatar_url']?.toString() ?? metadata['picture']?.toString();
     try {
       await client.from('profiles').upsert(
         {
@@ -363,9 +537,12 @@ class AuthNotifier extends StateNotifier<AppAuthState> {
     state = state.copyWith(isBusy: true, clearError: true);
     try {
       await client.auth.signOut();
+      await _rememberStorageScope(null);
+      await _setExplicitSignOutMarker(true);
       state = state.copyWith(
         session: null,
         user: null,
+        rememberedScopeId: null,
         isBusy: false,
       );
     } catch (error) {

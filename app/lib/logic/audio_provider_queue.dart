@@ -14,6 +14,7 @@ import 'history_manager.dart';
 import 'interaction_events.dart';
 import 'playlist_provider.dart';
 import 'proxy_runtime.dart';
+import 'recommendation_api_client.dart';
 import 'track_metadata.dart';
 
 enum PlaybackQueueMode { none, radio, playlist }
@@ -29,6 +30,7 @@ class PlaybackQueueState {
   final List<Map<String, dynamic>> recommendations;
   final bool isLoadingQueue;
   final bool isLoadingRecommendations;
+  final bool hasMoreRecommendations;
 
   const PlaybackQueueState({
     this.mode = PlaybackQueueMode.none,
@@ -41,6 +43,7 @@ class PlaybackQueueState {
     this.recommendations = const [],
     this.isLoadingQueue = false,
     this.isLoadingRecommendations = false,
+    this.hasMoreRecommendations = true,
   });
 
   PlaybackQueueState copyWith({
@@ -54,6 +57,7 @@ class PlaybackQueueState {
     List<Map<String, dynamic>>? recommendations,
     bool? isLoadingQueue,
     bool? isLoadingRecommendations,
+    bool? hasMoreRecommendations,
     bool clearPlaylist = false,
     bool clearRecommendations = false,
   }) {
@@ -71,6 +75,8 @@ class PlaybackQueueState {
       isLoadingQueue: isLoadingQueue ?? this.isLoadingQueue,
       isLoadingRecommendations:
           isLoadingRecommendations ?? this.isLoadingRecommendations,
+      hasMoreRecommendations:
+          hasMoreRecommendations ?? this.hasMoreRecommendations,
     );
   }
 }
@@ -263,14 +269,7 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
           .whereType<String>()
           .toSet(),
     );
-    final res = await runRecommendationRequest(
-      proxyControlHttpClient.post(
-        buildProxyUri('/recommend'),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode(body),
-      ),
-      recommendRequestTimeout,
-    );
+    final res = await postRecommendation(body);
 
     if (res.statusCode != 200) {
       throw Exception('Recommendation lookup failed: ${res.statusCode}');
@@ -580,6 +579,19 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
         }
         await playQueueIndex(refreshedNextIndex);
       }
+    } else if (state.mode == PlaybackQueueMode.playlist &&
+        state.hasMoreRecommendations) {
+      await _refreshPlaylistRecommendations(
+        state.currentTrackId,
+        append: true,
+      );
+      final refreshedNextIndex = _nextPlayableIndex(_resolvedCurrentIndex());
+      if (refreshedNextIndex >= 0) {
+        if (logCurrentSkip) {
+          unawaited(_recordCurrentQueueInteraction('skip'));
+        }
+        await playQueueIndex(refreshedNextIndex);
+      }
     }
   }
 
@@ -808,6 +820,7 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
       return;
     }
     if (state.mode == PlaybackQueueMode.playlist) {
+      if (!state.hasMoreRecommendations) return;
       await _refreshPlaylistRecommendations(
         state.currentTrackId,
         append: true,
@@ -857,6 +870,7 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
     if (state.mode != PlaybackQueueMode.playlist) return;
     if (seedId == null || seedId.isEmpty) return;
     if (state.isLoadingRecommendations) return;
+    if (append && !state.hasMoreRecommendations) return;
 
     final existingRecommendations = state.recommendations;
     state = state.copyWith(
@@ -868,7 +882,7 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
         if (append)
           ...state.recommendations.map(extractTrackId).whereType<String>(),
       };
-      final targetCount = append ? 8 : 10;
+      final targetCount = append ? 16 : 18;
 
       List<Map<String, dynamic>> similarTracks = const [];
       try {
@@ -900,14 +914,33 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
           .where((track) => !excludedIds.contains(extractTrackId(track)))
           .toList(growable: false);
       if (!append && nextRecommendations.isEmpty) {
-        state = state.copyWith(recommendations: existingRecommendations);
+        state = state.copyWith(
+          recommendations: existingRecommendations,
+          hasMoreRecommendations: false,
+        );
         return;
       }
-      state = state.copyWith(
-        recommendations: append
-            ? [...state.recommendations, ...nextRecommendations]
-            : nextRecommendations,
-      );
+      final isDiscoverySession =
+          state.playlistId?.startsWith('discovery:') == true;
+      if (isDiscoverySession && nextRecommendations.isNotEmpty) {
+        state = state.copyWith(
+          queue: [...state.queue, ...nextRecommendations],
+          recommendations: const [],
+          hasMoreRecommendations: true,
+        );
+        unawaited(
+          ref.read(audioPlayerProvider.notifier).appendManagedQueueTracks(
+                nextRecommendations,
+              ),
+        );
+      } else {
+        state = state.copyWith(
+          recommendations: append
+              ? [...state.recommendations, ...nextRecommendations]
+              : nextRecommendations,
+          hasMoreRecommendations: nextRecommendations.isNotEmpty,
+        );
+      }
       _primeTracks(nextRecommendations);
     } catch (_) {
       // Recommendation shelf loading stays silent.

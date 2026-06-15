@@ -22,6 +22,7 @@ class AudioStreamRuntime {
   final Map<String, Future<void>> _pendingPrepareBatches =
       <String, Future<void>>{};
   final Map<String, Future<void>> _fullPrefetchTasks = {};
+  String? _activePlaybackVideoId;
   int _latencySummaryProbeCounter = 0;
 
   Uri _proxyUri(String path) => buildProxyUri(path);
@@ -78,7 +79,9 @@ class AudioStreamRuntime {
 
   bool isKnownUnavailableRemoteTrack(Map<String, dynamic> track) {
     final localPath = track['local_path']?.toString();
-    if (localPath != null && localPath.isNotEmpty && File(localPath).existsSync()) {
+    if (localPath != null &&
+        localPath.isNotEmpty &&
+        File(localPath).existsSync()) {
       return false;
     }
     final videoId = extractTrackId(track);
@@ -108,6 +111,15 @@ class AudioStreamRuntime {
     return File('${cacheFile.path}.done');
   }
 
+  void markActivePlaybackVideoId(String? videoId) {
+    final normalized = videoId?.trim();
+    _activePlaybackVideoId =
+        normalized == null || normalized.isEmpty ? null : normalized;
+  }
+
+  bool _isActivePlaybackVideoId(String videoId) =>
+      _activePlaybackVideoId == videoId.trim();
+
   Future<LockCachingAudioSource> buildCachingSourceForVideoId(
     String videoId, {
     Map<String, String>? headers,
@@ -119,6 +131,26 @@ class AudioStreamRuntime {
       Uri.parse(urlOverride ?? _proxyUri('/proxy_stream/$videoId').toString()),
       headers: headers == null || headers.isEmpty ? null : headers,
       cacheFile: cacheFile,
+      tag: tag,
+    );
+  }
+
+  Future<AudioSource> buildPlaybackSourceForVideoId(
+    String videoId, {
+    Map<String, String>? headers,
+    String? urlOverride,
+    dynamic tag,
+  }) async {
+    final cacheFile = await cacheFileForVideoId(videoId);
+    final markerFile = await cacheMarkerForVideoId(videoId);
+    if (cacheFile.existsSync() &&
+        markerFile.existsSync() &&
+        cacheFile.lengthSync() > 100000) {
+      return AudioSource.file(cacheFile.path, tag: tag);
+    }
+    return AudioSource.uri(
+      Uri.parse(urlOverride ?? _proxyUri('/proxy_stream/$videoId').toString()),
+      headers: headers == null || headers.isEmpty ? null : headers,
       tag: tag,
     );
   }
@@ -297,14 +329,31 @@ class AudioStreamRuntime {
     final cacheDir = await streamCacheDirectory();
     if (!cacheDir.existsSync()) return;
     final keepNames = keepIds.map(_sanitizeCacheKey).toSet();
+    final activePlaybackName = _activePlaybackVideoId == null
+        ? null
+        : _sanitizeCacheKey(_activePlaybackVideoId!);
     for (final entity in cacheDir.listSync(followLinks: false)) {
       if (entity is! File) continue;
       final name =
           entity.uri.pathSegments.isEmpty ? '' : entity.uri.pathSegments.last;
       if (name.isEmpty) continue;
-      final baseName = name.endsWith('.done')
-          ? name.substring(0, name.length - 5)
-          : name.replaceAll('.audio', '');
+      // `.audio.part` is exclusively owned by LockCachingAudioSource. Deleting
+      // it from general cleanup races the writer and breaks playback/prefetch.
+      if (name.endsWith('.audio.part')) continue;
+      var baseName = '';
+      for (final suffix in const [
+        '.audio.full.part',
+        '.audio.done',
+        '.audio',
+      ]) {
+        if (!name.endsWith(suffix)) continue;
+        baseName = name.substring(0, name.length - suffix.length);
+        break;
+      }
+      if (baseName.isEmpty) continue;
+      if (activePlaybackName != null && baseName == activePlaybackName) {
+        continue;
+      }
       if (keepNames.contains(baseName)) continue;
       try {
         entity.deleteSync();
@@ -313,6 +362,9 @@ class AudioStreamRuntime {
   }
 
   Future<void> prefetchTrackToTempStorage(String videoId) async {
+    if (_isActivePlaybackVideoId(videoId)) {
+      return;
+    }
     final existing = _fullPrefetchTasks[videoId];
     if (existing != null) {
       return existing;
@@ -321,13 +373,19 @@ class AudioStreamRuntime {
     final task = () async {
       final cacheFile = await cacheFileForVideoId(videoId);
       final markerFile = await cacheMarkerForVideoId(videoId);
+      if (_isActivePlaybackVideoId(videoId)) {
+        return;
+      }
       if (cacheFile.existsSync() &&
           cacheFile.lengthSync() > 100000 &&
           markerFile.existsSync()) {
         return;
       }
 
-      final tempFile = File('${cacheFile.path}.part');
+      // Keep this distinct from just_audio's LockCachingAudioSource `.part`
+      // file, otherwise background full-prefetch can delete/rename the file
+      // the active player is using.
+      final tempFile = File('${cacheFile.path}.full.part');
       if (tempFile.existsSync()) {
         try {
           tempFile.deleteSync();
@@ -335,7 +393,8 @@ class AudioStreamRuntime {
       }
 
       try {
-        final request = http.Request('GET', _proxyUri('/proxy_stream/$videoId'));
+        final request =
+            http.Request('GET', _proxyUri('/proxy_stream/$videoId'));
         final response = await appHttpClient.send(request);
         if (response.statusCode != 200) {
           throw Exception('Prefetch failed: ${response.statusCode}');
@@ -345,6 +404,12 @@ class AudioStreamRuntime {
           sink.add(chunk);
         }
         await sink.close();
+        if (_isActivePlaybackVideoId(videoId)) {
+          if (tempFile.existsSync()) {
+            tempFile.deleteSync();
+          }
+          return;
+        }
         if (cacheFile.existsSync()) {
           try {
             cacheFile.deleteSync();

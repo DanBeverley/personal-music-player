@@ -122,6 +122,9 @@ class PlayerState {
     String? artist,
     String? videoId,
     int? sleepTimerRemainingSeconds,
+    bool clearThumbnail = false,
+    bool clearArtist = false,
+    bool clearVideoId = false,
   }) {
     final nextCurrentPosition = currentPosition ?? this.currentPosition;
     return PlayerState(
@@ -129,7 +132,7 @@ class PlayerState {
       isLooping: isLooping ?? this.isLooping,
       currentTrackName: currentTrackName ?? this.currentTrackName,
       isDownloading: isDownloading ?? this.isDownloading,
-      thumbnail: thumbnail ?? this.thumbnail,
+      thumbnail: clearThumbnail ? null : (thumbnail ?? this.thumbnail),
       duration: duration ?? this.duration,
       filesize: filesize ?? this.filesize,
       currentPosition: nextCurrentPosition,
@@ -137,8 +140,8 @@ class PlayerState {
           (currentPosition != null
               ? currentPosition * 1000
               : this.currentPositionMs),
-      artist: artist ?? this.artist,
-      videoId: videoId ?? this.videoId,
+      artist: clearArtist ? null : (artist ?? this.artist),
+      videoId: clearVideoId ? null : (videoId ?? this.videoId),
       sleepTimerRemainingSeconds:
           sleepTimerRemainingSeconds ?? this.sleepTimerRemainingSeconds,
     );

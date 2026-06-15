@@ -57,8 +57,17 @@ class FrequentlyPlayedNotifier
       state = [...state];
     }
     try {
-      final frequentSnapshots =
+      var frequentSnapshots =
           await HistoryManager.getFrequentlyPlayedTrackSnapshots(limit: 8);
+      if (frequentSnapshots.isEmpty) {
+        final hydrated =
+            await HistoryManager.hydrateFromPersistedHistoryIfNeeded();
+        if (!_isRequestCurrent(requestVersion)) return;
+        if (hydrated) {
+          frequentSnapshots =
+              await HistoryManager.getFrequentlyPlayedTrackSnapshots(limit: 8);
+        }
+      }
       if (!_isRequestCurrent(requestVersion)) return;
       final resolved = <Map<String, dynamic>>[];
       final seen = <String>{};
@@ -205,7 +214,15 @@ class LastPlayedNotifier extends StateNotifier<List<Map<String, dynamic>>> {
       state = [...state];
     }
     try {
-      final tracks = await HistoryManager.getLastPlayedTrackSnapshots(limit: 8);
+      var tracks = await HistoryManager.getLastPlayedTrackSnapshots(limit: 8);
+      if (tracks.isEmpty) {
+        final hydrated =
+            await HistoryManager.hydrateFromPersistedHistoryIfNeeded();
+        if (!_isRequestCurrent(requestVersion)) return;
+        if (hydrated) {
+          tracks = await HistoryManager.getLastPlayedTrackSnapshots(limit: 8);
+        }
+      }
       if (!_isRequestCurrent(requestVersion)) return;
       final resolved = <Map<String, dynamic>>[];
       final pendingIds = <String>[];

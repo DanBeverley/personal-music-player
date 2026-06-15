@@ -134,7 +134,7 @@ class AssistantPlaylistDraft {
             ))
         .toList(growable: false);
     return AssistantPlaylistDraft(
-      name: json['name']?.toString() ?? 'EBB Mix',
+      name: json['name']?.toString() ?? 'Neatie Mix',
       summary: json['summary']?.toString() ?? '',
       tracks: tracks,
     );

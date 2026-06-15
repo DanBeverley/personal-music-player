@@ -5,6 +5,7 @@ import 'cloud_search_queries.dart';
 import 'history_manager.dart';
 import 'library_catalog_provider.dart';
 import 'playlist_provider.dart';
+import 'proxy_runtime.dart';
 import 'search_semantics.dart';
 import 'track_metadata.dart';
 
@@ -17,20 +18,15 @@ enum RecommendationRequestMode {
   rowPage,
   rowContext,
   liveRowRefresh,
-  flagshipRefine,
 }
 
 class _RecommendationRequestBehavior {
-  final bool forceRefresh;
   final bool prepareNextSession;
   final bool preferFreshRows;
-  final bool hydrateHeavyRows;
 
   const _RecommendationRequestBehavior({
-    this.forceRefresh = false,
     this.prepareNextSession = false,
     this.preferFreshRows = false,
-    this.hydrateHeavyRows = false,
   });
 }
 
@@ -40,15 +36,12 @@ _RecommendationRequestBehavior _recommendationRequestBehavior(
 }) {
   switch (requestMode) {
     case RecommendationRequestMode.pullToRefresh:
-      return const _RecommendationRequestBehavior(forceRefresh: true);
+      return const _RecommendationRequestBehavior(
+        prepareNextSession: true,
+        preferFreshRows: true,
+      );
     case RecommendationRequestMode.backgroundPrepare:
       return const _RecommendationRequestBehavior(prepareNextSession: true);
-    case RecommendationRequestMode.flagshipRefine:
-      return _RecommendationRequestBehavior(
-        prepareNextSession: true,
-        preferFreshRows: preferFreshRows,
-        hydrateHeavyRows: true,
-      );
     case RecommendationRequestMode.launch:
     case RecommendationRequestMode.quick:
     case RecommendationRequestMode.queueSupplemental:
@@ -77,6 +70,43 @@ bool _looksLikeRecommendationTasteQuery(String query) {
   return sharedTasteKeywords.any((keyword) => normalized.contains(keyword));
 }
 
+bool _hasNonEmptySignal(dynamic value) {
+  if (value is String) return value.trim().isNotEmpty;
+  if (value is Iterable) return value.any(_hasNonEmptySignal);
+  if (value is Map) return value.values.any(_hasNonEmptySignal);
+  return value != null;
+}
+
+bool recommendationRequestHasUserSignals(Map<String, dynamic> body) {
+  for (final key in const [
+    'seed_id',
+    'seed_ids',
+    'recent_track_ids',
+    'top_track_ids',
+    'recent_track_snapshots',
+    'top_track_snapshots',
+    'last_played_tracks',
+    'recent_queries',
+    'taste_queries',
+    'artist_hints',
+    'playlist_names',
+    'library_track_ids',
+    'offline_track_ids',
+  ]) {
+    if (_hasNonEmptySignal(body[key])) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool recommendationRequestShouldShowFreshStart(Map<String, dynamic> body) {
+  if (body['fresh_account_empty_home'] == true) return true;
+  final signalTier = body['client_signal_tier']?.toString().trim();
+  if (signalTier == 'cold_start') return true;
+  return !recommendationRequestHasUserSignals(body);
+}
+
 Future<Map<String, dynamic>> buildRecommendationRequestBody(
   Ref ref,
   String? seedId, {
@@ -90,6 +120,7 @@ Future<Map<String, dynamic>> buildRecommendationRequestBody(
   List<String> extraSessionQueries = const <String>[],
   bool allowNetworkCloudQueries = true,
 }) async {
+  final requestBuildWatch = Stopwatch()..start();
   final behavior = _recommendationRequestBehavior(
     requestMode,
     preferFreshRows: preferFreshRows,
@@ -97,18 +128,21 @@ Future<Map<String, dynamic>> buildRecommendationRequestBody(
   final playlists = ref.read(playlistProvider);
   final libraryTracks = ref.read(libraryProvider).valueOrNull ?? const [];
   final storageScopeId = ref.read(authProvider).storageScopeId;
+  final hydrateWatch = Stopwatch()..start();
+  await HistoryManager.hydrateFromPersistedHistoryIfNeeded(limit: 36);
+  hydrateWatch.stop();
+  final signalWatch = Stopwatch()..start();
   final requestSignals = await Future.wait<Object?>([
-    HistoryManager.getRecentTrackSnapshots(
-      limit: behavior.forceRefresh ? 14 : 10,
-    ),
+    HistoryManager.getRecentTrackSnapshots(limit: 10),
     HistoryManager.getLastPlayedTrackSnapshots(limit: 8),
     HistoryManager.getFrequentlyPlayedTrackSnapshots(limit: 10),
-    HistoryManager.getRecentSeeds(limit: behavior.forceRefresh ? 14 : 10),
+    HistoryManager.getRecentSeeds(limit: 10),
     HistoryManager.getFrequentlyPlayedTrackIds(limit: 10),
-    allowNetworkCloudQueries
+      allowNetworkCloudQueries
         ? getRecentCloudSearchQueries(limit: 8)
         : Future<List<String>>.value(peekRecentCloudSearchQueries(limit: 8)),
   ]);
+  signalWatch.stop();
   final recentTrackSnapshots =
       List<Map<String, dynamic>>.from(requestSignals[0] as List);
   final lastPlayedSnapshots =
@@ -181,21 +215,33 @@ Future<Map<String, dynamic>> buildRecommendationRequestBody(
     }
   }
 
-  return {
+  final hasUserSignals = seedIds.isNotEmpty ||
+      recentTrackIds.isNotEmpty ||
+      topTrackIds.isNotEmpty ||
+      recentTrackSnapshots.isNotEmpty ||
+      topTrackSnapshots.isNotEmpty ||
+      lastPlayedSnapshots.isNotEmpty ||
+      blendedRecentQueries.isNotEmpty ||
+      explicitTasteQueries.isNotEmpty ||
+      explicitArtistHints.isNotEmpty ||
+      playlists.isNotEmpty ||
+      libraryTrackIds.isNotEmpty ||
+      offlineTrackIds.isNotEmpty;
+
+  final payload = {
     'query': '',
     'limit': limit,
     'offset': offset,
     'user_scope_id': storageScopeId,
-    'force_refresh': behavior.forceRefresh,
+    'client_signal_tier': hasUserSignals ? 'personalized' : 'cold_start',
+    'fresh_account_empty_home': !hasUserSignals,
+    'force_refresh': false,
     'prepare_next_session': behavior.prepareNextSession,
     'prefer_fresh_rows': behavior.preferFreshRows,
     if (behavior.preferFreshRows)
       'refresh_token': DateTime.now().millisecondsSinceEpoch.toString(),
-    'hydrate_heavy_rows': behavior.hydrateHeavyRows,
     if (seedIds.isNotEmpty) 'seed_id': seedIds.first,
-    'seed_ids': seedIds
-        .take(behavior.forceRefresh ? 6 : 5)
-        .toList(growable: false),
+    'seed_ids': seedIds.take(5).toList(growable: false),
     'recent_track_ids': recentTrackIds,
     'top_track_ids': topTrackIds,
     'recent_track_snapshots': recentTrackSnapshots,
@@ -214,35 +260,10 @@ Future<Map<String, dynamic>> buildRecommendationRequestBody(
       'taste_queries': explicitTasteQueries.take(8).toList(growable: false),
     'avoid_ids': avoidIds.take(40).toList(growable: false),
   };
-}
-
-Map<String, dynamic> buildRecommendationRowRefreshBody(
-  Ref ref, {
-  required String sessionId,
-  required String rowId,
-  String rowContext = 'flagship_refine',
-  int limit = 8,
-  RecommendationRequestMode requestMode =
-      RecommendationRequestMode.flagshipRefine,
-  bool preferFreshRows = false,
-}) {
-  final behavior = _recommendationRequestBehavior(
-    requestMode,
-    preferFreshRows: preferFreshRows,
+  requestBuildWatch.stop();
+  debugProxyLog(
+    'recommend',
+    'request body timing mode=$requestMode hydrateMs=${hydrateWatch.elapsedMilliseconds} signalMs=${signalWatch.elapsedMilliseconds} totalMs=${requestBuildWatch.elapsedMilliseconds} hasSignals=$hasUserSignals',
   );
-  final storageScopeId = ref.read(authProvider).storageScopeId;
-  return {
-    'query': '',
-    'user_scope_id': storageScopeId,
-    'session_id': sessionId,
-    'row_id': rowId,
-    'row_context': rowContext,
-    'offset': 0,
-    'limit': limit,
-    'prefer_fresh_rows': behavior.preferFreshRows,
-    if (behavior.preferFreshRows)
-      'refresh_token': DateTime.now().millisecondsSinceEpoch.toString(),
-    'prepare_next_session': behavior.prepareNextSession,
-    'hydrate_heavy_rows': behavior.hydrateHeavyRows,
-  };
+  return payload;
 }

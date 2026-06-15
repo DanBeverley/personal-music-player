@@ -10,17 +10,17 @@ Future<void> initAudioService() async {
   try {
     globalAudioHandler = await AudioService.init(
       builder: () => _bootstrapAudioHandler,
-      config: AudioServiceConfig(
+      config: const AudioServiceConfig(
         androidNotificationChannelId: 'com.danbeverley.ebb.channel.audio',
-        androidNotificationChannelName: 'EBB Audio Playback',
+        androidNotificationChannelName: 'Neatie Audio Playback',
         androidNotificationChannelDescription:
-            'Playback controls for EBB on notifications and the Android lock screen.',
+            'Playback controls for Neatie on notifications and the Android lock screen.',
         androidNotificationOngoing: true,
         androidNotificationClickStartsActivity: true,
         androidResumeOnClick: true,
-        androidStopForegroundOnPause: false,
-        fastForwardInterval: const Duration(seconds: 10),
-        rewindInterval: const Duration(seconds: 10),
+        androidStopForegroundOnPause: true,
+        fastForwardInterval: Duration(seconds: 10),
+        rewindInterval: Duration(seconds: 10),
       ),
     ).timeout(const Duration(seconds: 8));
   } on TimeoutException catch (error) {

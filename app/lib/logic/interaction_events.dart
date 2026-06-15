@@ -63,7 +63,7 @@ Future<void> recordProxyInteractionEvent(
           buildProxyUri('/interaction_event'),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({
-            'user_scope_id': currentAuthenticatedUserId ?? 'guest',
+            'user_scope_id': activeStorageScopeId,
             'track_id': resolvedTrackId,
             'event_type': eventType.trim().toLowerCase(),
             'artist_name': payload['channel'] ?? payload['artist'],
@@ -101,7 +101,7 @@ Future<void> recordProxySearchEvent(
           buildProxyUri('/search_interaction'),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({
-            'user_scope_id': currentAuthenticatedUserId ?? 'guest',
+            'user_scope_id': activeStorageScopeId,
             'query': trimmedQuery,
             'result_count': resultCount,
             'source': 'app_${payload['search_scope']}_search',

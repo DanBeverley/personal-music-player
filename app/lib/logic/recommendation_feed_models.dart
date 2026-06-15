@@ -1,5 +1,115 @@
 import 'track_metadata.dart';
 
+const Set<String> activeHomeFeedRowKinds = <String>{
+  'todays_pick',
+  'featured_new_albums',
+  'last_played',
+  'frequently_listened',
+  'made_for_you',
+  'because_you_played',
+  'trending_by_genre',
+  'recommended_albums',
+  'recommended_artists',
+  'quiet_picks',
+  'hidden_gems',
+};
+
+bool isActiveHomeFeedRowKind(String rowKind) =>
+    activeHomeFeedRowKinds.contains(rowKind.trim());
+
+String homeFeedRowKindFromJson(Map<String, dynamic> row) =>
+    (row['kind'] ?? row['id'] ?? '').toString().trim();
+
+List<Map<String, dynamic>> filterActiveHomeFeedRows(
+  Iterable<dynamic> rows,
+) {
+  return rows.whereType<Map>().where((row) {
+    final typedRow = Map<String, dynamic>.from(row);
+    return isActiveHomeFeedRowKind(homeFeedRowKindFromJson(typedRow));
+  }).map((row) => Map<String, dynamic>.from(row)).toList(growable: false);
+}
+
+Map<String, dynamic> filterActiveHomeFeedDiagnostics(
+  Map<String, dynamic> diagnostics,
+) {
+  Map<String, dynamic>? filterKeyedMap(dynamic value) {
+    if (value is! Map) return null;
+    final filtered = <String, dynamic>{};
+    for (final entry in value.entries) {
+      final key = entry.key?.toString() ?? '';
+      if (isActiveHomeFeedRowKind(key)) {
+        filtered[key] = entry.value;
+      }
+    }
+    return filtered;
+  }
+
+  List<dynamic>? filterRowKindList(dynamic value) {
+    if (value is! List) return null;
+    return value
+        .where((entry) => isActiveHomeFeedRowKind(entry.toString()))
+        .toList(growable: false);
+  }
+
+  final filtered = Map<String, dynamic>.from(diagnostics);
+  final rowStatus = filterKeyedMap(filtered['row_status']);
+  if (rowStatus != null) filtered['row_status'] = rowStatus;
+  final rowItemCounts = filterKeyedMap(filtered['row_item_counts']);
+  if (rowItemCounts != null) filtered['row_item_counts'] = rowItemCounts;
+  final rowQualityReasons = filterKeyedMap(filtered['row_quality_reasons']);
+  if (rowQualityReasons != null) {
+    filtered['row_quality_reasons'] = rowQualityReasons;
+  }
+  final rowOrder = filterRowKindList(filtered['row_order']);
+  if (rowOrder != null) filtered['row_order'] = rowOrder;
+  final deferredRowKinds = filterRowKindList(filtered['deferred_row_kinds']);
+  if (deferredRowKinds != null) {
+    filtered['deferred_row_kinds'] = deferredRowKinds;
+  }
+  return filtered;
+}
+
+Map<String, dynamic> filterActiveHomeFeedPayload(
+  Map<String, dynamic> payload,
+) {
+  final filtered = Map<String, dynamic>.from(payload);
+  final rows = filtered['rows'];
+  filtered['rows'] = filterActiveHomeFeedRows(
+    rows is List ? rows : const <dynamic>[],
+  );
+  final diagnostics = filtered['diagnostics'];
+  if (diagnostics is Map) {
+    filtered['diagnostics'] = filterActiveHomeFeedDiagnostics(
+      Map<String, dynamic>.from(diagnostics),
+    );
+  }
+  return filtered;
+}
+
+RecommendationFeedState filterActiveHomeFeedState(
+  RecommendationFeedState state,
+) {
+  final activeRows = state.rows
+      .where((row) =>
+          isActiveHomeFeedRowKind(row.kind) || isActiveHomeFeedRowKind(row.id))
+      .toList(growable: false);
+  return state.copyWith(
+    rows: activeRows,
+    diagnostics: filterActiveHomeFeedDiagnostics(state.diagnostics),
+  );
+}
+
+RecommendationFeedRowState? activeHomeFeedRowFromJson(
+  Map<dynamic, dynamic> json,
+) {
+  final typedJson = Map<String, dynamic>.from(json);
+  final rowKind = homeFeedRowKindFromJson(typedJson);
+  if (!isActiveHomeFeedRowKind(rowKind)) {
+    return null;
+  }
+  return RecommendationFeedRowState.fromJson(typedJson);
+}
+
 class RecommendationFeedRowState {
   final String id;
   final String title;
@@ -25,7 +135,8 @@ class RecommendationFeedRowState {
 
   factory RecommendationFeedRowState.fromJson(Map<String, dynamic> json) {
     final kind = (json['kind'] ?? json['id'] ?? 'tracks').toString();
-    final inferredItemType = kind == 'recommended_albums'
+    final inferredItemType = kind == 'recommended_albums' ||
+            kind == 'featured_new_albums'
         ? 'album'
         : kind == 'recommended_artists'
             ? 'artist'
@@ -86,7 +197,6 @@ class RecommendationFeedRowState {
 
   bool get isPending => (meta['loading_state']?.toString() ?? '') == 'pending';
 
-  bool get isDeferredFlagship => meta['deferred_flagship'] == true;
 
   bool get isPartialReady => meta['partial_ready'] == true;
 
@@ -181,6 +291,10 @@ class RecommendationFeedState {
           ? Map<String, dynamic>.from(json['diagnostics'] as Map)
           : const <String, dynamic>{},
     );
+  }
+
+  factory RecommendationFeedState.fromHomeJson(Map<String, dynamic> json) {
+    return RecommendationFeedState.fromJson(filterActiveHomeFeedPayload(json));
   }
 
   Map<String, dynamic> toJson() => {

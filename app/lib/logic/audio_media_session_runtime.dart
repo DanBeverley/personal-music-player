@@ -89,7 +89,7 @@ MediaItem currentMediaItem({
   );
   final album =
       (activeTrack?['album'] ?? activeTrack?['album_title'])?.toString().trim();
-  final albumTitle = album != null && album.isNotEmpty ? album : 'EBB';
+  final albumTitle = album != null && album.isNotEmpty ? album : 'Neatie';
   final artistName = _mediaSessionTrackArtist(activeTrack) ??
       state.artist ??
       'Unknown Artist';

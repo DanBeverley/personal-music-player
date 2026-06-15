@@ -17,6 +17,73 @@ import 'search_semantics.dart';
 import 'search_payload_runtime.dart';
 import 'track_metadata.dart';
 
+Future<Map<String, dynamic>?> resolveArtistReference(
+  ProviderReader read,
+  Map<String, dynamic> artist,
+) async {
+  final directId = (artist['id'] ?? artist['browseId'] ?? artist['artist_id'])
+          ?.toString()
+          .trim() ??
+      '';
+  final resolutionStatus =
+      artist['resolution_status']?.toString().trim().toLowerCase() ?? '';
+  final isCanonicalBrowseId = directId.startsWith('UC');
+  if (directId.isNotEmpty &&
+      isCanonicalBrowseId &&
+      resolutionStatus != 'derived_from_track') {
+    return <String, dynamic>{...artist, 'id': directId};
+  }
+  final artistName = artist['name']?.toString().trim() ?? '';
+  if (artistName.isEmpty) return null;
+  Map<String, dynamic>? payload;
+  try {
+    final response = await runSearchRequest(
+      appHttpClient.post(
+          buildProxyUri('/resolve_artist'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({
+            'query': artistName,
+            'limit': 4,
+            'user_scope_id': read(authProvider).storageScopeId,
+            'search_mode': 'entity',
+            'defer_side_surfaces': true,
+          }),
+        ),
+      const Duration(seconds: 12),
+    );
+    if (response.statusCode == 200) {
+      payload = jsonDecode(response.body) as Map<String, dynamic>;
+    }
+  } catch (_) {
+    payload = null;
+  }
+  final directArtist = payload?['artist'];
+  if (directArtist is Map) {
+    final resolved = Map<String, dynamic>.from(directArtist);
+    final resolvedId =
+        (resolved['id'] ?? resolved['browseId'])?.toString().trim() ?? '';
+    if (resolvedId.isNotEmpty) {
+      return <String, dynamic>{...resolved, 'id': resolvedId};
+    }
+  }
+  final candidates = (payload?['artists'] as List<dynamic>? ?? const [])
+      .whereType<Map>()
+      .map((entry) => Map<String, dynamic>.from(entry))
+      .toList(growable: false);
+  if (candidates.isEmpty) {
+    return isCanonicalBrowseId ? <String, dynamic>{...artist, 'id': directId} : null;
+  }
+  final normalizedName = artistName.toLowerCase();
+  final resolved = candidates.firstWhere(
+    (candidate) =>
+        candidate['name']?.toString().trim().toLowerCase() == normalizedName,
+    orElse: () => candidates.first,
+  );
+  final resolvedId =
+      (resolved['id'] ?? resolved['browseId'])?.toString().trim() ?? '';
+  return resolvedId.isEmpty ? null : <String, dynamic>{...resolved, 'id': resolvedId};
+}
+
 class TrackDetailsNotifier extends StateNotifier<Map<String, dynamic>?> {
   final Ref ref;
 

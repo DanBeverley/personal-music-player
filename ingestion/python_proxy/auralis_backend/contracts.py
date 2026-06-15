@@ -45,7 +45,6 @@ class RecommendationHomeV2Request(BaseModel):
     prepare_next_session: bool = False
     prefer_fresh_rows: bool = False
     refresh_token: str = ""
-    hydrate_heavy_rows: bool = False
     recent_track_ids: List[str] = Field(default_factory=list)
     top_track_ids: List[str] = Field(default_factory=list)
     recent_tracks: List[Dict[str, Any]] = Field(default_factory=list)
@@ -122,11 +121,12 @@ class SearchRequest(SearchV3Request):
     prepare_next_session: bool = False
     prefer_fresh_rows: bool = False
     refresh_token: str = ""
-    hydrate_heavy_rows: bool = False
     defer_side_surfaces: bool = False
     recent_track_snapshots: List[Dict[str, Any]] = Field(default_factory=list)
     top_track_snapshots: List[Dict[str, Any]] = Field(default_factory=list)
     anchor_track_snapshots: List[Dict[str, Any]] = Field(default_factory=list)
+    client_signal_tier: str = ""
+    fresh_account_empty_home: bool = False
 
 
 class RecommendationInteractionEventRequest(BaseModel):
@@ -146,6 +146,11 @@ class RecommendationSearchEventRequest(BaseModel):
     source: str = "app"
     occurred_at: Optional[float] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class HistorySeedRequest(BaseModel):
+    user_scope_id: str = "guest"
+    limit: int = 24
 
 
 class RecommendationModelTrainRequest(BaseModel):
@@ -247,6 +252,9 @@ class SearchPageResponse(BaseModel):
     artists: List[Dict[str, Any]] = Field(default_factory=list)
     albums: List[Dict[str, Any]] = Field(default_factory=list)
     similar_artists: List[Dict[str, Any]] = Field(default_factory=list)
+    similar_tracks: List[Dict[str, Any]] = Field(default_factory=list)
+    artist_tracks: List[Dict[str, Any]] = Field(default_factory=list)
+    related_albums: List[Dict[str, Any]] = Field(default_factory=list)
     diagnostics: Dict[str, Any] = Field(default_factory=dict)
 
 

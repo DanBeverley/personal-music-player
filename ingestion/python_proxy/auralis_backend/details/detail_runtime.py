@@ -20,21 +20,28 @@ def build_artist_details_payload(
         if cached is not None:
             return dict(cached)
 
-    artist = server.ytmusic.get_artist(artist_id)
+    raw_artist = server.ytmusic.get_artist(artist_id)
+    artist = dict(raw_artist) if isinstance(raw_artist, dict) else {}
     name = artist.get("name") or "Unknown Artist"
     songs_section = artist.get("songs") or {}
     album_section = artist.get("albums") or {}
     related_section = artist.get("related") or {}
 
-    top_songs = server.normalize_artist_song_entries(
-        songs_section.get("results") or [],
-        fallback_artist=name,
-    )
+    try:
+        top_songs = server.normalize_artist_song_entries(
+            songs_section.get("results") or [],
+            fallback_artist=name,
+        )
+    except Exception:
+        top_songs = []
 
-    albums = server.normalize_artist_album_entries(
-        album_section.get("results") or [],
-        fallback_artist=name,
-    )
+    try:
+        albums = server.normalize_artist_album_entries(
+            album_section.get("results") or [],
+            fallback_artist=name,
+        )
+    except Exception:
+        albums = []
     album_browse_id = album_section.get("browseId")
     album_params = album_section.get("params")
     if album_browse_id and album_params:
@@ -46,10 +53,14 @@ def build_artist_details_payload(
             )
         except Exception:
             more_albums = []
-        for album in server.normalize_artist_album_entries(
-            more_albums,
-            fallback_artist=name,
-        ):
+        try:
+            normalized_more_albums = server.normalize_artist_album_entries(
+                more_albums,
+                fallback_artist=name,
+            )
+        except Exception:
+            normalized_more_albums = []
+        for album in normalized_more_albums:
             album_id = album.get("id")
             if album_id and any(existing.get("id") == album_id for existing in albums):
                 continue
@@ -57,26 +68,50 @@ def build_artist_details_payload(
             if len(albums) >= 12:
                 break
 
-    related_artists = server.rank_artist_detail_related_artists(
-        {
-            "id": artist_id,
-            "name": name,
-            "description": artist.get("description") or "",
-            "thumbnail": server.extract_thumbnail(artist),
-        },
-        top_songs,
-        server.normalize_artist_results(related_section.get("results") or []),
-        enrich_related=enrich_related,
-    )
+    try:
+        normalized_related = server.normalize_artist_results(
+            related_section.get("results") or []
+        )
+    except Exception:
+        normalized_related = []
+    try:
+        related_artists = server.rank_artist_detail_related_artists(
+            {
+                "id": artist_id,
+                "name": name,
+                "description": artist.get("description") or "",
+                "thumbnail": server.extract_thumbnail(artist),
+            },
+            top_songs,
+            normalized_related,
+            enrich_related=enrich_related,
+        )
+    except Exception:
+        related_artists = normalized_related if enrich_related else []
+
+    try:
+        thumbnail = server.extract_thumbnail(artist)
+    except Exception:
+        thumbnail = None
+    try:
+        description = server.summarize_artist_description(
+            artist.get("description") or ""
+        )
+    except Exception:
+        description = artist.get("description") or ""
+    try:
+        stats = server.normalize_artist_stats(artist)
+    except Exception:
+        stats = {}
 
     payload = {
         "status": "success",
         "id": artist_id,
         "name": name,
-        "description": server.summarize_artist_description(artist.get("description") or ""),
+        "description": description,
         "full_description": artist.get("description") or "",
-        "thumbnail": server.extract_thumbnail(artist),
-        "stats": server.normalize_artist_stats(artist),
+        "thumbnail": thumbnail,
+        "stats": stats,
         "top_songs": top_songs[:12],
         "albums": albums[:12],
         "related_artists": related_artists[:12],

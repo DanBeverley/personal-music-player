@@ -435,7 +435,7 @@ def assistant_fallback_chat_reply(server: Any, req: Any, model_override=None):
         {
             "role": "system",
             "content": (
-                "You are EBB, a warm conversational assistant. "
+                "You are Neatie, a warm conversational assistant. "
                 "Reply naturally to the user's latest message. "
                 "If they want comfort or conversation, be present and human. "
                 "Do not force music suggestions unless they explicitly ask for music. "

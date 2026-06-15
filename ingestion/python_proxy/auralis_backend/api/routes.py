@@ -21,6 +21,7 @@ from ..contracts import (
     AssistantSessionCreateRequest,
     AssistantSessionUpdateRequest,
     DownloadRequest,
+    HistorySeedRequest,
     RecommendationInteractionEventRequest,
     RecommendationModelTrainRequest,
     RecommendationSearchEventRequest,
@@ -134,6 +135,11 @@ def search_artists(req: SearchRequest):
     return _require_search_service().search_artists(req)
 
 
+@router.post("/resolve_artist")
+def resolve_artist(req: SearchRequest):
+    return _require_search_service().resolve_artist(req)
+
+
 @router.post("/recommended_artists")
 def recommended_artists(req: SearchRequest):
     return _require_recommendation_service().recommended_artists(req)
@@ -149,11 +155,6 @@ def recommend(req: SearchRequest):
     return _require_recommendation_service().recommend(req)
 
 
-@router.post("/recommend/flagship_stream")
-def recommend_flagship_stream(req: SearchRequest):
-    return _require_recommendation_service().flagship_stream(req)
-
-
 @router.post("/interaction_event")
 def recommendation_interaction_event(req: RecommendationInteractionEventRequest):
     return _require_recommendation_service().interaction_event(req)
@@ -162,6 +163,11 @@ def recommendation_interaction_event(req: RecommendationInteractionEventRequest)
 @router.post("/search_interaction")
 def recommendation_search_interaction(req: RecommendationSearchEventRequest):
     return _require_recommendation_service().search_interaction(req)
+
+
+@router.post("/history_seed")
+def recommendation_history_seed(req: HistorySeedRequest):
+    return _require_recommendation_service().history_seed(req)
 
 
 @router.get("/recommendation_model")

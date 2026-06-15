@@ -18,9 +18,12 @@ dependencies:
   cached_network_image: ^3.4.1
   just_audio: ^0.10.5
   image_picker: ^1.1.2
+  file_picker: ^8.1.2
   supabase_flutter: ^2.12.0
   permission_handler: ^12.0.1
+  record: ^6.0.0
   url_launcher: ^6.3.1
+  crypto: ^3.0.6
 
 dev_dependencies:
   flutter_test:
@@ -31,10 +34,10 @@ dev_dependencies:
 flutter:
   uses-material-design: true
   assets:
-    - assets/branding/ebb_app_icon.png
-    - assets/branding/ebb_intro_mark.png
-    - assets/branding/ebb_intro_icon.png
+    - assets/branding/neatie_app_icon.png
+    - assets/branding/neatie_intro_mark.png
+    - assets/branding/neatie_intro_icon.png
 
 flutter_launcher_icons:
   android: true
-  image_path: assets/branding/ebb_app_icon.png
+  image_path: assets/branding/neatie_app_icon.png

@@ -2,8 +2,11 @@ package com.danbeverley.ebb
 
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.provider.OpenableColumns
+import android.provider.Settings
+import androidx.core.content.FileProvider
 import com.ryanheise.audioservice.AudioServiceActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -12,6 +15,7 @@ import java.io.File
 class MainActivity : AudioServiceActivity() {
     companion object {
         private const val SONG_MATCH_CHANNEL = "ebb/song_match_intents"
+        private const val APP_UPDATE_CHANNEL = "ebb/app_update"
     }
 
     private var songMatchChannel: MethodChannel? = null
@@ -34,6 +38,26 @@ class MainActivity : AudioServiceActivity() {
                 "clearPendingSharedMedia" -> {
                     pendingSharedMedia = null
                     result.success(null)
+                }
+                else -> result.notImplemented()
+            }
+        }
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            APP_UPDATE_CHANNEL
+        ).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "getVersionInfo" -> result.success(versionInfo())
+                "getSupportedAbis" -> result.success(Build.SUPPORTED_ABIS.toList())
+                "canRequestPackageInstalls" -> result.success(canRequestPackageInstalls())
+                "openInstallPermissionSettings" -> {
+                    openInstallPermissionSettings()
+                    result.success(null)
+                }
+                "installApk" -> {
+                    val path = call.argument<String>("path") ?: ""
+                    val launched = installApk(path)
+                    result.success(launched)
                 }
                 else -> result.notImplemented()
             }
@@ -113,5 +137,71 @@ class MainActivity : AudioServiceActivity() {
             }
         val fromPath = uri.lastPathSegment ?: ""
         return fromPath.substringAfterLast('/')
+    }
+
+    private fun versionInfo(): Map<String, Any> {
+        val packageInfo = packageManager.getPackageInfo(packageName, 0)
+        val versionCode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            packageInfo.longVersionCode
+        } else {
+            @Suppress("DEPRECATION")
+            packageInfo.versionCode.toLong()
+        }
+        return mapOf(
+            "packageName" to packageName,
+            "versionName" to (packageInfo.versionName ?: ""),
+            "versionCode" to versionCode,
+        )
+    }
+
+    private fun canRequestPackageInstalls(): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            packageManager.canRequestPackageInstalls()
+        } else {
+            true
+        }
+    }
+
+    private fun openInstallPermissionSettings() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val intent = Intent(
+                Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                Uri.parse("package:$packageName")
+            ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(intent)
+        }
+    }
+
+    private fun installApk(path: String): Boolean {
+        val apk = File(path)
+        if (!apk.exists() || !apk.isFile) return false
+        val uri = FileProvider.getUriForFile(
+            this,
+            "$packageName.update_file_provider",
+            apk
+        )
+        val intent = Intent(Intent.ACTION_INSTALL_PACKAGE).apply {
+            data = uri
+            putExtra(Intent.EXTRA_NOT_UNKNOWN_SOURCE, true)
+            putExtra(Intent.EXTRA_RETURN_RESULT, true)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        return try {
+            startActivity(intent)
+            true
+        } catch (_: Exception) {
+            val fallback = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, "application/vnd.android.package-archive")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            try {
+                startActivity(fallback)
+                true
+            } catch (_: Exception) {
+                false
+            }
+        }
     }
 }

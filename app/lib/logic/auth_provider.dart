@@ -388,7 +388,16 @@ class AuthNotifier extends StateNotifier<AppAuthState> {
 
     _authSubscription = client.auth.onAuthStateChange.listen((authState) {
       _sawInitialAuthSignal = true;
-      final user = authState.session?.user;
+      final explicitlySignedOut =
+          authState.event == AuthChangeEvent.signedOut &&
+              client.auth.currentSession == null &&
+              client.auth.currentUser == null;
+      final session = explicitlySignedOut
+          ? null
+          : authState.session ?? client.auth.currentSession ?? state.session;
+      final user = explicitlySignedOut
+          ? null
+          : session?.user ?? client.auth.currentUser ?? state.user;
       if (user != null) {
         unawaited(_rememberStorageScope(user.id));
       }
@@ -398,10 +407,11 @@ class AuthNotifier extends StateNotifier<AppAuthState> {
         'remembered=${rememberedScope ?? ''}',
       );
       state = state.copyWith(
-        session: authState.session,
+        session: session,
         user: user,
         rememberedScopeId: rememberedScope,
-        isInitialized: user != null ? true : state.isInitialized,
+        isInitialized:
+            user != null || explicitlySignedOut ? true : state.isInitialized,
         isBusy: false,
         clearError: true,
       );

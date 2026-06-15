@@ -78,6 +78,8 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
   String? _completedTrackIdNotified;
   bool _streamTransitionInProgress = false;
   bool _streamSeekRecoveryInProgress = false;
+  Future<void>? _streamSeekDrainFuture;
+  int? _pendingStreamSeekSeconds;
   bool _managedQueueActive = false;
   List<Map<String, dynamic>> _managedQueueTracks = const [];
   final List<String?> _prefetchedTrackIds = <String?>[null, null];
@@ -1373,6 +1375,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
 
   Future<bool> loadLocalWithMeta(String path, Map<String, dynamic> meta) async {
     final loadVersion = ++_streamLoadVersion;
+    _pendingStreamSeekSeconds = null;
     _desiredStreamPlaying = false;
     _activeStream = true;
     _managedQueueActive = false;
@@ -1587,6 +1590,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       return;
     }
 
+    _pendingStreamSeekSeconds = null;
     _activeStream = true;
     _managedQueueActive = false;
     _managedQueueTracks = const [];
@@ -1766,6 +1770,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
 
   Future<void> stopPlayback({bool resetState = true}) async {
     _desiredStreamPlaying = false;
+    _pendingStreamSeekSeconds = null;
     _playbackTimer?.cancel();
     _sleepTimer?.cancel();
     _sleepTimer = null;
@@ -1814,48 +1819,11 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         ? seconds.clamp(0, maxSeekSeconds).toInt()
         : (seconds < 0 ? 0 : seconds);
     if (_activeStream) {
-      if (_streamTransitionInProgress ||
-          _streamSeekRecoveryInProgress) {
-        return;
-      }
-      final previousPosition = state.currentPosition;
-      final previousPositionMs = state.currentPositionMs;
-      final shouldResume =
-          _desiredStreamPlaying || streamPlayer.playing || state.isPlaying;
-      try {
-        try {
-          await _runStreamCommand(() async {
-            if (!_activeStream) return;
-            if (streamPlayer.audioSource == null) {
-              throw StateError('stream_source_missing');
-            }
-            await streamPlayer.setLoopMode(_streamLoopMode);
-            await _seekActiveStreamPlayer(Duration(seconds: boundedSeconds));
-          });
-        } catch (_) {
-          await _recoverStreamAfterSeekFailure(
-            boundedSeconds: boundedSeconds,
-            shouldResume: shouldResume,
-          );
-        }
-        if (shouldResume && !streamPlayer.playing) {
-          await _resumeStreamPlayback();
-        }
-        state = state.copyWith(
-          isPlaying: shouldResume || streamPlayer.playing,
-          isDownloading: false,
-          currentPosition: boundedSeconds,
-          currentPositionMs: boundedSeconds * 1000,
-        );
-      } catch (recoveryError) {
-        _markStreamFailed(
-          recoveryError,
-          currentPosition: previousPosition,
-          currentPositionMs: previousPositionMs,
-        );
-        unawaited(_handleStreamFailure(recoveryError));
-      }
-      return;
+      state = state.copyWith(
+        currentPosition: boundedSeconds,
+        currentPositionMs: boundedSeconds * 1000,
+      );
+      return _queueStreamSeek(boundedSeconds);
     }
 
     audioEngine.seek(boundedSeconds * 1000); // Send MS to C++
@@ -1863,6 +1831,76 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       currentPosition: boundedSeconds,
       currentPositionMs: boundedSeconds * 1000,
     );
+  }
+
+  Future<void> _queueStreamSeek(int boundedSeconds) {
+    _pendingStreamSeekSeconds = boundedSeconds;
+    return _streamSeekDrainFuture ??= _drainStreamSeekQueue();
+  }
+
+  Future<void> _drainStreamSeekQueue() async {
+    try {
+      while (_activeStream && _pendingStreamSeekSeconds != null) {
+        if (_streamTransitionInProgress || _streamSeekRecoveryInProgress) {
+          await Future<void>.delayed(const Duration(milliseconds: 80));
+          continue;
+        }
+        final boundedSeconds = _pendingStreamSeekSeconds!;
+        _pendingStreamSeekSeconds = null;
+        await _performStreamSeek(boundedSeconds);
+      }
+    } finally {
+      _streamSeekDrainFuture = null;
+      final pendingSeconds = _pendingStreamSeekSeconds;
+      if (_activeStream && pendingSeconds != null) {
+        unawaited(_queueStreamSeek(pendingSeconds));
+      }
+    }
+  }
+
+  Future<void> _performStreamSeek(int boundedSeconds) async {
+    final previousPosition = state.currentPosition;
+    final previousPositionMs = state.currentPositionMs;
+    final shouldResume =
+        _desiredStreamPlaying || streamPlayer.playing || state.isPlaying;
+    try {
+      try {
+        await _runStreamCommand(() async {
+          if (!_activeStream) return;
+          if (streamPlayer.audioSource == null) {
+            throw StateError('stream_source_missing');
+          }
+          await streamPlayer.setLoopMode(_streamLoopMode);
+          await _seekActiveStreamPlayer(Duration(seconds: boundedSeconds));
+        });
+      } catch (_) {
+        // A newer seek supersedes this failure; recovering the stale position
+        // would replace the source while the user is still scrubbing.
+        if (_pendingStreamSeekSeconds != null) return;
+        await _recoverStreamAfterSeekFailure(
+          boundedSeconds: boundedSeconds,
+          shouldResume: shouldResume,
+        );
+      }
+      if (_pendingStreamSeekSeconds != null) return;
+      if (shouldResume && !streamPlayer.playing) {
+        await _resumeStreamPlayback();
+      }
+      state = state.copyWith(
+        isPlaying: shouldResume || streamPlayer.playing,
+        isDownloading: false,
+        currentPosition: boundedSeconds,
+        currentPositionMs: boundedSeconds * 1000,
+      );
+    } catch (recoveryError) {
+      if (_pendingStreamSeekSeconds != null) return;
+      _markStreamFailed(
+        recoveryError,
+        currentPosition: previousPosition,
+        currentPositionMs: previousPositionMs,
+      );
+      unawaited(_handleStreamFailure(recoveryError));
+    }
   }
 
   Future<void> toggleLoop(int startMs, int endMs) async {

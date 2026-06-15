@@ -13,96 +13,101 @@ import '../../logic/track_metadata.dart';
 import '../../main_details.dart';
 import '../../main_dialogs.dart';
 import '../../main_player.dart';
+import '../../ui/app_theme_tokens.dart';
+import '../../ui/neatie_components.dart';
 import '../app_artwork.dart';
 
-class LibraryStatChip extends StatelessWidget {
-  final String label;
+class LibraryReferenceHeader extends StatelessWidget {
+  const LibraryReferenceHeader({
+    super.key,
+    required this.onCreatePlaylist,
+    required this.onSearch,
+    required this.selectedFilter,
+    required this.onFilterSelected,
+  });
 
-  const LibraryStatChip({super.key, required this.label});
+  final VoidCallback onCreatePlaylist;
+  final VoidCallback onSearch;
+  final String selectedFilter;
+  final ValueChanged<String> onFilterSelected;
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-      decoration: BoxDecoration(
-        color: Colors.white.withValues(alpha: 0.06),
-        borderRadius: BorderRadius.circular(999),
-        border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
-      ),
-      child: Text(
-        label,
-        style: TextStyle(
-          color: Colors.white.withValues(alpha: 0.8),
-          fontSize: 11,
-          fontWeight: FontWeight.w700,
-          letterSpacing: 0.35,
+    const filters = ['Playlists', 'Albums', 'Artists', 'Downloaded'];
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            const Expanded(
+              child: Text(
+                'Library',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 26,
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: -0.7,
+                ),
+              ),
+            ),
+            IconButton(
+              onPressed: onSearch,
+              icon: const Icon(Icons.search_rounded),
+              color: Colors.white,
+            ),
+            IconButton(
+              onPressed: onCreatePlaylist,
+              icon: const Icon(Icons.add_rounded),
+              color: Colors.white,
+            ),
+          ],
         ),
-      ),
+        const SizedBox(height: 10),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            for (final filter in filters)
+              NeatiePill(
+                label: filter,
+                selected: selectedFilter == filter,
+                onTap: () => onFilterSelected(filter),
+              ),
+          ],
+        ),
+      ],
     );
   }
 }
 
-class LibraryProfileCard extends StatelessWidget {
-  final String displayName;
-  final String email;
-  final String? avatarUrl;
-  final String providerName;
-  final int playlistCount;
-  final int offlineCount;
-  final bool isBusy;
-  final double radiusLarge;
-  final double radiusMedium;
-  final VoidCallback onSignOut;
-
-  const LibraryProfileCard({
+class LibraryEmptyStateCard extends StatelessWidget {
+  const LibraryEmptyStateCard({
     super.key,
-    required this.displayName,
-    required this.email,
-    required this.avatarUrl,
-    required this.providerName,
-    required this.playlistCount,
-    required this.offlineCount,
-    required this.isBusy,
-    required this.radiusLarge,
-    required this.radiusMedium,
-    required this.onSignOut,
+    required this.title,
+    required this.body,
   });
+
+  final String title;
+  final String body;
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(18),
-      decoration: BoxDecoration(
-        color: Colors.white.withValues(alpha: 0.03),
-        borderRadius: BorderRadius.circular(radiusLarge),
-        border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
-      ),
+    return NeatieSurface(
+      radius: neatieRadiusMedium,
+      color: Colors.white.withValues(alpha: 0.025),
       child: Row(
         children: [
           Container(
-            width: 56,
-            height: 56,
+            width: 46,
+            height: 46,
             decoration: BoxDecoration(
               color: Colors.white.withValues(alpha: 0.06),
-              borderRadius: BorderRadius.circular(radiusMedium),
+              borderRadius: BorderRadius.circular(14),
             ),
-            alignment: Alignment.center,
-            child: ClipRRect(
-              borderRadius: BorderRadius.circular(radiusMedium),
-              child: avatarUrl != null && avatarUrl!.isNotEmpty
-                  ? Image.network(
-                      avatarUrl!,
-                      fit: BoxFit.cover,
-                      errorBuilder: (_, __, ___) => const Icon(
-                        Icons.person_outline_rounded,
-                        color: Colors.white,
-                      ),
-                    )
-                  : const Icon(
-                      Icons.person_outline_rounded,
-                      color: Colors.white,
-                    ),
+            child: const Icon(
+              Icons.library_music_rounded,
+              color: Colors.white,
+              size: 22,
             ),
           ),
           const SizedBox(width: 14),
@@ -111,44 +116,111 @@ class LibraryProfileCard extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  displayName,
+                  title,
                   style: const TextStyle(
                     color: Colors.white,
-                    fontSize: 17,
-                    fontWeight: FontWeight.w700,
+                    fontSize: 15,
+                    fontWeight: FontWeight.w800,
                   ),
                 ),
                 const SizedBox(height: 4),
                 Text(
-                  email,
-                  style: TextStyle(
-                    color: Colors.white.withValues(alpha: 0.56),
-                    fontSize: 13,
+                  body,
+                  style: const TextStyle(
+                    color: neatieMutedText,
+                    fontSize: 12,
+                    height: 1.35,
                   ),
-                ),
-                const SizedBox(height: 10),
-                Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  children: [
-                    LibraryStatChip(label: providerName.toUpperCase()),
-                    LibraryStatChip(label: '$playlistCount playlists'),
-                    LibraryStatChip(label: '$offlineCount offline'),
-                  ],
                 ),
               ],
             ),
           ),
-          const SizedBox(width: 12),
-          TextButton(
-            onPressed: isBusy ? null : onSignOut,
-            child: const Text(
-              'Sign Out',
-              style: TextStyle(color: Colors.white),
-            ),
-          ),
         ],
       ),
+    );
+  }
+}
+
+class LibraryQuickAccessSection extends StatelessWidget {
+  const LibraryQuickAccessSection({
+    super.key,
+    required this.savedCount,
+    required this.downloadedCount,
+  });
+
+  final int savedCount;
+  final int downloadedCount;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        _LibraryQuickAccessTile(
+          title: 'Liked Songs',
+          subtitle: '$savedCount songs',
+          icon: Icons.favorite_rounded,
+          gradient: const [Color(0xFF6E4BFF), Color(0xFF8D6BFF)],
+        ),
+        const SizedBox(height: 12),
+        _LibraryQuickAccessTile(
+          title: 'Downloaded',
+          subtitle: '$downloadedCount songs',
+          icon: Icons.download_done_rounded,
+          gradient: const [Color(0xFF0EA45B), Color(0xFF158047)],
+        ),
+      ],
+    );
+  }
+}
+
+class _LibraryQuickAccessTile extends StatelessWidget {
+  const _LibraryQuickAccessTile({
+    required this.title,
+    required this.subtitle,
+    required this.icon,
+    required this.gradient,
+  });
+
+  final String title;
+  final String subtitle;
+  final IconData icon;
+  final List<Color> gradient;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        Container(
+          width: 48,
+          height: 48,
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(10),
+            gradient: LinearGradient(colors: gradient),
+          ),
+          child: Icon(icon, color: Colors.white, size: 25),
+        ),
+        const SizedBox(width: 14),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                title,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 15,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+              const SizedBox(height: 3),
+              Text(
+                subtitle,
+                style: const TextStyle(color: neatieMutedText, fontSize: 12),
+              ),
+            ],
+          ),
+        ),
+      ],
     );
   }
 }
@@ -185,15 +257,17 @@ class LibraryHistoryLane extends ConsumerWidget {
           path != null &&
           path.isNotEmpty;
       if (!hasLocalFile) return;
-      final loaded = await ref.read(playbackQueueProvider.notifier).startLocalSession(
-            track: track,
-            path: path,
-          );
+      final loaded =
+          await ref.read(playbackQueueProvider.notifier).startLocalSession(
+                track: track,
+                path: path,
+              );
       if (!context.mounted) return;
       if (!loaded) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
-            content: Text('This downloaded track could not be loaded for playback.'),
+            content:
+                Text('This downloaded track could not be loaded for playback.'),
             duration: Duration(seconds: 2),
           ),
         );
@@ -230,13 +304,13 @@ class LibraryHistoryLane extends ConsumerWidget {
           title,
           style: const TextStyle(
             color: Colors.white,
-            fontSize: 24,
-            fontWeight: FontWeight.bold,
+            fontSize: 19,
+            fontWeight: FontWeight.w800,
           ),
         ),
-        const SizedBox(height: 16),
+        const SizedBox(height: 12),
         SizedBox(
-          height: 214,
+          height: 174,
           child: ListView.separated(
             scrollDirection: Axis.horizontal,
             physics: const BouncingScrollPhysics(),
@@ -253,46 +327,41 @@ class LibraryHistoryLane extends ConsumerWidget {
                   (track['author'] ?? track['artist'] ?? track['channel'] ?? '')
                       .toString()
                       .trim();
-              return Container(
-                width: 182,
-                decoration: BoxDecoration(
-                  color: Colors.white.withValues(alpha: 0.03),
-                  borderRadius: BorderRadius.circular(24),
-                  border: Border.all(
-                    color: Colors.white.withValues(alpha: 0.06),
-                    width: 1,
-                  ),
-                ),
-                child: Material(
-                  color: Colors.transparent,
-                  child: InkWell(
-                    borderRadius: BorderRadius.circular(24),
+              return NeatieSurface(
+                margin: EdgeInsets.zero,
+                radius: 18,
+                color: Colors.white.withValues(alpha: 0.035),
+                blur: false,
+                padding: EdgeInsets.zero,
+                width: 132,
+                child: InkWell(
+                    borderRadius: BorderRadius.circular(18),
                     onTap: () => _playTrack(context, ref, track),
                     child: Padding(
-                      padding: const EdgeInsets.all(12),
+                      padding: const EdgeInsets.all(9),
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Expanded(
                             child: ClipRRect(
-                              borderRadius: BorderRadius.circular(18),
+                              borderRadius: BorderRadius.circular(12),
                               child: AppArtwork(
                                 thumbnail: track['thumbnail'],
                                 videoId: videoId,
                                 width: double.infinity,
                                 height: double.infinity,
-                                radius: 18,
+                                radius: 12,
                               ),
                             ),
                           ),
-                          const SizedBox(height: 12),
+                          const SizedBox(height: 8),
                           Text(
                             trackTitle.isEmpty ? 'Unknown Track' : trackTitle,
                             maxLines: 2,
                             overflow: TextOverflow.ellipsis,
                             style: const TextStyle(
                               color: Colors.white,
-                              fontSize: 15,
+                              fontSize: 12.5,
                               fontWeight: FontWeight.w700,
                               height: 1.2,
                             ),
@@ -304,18 +373,18 @@ class LibraryHistoryLane extends ConsumerWidget {
                             overflow: TextOverflow.ellipsis,
                             style: TextStyle(
                               color: Colors.white.withValues(alpha: 0.66),
-                              fontSize: 12,
+                              fontSize: 11,
                             ),
                           ),
-                          const SizedBox(height: 10),
+                          const SizedBox(height: 6),
                           Row(
                             children: [
                               InkWell(
                                 onTap: () => _playTrack(context, ref, track),
                                 borderRadius: BorderRadius.circular(999),
                                 child: Container(
-                                  width: 38,
-                                  height: 38,
+                                  width: 30,
+                                  height: 30,
                                   decoration: BoxDecoration(
                                     color: Colors.white.withValues(alpha: 0.06),
                                     shape: BoxShape.circle,
@@ -323,17 +392,20 @@ class LibraryHistoryLane extends ConsumerWidget {
                                   child: const Icon(
                                     Icons.play_arrow_rounded,
                                     color: Colors.white,
-                                    size: 22,
+                                    size: 18,
                                   ),
                                 ),
                               ),
                               const Spacer(),
-                              IconButton(
-                                onPressed: videoId == null
+                              InkWell(
+                                onTap: videoId == null
                                     ? null
-                                    : () => _openTrackDetails(context, ref, track),
-                                icon: Container(
-                                  padding: const EdgeInsets.all(8),
+                                    : () =>
+                                        _openTrackDetails(context, ref, track),
+                                borderRadius: BorderRadius.circular(999),
+                                child: Container(
+                                  width: 30,
+                                  height: 30,
                                   decoration: BoxDecoration(
                                     color: Colors.white.withValues(alpha: 0.05),
                                     shape: BoxShape.circle,
@@ -345,17 +417,23 @@ class LibraryHistoryLane extends ConsumerWidget {
                                   ),
                                 ),
                               ),
+                              const SizedBox(width: 4),
                               Consumer(
                                 builder: (context, ref, child) {
                                   final task = videoId == null
                                       ? null
-                                      : ref.watch(downloadTaskProvider(videoId));
-                                  final isActive = task?.phase == DownloadPhase.active;
-                                  return IconButton(
-                                    icon: Container(
-                                      padding: const EdgeInsets.all(8),
+                                      : ref
+                                          .watch(downloadTaskProvider(videoId));
+                                  final isActive =
+                                      task?.phase == DownloadPhase.active;
+                                  return InkWell(
+                                    borderRadius: BorderRadius.circular(999),
+                                    child: Container(
+                                      width: 30,
+                                      height: 30,
                                       decoration: BoxDecoration(
-                                        color: Colors.white.withValues(alpha: 0.05),
+                                        color: Colors.white
+                                            .withValues(alpha: 0.05),
                                         shape: BoxShape.circle,
                                       ),
                                       child: isActive
@@ -371,18 +449,20 @@ class LibraryHistoryLane extends ConsumerWidget {
                                               ),
                                             )
                                           : Icon(
-                                              task?.phase == DownloadPhase.complete
+                                              task?.phase ==
+                                                      DownloadPhase.complete
                                                   ? Icons.check_rounded
                                                   : Icons.download_rounded,
                                               color: Colors.white70,
                                               size: 18,
                                             ),
                                     ),
-                                    onPressed: videoId == null
+                                    onTap: videoId == null
                                         ? null
                                         : () {
                                             ref
-                                                .read(downloadCenterProvider.notifier)
+                                                .read(downloadCenterProvider
+                                                    .notifier)
                                                 .downloadTrack(track);
                                           },
                                   );
@@ -393,7 +473,6 @@ class LibraryHistoryLane extends ConsumerWidget {
                         ],
                       ),
                     ),
-                  ),
                 ),
               );
             },
@@ -426,8 +505,8 @@ class LibraryPlaylistsSection extends ConsumerWidget {
               'Playlists',
               style: TextStyle(
                 color: Colors.white,
-                fontSize: 24,
-                fontWeight: FontWeight.bold,
+                fontSize: 19,
+                fontWeight: FontWeight.w800,
               ),
             ),
             TextButton.icon(
@@ -477,11 +556,11 @@ class LibraryPlaylistsSection extends ConsumerWidget {
             ),
           ],
         ),
-        const SizedBox(height: 16),
+        const SizedBox(height: 12),
         if (playlists.isEmpty)
           const Text(
-            'No playlists yet. Create one to get started!',
-            style: TextStyle(color: Colors.white54, fontSize: 16),
+            'No playlists yet. Create one to get started.',
+            style: TextStyle(color: neatieMutedText, fontSize: 13),
           )
         else
           ListView.builder(
@@ -490,104 +569,124 @@ class LibraryPlaylistsSection extends ConsumerWidget {
             itemCount: playlists.length,
             itemBuilder: (context, index) {
               final playlist = playlists[index];
-              return Container(
+              return NeatieSurface(
                 margin: const EdgeInsets.only(bottom: 12),
-                decoration: BoxDecoration(
-                  color: Colors.white.withValues(alpha: 0.03),
-                  borderRadius: BorderRadius.circular(16),
-                  border: Border.all(
-                    color: Colors.white.withValues(alpha: 0.05),
-                    width: 1,
-                  ),
-                ),
-                child: ListTile(
-                  onTap: () => onOpenPlaylist(playlist),
-                  leading: PlaylistArtworkView(playlist: playlist),
-                  title: Text(
-                    playlist.name,
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontWeight: FontWeight.bold,
+                radius: neatieRadiusMedium,
+                color: Colors.white.withValues(alpha: 0.035),
+                blur: false,
+                padding: EdgeInsets.zero,
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(neatieRadiusMedium),
+                    onTap: () => onOpenPlaylist(playlist),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 10,
                     ),
-                  ),
-                  subtitle: Text(
-                    '${playlist.tracks.length} tracks',
-                    style: const TextStyle(color: Colors.white54),
-                  ),
-                  trailing: PopupMenuButton<String>(
-                    icon: const Icon(Icons.more_vert, color: Colors.white70),
-                    color: Colors.grey[900],
-                    onSelected: (value) {
-                      if (value == 'delete') {
-                        ref
-                            .read(playlistProvider.notifier)
-                            .deletePlaylist(playlist.id);
-                      } else if (value == 'artwork') {
-                        showPlaylistArtworkDialog(
-                          context: context,
-                          playlist: playlist,
-                        );
-                      } else if (value == 'rename') {
-                        final ctrl = TextEditingController(text: playlist.name);
-                        showGlassDialog(
-                          context: context,
-                          title: 'Rename Playlist',
-                          content: TextField(
-                            controller: ctrl,
-                            style: const TextStyle(color: Colors.white),
+                    child: Row(
+                      children: [
+                        PlaylistArtworkView(playlist: playlist),
+                        const SizedBox(width: 16),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                playlist.name,
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                              const SizedBox(height: 3),
+                              Text(
+                                '${playlist.tracks.length} tracks',
+                                style: const TextStyle(color: neatieMutedText),
+                              ),
+                            ],
                           ),
-                          actions: [
-                            TextButton(
-                              onPressed: () => Navigator.pop(context),
-                              child: const Text(
-                                'Cancel',
-                                style: TextStyle(color: Colors.white54),
-                              ),
+                        ),
+                        PopupMenuButton<String>(
+                      icon: const Icon(
+                        Icons.more_vert,
+                        color: neatieMutedText,
+                      ),
+                      color: neatieRaised,
+                      onSelected: (value) {
+                        if (value == 'delete') {
+                          ref
+                              .read(playlistProvider.notifier)
+                              .deletePlaylist(playlist.id);
+                        } else if (value == 'artwork') {
+                          showPlaylistArtworkDialog(
+                            context: context,
+                            playlist: playlist,
+                          );
+                        } else if (value == 'rename') {
+                          final ctrl =
+                              TextEditingController(text: playlist.name);
+                          showGlassDialog(
+                            context: context,
+                            title: 'Rename Playlist',
+                            content: TextField(
+                              controller: ctrl,
+                              style: const TextStyle(color: Colors.white),
                             ),
-                            TextButton(
-                              onPressed: () {
-                                if (ctrl.text.trim().isNotEmpty) {
-                                  ref
-                                      .read(playlistProvider.notifier)
-                                      .renamePlaylist(
-                                        playlist.id,
-                                        ctrl.text.trim(),
-                                      );
-                                }
-                                Navigator.pop(context);
-                              },
-                              child: const Text(
-                                'Save',
-                                style: TextStyle(color: Colors.white),
+                            actions: [
+                              TextButton(
+                                onPressed: () => Navigator.pop(context),
+                                child: const Text(
+                                  'Cancel',
+                                  style: TextStyle(color: Colors.white54),
+                                ),
                               ),
-                            ),
-                          ],
-                        );
-                      }
-                    },
-                    itemBuilder: (context) => const [
-                      PopupMenuItem(
-                        value: 'artwork',
-                        child: Text(
-                          'Artwork',
-                          style: TextStyle(color: Colors.white),
+                              TextButton(
+                                onPressed: () {
+                                  if (ctrl.text.trim().isNotEmpty) {
+                                    ref
+                                        .read(playlistProvider.notifier)
+                                        .renamePlaylist(
+                                          playlist.id,
+                                          ctrl.text.trim(),
+                                        );
+                                  }
+                                  Navigator.pop(context);
+                                },
+                                child: const Text(
+                                  'Save',
+                                  style: TextStyle(color: Colors.white),
+                                ),
+                              ),
+                            ],
+                          );
+                        }
+                      },
+                      itemBuilder: (context) => const [
+                        PopupMenuItem(
+                          value: 'artwork',
+                          child: Text(
+                            'Artwork',
+                            style: TextStyle(color: Colors.white),
+                          ),
                         ),
-                      ),
-                      PopupMenuItem(
-                        value: 'rename',
-                        child: Text(
-                          'Rename',
-                          style: TextStyle(color: Colors.white),
+                        PopupMenuItem(
+                          value: 'rename',
+                          child: Text(
+                            'Rename',
+                            style: TextStyle(color: Colors.white),
+                          ),
                         ),
-                      ),
-                      PopupMenuItem(
-                        value: 'delete',
-                        child: Text(
-                          'Delete',
-                          style: TextStyle(color: Colors.red),
+                        PopupMenuItem(
+                          value: 'delete',
+                          child: Text(
+                            'Delete',
+                            style: TextStyle(color: Colors.red),
+                          ),
                         ),
-                      ),
-                    ],
+                      ],
+                    ),
+                      ],
+                    ),
                   ),
                 ),
               );
@@ -622,8 +721,8 @@ class SavedTracksSection extends ConsumerWidget {
               'Saved tracks',
               style: TextStyle(
                 color: Colors.white,
-                fontSize: 24,
-                fontWeight: FontWeight.bold,
+                fontSize: 19,
+                fontWeight: FontWeight.w800,
               ),
             ),
             if (missingOfflineTracks.isNotEmpty)
@@ -647,13 +746,13 @@ class SavedTracksSection extends ConsumerWidget {
               ),
           ],
         ),
-        const SizedBox(height: 16),
+        const SizedBox(height: 12),
         libraryAsync.when(
           data: (files) {
             if (files.isEmpty) {
               return const Text(
                 'No saved tracks yet.',
-                style: TextStyle(color: Colors.white54, fontSize: 16),
+                style: TextStyle(color: neatieMutedText, fontSize: 13),
               );
             }
             return ListView.builder(
@@ -669,20 +768,13 @@ class SavedTracksSection extends ConsumerWidget {
                 final hasLocalFile =
                     isDownloadedLocally && path != null && path.isNotEmpty;
                 final videoId = (track['video_id'] ?? track['id'])?.toString();
-                return Container(
+                return NeatieSurface(
                   margin: const EdgeInsets.only(bottom: 12),
-                  decoration: BoxDecoration(
-                    color: Colors.white.withValues(alpha: 0.03),
-                    borderRadius: BorderRadius.circular(16),
-                    border: Border.all(
-                      color: Colors.white.withValues(alpha: 0.05),
-                      width: 1,
-                    ),
-                  ),
-                  child: Material(
-                    color: Colors.transparent,
-                    child: InkWell(
-                      borderRadius: BorderRadius.circular(16),
+                  radius: neatieRadiusMedium,
+                  color: Colors.white.withValues(alpha: 0.035),
+                  blur: false,
+                  child: InkWell(
+                      borderRadius: BorderRadius.circular(neatieRadiusMedium),
                       onTap: () async {
                         final trackId = extractTrackId(track);
                         if (trackId != null) {
@@ -735,9 +827,9 @@ class SavedTracksSection extends ConsumerWidget {
                             AppArtwork(
                               thumbnail: track['thumbnail'],
                               videoId: videoId,
-                              width: 70,
-                              height: 70,
-                              radius: 16,
+                              width: 54,
+                              height: 54,
+                              radius: 10,
                             ),
                             const SizedBox(width: 16),
                             Expanded(
@@ -750,7 +842,7 @@ class SavedTracksSection extends ConsumerWidget {
                                     overflow: TextOverflow.ellipsis,
                                     style: const TextStyle(
                                       color: Colors.white,
-                                      fontSize: 16,
+                                      fontSize: 14,
                                       fontWeight: FontWeight.w700,
                                     ),
                                   ),
@@ -759,8 +851,9 @@ class SavedTracksSection extends ConsumerWidget {
                                     track['author'] ?? track['artist'] ?? '',
                                     maxLines: 1,
                                     style: TextStyle(
-                                      color: Colors.white.withValues(alpha: 0.6),
-                                      fontSize: 13,
+                                      color:
+                                          Colors.white.withValues(alpha: 0.6),
+                                      fontSize: 12,
                                     ),
                                   ),
                                   if (!hasLocalFile)
@@ -769,7 +862,8 @@ class SavedTracksSection extends ConsumerWidget {
                                       child: Text(
                                         'Saved to account - download to listen offline',
                                         style: TextStyle(
-                                          color: Colors.white.withValues(alpha: 0.45),
+                                          color: Colors.white
+                                              .withValues(alpha: 0.45),
                                           fontSize: 11,
                                           fontWeight: FontWeight.w600,
                                         ),
@@ -786,7 +880,8 @@ class SavedTracksSection extends ConsumerWidget {
                                 final isDownloading =
                                     downloadTask?.phase == DownloadPhase.active;
                                 final isDownloadedNow = hasLocalFile ||
-                                    downloadTask?.phase == DownloadPhase.complete;
+                                    downloadTask?.phase ==
+                                        DownloadPhase.complete;
                                 return Column(
                                   crossAxisAlignment: CrossAxisAlignment.end,
                                   mainAxisAlignment: MainAxisAlignment.center,
@@ -799,7 +894,8 @@ class SavedTracksSection extends ConsumerWidget {
                                             icon: Container(
                                               padding: const EdgeInsets.all(6),
                                               decoration: BoxDecoration(
-                                                color: Colors.white.withValues(alpha: 0.08),
+                                                color: Colors.white
+                                                    .withValues(alpha: 0.08),
                                                 shape: BoxShape.circle,
                                               ),
                                               child: const Icon(
@@ -810,11 +906,13 @@ class SavedTracksSection extends ConsumerWidget {
                                             ),
                                             onPressed: () {
                                               ref
-                                                  .read(trackDetailsProvider.notifier)
+                                                  .read(trackDetailsProvider
+                                                      .notifier)
                                                   .fetchDetails(videoId);
                                               Navigator.of(context).push(
                                                 MaterialPageRoute(
-                                                  builder: (_) => TrackDetailsScreen(
+                                                  builder: (_) =>
+                                                      TrackDetailsScreen(
                                                     track: track,
                                                   ),
                                                 ),
@@ -826,16 +924,21 @@ class SavedTracksSection extends ConsumerWidget {
                                             icon: Container(
                                               padding: const EdgeInsets.all(6),
                                               decoration: BoxDecoration(
-                                                color: Colors.white.withValues(alpha: 0.08),
+                                                color: Colors.white
+                                                    .withValues(alpha: 0.08),
                                                 shape: BoxShape.circle,
                                               ),
                                               child: isDownloading
                                                   ? SizedBox(
                                                       width: 20,
                                                       height: 20,
-                                                      child: CircularProgressIndicator(
-                                                        value: downloadTask!.progress > 0
-                                                            ? downloadTask.progress
+                                                      child:
+                                                          CircularProgressIndicator(
+                                                        value: downloadTask!
+                                                                    .progress >
+                                                                0
+                                                            ? downloadTask
+                                                                .progress
                                                             : null,
                                                         strokeWidth: 2,
                                                         color: accentColor,
@@ -844,7 +947,8 @@ class SavedTracksSection extends ConsumerWidget {
                                                   : Icon(
                                                       isDownloadedNow
                                                           ? Icons.check_rounded
-                                                          : Icons.download_for_offline_rounded,
+                                                          : Icons
+                                                              .download_for_offline_rounded,
                                                       color: Colors.white70,
                                                       size: 20,
                                                     ),
@@ -854,7 +958,9 @@ class SavedTracksSection extends ConsumerWidget {
                                                 : () {
                                                     unawaited(
                                                       ref
-                                                          .read(downloadCenterProvider.notifier)
+                                                          .read(
+                                                              downloadCenterProvider
+                                                                  .notifier)
                                                           .downloadTrack(track),
                                                     );
                                                   },
@@ -863,7 +969,8 @@ class SavedTracksSection extends ConsumerWidget {
                                           icon: Container(
                                             padding: const EdgeInsets.all(6),
                                             decoration: BoxDecoration(
-                                              color: Colors.redAccent.withValues(alpha: 0.1),
+                                              color: Colors.redAccent
+                                                  .withValues(alpha: 0.1),
                                               shape: BoxShape.circle,
                                             ),
                                             child: const Icon(
@@ -876,12 +983,16 @@ class SavedTracksSection extends ConsumerWidget {
                                             try {
                                               if (hasLocalFile) {
                                                 File(path).deleteSync();
-                                                final jsonPath = path.replaceAll('.mp3', '.json');
-                                                if (File(jsonPath).existsSync()) {
+                                                final jsonPath =
+                                                    path.replaceAll(
+                                                        '.mp3', '.json');
+                                                if (File(jsonPath)
+                                                    .existsSync()) {
                                                   File(jsonPath).deleteSync();
                                                 }
                                               }
-                                              unawaited(removeCloudLibraryTrack(videoId));
+                                              unawaited(removeCloudLibraryTrack(
+                                                  videoId));
                                               ref.invalidate(libraryProvider);
                                             } catch (_) {
                                               // Best effort cleanup.
@@ -890,13 +1001,16 @@ class SavedTracksSection extends ConsumerWidget {
                                         ),
                                       ],
                                     ),
-                                    if (track['filesize'] != null && track['filesize'] > 0)
+                                    if (track['filesize'] != null &&
+                                        track['filesize'] > 0)
                                       Padding(
-                                        padding: const EdgeInsets.only(right: 8),
+                                        padding:
+                                            const EdgeInsets.only(right: 8),
                                         child: Text(
                                           '${(track['filesize'] / 1024 / 1024).toStringAsFixed(1)} MB',
                                           style: TextStyle(
-                                            color: Colors.white.withValues(alpha: 0.3),
+                                            color: Colors.white
+                                                .withValues(alpha: 0.3),
                                             fontSize: 10,
                                             fontWeight: FontWeight.w600,
                                           ),
@@ -909,7 +1023,6 @@ class SavedTracksSection extends ConsumerWidget {
                           ],
                         ),
                       ),
-                    ),
                   ),
                 );
               },

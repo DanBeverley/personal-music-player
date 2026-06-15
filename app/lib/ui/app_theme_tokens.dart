@@ -1,12 +1,20 @@
 import 'package:flutter/material.dart';
 
-const appAccentGrey = Color(0xFFF2F1ED);
-const appSurfaceGrey = Color(0xFF1C1C1E);
-const appSurfaceGreyAlt = Color(0xFF151517);
-const appVoidBlack = Color(0xFF090909);
-const double appRadiusLarge = 18;
-const double appRadiusMedium = 14;
-const List<Color> appPlaylistCoverPalette = <Color>[
+const neatieInk = Color(0xFF030303);
+const neatieRaised = Color(0xFF101010);
+const neatieGlass = Color(0xE6171717);
+const neatieStroke = Color(0x33FFFFFF);
+const neatieHairline = Color(0x1AFFFFFF);
+const neatieMutedText = Color(0xB3FFFFFF);
+const neatieDimText = Color(0x80FFFFFF);
+const neatieActive = Color(0xFFF8F8F4);
+const neatieInactive = Color(0x8CFFFFFF);
+const double neatieRadiusXLarge = 26;
+const double neatieRadiusLarge = 20;
+const double neatieRadiusMedium = 14;
+const double neatieRadiusSmall = 10;
+const double neatieBlur = 24;
+const List<Color> neatiePlaylistCoverPalette = <Color>[
   Color(0xFF272729),
   Color(0xFF202022),
   Color(0xFF1A1A1C),

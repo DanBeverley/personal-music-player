@@ -10,12 +10,14 @@ import '../logic/audio_provider_queue.dart';
 import '../logic/auth_provider.dart';
 import '../logic/download_provider.dart';
 import '../logic/playlist_provider.dart';
+import '../ui/app_theme_tokens.dart';
+import '../ui/neatie_components.dart';
 import '../widgets/app_artwork.dart';
 
-const _assistantBg = Color(0xFF252A2D);
-const _assistantSurface = Color(0xFF363C40);
-const _assistantSurfaceAlt = Color(0xFF2C3135);
-const _assistantAccent = Color(0xFFD0D5D8);
+const _assistantBg = neatieInk;
+const _assistantSurface = neatieRaised;
+const _assistantSurfaceAlt = neatieGlass;
+const _assistantAccent = neatieActive;
 
 typedef AssistantAlbumOpener = Future<void> Function(Map<String, dynamic> album);
 
@@ -210,33 +212,60 @@ class _AssistantScreenState extends ConsumerState<AssistantScreen> {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              ListTile(
-                leading: const Icon(Icons.add_rounded, color: Colors.white),
-                title: const Text('New playlist', style: TextStyle(color: Colors.white)),
-                onTap: () async {
-                  Navigator.of(context).pop();
-                  final playlistName = await _promptText(
-                    title: 'Playlist name',
-                    initialValue: '',
-                    confirmLabel: 'Create',
-                  );
-                  if (playlistName == null) return;
-                  final playlist = ref.read(playlistProvider.notifier).createPlaylist(playlistName);
-                  await _addTracksToPlaylist(playlist.id, playlist.name, tracks);
-                },
-              ),
-              ...playlists.map((playlist) {
-                return ListTile(
-                  leading: const Icon(Icons.queue_music_rounded, color: Colors.white70),
-                  title: Text(playlist.name, style: const TextStyle(color: Colors.white)),
-                  subtitle: Text(
-                    '${playlist.tracks.length} tracks',
-                    style: TextStyle(color: Colors.white.withValues(alpha: 0.5)),
+              Material(
+                type: MaterialType.transparency,
+                child: ListTile(
+                  leading: const Icon(Icons.add_rounded, color: Colors.white),
+                  title: const Text(
+                    'New playlist',
+                    style: TextStyle(color: Colors.white),
                   ),
                   onTap: () async {
                     Navigator.of(context).pop();
-                    await _addTracksToPlaylist(playlist.id, playlist.name, tracks);
+                    final playlistName = await _promptText(
+                      title: 'Playlist name',
+                      initialValue: '',
+                      confirmLabel: 'Create',
+                    );
+                    if (playlistName == null) return;
+                    final playlist = ref
+                        .read(playlistProvider.notifier)
+                        .createPlaylist(playlistName);
+                    await _addTracksToPlaylist(
+                      playlist.id,
+                      playlist.name,
+                      tracks,
+                    );
                   },
+                ),
+              ),
+              ...playlists.map((playlist) {
+                return Material(
+                  type: MaterialType.transparency,
+                  child: ListTile(
+                    leading: const Icon(
+                      Icons.queue_music_rounded,
+                      color: Colors.white70,
+                    ),
+                    title: Text(
+                      playlist.name,
+                      style: const TextStyle(color: Colors.white),
+                    ),
+                    subtitle: Text(
+                      '${playlist.tracks.length} tracks',
+                      style: TextStyle(
+                        color: Colors.white.withValues(alpha: 0.5),
+                      ),
+                    ),
+                    onTap: () async {
+                      Navigator.of(context).pop();
+                      await _addTracksToPlaylist(
+                        playlist.id,
+                        playlist.name,
+                        tracks,
+                      );
+                    },
+                  ),
                 );
               }),
             ],
@@ -531,13 +560,10 @@ class _AssistantScreenState extends ConsumerState<AssistantScreen> {
         albumId != null &&
         albumId.isNotEmpty &&
         albumTitle.isNotEmpty;
-    return Container(
+    return NeatieSurface(
       margin: const EdgeInsets.only(bottom: 12),
-      decoration: BoxDecoration(
-        color: Colors.white.withValues(alpha: 0.03),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
-      ),
+      radius: neatieRadiusMedium,
+      color: Colors.white.withValues(alpha: 0.03),
       child: Padding(
         padding: const EdgeInsets.all(12),
         child: Column(
@@ -854,16 +880,11 @@ class _AssistantScreenState extends ConsumerState<AssistantScreen> {
   }
 
   Widget _buildStatusCard(String label) {
-    return Container(
+    return NeatieSurface(
       margin: const EdgeInsets.only(bottom: 14),
       padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: Colors.white.withValues(alpha: 0.03),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(
-          color: Colors.white.withValues(alpha: 0.08),
-        ),
-      ),
+      radius: neatieRadiusMedium,
+      color: Colors.white.withValues(alpha: 0.03),
       child: Row(
         children: [
           const SizedBox(
@@ -1015,7 +1036,7 @@ class _AssistantScreenState extends ConsumerState<AssistantScreen> {
       backgroundColor: _assistantBg,
       appBar: AppBar(
         backgroundColor: Colors.transparent,
-        title: const Text('Ask EBB'),
+        title: const Text('Ask Neatie'),
         actions: [
           IconButton(
             tooltip: assistantState.thinkingMode
@@ -1121,74 +1142,77 @@ class _SessionTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return ListTile(
-      selected: selected,
-      selectedTileColor: Colors.white.withValues(alpha: 0.05),
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(12),
-      ),
-      leading: Icon(
-        session.isArchived
-            ? Icons.archive_rounded
-            : session.isPinned
-                ? Icons.push_pin_rounded
-                : Icons.chat_bubble_outline_rounded,
-        color: session.isArchived ? Colors.white54 : Colors.white70,
-      ),
-      title: Text(
-        session.title,
-        maxLines: 1,
-        overflow: TextOverflow.ellipsis,
-        style: const TextStyle(color: Colors.white),
-      ),
-      subtitle: session.lastMessagePreview.trim().isEmpty
-          ? null
-          : Text(
-              session.lastMessagePreview,
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(
-                color: Colors.white.withValues(alpha: 0.58),
+    return Material(
+      type: MaterialType.transparency,
+      child: ListTile(
+        selected: selected,
+        selectedTileColor: Colors.white.withValues(alpha: 0.05),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(12),
+        ),
+        leading: Icon(
+          session.isArchived
+              ? Icons.archive_rounded
+              : session.isPinned
+                  ? Icons.push_pin_rounded
+                  : Icons.chat_bubble_outline_rounded,
+          color: session.isArchived ? Colors.white54 : Colors.white70,
+        ),
+        title: Text(
+          session.title,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(color: Colors.white),
+        ),
+        subtitle: session.lastMessagePreview.trim().isEmpty
+            ? null
+            : Text(
+                session.lastMessagePreview,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  color: Colors.white.withValues(alpha: 0.58),
+                ),
               ),
+        onTap: onTap,
+        trailing: PopupMenuButton<String>(
+          color: _assistantSurface,
+          iconColor: Colors.white70,
+          onSelected: (value) {
+            switch (value) {
+              case 'rename':
+                onRename();
+                break;
+              case 'pin':
+                onTogglePin();
+                break;
+              case 'archive':
+                onToggleArchive();
+                break;
+              case 'delete':
+                onDelete();
+                break;
+            }
+          },
+          itemBuilder: (context) => [
+            const PopupMenuItem<String>(
+              value: 'rename',
+              child: Text('Rename'),
             ),
-      onTap: onTap,
-      trailing: PopupMenuButton<String>(
-        color: _assistantSurface,
-        iconColor: Colors.white70,
-        onSelected: (value) {
-          switch (value) {
-            case 'rename':
-              onRename();
-              break;
-            case 'pin':
-              onTogglePin();
-              break;
-            case 'archive':
-              onToggleArchive();
-              break;
-            case 'delete':
-              onDelete();
-              break;
-          }
-        },
-        itemBuilder: (context) => [
-          const PopupMenuItem<String>(
-            value: 'rename',
-            child: Text('Rename'),
-          ),
-          PopupMenuItem<String>(
-            value: 'pin',
-            child: Text(session.isPinned ? 'Unpin' : 'Pin'),
-          ),
-          PopupMenuItem<String>(
-            value: 'archive',
-            child: Text(session.isArchived ? 'Unarchive' : 'Archive'),
-          ),
-          const PopupMenuItem<String>(
-            value: 'delete',
-            child: Text('Delete'),
-          ),
-        ],
+            PopupMenuItem<String>(
+              value: 'pin',
+              child: Text(session.isPinned ? 'Unpin' : 'Pin'),
+            ),
+            PopupMenuItem<String>(
+              value: 'archive',
+              child: Text(session.isArchived ? 'Unarchive' : 'Archive'),
+            ),
+            const PopupMenuItem<String>(
+              value: 'delete',
+              child: Text('Delete'),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -1290,14 +1314,10 @@ class _ComposerPanel extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
+    return NeatieSurface(
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
-      decoration: BoxDecoration(
-        color: _assistantSurfaceAlt,
-        border: Border(
-          top: BorderSide(color: Colors.white.withValues(alpha: 0.08)),
-        ),
-      ),
+      radius: 0,
+      color: _assistantSurfaceAlt,
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
@@ -1359,14 +1379,11 @@ class _FreshComposerPanel extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
+    return NeatieSurface(
       constraints: const BoxConstraints(maxWidth: 760),
       padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: _assistantSurfaceAlt,
-        borderRadius: BorderRadius.circular(28),
-        border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
-      ),
+      radius: 28,
+      color: _assistantSurfaceAlt,
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.end,
         children: [
@@ -1412,21 +1429,7 @@ class _MetadataChip extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final chip = Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-      decoration: BoxDecoration(
-        color: Colors.white.withValues(alpha: 0.06),
-        borderRadius: BorderRadius.circular(999),
-      ),
-      child: Text(
-        label,
-        style: TextStyle(
-          color: Colors.white.withValues(alpha: 0.72),
-          fontSize: 11,
-          fontWeight: FontWeight.w600,
-        ),
-      ),
-    );
+    final chip = NeatiePill(label: label);
     if (onTap == null) {
       return chip;
     }
@@ -1449,14 +1452,12 @@ class _AssistantFactCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
+    return NeatieSurface(
       margin: const EdgeInsets.only(bottom: 10),
       padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: Colors.white.withValues(alpha: 0.03),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
-      ),
+      radius: neatieRadiusMedium,
+      color: Colors.white.withValues(alpha: 0.035),
+      blur: false,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -1561,13 +1562,11 @@ class _ActionChip extends StatelessWidget {
     return InkWell(
       onTap: onTap,
       borderRadius: BorderRadius.circular(999),
-      child: Container(
+      child: NeatieSurface(
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-        decoration: BoxDecoration(
-          color: Colors.white.withValues(alpha: 0.06),
-          borderRadius: BorderRadius.circular(999),
-          border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
-        ),
+        radius: 999,
+        color: Colors.white.withValues(alpha: 0.04),
+        blur: false,
         child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -1634,13 +1633,11 @@ class _AssistantInlinePlayer extends ConsumerWidget {
       return const SizedBox.shrink();
     }
 
-    final bar = Container(
+    final bar = NeatieSurface(
       height: 58,
-      decoration: BoxDecoration(
-        color: Colors.white.withValues(alpha: 0.04),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
-      ),
+      radius: neatieRadiusMedium,
+      color: Colors.white.withValues(alpha: 0.04),
+      blur: false,
       child: Column(
         children: [
           Expanded(
@@ -1749,13 +1746,11 @@ class _PlaylistDraftCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
+    return NeatieSurface(
       padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: Colors.white.withValues(alpha: 0.03),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
-      ),
+      radius: neatieRadiusMedium,
+      color: Colors.white.withValues(alpha: 0.035),
+      blur: false,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [

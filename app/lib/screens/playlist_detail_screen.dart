@@ -9,11 +9,11 @@ import '../logic/playlist_provider.dart';
 import '../main_dialogs.dart';
 import '../main_player.dart';
 import '../ui/app_theme_tokens.dart';
+import '../ui/neatie_components.dart';
 import '../widgets/app_artwork.dart';
 
-const _surfaceGrey = appSurfaceGrey;
-const _voidBlack = appVoidBlack;
-const double _radiusLarge = appRadiusLarge;
+const _voidBlack = neatieInk;
+const double _radiusLarge = neatieRadiusLarge;
 
 class PlaylistDetailScreen extends ConsumerStatefulWidget {
   final String playlistId;
@@ -141,20 +141,24 @@ class _PlaylistDetailScreenState extends ConsumerState<PlaylistDetailScreen> {
               radiusLarge: _radiusLarge,
             ),
             const SizedBox(height: 16),
-            TextField(
-              controller: _searchCtrl,
-              style: const TextStyle(color: Colors.white),
-              decoration: InputDecoration(
-                hintText: "Let's find something for your playlist",
-                hintStyle: const TextStyle(color: Colors.white54),
-                filled: true,
-                fillColor: _surfaceGrey,
-                suffixIcon: IconButton(
-                  icon: const Icon(Icons.search, color: Colors.white),
-                  onPressed: () => _search(_searchCtrl.text),
+            NeatieSurface(
+              padding: const EdgeInsets.symmetric(horizontal: 14),
+              color: Colors.white.withValues(alpha: 0.04),
+              blur: false,
+              child: TextField(
+                controller: _searchCtrl,
+                style: const TextStyle(color: Colors.white),
+                decoration: InputDecoration(
+                  hintText: "Let's find something for your playlist",
+                  hintStyle: const TextStyle(color: neatieDimText),
+                  border: InputBorder.none,
+                  suffixIcon: IconButton(
+                    icon: const Icon(Icons.search, color: Colors.white),
+                    onPressed: () => _search(_searchCtrl.text),
+                  ),
                 ),
+                onSubmitted: _search,
               ),
-              onSubmitted: _search,
             ),
             const SizedBox(height: 16),
             _PlaylistSearchResultsSection(
@@ -187,13 +191,11 @@ class _PlaylistHeaderCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final hiddenCount = playlist.tracks.where(isTrackHidden).length;
-    return Container(
+    return NeatieSurface(
       padding: const EdgeInsets.all(18),
-      decoration: BoxDecoration(
-        color: Colors.white.withValues(alpha: 0.03),
-        borderRadius: BorderRadius.circular(radiusLarge),
-        border: Border.all(color: Colors.white.withValues(alpha: 0.06)),
-      ),
+      radius: radiusLarge,
+      color: Colors.white.withValues(alpha: 0.035),
+      blur: false,
       child: Row(
         children: [
           PlaylistArtworkView(
@@ -302,26 +304,53 @@ class _PlaylistSearchResultsSection extends StatelessWidget {
           itemBuilder: (context, index) {
             final track = searchResults[index];
             final videoId = (track['id'] ?? track['videoId'])?.toString();
-            return ListTile(
-              leading: AppArtwork(
-                thumbnail: track['thumbnail'],
-                videoId: videoId,
-                width: 50,
-                height: 50,
-                radius: 14,
-              ),
-              title: Text(
-                track['title'] ?? 'Unknown',
-                style: const TextStyle(color: Colors.white),
-                maxLines: 1,
-              ),
-              subtitle: Text(
-                track['channel'] ?? '',
-                style: const TextStyle(color: Colors.white54),
-              ),
-              trailing: IconButton(
-                icon: const Icon(Icons.add_circle_outline, color: Colors.white),
-                onPressed: () => onAddTrack(track),
+            return NeatieSurface(
+              margin: const EdgeInsets.only(bottom: 10),
+              padding: const EdgeInsets.all(10),
+              radius: neatieRadiusMedium,
+              color: Colors.white.withValues(alpha: 0.035),
+              blur: false,
+              child: Row(
+                children: [
+                  AppArtwork(
+                    thumbnail: track['thumbnail'],
+                    videoId: videoId,
+                    width: 50,
+                    height: 50,
+                    radius: 14,
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          track['title'] ?? 'Unknown',
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontWeight: FontWeight.w700,
+                          ),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          track['channel'] ?? '',
+                          style: const TextStyle(color: neatieMutedText),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ],
+                    ),
+                  ),
+                  IconButton(
+                    icon: const Icon(
+                      Icons.add_circle_outline,
+                      color: Colors.white,
+                    ),
+                    onPressed: () => onAddTrack(track),
+                  ),
+                ],
               ),
             );
           },
@@ -369,44 +398,77 @@ class _PlaylistTracksSection extends ConsumerWidget {
           itemBuilder: (context, index) {
             final track = playlist.tracks[index];
             final videoId = (track['id'] ?? track['videoId'])?.toString();
-            return ListTile(
-              onTap: () => onPlayTrack(track),
-              leading: AppArtwork(
-                thumbnail: track['thumbnail'],
-                videoId: videoId,
-                width: 50,
-                height: 50,
-                radius: 14,
-              ),
-              title: Text(
-                track['title'] ?? 'Unknown',
-                style: const TextStyle(color: Colors.white),
-                maxLines: 1,
-              ),
-              subtitle: Text(
-                track['channel'] ?? track['author'] ?? '',
-                style: const TextStyle(color: Colors.white54),
-              ),
-              trailing: PopupMenuButton<String>(
-                icon: const Icon(Icons.more_vert, color: Colors.white70),
-                color: Colors.grey[900],
-                onSelected: (value) {
-                  if (value == 'remove') {
-                    if (videoId == null || videoId.isEmpty) return;
-                    ref
-                        .read(playlistProvider.notifier)
-                        .removeTrackFromPlaylist(playlistId, videoId);
-                  }
-                },
-                itemBuilder: (_) => const [
-                  PopupMenuItem(
-                    value: 'remove',
-                    child: Text(
-                      'Remove from Playlist',
-                      style: TextStyle(color: Colors.red),
-                    ),
+            return NeatieSurface(
+              margin: const EdgeInsets.only(bottom: 10),
+              padding: const EdgeInsets.all(10),
+              radius: neatieRadiusMedium,
+              color: Colors.white.withValues(alpha: 0.035),
+              blur: false,
+              child: Material(
+                color: Colors.transparent,
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(neatieRadiusMedium),
+                  onTap: () => onPlayTrack(track),
+                  child: Row(
+                    children: [
+                      AppArtwork(
+                        thumbnail: track['thumbnail'],
+                        videoId: videoId,
+                        width: 50,
+                        height: 50,
+                        radius: 14,
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              track['title'] ?? 'Unknown',
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontWeight: FontWeight.w700,
+                              ),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              track['channel'] ?? track['author'] ?? '',
+                              style: const TextStyle(color: neatieMutedText),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ],
+                        ),
+                      ),
+                      PopupMenuButton<String>(
+                        icon: const Icon(
+                          Icons.more_vert,
+                          color: neatieMutedText,
+                        ),
+                        color: neatieRaised,
+                        onSelected: (value) {
+                          if (value == 'remove') {
+                            if (videoId == null || videoId.isEmpty) return;
+                            ref
+                                .read(playlistProvider.notifier)
+                                .removeTrackFromPlaylist(playlistId, videoId);
+                          }
+                        },
+                        itemBuilder: (_) => const [
+                          PopupMenuItem(
+                            value: 'remove',
+                            child: Text(
+                              'Remove from Playlist',
+                              style: TextStyle(color: Colors.red),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
                   ),
-                ],
+                ),
               ),
             );
           },

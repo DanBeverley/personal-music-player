@@ -117,6 +117,19 @@ def _search_cache_key(query: str, limit: int, *, server: Any | None = None) -> s
     return f"{normalized_query}|{max(int(limit or 0), 0)}"
 
 
+def _has_resolved_album_artist(server: Any, album: Dict[str, Any]) -> bool:
+    artist = server.normalize_text((album or {}).get("artist") or "")
+    return bool(artist and artist not in {"unknown", "unknown artist"})
+
+
+def _resolved_albums(server: Any, albums: Any) -> List[Dict[str, Any]]:
+    return [
+        dict(album)
+        for album in list(albums or [])
+        if isinstance(album, dict) and _has_resolved_album_artist(server, album)
+    ]
+
+
 def search_tracks_direct(query: str, limit: int, *, server: Any | None = None):
     server = _resolve_server(server)
     query = (query or "").strip()
@@ -128,9 +141,26 @@ def search_tracks_direct(query: str, limit: int, *, server: Any | None = None):
     if cached is not None:
         return [dict(item) for item in cached]
 
+    ytmusic_started = time.perf_counter()
     results = resolve_ytmusic_song_search(server, query, max(limit, 12))
+    print(
+        "[EBB:search][direct] "
+        f"query={query[:48]} stage=ytmusic done elapsed_ms={int((time.perf_counter() - ytmusic_started) * 1000)} "
+        f"results={len(results or [])}",
+        flush=True,
+    )
     if not results:
-        results = resolve_ytdlp_song_search(server, query, max(limit, 12))
+        ytdlp_started = time.perf_counter()
+        results = server.search_upstream_call_with_retry(
+            lambda: resolve_ytdlp_song_search(server, query, max(limit, 12)),
+            default=[],
+        )
+        print(
+            "[EBB:search][direct] "
+            f"query={query[:48]} stage=ytdlp_fallback done elapsed_ms={int((time.perf_counter() - ytdlp_started) * 1000)} "
+            f"results={len(results or [])}",
+            flush=True,
+        )
     final_results = [dict(item) for item in list(results or [])[:limit] if isinstance(item, dict)]
     store_search_result("tracks_direct", cache_key, final_results)
     return [dict(item) for item in final_results]
@@ -162,7 +192,7 @@ def search_albums_direct(query: str, limit: int, *, server: Any | None = None):
     cache_key = _search_cache_key(query, limit, server=server)
     cached = lookup_search_result("albums_direct", cache_key)
     if cached is not None:
-        return [dict(item) for item in cached]
+        return _resolved_albums(server, cached)[:limit]
 
     direct_results = server.search_upstream_call_with_retry(
         lambda: server.ytmusic.search(query, filter="albums", limit=max(limit, 8)),
@@ -175,9 +205,64 @@ def search_albums_direct(query: str, limit: int, *, server: Any | None = None):
             default=[],
         )
         albums = server.normalize_album_results(fallback_results)
-    final_results = [dict(item) for item in list(albums or [])[:limit] if isinstance(item, dict)]
+    final_results = _resolved_albums(server, albums)[:limit]
     store_search_result("albums_direct", cache_key, final_results)
     return [dict(item) for item in final_results]
+
+
+def album_matches_track_anchor(
+    track: Dict[str, Any] | None,
+    album: Dict[str, Any] | None,
+    *,
+    server: Any | None = None,
+) -> bool:
+    server = _resolve_server(server)
+    if not isinstance(track, dict) or not isinstance(album, dict):
+        return False
+    track_album = server.normalize_text(
+        track.get("album") or track.get("album_title") or ""
+    )
+    album_title = server.normalize_text(album.get("title") or "")
+    if not track_album or album_title != track_album:
+        return False
+    track_artist = server.normalize_text(
+        track.get("channel") or track.get("artist") or ""
+    )
+    album_artist = server.normalize_text(album.get("artist") or "")
+    return not track_artist or not album_artist or album_artist == track_artist
+
+
+def search_canonical_album_for_track(
+    track: Dict[str, Any] | None,
+    *,
+    server: Any | None = None,
+) -> Dict[str, Any] | None:
+    server = _resolve_server(server)
+    if not isinstance(track, dict):
+        return None
+    album_title = trim_text(track.get("album") or track.get("album_title"))
+    if not album_title:
+        return None
+    album_id = trim_text(track.get("album_id"))
+    canonical = {
+        "id": album_id or None,
+        "title": album_title,
+        "artist": trim_text(track.get("channel") or track.get("artist")) or None,
+        "thumbnail": track.get("thumbnail"),
+        "year": track.get("year") or "",
+        "track_count": 0,
+    }
+    if album_id:
+        return canonical
+    for album in search_albums_direct(album_title, 6, server=server):
+        if not album_matches_track_anchor(track, album, server=server):
+            continue
+        resolved = dict(album)
+        for key, value in canonical.items():
+            if not resolved.get(key) and value:
+                resolved[key] = value
+        return resolved
+    return canonical
 
 
 def search_albums_blended(query: str, limit: int, *, server: Any | None = None):
@@ -189,16 +274,14 @@ def search_albums_blended(query: str, limit: int, *, server: Any | None = None):
     cache_key = _search_cache_key(query, limit, server=server)
     cached = lookup_search_result("albums", cache_key)
     if cached is not None:
-        return [dict(item) for item in cached]
+        return _resolved_albums(server, cached)[:limit]
 
     results = []
     seen = set()
 
     def add_albums(albums, max_to_add: Optional[int] = None):
         added = 0
-        for raw_album in albums or []:
-            if not isinstance(raw_album, dict):
-                continue
+        for raw_album in _resolved_albums(server, albums):
             album_id = trim_text(raw_album.get("id"))
             title = trim_text(raw_album.get("title"))
             artist = trim_text(raw_album.get("artist"))

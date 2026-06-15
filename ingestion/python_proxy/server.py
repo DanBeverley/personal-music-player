@@ -13,7 +13,6 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel, Field
 import json
 import hashlib
 import math
@@ -22,6 +21,7 @@ import random
 import re
 import sqlite3
 import sys
+import tempfile
 import time
 import traceback
 import uuid
@@ -30,6 +30,11 @@ import requests
 import yt_dlp
 from ytmusicapi import YTMusic
 
+from auralis_backend.contracts import (
+    RecommendationInteractionEventRequest,
+    RecommendationSearchEventRequest,
+    SearchRequest,
+)
 from auralis_backend.storage.cache_runtime import (
     clear_ttl_namespace as _cache_clear_namespace,
     detail_result_cache,
@@ -70,15 +75,6 @@ except Exception as exc:
     def run_langgraph_assistant(req: Any, deps: Dict[str, Any]):
         raise RuntimeError(f"LangGraph assistant import failed: {exc}")
 
-from auralis_backend.recommend.source_runtime import (
-    _recommendation_album_candidates_for_track,
-    _recommendation_anchor_query,
-    _recommendation_candidate_sources_for_track,
-    _recommendation_home_fallback_tracks,
-    _recommendation_quiet_base_query,
-    _recommendation_recommended_albums_row,
-    _recommendation_taste_filtered_tracks,
-)
 from auralis_backend.details.detail_runtime import (
     build_album_details_payload as _detail_build_album_details_payload,
     build_artist_details_payload as _detail_build_artist_details_payload,
@@ -1198,6 +1194,7 @@ def normalize_recommendation_track(data):
         or data.get("song")
         or "Unknown Track"
     )
+    artist = extract_artist(data)
     return {
         "id": video_id,
         "title": title,
@@ -1208,7 +1205,8 @@ def normalize_recommendation_track(data):
             or data.get("duration")
         ),
         "thumbnail": extract_thumbnail(data),
-        "channel": extract_artist(data),
+        "artist": artist,
+        "channel": artist,
         "album": album_info.get("title"),
         "album_id": album_info.get("id"),
     }
@@ -1692,12 +1690,33 @@ ASSISTANT_EMBED_DIM = int(os.environ.get("ASSISTANT_EMBED_DIM", "256"))
 USE_LANGGRAPH_ASSISTANT = os.environ.get("USE_LANGGRAPH_ASSISTANT", "1").strip().lower() not in {"0", "false", "no"}
 ASSISTANT_VECTOR_BACKEND = os.environ.get("ASSISTANT_VECTOR_BACKEND", "sqlite").strip().lower()
 ASSISTANT_PGVECTOR_DSN = os.environ.get("ASSISTANT_PGVECTOR_DSN", os.environ.get("DATABASE_URL", "")).strip()
-ASSISTANT_MEMORY_DB_PATH = os.path.join(os.getcwd(), "assistant_memory.sqlite")
+
+
+def _server_runtime_path(filename: str, env_var: str = "") -> str:
+    override = (os.environ.get(env_var or "") or "").strip() if env_var else ""
+    if override:
+        return os.path.abspath(override)
+    runtime_dir = (
+        os.environ.get("AURALIS_PROXY_RUNTIME_DIR")
+        or os.environ.get("AURALIS_RUNTIME_DIR")
+        or os.path.join(tempfile.gettempdir(), "auralis_proxy")
+    )
+    os.makedirs(runtime_dir, exist_ok=True)
+    return os.path.join(os.path.abspath(runtime_dir), filename)
+
+
+ASSISTANT_MEMORY_DB_PATH = _server_runtime_path(
+    "assistant_memory.sqlite",
+    "AURALIS_ASSISTANT_MEMORY_DB_PATH",
+)
 RECOMMENDATION_SYNC_DATABASE_DSN = os.environ.get(
     "RECOMMENDATION_SYNC_DATABASE_DSN",
     ASSISTANT_PGVECTOR_DSN,
 ).strip()
-RECOMMENDATION_STORE_DB_PATH = os.path.join(os.getcwd(), "recommendation_store.sqlite")
+RECOMMENDATION_STORE_DB_PATH = _server_runtime_path(
+    "recommendation_store.sqlite",
+    "AURALIS_RECOMMENDATION_STORE_DB_PATH",
+)
 RECOMMENDATION_MODEL_CACHE_TTL_SECONDS = int(
     os.environ.get("RECOMMENDATION_MODEL_CACHE_TTL_SECONDS", "180")
 )
@@ -1787,7 +1806,7 @@ RECOMMENDATION_REQUIRED_ROWS = tuple(
     item.strip()
     for item in os.environ.get(
         "RECOMMENDATION_REQUIRED_ROWS",
-        "continue_listening,because_you_played,trending_for_you,quiet_picks",
+        "continue_listening,because_you_played,quiet_picks",
     ).split(",")
     if item.strip()
 )
@@ -1836,61 +1855,6 @@ upstream_http = requests.Session()
 ollama_http = requests.Session()
 assistant_memory_lock = Lock()
 
-class SearchRequest(BaseModel):
-    query: str
-    limit: int = 10
-    surface: str = "home_feed"
-    seed_id: str = None
-    seed_ids: List[str] = Field(default_factory=list)
-    taste_queries: List[str] = Field(default_factory=list)
-    artist_hints: List[str] = Field(default_factory=list)
-    anchor_artist_hints: List[str] = Field(default_factory=list)
-    album_hints: List[str] = Field(default_factory=list)
-    avoid_ids: List[str] = Field(default_factory=list)
-    offset: int = 0
-    user_scope_id: str = "guest"
-    session_id: Optional[str] = None
-    row_id: Optional[str] = None
-    row_context: Optional[str] = None
-    force_refresh: bool = False
-    prefer_fresh_rows: bool = False
-    refresh_token: str = ""
-    hydrate_heavy_rows: bool = False
-    recent_track_ids: List[str] = Field(default_factory=list)
-    top_track_ids: List[str] = Field(default_factory=list)
-    recent_queries: List[str] = Field(default_factory=list)
-    playlist_names: List[str] = Field(default_factory=list)
-    library_track_ids: List[str] = Field(default_factory=list)
-    offline_track_ids: List[str] = Field(default_factory=list)
-    recent_track_snapshots: List[Dict[str, Any]] = Field(default_factory=list)
-    top_track_snapshots: List[Dict[str, Any]] = Field(default_factory=list)
-    anchor_track_snapshots: List[Dict[str, Any]] = Field(default_factory=list)
-    last_played_tracks: List[Dict[str, Any]] = Field(default_factory=list)
-
-
-class RecommendationInteractionEventRequest(BaseModel):
-    user_scope_id: str = "guest"
-    track_id: str
-    event_type: str = "play"
-    artist_name: Optional[str] = None
-    source: str = "app"
-    occurred_at: Optional[float] = None
-    metadata: Dict[str, Any] = Field(default_factory=dict)
-
-
-class RecommendationSearchEventRequest(BaseModel):
-    user_scope_id: str = "guest"
-    query: str
-    result_count: int = 0
-    source: str = "app"
-    occurred_at: Optional[float] = None
-    metadata: Dict[str, Any] = Field(default_factory=dict)
-
-
-class RecommendationModelTrainRequest(BaseModel):
-    force_sync: bool = False
-
-
 def _cache_lookup(cache_root, lock: Lock, namespace: str, key: str):
     return _cache_runtime_lookup(cache_root, lock, namespace, key)
 
@@ -1898,10 +1862,6 @@ def _cache_lookup(cache_root, lock: Lock, namespace: str, key: str):
 def _cache_store(cache_root, lock: Lock, namespace: str, key: str, value, ttl_seconds: int):
     _cache_runtime_store(cache_root, lock, namespace, key, value, ttl_seconds)
 
-
-_recommendation_required_row_fallback_seed = _recommendation_helper_runtime._recommendation_required_row_fallback_seed
-
-_recommendation_apply_quiet_row_runtime_fields = _recommendation_helper_runtime._recommendation_apply_quiet_row_runtime_fields
 
 def _search_cache_key(query: str, limit: int) -> str:
     normalized_query = _normalize_text(query)
@@ -1937,69 +1897,6 @@ def _recommended_artists_cache_key(req: SearchRequest) -> str:
     return hashlib.sha1(
         json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
     ).hexdigest()
-
-class DownloadRequest(BaseModel):
-    video_id: str
-    title: str = ""
-
-class WarmStreamRequest(BaseModel):
-    video_ids: List[str] = Field(default_factory=list)
-    current_video_id: Optional[str] = None
-    active_queue: bool = False
-    lookahead: int = 0
-
-class AssistantConversationMessage(BaseModel):
-    role: str
-    content: str
-
-class AssistantPlaylistSummary(BaseModel):
-    id: str
-    name: str
-    track_count: int = 0
-
-class AssistantLibraryTrack(BaseModel):
-    id: Optional[str] = None
-    title: str = ""
-    artist: str = ""
-    album: Optional[str] = None
-
-class AssistantContextTrack(BaseModel):
-    id: Optional[str] = None
-    title: str = ""
-    artist: str = ""
-    channel: Optional[str] = None
-    album: Optional[str] = None
-    thumbnail: Optional[str] = None
-    duration: int = 0
-    reason: Optional[str] = None
-
-class AssistantChatRequest(BaseModel):
-    message: str
-    user_scope_id: str = "guest"
-    session_id: Optional[str] = None
-    thinking_mode: bool = True
-    force_refresh: bool = False
-    conversation: List[AssistantConversationMessage] = Field(default_factory=list)
-    last_assistant_tracks: List[AssistantContextTrack] = Field(default_factory=list)
-    last_playlist_draft_tracks: List[AssistantContextTrack] = Field(default_factory=list)
-    recent_assistant_tracks: List[AssistantContextTrack] = Field(default_factory=list)
-    playlist_summaries: List[AssistantPlaylistSummary] = Field(default_factory=list)
-    recent_track_ids: List[str] = Field(default_factory=list)
-    recent_queries: List[str] = Field(default_factory=list)
-    library_tracks: List[AssistantLibraryTrack] = Field(default_factory=list)
-    limit: int = 10
-
-
-class AssistantSessionCreateRequest(BaseModel):
-    user_scope_id: str = "guest"
-    title: Optional[str] = None
-
-
-class AssistantSessionUpdateRequest(BaseModel):
-    user_scope_id: str = "guest"
-    title: Optional[str] = None
-    archived: Optional[bool] = None
-    pinned: Optional[bool] = None
 
 _assistant_db_connection = _bind_server(_assistant_core_runtime.assistant_db_connection)
 _assistant_pgvector_enabled = _bind_server(_assistant_core_runtime.assistant_pgvector_enabled)
@@ -2398,31 +2295,10 @@ _recommendation_collaborative_track_scores = _recommendation_row_helper_runtime.
 
 _recommendation_fetch_tracks_for_ids = _recommendation_row_helper_runtime._recommendation_fetch_tracks_for_ids
 
-_recommendation_candidate = _recommendation_row_helper_runtime._recommendation_candidate
-
-_recommendation_vector_similarities = _recommendation_row_helper_runtime._recommendation_vector_similarities
-
-_recommendation_track_score = _recommendation_row_helper_runtime._recommendation_track_score
-
-_recommendation_quality_floor = _recommendation_row_helper_runtime._recommendation_quality_floor
-
 _recommendation_track_signature = _recommendation_row_helper_runtime._recommendation_track_signature
-
-_recommendation_min_items = _recommendation_row_helper_runtime._recommendation_min_items
-
-_recommendation_is_query_derived_source = _recommendation_row_helper_runtime._recommendation_is_query_derived_source
-
-_recommendation_finalize_row_items = _recommendation_row_helper_runtime._recommendation_finalize_row_items
-
-_recommendation_candidates_from_tracks = _recommendation_row_helper_runtime._recommendation_candidates_from_tracks
 
 _recommendation_feed_session_key = _bind_server(
     _recommendation_session_runtime.feed_session_key
-)
-
-
-_recommendation_store_feed_session = _bind_server(
-    _recommendation_session_runtime.store_feed_session
 )
 
 

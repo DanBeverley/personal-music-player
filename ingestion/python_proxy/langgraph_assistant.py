@@ -1332,8 +1332,8 @@ def _suggest_playlist_name(
             return f"{primary_artist} {year}"
         return f"{primary_artist} Essentials"
     if year:
-        return f"EBB {year} Mix"
-    return "EBB Mix"
+        return f"Neatie {year} Mix"
+    return "Neatie Mix"
 
 
 def _merge_unique_tracks(*track_lists: List[Dict[str, Any]], limit: int = 12) -> List[Dict[str, Any]]:
@@ -2414,7 +2414,7 @@ def run_langgraph_assistant(req: Any, deps: Dict[str, Any]) -> Dict[str, Any]:
             {
                 "role": "system",
                 "content": (
-                "You are EBB, a professional music assistant with strong conversation skills. "
+                "You are Neatie, a professional music assistant with strong conversation skills. "
                     "First decide the mode and the deliverable. "
                     "If the user wants normal conversation or comfort, stay conversational and provide a real reply. "
                     "If the user asks factual music questions, use factual tools. "
@@ -2842,14 +2842,14 @@ def run_langgraph_assistant(req: Any, deps: Dict[str, Any]) -> Dict[str, Any]:
             {
                 "role": "system",
                 "content": (
-                    "You are EBB, a warm, capable music assistant. "
+                    "You are Neatie, a warm, capable music assistant. "
                     "Answer naturally and directly. "
                     "Satisfy the requested deliverable exactly. "
                     "If the user asked a factual question, answer the question first, then optionally mention that more detail is below. "
                     "If the user wants songs, recommend only from available_track_ids and vary the number of picks naturally. "
                     "If the user wants a playlist, use the available tracks or context tracks instead of inventing unrelated songs. "
                     "When the user asks for a playlist and available_track_ids exists, return action_type=create_playlist and include selected_track_ids. "
-                    "Choose a specific playlist_name shaped by the conversation or the energy of the songs, never a generic name like EBB Mix. "
+                    "Choose a specific playlist_name shaped by the conversation or the energy of the songs, never a generic name like Neatie Mix. "
                     "If there are clarification options, ask a clean follow-up only when ambiguity still matters. "
                     "Never say you cannot access music streaming services, playlists, or music tools. "
                     "If the request is actionable and tracks are available, act like a capable in-app assistant and use them. "

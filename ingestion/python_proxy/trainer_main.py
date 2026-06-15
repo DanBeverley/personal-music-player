@@ -15,10 +15,6 @@ from auralis_backend.domain.ranking import (
     SEARCH_TRACK_DEFAULT_WEIGHTS,
 )
 from auralis_backend.runtime_context import resolve_server
-from auralis_backend.recommend.allocator import (
-    ROW_ALLOCATOR_DEFAULTS_BY_KEY,
-    ROW_ALLOCATOR_MODEL_KEYS,
-)
 from auralis_backend.storage.object_store import get_object_store
 from auralis_backend.storage.postgres import (
     ensure_backend_schema,
@@ -89,7 +85,7 @@ def _register_linear_models(model_id: str) -> None:
         version=model_id,
         model_type="linear_reranker",
         weights=HOME_TRENDING_DEFAULT_WEIGHTS,
-        metadata={"surface": "home_feed", "entity_type": "track", "row_kind": "trending_for_you"},
+        metadata={"surface": "home_feed", "entity_type": "track", "row_kind": "quiet_picks"},
     )
     upsert_default_model_weights(
         model_key="home_discovery_ranker_v1",
@@ -98,24 +94,6 @@ def _register_linear_models(model_id: str) -> None:
         weights=HOME_DISCOVERY_DEFAULT_WEIGHTS,
         metadata={"surface": "home_feed", "entity_type": "track", "row_kind": "discovery"},
     )
-    allocator_row_kinds = {
-        model_key: row_kind
-        for row_kind, model_key in ROW_ALLOCATOR_MODEL_KEYS.items()
-    }
-    for model_key, weights in ROW_ALLOCATOR_DEFAULTS_BY_KEY.items():
-        upsert_default_model_weights(
-            model_key=model_key,
-            version=model_id,
-            model_type="linear_allocator",
-            weights=weights,
-            metadata={
-                "surface": "home_feed",
-                "entity_type": "row_allocator",
-                "row_kind": allocator_row_kinds.get(model_key) or "",
-            },
-        )
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description="Train and export Auralis recommender artifacts")
     parser.add_argument("--force-sync", action="store_true", help="Sync external events before training")
@@ -162,7 +140,6 @@ def main() -> int:
             "home_quiet_ranker_v1",
             "home_trending_ranker_v1",
             "home_discovery_ranker_v1",
-            *sorted(ROW_ALLOCATOR_DEFAULTS_BY_KEY.keys()),
         ],
         "metrics": metrics,
     }

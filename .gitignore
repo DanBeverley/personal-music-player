@@ -33,6 +33,7 @@ core_native/bin/
 *.lib
 
 # Downloads Storage
+downloads/
 app/assets/downloads/
 ingestion/python_proxy/downloads/
 ingestion/python_proxy/ffmpeg.exe
@@ -40,6 +41,12 @@ ingestion/python_proxy/ffplay.exe
 ingestion/python_proxy/ffprobe.exe
 ingestion/python_proxy/ffmpeg.zip
 runtime/
+recommendation_store.sqlite
+assistant_memory.sqlite
+ingestion/python_proxy/recommendation_store.sqlite
+ingestion/python_proxy/assistant_memory.sqlite
+ingestion/python_proxy/dump.json
+tmp_server_*.txt
 
 # IDE & OS
 .idea/

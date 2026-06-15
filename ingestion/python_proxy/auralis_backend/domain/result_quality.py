@@ -106,6 +106,7 @@ def artist_result_penalty(server, artist: Dict[str, Any], *, query: str = "") ->
 
 
 def album_result_penalty(server, album: Dict[str, Any], *, query: str = "") -> float:
+    normalized_artist = _normalize(server, album.get("artist"))
     combined = _combined_text(
         server,
         [album.get("title"), album.get("artist")],
@@ -113,6 +114,8 @@ def album_result_penalty(server, album: Dict[str, Any], *, query: str = "") -> f
     if not combined:
         return 0.0
     penalty = 0.0
+    if not normalized_artist or normalized_artist in {"unknown", "unknown artist"}:
+        penalty += 5.0
     query_allows_derivative = _contains_any(_normalize(server, query), _HARD_REJECT_TERMS)
     if not query_allows_derivative and _contains_any(combined, _HARD_REJECT_TERMS):
         penalty += 2.4

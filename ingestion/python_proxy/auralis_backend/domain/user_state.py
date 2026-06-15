@@ -60,6 +60,7 @@ class UserStateSnapshot(TypedDict, total=False):
     playlist_names: List[str]
     library_track_ids: List[str]
     offline_track_ids: List[str]
+    negative_track_ids: List[str]
     top_artists: List[str]
     listened_artists: List[str]
     top_albums: List[str]
@@ -245,6 +246,7 @@ def _load_scope_history_seed(
                    occurred_at
             FROM recommendation_events
             WHERE user_scope_id = ?
+              AND LOWER(COALESCE(event_type, 'play')) NOT IN ('impression', 'tab_tap')
             ORDER BY occurred_at DESC
             LIMIT 180
             """,
@@ -265,6 +267,11 @@ def _load_scope_history_seed(
     finally:
         connection.close()
 
+    diagnostics = {
+        "persisted_event_count": len(list(event_rows or [])),
+        "persisted_search_event_count": len(list(search_rows or [])),
+        "persisted_scope": normalized_scope,
+    }
     recent_track_ids: List[str] = []
     top_track_scores: Dict[str, float] = defaultdict(float)
     library_track_ids: List[str] = []
@@ -273,6 +280,8 @@ def _load_scope_history_seed(
     recent_track_snapshots: List[Dict[str, Any]] = []
     seen_recent_ids = set()
     seen_library_ids = set()
+    negative_track_ids: List[str] = []
+    seen_negative_ids = set()
     now = max(
         [float(row["occurred_at"] or 0.0) for row in list(event_rows or [])] or [0.0]
     )
@@ -295,7 +304,17 @@ def _load_scope_history_seed(
             base_weight = float(row["weight"] or 0.0)
         except Exception:
             base_weight = 0.0
-        if base_weight <= 0.0:
+        is_negative_event = event_type in {"skip", "dislike", "hide", "remove"}
+        if is_negative_event or base_weight < 0.0:
+            if track_id not in seen_negative_ids:
+                seen_negative_ids.add(track_id)
+                negative_track_ids.append(track_id)
+            continue
+        if event_type in {"impression", "tab_tap"}:
+            continue
+        if track_id in seen_negative_ids:
+            continue
+        if base_weight == 0.0:
             base_weight = 1.0
         top_track_scores[track_id] += base_weight * recency_bonus
         if track_id not in seen_recent_ids:
@@ -391,6 +410,8 @@ def _load_scope_history_seed(
         "taste_queries": taste_queries,
         "artist_hints": unique_strings(artist_hints, 12),
         "library_track_ids": server.unique_track_ids(library_track_ids, 28),
+        "negative_track_ids": server.unique_track_ids(negative_track_ids, 28),
+        "_diagnostics": diagnostics,
     }
 
 
@@ -441,88 +462,129 @@ def _build_state_snapshot(legacy_req, *, server: Any | None = None) -> UserState
         legacy_req.library_track_ids,
         28,
     )
-    if _sparse_home_request(
+    negative_track_ids: List[str] = []
+    client_signal_diagnostics = {
+        "client_recent_track_count": len(recent_track_snapshots),
+        "client_top_track_count": len(top_track_snapshots),
+        "client_last_played_count": len(last_played_tracks),
+        "client_recent_seed_count": len(recent_track_ids),
+        "client_top_seed_count": len(top_track_ids),
+        "client_recent_query_count": len(recent_queries),
+        "client_artist_hint_count": len(explicit_artist_hints),
+        "client_library_track_count": len(library_track_ids),
+    }
+    persisted_diagnostics: Dict[str, Any] = {}
+    sparse_request = _sparse_home_request(
         recent_track_snapshots=recent_track_snapshots,
         top_track_snapshots=top_track_snapshots,
         recent_queries=recent_queries,
         artist_hints=explicit_artist_hints,
         library_track_ids=library_track_ids,
-    ):
-        persisted = _load_scope_history_seed(
-            server,
-            trim_text(legacy_req.user_scope_id or "guest") or "guest",
+    )
+    persisted = _load_scope_history_seed(
+        server,
+        trim_text(legacy_req.user_scope_id or "guest") or "guest",
+    )
+    persisted_diagnostics = dict(persisted.get("_diagnostics") or {}) if persisted else {}
+    if persisted:
+        recent_track_snapshots = server.unique_snapshot_tracks(
+            [
+                *recent_track_snapshots,
+                *(persisted.get("recent_track_snapshots") or []),
+            ],
+            16,
         )
-        if persisted:
-            recent_track_snapshots = server.unique_snapshot_tracks(
-                [
-                    *recent_track_snapshots,
-                    *(persisted.get("recent_track_snapshots") or []),
-                ],
-                16,
-            )
-            top_track_snapshots = server.unique_snapshot_tracks(
-                [
-                    *top_track_snapshots,
-                    *(persisted.get("top_track_snapshots") or []),
-                ],
-                16,
-            )
-            last_played_tracks = server.unique_snapshot_tracks(
-                [
-                    *last_played_tracks,
-                    *(persisted.get("last_played_tracks") or []),
-                ],
-                12,
-            )
-            anchor_track_snapshots = server.unique_snapshot_tracks(
-                [
-                    *anchor_track_snapshots,
-                    *(persisted.get("anchor_track_snapshots") or []),
-                ],
-                8,
-            )
-            recent_track_ids = server.unique_track_ids(
-                [
-                    *(recent_track_ids or []),
-                    *(persisted.get("recent_track_ids") or []),
-                ],
-                16,
-            )
-            top_track_ids = server.unique_track_ids(
-                [
-                    *(top_track_ids or []),
-                    *(persisted.get("top_track_ids") or []),
-                ],
-                16,
-            )
-            recent_queries = _clean_query_values(
-                [
-                    *recent_queries,
-                    *(persisted.get("recent_queries") or []),
-                ],
-                limit=12,
-            )
-            taste_queries = _clean_query_values(
-                [
-                    *taste_queries,
-                    *(persisted.get("taste_queries") or []),
-                ],
-                limit=12,
-            )
-            explicit_artist_hints = unique_strings(
-                [
-                    *explicit_artist_hints,
-                    *(persisted.get("artist_hints") or []),
-                ],
-                12,
-            )
-            library_track_ids = server.unique_track_ids(
-                [
-                    *library_track_ids,
-                    *(persisted.get("library_track_ids") or []),
-                ],
-                28,
-            )
+        top_track_snapshots = server.unique_snapshot_tracks(
+            [
+                *top_track_snapshots,
+                *(persisted.get("top_track_snapshots") or []),
+            ],
+            16,
+        )
+        last_played_tracks = server.unique_snapshot_tracks(
+            [
+                *last_played_tracks,
+                *(persisted.get("last_played_tracks") or []),
+            ],
+            12,
+        )
+        anchor_track_snapshots = server.unique_snapshot_tracks(
+            [
+                *anchor_track_snapshots,
+                *(persisted.get("anchor_track_snapshots") or []),
+            ],
+            8,
+        )
+        recent_track_ids = server.unique_track_ids(
+            [
+                *(recent_track_ids or []),
+                *(persisted.get("recent_track_ids") or []),
+            ],
+            16,
+        )
+        top_track_ids = server.unique_track_ids(
+            [
+                *(top_track_ids or []),
+                *(persisted.get("top_track_ids") or []),
+            ],
+            16,
+        )
+        recent_queries = _clean_query_values(
+            [
+                *recent_queries,
+                *(persisted.get("recent_queries") or []),
+            ],
+            limit=12,
+        )
+        taste_queries = _clean_query_values(
+            [
+                *taste_queries,
+                *(persisted.get("taste_queries") or []),
+            ],
+            limit=12,
+        )
+        explicit_artist_hints = unique_strings(
+            [
+                *explicit_artist_hints,
+                *(persisted.get("artist_hints") or []),
+            ],
+            12,
+        )
+        library_track_ids = server.unique_track_ids(
+            [
+                *library_track_ids,
+                *(persisted.get("library_track_ids") or []),
+            ],
+            28,
+        )
+        negative_track_ids = server.unique_track_ids(
+            persisted.get("negative_track_ids") or [],
+            28,
+        )
+    if negative_track_ids:
+        negative_ids = set(negative_track_ids)
+        recent_track_ids = [track_id for track_id in recent_track_ids if track_id not in negative_ids]
+        top_track_ids = [track_id for track_id in top_track_ids if track_id not in negative_ids]
+        recent_track_snapshots = [
+            track
+            for track in recent_track_snapshots
+            if trim_text(track.get("id")) not in negative_ids
+        ]
+        top_track_snapshots = [
+            track
+            for track in top_track_snapshots
+            if trim_text(track.get("id")) not in negative_ids
+        ]
+        last_played_tracks = [
+            track
+            for track in last_played_tracks
+            if trim_text(track.get("id")) not in negative_ids
+        ]
+        anchor_track_snapshots = [
+            track
+            for track in anchor_track_snapshots
+            if trim_text(track.get("id")) not in negative_ids
+        ]
     anchor_artist_hints = unique_strings(
         [
             *(legacy_req.anchor_artist_hints or []),
@@ -610,6 +672,7 @@ def _build_state_snapshot(legacy_req, *, server: Any | None = None) -> UserState
         "playlist_names": playlist_names,
         "library_track_ids": library_track_ids,
         "offline_track_ids": offline_track_ids,
+        "negative_track_ids": negative_track_ids,
         "top_artists": top_artist_names,
         "listened_artists": listened_artist_names,
         "top_albums": top_album_names,
@@ -620,6 +683,19 @@ def _build_state_snapshot(legacy_req, *, server: Any | None = None) -> UserState
         "experiment_variant": server.recommendation_assignment_for_user(
             trim_text(legacy_req.user_scope_id or "guest") or "guest"
         ),
+        "signal_diagnostics": {
+            "sparse_request": bool(sparse_request),
+            **client_signal_diagnostics,
+            "resolved_recent_track_count": len(recent_track_snapshots),
+            "resolved_top_track_count": len(top_track_snapshots),
+            "resolved_last_played_count": len(last_played_tracks),
+            "resolved_recent_seed_count": len(recent_track_ids),
+            "resolved_top_seed_count": len(top_track_ids),
+            "resolved_recent_query_count": len(recent_queries),
+            "resolved_artist_hint_count": len(explicit_artist_hints),
+            "resolved_library_track_count": len(library_track_ids),
+            **persisted_diagnostics,
+        },
     }
     return hydrate_state_profile(
         server,

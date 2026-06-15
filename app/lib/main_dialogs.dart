@@ -29,9 +29,9 @@ void showGlassDialog(
                 scale: CurvedAnimation(
                     parent: animation, curve: Curves.easeOutBack),
                 child: AlertDialog(
-                  backgroundColor: Colors.grey[900]?.withValues(alpha: 0.7),
+                  backgroundColor: neatieGlass,
                   shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(appRadiusLarge),
+                    borderRadius: BorderRadius.circular(neatieRadiusLarge),
                     side: BorderSide(
                         color: Colors.white.withValues(alpha: 0.1), width: 1),
                   ),
@@ -49,8 +49,8 @@ Color _playlistCoverColor(Playlist playlist) {
   if (value != null) {
     return Color(value);
   }
-  return appPlaylistCoverPalette[
-      playlist.name.hashCode.abs() % appPlaylistCoverPalette.length];
+  return neatiePlaylistCoverPalette[
+      playlist.name.hashCode.abs() % neatiePlaylistCoverPalette.length];
 }
 
 class PlaylistArtworkView extends StatelessWidget {
@@ -220,8 +220,8 @@ class _PlaylistArtworkDialogState
           margin: const EdgeInsets.symmetric(horizontal: 24),
           padding: const EdgeInsets.fromLTRB(24, 22, 24, 18),
           decoration: BoxDecoration(
-            color: Colors.grey[900]?.withValues(alpha: 0.88),
-            borderRadius: BorderRadius.circular(appRadiusLarge),
+            color: neatieGlass,
+            borderRadius: BorderRadius.circular(neatieRadiusLarge),
             border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
           ),
           child: Column(
@@ -256,7 +256,7 @@ class _PlaylistArtworkDialogState
               Wrap(
                 spacing: 10,
                 runSpacing: 10,
-                children: appPlaylistCoverPalette.map((color) {
+                children: neatiePlaylistCoverPalette.map((color) {
                   return GestureDetector(
                     onTap: () => _applyColor(color),
                     child: Container(

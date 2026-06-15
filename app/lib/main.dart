@@ -11,9 +11,9 @@ import 'logic/auth_provider.dart';
 import 'main_shell.dart';
 import 'ui/app_theme_tokens.dart';
 
-const _accentGrey = appAccentGrey;
-const _surfaceGrey = appSurfaceGrey;
-const _voidBlack = appVoidBlack;
+const _accentGrey = neatieActive;
+const _surfaceGrey = neatieRaised;
+const _voidBlack = neatieInk;
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -87,15 +87,36 @@ class _AuralisAppState extends ConsumerState<AuralisApp>
   @override
   Widget build(BuildContext context) {
     final authState = ref.watch(authProvider);
-    final home = authState.isConfigured && !authState.isAuthenticated
-        ? const AuthGateScreen()
-        : const MainLayout();
+    final Widget home;
+    if (authState.isRestoring) {
+      home = const _AuthRestoringScreen();
+    } else if (authState.requiresAuthGate) {
+      home = const AuthGateScreen();
+    } else {
+      home = const MainLayout();
+    }
 
     return MaterialApp(
-      title: 'EBB',
+      title: 'Neatie',
+      onGenerateRoute: (settings) {
+        final routeName = settings.name ?? '';
+        if (routeName.startsWith('/?code=') ||
+            routeName.startsWith('/?error=') ||
+            routeName.startsWith('/#')) {
+          return MaterialPageRoute<void>(
+            settings: settings,
+            builder: (_) => home,
+          );
+        }
+        return null;
+      },
+      onUnknownRoute: (settings) => MaterialPageRoute<void>(
+        settings: settings,
+        builder: (_) => home,
+      ),
       theme: ThemeData(
         brightness: Brightness.dark,
-        scaffoldBackgroundColor: _voidBlack,
+        scaffoldBackgroundColor: neatieInk,
         primaryColor: _accentGrey,
         colorScheme: const ColorScheme.dark(
           primary: _accentGrey,
@@ -110,6 +131,8 @@ class _AuralisAppState extends ConsumerState<AuralisApp>
           backgroundColor: Colors.transparent,
           elevation: 0,
         ),
+        splashColor: Colors.white10,
+        highlightColor: Colors.white10,
       ),
       home: Stack(
         children: [
@@ -129,7 +152,7 @@ class _AuralisAppState extends ConsumerState<AuralisApp>
                       color: Colors.black,
                       child: Center(
                         child: Image.asset(
-                          'assets/branding/ebb_intro_mark.png',
+                          'assets/branding/neatie_intro_mark.png',
                           width: 140,
                           height: 140,
                           fit: BoxFit.contain,
@@ -141,6 +164,27 @@ class _AuralisAppState extends ConsumerState<AuralisApp>
               ),
             ),
         ],
+      ),
+    );
+  }
+}
+
+class _AuthRestoringScreen extends StatelessWidget {
+  const _AuthRestoringScreen();
+
+  @override
+  Widget build(BuildContext context) {
+    return const Scaffold(
+      backgroundColor: _voidBlack,
+      body: Center(
+        child: SizedBox(
+          width: 24,
+          height: 24,
+          child: CircularProgressIndicator(
+            strokeWidth: 2,
+            color: Colors.white70,
+          ),
+        ),
       ),
     );
   }

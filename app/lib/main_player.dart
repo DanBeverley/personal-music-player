@@ -7,16 +7,16 @@ import 'logic/audio_provider.dart';
 import 'logic/audio_provider_queue.dart';
 import 'logic/details_provider.dart';
 import 'ui/app_theme_tokens.dart';
+import 'ui/neatie_components.dart';
 import 'widgets/player/player_lyrics_panel.dart';
 import 'widgets/player/player_now_playing_panel.dart';
 import 'widgets/player/player_queue_widgets.dart';
 import 'widgets/player/player_queue_sheet.dart';
 
-const _accentGrey = appAccentGrey;
-const _surfaceGreyAlt = appSurfaceGreyAlt;
-const _voidBlack = appVoidBlack;
-const double _radiusLarge = appRadiusLarge;
-const double _radiusMedium = appRadiusMedium;
+const _accentGrey = neatieActive;
+const _surfaceGreyAlt = neatieRaised;
+const double _radiusLarge = neatieRadiusLarge;
+const double _radiusMedium = neatieRadiusMedium;
 
 class FullPlayerScreen extends ConsumerStatefulWidget {
   const FullPlayerScreen({super.key});
@@ -400,39 +400,38 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
           icon: const Icon(Icons.keyboard_arrow_down, color: Colors.white),
           onPressed: () => Navigator.pop(context),
         ),
-        title: const Text(
-          'Now Playing',
-          style: TextStyle(
-            fontSize: 11,
-            color: Colors.white,
-            fontWeight: FontWeight.w700,
-            letterSpacing: 1.4,
-          ),
-        ),
+        title: const SizedBox.shrink(),
         centerTitle: true,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.queue_music_rounded, color: Colors.white),
+            onPressed: _openQueueSheet,
+          ),
+        ],
       ),
       body: Stack(
         fit: StackFit.expand,
         children: [
-          const ColoredBox(color: _voidBlack),
-          PageView(
-            controller: _pageController,
-            onPageChanged: (index) {
-              setState(() => _activePage = index);
-              if (index == 1) {
-                _lastSyncedLyricIndex = -1;
-                _dismissQueueSheetIfOpen();
-              }
-            },
-            children: [
-              _buildPlayerPanel(
-                context,
-                playerState,
-                audioNotifier,
-                queueState,
-              ),
-              _buildLyricsPanel(context, playerState, lyricsState),
-            ],
+          NeatieBackground(
+            child: PageView(
+              controller: _pageController,
+              onPageChanged: (index) {
+                setState(() => _activePage = index);
+                if (index == 1) {
+                  _lastSyncedLyricIndex = -1;
+                  _dismissQueueSheetIfOpen();
+                }
+              },
+              children: [
+                _buildPlayerPanel(
+                  context,
+                  playerState,
+                  audioNotifier,
+                  queueState,
+                ),
+                _buildLyricsPanel(context, playerState, lyricsState),
+              ],
+            ),
           ),
           Positioned(
             right: _activePage == 0 ? 0 : null,

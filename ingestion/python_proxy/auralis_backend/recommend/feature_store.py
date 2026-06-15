@@ -14,6 +14,7 @@ from ..domain.catalog import (
     canonical_album_identity,
     canonical_artist_identity,
     canonical_title_artist_identity,
+    normalized_audio_traits,
 )
 from ..storage.postgres import db_available, get_connection
 from .store_runtime import open_recommendation_store_connection
@@ -571,7 +572,24 @@ def derive_track_feature(server: Any, track: Dict[str, Any]) -> Dict[str, Any]:
     era = era_bucket(year)
     type_tags = _infer_type_tags(text)
     primary_genre, secondary_genres, subgenre = _infer_genre_bundle(text)
-    language, region = _infer_language_region(text, script)
+    inferred_language, inferred_region = _infer_language_region(text, script)
+    language = str(normalized_track.get("language") or "").strip()
+    region = str(normalized_track.get("region") or "").strip()
+    if not language or language == "unknown":
+        language = inferred_language
+    if not region or region == "unknown":
+        region = inferred_region
+    inferred_mood_axes = _infer_mood_axes(primary_genre, subgenre, type_tags)
+    mood_axes = {**inferred_mood_axes, **normalized_audio_traits(normalized_track)}
+    popularity = float(normalized_track.get("popularity") or 0.0)
+    if popularity <= 0:
+        popularity = 0.45
+    peer_artist_ids = _normalize_sequence(
+        [
+            *(normalized_track.get("peer_artist_ids") or []),
+            normalized_track.get("related_to_artist") or "",
+        ]
+    )
     confidence = 0.25 + (0.25 if primary_genre else 0.0) + (0.15 if year else 0.0) + (0.12 if script != "unknown" else 0.0) + (0.08 if type_tags else 0.0)
     return {
         "entity_type": "track",
@@ -590,10 +608,10 @@ def derive_track_feature(server: Any, track: Dict[str, Any]) -> Dict[str, Any]:
         "script": script,
         "region": region,
         "scene_cluster_ids": _scene_clusters(primary_genre, subgenre, era, region),
-        "peer_artist_ids": [],
+        "peer_artist_ids": peer_artist_ids,
         "track_type_tags": type_tags,
-        "mood_axes": _infer_mood_axes(primary_genre, subgenre, type_tags),
-        "popularity": 0.45,
+        "mood_axes": mood_axes,
+        "popularity": max(0.0, min(popularity, 1.0)),
         "freshness": _freshness_from_year(year),
         "confidence": round(max(0.0, min(confidence, 0.95)), 4),
         "source_metadata": {
@@ -651,7 +669,16 @@ def derive_album_feature(server: Any, album: Dict[str, Any]) -> Dict[str, Any]:
         if year is not None:
             break
     era = era_bucket(year)
-    language, region = _infer_language_region(text, script)
+    inferred_language, inferred_region = _infer_language_region(text, script)
+    language = str(payload.get("language") or "").strip()
+    region = str(payload.get("region") or "").strip()
+    if not language or language == "unknown":
+        language = inferred_language
+    if not region or region == "unknown":
+        region = inferred_region
+    popularity = float(payload.get("popularity") or 0.0)
+    if popularity <= 0:
+        popularity = 0.46
     return {
         "entity_type": "album",
         "feature_version": CATALOG_FEATURE_VERSION,
@@ -669,7 +696,7 @@ def derive_album_feature(server: Any, album: Dict[str, Any]) -> Dict[str, Any]:
         "script": script,
         "region": region,
         "scene_cluster_ids": _scene_clusters(primary_genre, subgenre, era, region),
-        "popularity": 0.46,
+        "popularity": max(0.0, min(popularity, 1.0)),
         "freshness": _freshness_from_year(year),
         "confidence": round(0.28 + (0.2 if primary_genre else 0.0) + (0.14 if year else 0.0), 4),
         "source_metadata": {

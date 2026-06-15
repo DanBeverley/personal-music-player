@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 
 import '../../logic/audio_provider.dart';
+import '../../ui/app_theme_tokens.dart';
+import '../../ui/neatie_components.dart';
 import '../app_artwork.dart';
 import 'track_menu_button.dart';
 
@@ -18,37 +20,10 @@ class GenreTabChip extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Material(
-      color: Colors.transparent,
-      child: InkWell(
-        onTap: onTap,
-        borderRadius: BorderRadius.circular(999),
-        child: AnimatedContainer(
-          duration: const Duration(milliseconds: 180),
-          curve: Curves.easeOutCubic,
-          padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 11),
-          decoration: BoxDecoration(
-            color: selected
-                ? Colors.blueAccent.withValues(alpha: 0.14)
-                : Colors.transparent,
-            borderRadius: BorderRadius.circular(999),
-            border: Border.all(
-              color: selected
-                  ? Colors.blueAccent.withValues(alpha: 0.85)
-                  : Colors.white.withValues(alpha: 0.52),
-            ),
-          ),
-          child: Text(
-            label,
-            style: TextStyle(
-              color: selected ? Colors.blueAccent.shade100 : Colors.white70,
-              fontSize: 13,
-              fontWeight: FontWeight.w700,
-              letterSpacing: 0.2,
-            ),
-          ),
-        ),
-      ),
+    return NeatiePill(
+      label: label,
+      selected: selected,
+      onTap: onTap,
     );
   }
 }
@@ -128,13 +103,13 @@ class GenreTrackTile extends StatelessWidget {
             child: Container(
               width: 42,
               height: 42,
-              decoration: BoxDecoration(
-                color: Colors.white.withValues(alpha: 0.08),
+              decoration: const BoxDecoration(
+                color: neatieActive,
                 shape: BoxShape.circle,
               ),
               child: const Icon(
                 Icons.play_arrow_rounded,
-                color: Colors.white,
+                color: Colors.black,
                 size: 24,
               ),
             ),

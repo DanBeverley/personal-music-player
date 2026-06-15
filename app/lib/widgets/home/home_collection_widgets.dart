@@ -4,6 +4,7 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 
 import '../../ui/app_theme_tokens.dart';
+import '../../ui/neatie_components.dart';
 import '../app_artwork.dart';
 import '../track_list_skeleton.dart';
 import 'track_menu_button.dart';
@@ -26,7 +27,7 @@ class HomeAlbumList extends StatelessWidget {
       return const Center(
         child: Padding(
           padding: EdgeInsets.symmetric(vertical: 18),
-          child: CircularProgressIndicator(color: appAccentGrey),
+          child: CircularProgressIndicator(color: neatieActive),
         ),
       );
     }
@@ -40,20 +41,15 @@ class HomeAlbumList extends StatelessWidget {
       itemCount: albums.length,
       itemBuilder: (context, index) {
         final album = albums[index];
-        return Container(
+        return NeatieSurface(
           margin: const EdgeInsets.only(bottom: 14),
-          decoration: BoxDecoration(
-            color: Colors.white.withValues(alpha: 0.025),
-            borderRadius: BorderRadius.circular(appRadiusLarge),
-            border: Border.all(
-              color: Colors.white.withValues(alpha: 0.06),
-              width: 1,
-            ),
-          ),
+          radius: neatieRadiusLarge,
+          color: Colors.white.withValues(alpha: 0.035),
+          blur: false,
           child: Material(
             color: Colors.transparent,
             child: InkWell(
-              borderRadius: BorderRadius.circular(appRadiusLarge),
+              borderRadius: BorderRadius.circular(neatieRadiusLarge),
               onTap: () => onOpenAlbum(album),
               child: Padding(
                 padding: const EdgeInsets.all(14),
@@ -70,38 +66,9 @@ class HomeAlbumList extends StatelessWidget {
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 10,
-                              vertical: 5,
-                            ),
-                            decoration: BoxDecoration(
-                              color: Colors.white.withValues(alpha: 0.06),
-                              borderRadius: BorderRadius.circular(999),
-                              border: Border.all(
-                                color: Colors.white.withValues(alpha: 0.08),
-                              ),
-                            ),
-                            child: Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                Icon(
-                                  Icons.album_outlined,
-                                  size: 12,
-                                  color: Colors.white.withValues(alpha: 0.72),
-                                ),
-                                const SizedBox(width: 6),
-                                Text(
-                                  'Album',
-                                  style: TextStyle(
-                                    color: Colors.white.withValues(alpha: 0.74),
-                                    fontSize: 11,
-                                    fontWeight: FontWeight.w700,
-                                    letterSpacing: 0.4,
-                                  ),
-                                ),
-                              ],
-                            ),
+                          const NeatiePill(
+                            label: 'Album',
+                            icon: Icons.album_outlined,
                           ),
                           const SizedBox(height: 10),
                           Text(
@@ -268,122 +235,6 @@ class HomeArtistRow extends StatelessWidget {
   }
 }
 
-class HomeFeaturedArtistCard extends StatelessWidget {
-  const HomeFeaturedArtistCard({
-    super.key,
-    required this.artist,
-    required this.onOpenArtist,
-  });
-
-  final Map<String, dynamic> artist;
-  final ValueChanged<Map<String, dynamic>> onOpenArtist;
-
-  @override
-  Widget build(BuildContext context) {
-    final description = (artist['description'] ?? '').toString().trim();
-    final artistId = artist['id']?.toString().trim() ?? '';
-    return Container(
-      margin: const EdgeInsets.only(bottom: 16),
-      decoration: BoxDecoration(
-        color: Colors.white.withValues(alpha: 0.03),
-        borderRadius: BorderRadius.circular(appRadiusLarge),
-        border: Border.all(
-          color: Colors.white.withValues(alpha: 0.08),
-        ),
-      ),
-      child: Material(
-        color: Colors.transparent,
-        child: InkWell(
-          borderRadius: BorderRadius.circular(appRadiusLarge),
-          onTap: artistId.isEmpty ? null : () => onOpenArtist(artist),
-          child: Padding(
-            padding: const EdgeInsets.all(16),
-            child: Row(
-              children: [
-                AppArtwork(
-                  thumbnail: artist['thumbnail'],
-                  width: 88,
-                  height: 88,
-                  radius: 999,
-                ),
-                const SizedBox(width: 16),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 10,
-                          vertical: 5,
-                        ),
-                        decoration: BoxDecoration(
-                          color: Colors.white.withValues(alpha: 0.06),
-                          borderRadius: BorderRadius.circular(999),
-                          border: Border.all(
-                            color: Colors.white.withValues(alpha: 0.08),
-                          ),
-                        ),
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Icon(
-                              Icons.mic_external_on_rounded,
-                              size: 12,
-                              color: Colors.white.withValues(alpha: 0.72),
-                            ),
-                            const SizedBox(width: 6),
-                            Text(
-                              'Artist',
-                              style: TextStyle(
-                                color: Colors.white.withValues(alpha: 0.74),
-                                fontSize: 11,
-                                fontWeight: FontWeight.w700,
-                                letterSpacing: 0.4,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                      const SizedBox(height: 10),
-                      Text(
-                        artist['name']?.toString() ?? 'Unknown Artist',
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 18,
-                          fontWeight: FontWeight.w700,
-                        ),
-                      ),
-                      if (description.isNotEmpty) ...[
-                        const SizedBox(height: 6),
-                        Text(
-                          description,
-                          maxLines: 2,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            color: Colors.white.withValues(alpha: 0.56),
-                            fontSize: 12,
-                            height: 1.35,
-                          ),
-                        ),
-                      ],
-                    ],
-                  ),
-                ),
-                Icon(
-                  Icons.chevron_right_rounded,
-                  color: Colors.white.withValues(alpha: 0.48),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
 class HomeTrackList extends StatelessWidget {
   const HomeTrackList({
     super.key,
@@ -457,7 +308,8 @@ class HomeTrackList extends StatelessWidget {
         if (index >= tracks.length) {
           return const TrackListSkeleton(count: 1);
         }
-        final nearEndIndex = math.max(0, tracks.length - math.max(1, nearEndLead));
+        final nearEndIndex =
+            math.max(0, tracks.length - math.max(1, nearEndLead));
         if (onNearEnd != null && index >= nearEndIndex) {
           WidgetsBinding.instance.addPostFrameCallback((_) {
             onNearEnd!();
@@ -465,27 +317,15 @@ class HomeTrackList extends StatelessWidget {
         }
         final rawTrack = Map<String, dynamic>.from(tracks[index] as Map);
         final videoId = (rawTrack['id'] ?? rawTrack['videoId'])?.toString();
-        return Container(
+        return NeatieSurface(
           margin: const EdgeInsets.only(bottom: 14),
-          decoration: BoxDecoration(
-            color: const Color(0xFF1B1D20),
-            borderRadius: BorderRadius.circular(appRadiusLarge),
-            border: Border.all(
-              color: Colors.white.withValues(alpha: 0.06),
-              width: 1,
-            ),
-            boxShadow: [
-              BoxShadow(
-                color: Colors.black.withValues(alpha: 0.2),
-                blurRadius: 18,
-                offset: const Offset(0, 10),
-              ),
-            ],
-          ),
+          radius: neatieRadiusLarge,
+          color: Colors.white.withValues(alpha: 0.035),
+          blur: false,
           child: Material(
             color: Colors.transparent,
             child: InkWell(
-              borderRadius: BorderRadius.circular(16),
+              borderRadius: BorderRadius.circular(neatieRadiusLarge),
               onTapDown: (_) => onWarmTrack(videoId),
               onTap: () {
                 if (playAsDiscoveryMix) {
@@ -516,7 +356,7 @@ class HomeTrackList extends StatelessWidget {
                       videoId: videoId,
                       width: 74,
                       height: 74,
-                      radius: 18,
+                      radius: neatieRadiusMedium,
                     ),
                     const SizedBox(width: 16),
                     Expanded(
@@ -537,8 +377,8 @@ class HomeTrackList extends StatelessWidget {
                           Text(
                             rawTrack['channel'] ?? '',
                             maxLines: 1,
-                            style: TextStyle(
-                              color: Colors.white.withValues(alpha: 0.6),
+                            style: const TextStyle(
+                              color: neatieDimText,
                               fontSize: 13,
                             ),
                           ),

@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 
 import '../../logic/song_match_provider.dart';
 import '../../ui/app_theme_tokens.dart';
+import '../../ui/neatie_components.dart';
 
 Future<void> showSongMatchOptionsSheet({
   required BuildContext context,
@@ -19,33 +20,11 @@ Future<void> showSongMatchOptionsSheet({
     backgroundColor: Colors.transparent,
     isScrollControlled: true,
     builder: (sheetContext) {
-      return SafeArea(
-        top: false,
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
-          child: Container(
-            decoration: BoxDecoration(
-              color: const Color(0xFF111315),
-              borderRadius: const BorderRadius.vertical(
-                top: Radius.circular(28),
-                bottom: Radius.circular(24),
-              ),
-              border: Border.all(
-                color: Colors.white.withValues(alpha: 0.08),
-              ),
-            ),
+      return NeatieBottomSheetSurface(
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                Container(
-                  margin: const EdgeInsets.only(top: 10, bottom: 10),
-                  width: 48,
-                  height: 4,
-                  decoration: BoxDecoration(
-                    color: Colors.white.withValues(alpha: 0.22),
-                    borderRadius: BorderRadius.circular(999),
-                  ),
-                ),
+                const NeatieSheetHandle(),
                 Padding(
                   padding: const EdgeInsets.fromLTRB(18, 0, 18, 14),
                   child: Row(
@@ -55,7 +34,8 @@ Future<void> showSongMatchOptionsSheet({
                         height: 42,
                         decoration: BoxDecoration(
                           color: Colors.white.withValues(alpha: 0.06),
-                          borderRadius: BorderRadius.circular(appRadiusMedium),
+                          borderRadius:
+                              BorderRadius.circular(neatieRadiusMedium),
                         ),
                         child: const Icon(
                           Icons.graphic_eq_rounded,
@@ -95,7 +75,7 @@ Future<void> showSongMatchOptionsSheet({
                     icon: Icons.share_rounded,
                     title: 'Use shared file',
                     subtitle: pendingShared.displayName.isEmpty
-                        ? 'Use the shared media waiting in EBB.'
+                        ? 'Use the shared media waiting in Neatie.'
                         : pendingShared.displayName,
                     onTap: () {
                       Navigator.of(sheetContext).pop();
@@ -125,7 +105,7 @@ Future<void> showSongMatchOptionsSheet({
                     icon: Icons.share_rounded,
                     title: 'Use shared file',
                     subtitle: pendingShared.displayName.isEmpty
-                        ? 'Use the shared media waiting in EBB.'
+                        ? 'Use the shared media waiting in Neatie.'
                         : pendingShared.displayName,
                     onTap: () {
                       Navigator.of(sheetContext).pop();
@@ -135,8 +115,6 @@ Future<void> showSongMatchOptionsSheet({
                 const SizedBox(height: 10),
               ],
             ),
-          ),
-        ),
       );
     },
   );
@@ -152,33 +130,11 @@ Future<void> showSongMatchAlternativesSheet({
     backgroundColor: Colors.transparent,
     isScrollControlled: true,
     builder: (sheetContext) {
-      return SafeArea(
-        top: false,
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
-          child: Container(
-            decoration: BoxDecoration(
-              color: const Color(0xFF111315),
-              borderRadius: const BorderRadius.vertical(
-                top: Radius.circular(28),
-                bottom: Radius.circular(24),
-              ),
-              border: Border.all(
-                color: Colors.white.withValues(alpha: 0.08),
-              ),
-            ),
+      return NeatieBottomSheetSurface(
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                Container(
-                  margin: const EdgeInsets.only(top: 10, bottom: 10),
-                  width: 48,
-                  height: 4,
-                  decoration: BoxDecoration(
-                    color: Colors.white.withValues(alpha: 0.22),
-                    borderRadius: BorderRadius.circular(999),
-                  ),
-                ),
+                const NeatieSheetHandle(),
                 const Padding(
                   padding: EdgeInsets.fromLTRB(18, 0, 18, 12),
                   child: Align(
@@ -226,48 +182,52 @@ Future<void> showSongMatchAlternativesSheet({
                           ? resolvedTrack!['channel'].toString().trim()
                           : (recognizedMetadata['artist'] ?? 'Unknown artist')
                               .toString();
-                      return ListTile(
-                        leading: Container(
-                          width: 40,
-                          height: 40,
-                          decoration: BoxDecoration(
-                            color: Colors.white.withValues(alpha: 0.06),
-                            borderRadius:
-                                BorderRadius.circular(appRadiusMedium),
+                      return Material(
+                        type: MaterialType.transparency,
+                        child: ListTile(
+                          leading: Container(
+                            width: 40,
+                            height: 40,
+                            decoration: BoxDecoration(
+                              color: Colors.white.withValues(alpha: 0.06),
+                              borderRadius:
+                                  BorderRadius.circular(neatieRadiusMedium),
+                            ),
+                            child: const Icon(
+                              Icons.music_note_rounded,
+                              color: Colors.white70,
+                            ),
                           ),
-                          child: const Icon(
-                            Icons.music_note_rounded,
-                            color: Colors.white70,
+                          title: Text(
+                            title,
+                            style: const TextStyle(color: Colors.white),
                           ),
-                        ),
-                        title: Text(
-                          title,
-                          style: const TextStyle(color: Colors.white),
-                        ),
-                        subtitle: Text(
-                          artist,
-                          style: TextStyle(
-                            color: Colors.white.withValues(alpha: 0.6),
+                          subtitle: Text(
+                            artist,
+                            style: TextStyle(
+                              color: Colors.white.withValues(alpha: 0.6),
+                            ),
                           ),
-                        ),
-                        trailing: Text(
-                          '${(entry['confidence'] as num?)?.toStringAsFixed(0) ?? '0'}%',
-                          style: TextStyle(
-                            color: Colors.white.withValues(alpha: 0.6),
-                            fontSize: 12,
-                            fontWeight: FontWeight.w600,
+                          trailing: Text(
+                            '${(entry['confidence'] as num?)?.toStringAsFixed(0) ?? '0'}%',
+                            style: TextStyle(
+                              color: Colors.white.withValues(alpha: 0.6),
+                              fontSize: 12,
+                              fontWeight: FontWeight.w600,
+                            ),
                           ),
+                          onTap: resolvedTrack == null
+                              ? null
+                              : () {
+                                  Navigator.of(sheetContext).pop();
+                                  WidgetsBinding.instance
+                                      .addPostFrameCallback((_) {
+                                    unawaited(
+                                      onSelectAlternative(resolvedTrack),
+                                    );
+                                  });
+                                },
                         ),
-                        onTap: resolvedTrack == null
-                            ? null
-                            : () {
-                                Navigator.of(sheetContext).pop();
-                                WidgetsBinding.instance.addPostFrameCallback((_) {
-                                  unawaited(
-                                    onSelectAlternative(resolvedTrack),
-                                  );
-                                });
-                              },
                       );
                     },
                   ),
@@ -275,8 +235,6 @@ Future<void> showSongMatchAlternativesSheet({
                 const SizedBox(height: 12),
               ],
             ),
-          ),
-        ),
       );
     },
   );
@@ -299,16 +257,12 @@ class SongMatchLauncher extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final pendingShared = songMatchState.pendingSharedMedia;
-    return Container(
+    return NeatieSurface(
       width: double.infinity,
       padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: Colors.white.withValues(alpha: 0.03),
-        borderRadius: BorderRadius.circular(appRadiusLarge),
-        border: Border.all(
-          color: Colors.white.withValues(alpha: 0.08),
-        ),
-      ),
+      radius: neatieRadiusLarge,
+      color: Colors.white.withValues(alpha: 0.035),
+      blur: false,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -319,7 +273,7 @@ class SongMatchLauncher extends StatelessWidget {
                 height: 42,
                 decoration: BoxDecoration(
                   color: Colors.white.withValues(alpha: 0.06),
-                  borderRadius: BorderRadius.circular(appRadiusMedium),
+                  borderRadius: BorderRadius.circular(neatieRadiusMedium),
                 ),
                 child: const Icon(
                   Icons.graphic_eq_rounded,
@@ -436,36 +390,11 @@ class SongMatchOptionTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return ListTile(
+    return NeatieIconTile(
       onTap: onTap,
-      leading: Container(
-        width: 42,
-        height: 42,
-        decoration: BoxDecoration(
-          color: Colors.white.withValues(alpha: 0.06),
-          borderRadius: BorderRadius.circular(appRadiusMedium),
-        ),
-        child: Icon(icon, color: Colors.white),
-      ),
-      title: Text(
-        title,
-        style: const TextStyle(
-          color: Colors.white,
-          fontWeight: FontWeight.w600,
-        ),
-      ),
-      subtitle: Text(
-        subtitle,
-        style: TextStyle(
-          color: Colors.white.withValues(alpha: 0.62),
-          fontSize: 12,
-          height: 1.35,
-        ),
-      ),
-      trailing: const Icon(
-        Icons.chevron_right_rounded,
-        color: Colors.white70,
-      ),
+      icon: icon,
+      title: title,
+      subtitle: subtitle,
     );
   }
 }

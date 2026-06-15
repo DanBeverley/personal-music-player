@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../logic/audio_provider.dart';
 import '../../logic/audio_provider_queue.dart';
 import '../../logic/download_provider.dart';
+import '../../ui/neatie_components.dart';
 import '../app_artwork.dart';
 
 typedef TrackActionCallback = Future<void> Function(Map<String, dynamic> track);
@@ -76,43 +77,12 @@ Future<void> showTrackActionSheet({
         await action(normalizedTrack);
       }
 
-      return SafeArea(
-        top: false,
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
-          child: Container(
-            decoration: BoxDecoration(
-              color: const Color(0xFF111315),
-              borderRadius: const BorderRadius.vertical(
-                top: Radius.circular(30),
-                bottom: Radius.circular(26),
-              ),
-              border: Border.all(
-                color: Colors.white.withValues(alpha: 0.08),
-              ),
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.black.withValues(alpha: 0.32),
-                  blurRadius: 30,
-                  offset: const Offset(0, 18),
-                ),
-              ],
-            ),
+      return NeatieBottomSheetSurface(
             child: Column(
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Center(
-                  child: Container(
-                    margin: const EdgeInsets.only(top: 10),
-                    width: 48,
-                    height: 4,
-                    decoration: BoxDecoration(
-                      color: Colors.white.withValues(alpha: 0.24),
-                      borderRadius: BorderRadius.circular(999),
-                    ),
-                  ),
-                ),
+                const NeatieSheetHandle(),
                 Padding(
                   padding: const EdgeInsets.fromLTRB(18, 18, 18, 14),
                   child: Row(
@@ -226,8 +196,6 @@ Future<void> showTrackActionSheet({
                 const SizedBox(height: 8),
               ],
             ),
-          ),
-        ),
       );
     },
   );

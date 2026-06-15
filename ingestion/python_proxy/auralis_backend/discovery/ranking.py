@@ -146,6 +146,10 @@ def _profile_string_set(taste: TasteProfile, *keys: str) -> Set[str]:
                         child = child.keys()
                     if isinstance(child, (list, tuple, set)):
                         output.update(normalize_text(item) for item in child if normalize_text(item))
+                    else:
+                        normalized = normalize_text(child)
+                        if normalized:
+                            output.add(normalized)
                 elif isinstance(child, dict):
                     pending.append(child)
     return output
@@ -166,6 +170,29 @@ def _taste_genre_keys(taste: TasteProfile) -> Set[str]:
         if cluster.startswith("genre:"):
             genres.add(cluster.split(":", 1)[1])
     return genres
+
+
+def _taste_language_keys(taste: TasteProfile) -> Set[str]:
+    values = _profile_string_set(
+        taste,
+        "supported_languages",
+        "dominant_language",
+        "languages",
+    )
+    for track in taste.recent_tracks + taste.top_tracks + taste.last_played_tracks:
+        value = normalize_text(track.get("language"))
+        if value and value != "unknown":
+            values.add(value)
+    return values
+
+
+def _taste_region_keys(taste: TasteProfile) -> Set[str]:
+    values = _profile_string_set(taste, "regions", "dominant_region", "region")
+    for track in taste.recent_tracks + taste.top_tracks + taste.last_played_tracks:
+        value = normalize_text(track.get("region"))
+        if value and value != "unknown":
+            values.add(value)
+    return values
 
 
 def _candidate_matches_taste(candidate: DiscoveryCandidate, taste: TasteProfile) -> bool:
@@ -293,8 +320,24 @@ def _score_candidate(
     score -= _number(candidate.item.get("discovery_quality_penalty"))
     score += _number(candidate.item.get("feature_confidence")) * 0.25
     score += _number(candidate.item.get("popularity")) * 0.12
+    authority = normalize_text(candidate.item.get("source_authority"))
+    score += {
+        "official": 0.45,
+        "canonical": 0.35,
+        "verified_catalog": 0.18,
+        "unknown": -0.2,
+        "search_only": -4.0,
+    }.get(authority, -0.1)
     if row.kind in DISCOVERY_ROWS:
         score += _number(candidate.item.get("freshness")) * 0.12
+        language = normalize_text(candidate.item.get("language"))
+        supported_languages = _taste_language_keys(taste)
+        if language and language != "unknown" and supported_languages:
+            score += 0.3 if language in supported_languages else -1.8
+        region = normalize_text(candidate.item.get("region"))
+        supported_regions = _taste_region_keys(taste)
+        if region and region != "unknown" and supported_regions:
+            score += 0.18 if region in supported_regions else -0.35
     artist_key = normalize_text(artist_name(candidate.item))
     if artist_key and artist_key in _taste_artist_keys(taste):
         score += 0.7
@@ -501,6 +544,13 @@ def rank_albums(
         has_release_metadata = has_release_metadata or bool(release)
         score = candidate.score + SOURCE_WEIGHTS.get(candidate.source, 0.0)
         score -= _number(item.get("discovery_quality_penalty"))
+        authority = normalize_text(item.get("source_authority"))
+        score += {
+            "official": 0.65,
+            "canonical": 0.5,
+            "verified_catalog": 0.25,
+            "unknown": -0.5,
+        }.get(authority, -0.15)
         album_key = f"{title}|{artist}"
         if album_key in listened_album_exact:
             score -= 5.0

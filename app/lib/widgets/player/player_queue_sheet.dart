@@ -149,7 +149,11 @@ class PlayerQueueSheet extends ConsumerWidget {
           buildDefaultDragHandles: false,
           physics: const NeverScrollableScrollPhysics(),
           itemCount: upcomingQueue.length,
-          onReorder: queueNotifier.reorderUpcomingQueue,
+          onReorderItem: (oldIndex, newIndex) {
+            final legacyNewIndex =
+                newIndex >= oldIndex ? newIndex + 1 : newIndex;
+            queueNotifier.reorderUpcomingQueue(oldIndex, legacyNewIndex);
+          },
           proxyDecorator: (child, index, animation) {
             return AnimatedBuilder(
               animation: animation,
@@ -347,6 +351,22 @@ class PlayerQueueSheet extends ConsumerWidget {
           ),
         );
       }
+    }
+    if (queueState.mode == PlaybackQueueMode.playlist &&
+        !queueState.hasMoreRecommendations &&
+        !queueState.isLoadingRecommendations) {
+      queueChildren.add(
+        Padding(
+          padding: const EdgeInsets.fromLTRB(6, 18, 6, 8),
+          child: Text(
+            'No more related songs are available for this session.',
+            style: TextStyle(
+              color: Colors.white.withValues(alpha: 0.46),
+              fontSize: 12.5,
+            ),
+          ),
+        ),
+      );
     }
 
     return Container(

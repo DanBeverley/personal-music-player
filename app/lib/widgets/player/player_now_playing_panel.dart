@@ -6,27 +6,11 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../logic/audio_provider.dart';
 import '../../logic/audio_provider_queue.dart';
-import '../../logic/download_provider.dart';
+import '../../ui/app_theme_tokens.dart';
 import '../app_artwork.dart';
-import '../playlist/add_to_playlist_dialog.dart';
 import 'player_queue_widgets.dart';
-import 'player_sleep_timer_sheet.dart';
 
 class PlayerNowPlayingPanel extends ConsumerWidget {
-  final PlayerState playerState;
-  final AudioPlayerNotifier audioNotifier;
-  final PlaybackQueueState queueState;
-  final double? dragValue;
-  final ValueChanged<double> onSeekDragChanged;
-  final ValueChanged<double> onSeekDragEnd;
-  final VoidCallback onOpenQueueSheet;
-  final VoidCallback onDismissPlayer;
-  final Color accentColor;
-  final Color surfaceColor;
-  final double radiusLarge;
-  final double radiusMedium;
-  final String Function(int remainingSeconds) sleepTimerBadgeLabel;
-
   const PlayerNowPlayingPanel({
     super.key,
     required this.playerState,
@@ -44,17 +28,26 @@ class PlayerNowPlayingPanel extends ConsumerWidget {
     required this.sleepTimerBadgeLabel,
   });
 
+  final PlayerState playerState;
+  final AudioPlayerNotifier audioNotifier;
+  final PlaybackQueueState queueState;
+  final double? dragValue;
+  final ValueChanged<double> onSeekDragChanged;
+  final ValueChanged<double> onSeekDragEnd;
+  final VoidCallback onOpenQueueSheet;
+  final VoidCallback onDismissPlayer;
+  final Color accentColor;
+  final Color surfaceColor;
+  final double radiusLarge;
+  final double radiusMedium;
+  final String Function(int remainingSeconds) sleepTimerBadgeLabel;
+
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final nextUpTrack = playerNextUpTrack(queueState);
     final queueNotifier = ref.read(playbackQueueProvider.notifier);
+    final nextUpTrack = playerNextUpTrack(queueState);
     final mediaQuery = MediaQuery.of(context);
-    final bottomInset = mediaQuery.padding.bottom > mediaQuery.viewPadding.bottom
-        ? mediaQuery.padding.bottom
-        : mediaQuery.viewPadding.bottom;
-    final downloadTask = playerState.videoId == null
-        ? null
-        : ref.watch(downloadTaskProvider(playerState.videoId!));
+    final layout = _NowPlayingLayout.from(mediaQuery.size);
 
     return GestureDetector(
       behavior: HitTestBehavior.translucent,
@@ -67,325 +60,228 @@ class PlayerNowPlayingPanel extends ConsumerWidget {
         }
       },
       child: SafeArea(
-        child: LayoutBuilder(
-          builder: (context, constraints) {
-            final layout = _PlayerPanelLayout.from(
-              constraints: constraints,
-              mediaQuery: mediaQuery,
-              hasQueuePreview: nextUpTrack != null,
-            );
-            return SingleChildScrollView(
-              physics: const BouncingScrollPhysics(
-                parent: AlwaysScrollableScrollPhysics(),
+        child: SingleChildScrollView(
+          physics: const BouncingScrollPhysics(
+            parent: AlwaysScrollableScrollPhysics(),
+          ),
+          padding: EdgeInsets.fromLTRB(
+            28,
+            26,
+            28,
+            math.max(mediaQuery.padding.bottom + 86, 128),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              _ArtworkStage(
+                playerState: playerState,
+                artworkSize: layout.artworkSize,
+                radius: radiusLarge,
               ),
-              padding: EdgeInsets.fromLTRB(
-                24,
-                18,
-                24,
-                math.max(
-                  layout.compactLayout ? 161 : 201,
-                  bottomInset + 109,
-                ).toDouble(),
+              SizedBox(height: layout.infoGap),
+              _TrackIdentity(playerState: playerState),
+              const SizedBox(height: 24),
+              _ProgressSection(
+                playerState: playerState,
+                queueState: queueState,
+                nextUpTrack: nextUpTrack,
+                dragValue: dragValue,
+                onSeekDragChanged: onSeekDragChanged,
+                onSeekDragEnd: onSeekDragEnd,
+                onOpenQueueSheet: onOpenQueueSheet,
               ),
-              child: ConstrainedBox(
-                constraints: BoxConstraints(minHeight: constraints.maxHeight),
-                child: Transform.translate(
-                  offset: const Offset(0, -5),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      const SizedBox(height: 8),
-                      _PlayerArtworkHeader(
-                        playerState: playerState,
-                        layout: layout,
-                        radiusLarge: radiusLarge,
-                        radiusMedium: radiusMedium,
-                      ),
-                      _NextUpCard(
-                        nextUpTrack: nextUpTrack,
-                        queueAwareCompactLayout: layout.queueAwareCompactLayout,
-                        radiusLarge: radiusLarge,
-                        onTap: onOpenQueueSheet,
-                      ),
-                      SizedBox(height: layout.sliderGap),
-                      _PlayerProgressSection(
-                        playerState: playerState,
-                        dragValue: dragValue,
-                        onSeekDragChanged: onSeekDragChanged,
-                        onSeekDragEnd: onSeekDragEnd,
-                      ),
-                      SizedBox(height: layout.toolRowGap),
-                      _PlayerToolActionsRow(
-                        playerState: playerState,
-                        audioNotifier: audioNotifier,
-                        queueNotifier: queueNotifier,
-                        accentColor: accentColor,
-                        surfaceColor: surfaceColor,
-                        radiusLarge: radiusLarge,
-                        sleepTimerBadgeLabel: sleepTimerBadgeLabel,
-                        downloadTask: downloadTask,
-                      ),
-                      SizedBox(height: layout.compactLayout ? 12 : 18),
-                      _PlayerTransportControls(
-                        playerState: playerState,
-                        audioNotifier: audioNotifier,
-                        queueNotifier: queueNotifier,
-                        layout: layout,
-                        surfaceColor: surfaceColor,
-                      ),
-                      SizedBox(height: layout.compactLayout ? 10 : 14),
-                    ],
-                  ),
-                ),
+              const SizedBox(height: 16),
+              _SecondaryActionsRow(
+                playerState: playerState,
+                audioNotifier: audioNotifier,
+                queueNotifier: queueNotifier,
+                onOpenQueueSheet: onOpenQueueSheet,
+                accentColor: accentColor,
               ),
-            );
-          },
+              const SizedBox(height: 14),
+              _TransportRow(
+                playerState: playerState,
+                audioNotifier: audioNotifier,
+                queueNotifier: queueNotifier,
+              ),
+            ],
+          ),
         ),
       ),
     );
   }
 }
 
-class _PlayerArtworkHeader extends StatelessWidget {
-  final PlayerState playerState;
-  final _PlayerPanelLayout layout;
-  final double radiusLarge;
-  final double radiusMedium;
-
-  const _PlayerArtworkHeader({
+class _ArtworkStage extends StatelessWidget {
+  const _ArtworkStage({
     required this.playerState,
-    required this.layout,
-    required this.radiusLarge,
-    required this.radiusMedium,
+    required this.artworkSize,
+    required this.radius,
   });
+
+  final PlayerState playerState;
+  final double artworkSize;
+  final double radius;
 
   @override
   Widget build(BuildContext context) {
-    return Column(
+    return Center(
+      child: Hero(
+        tag: 'album_art_${playerState.currentTrackName}',
+        child: Container(
+          padding: const EdgeInsets.all(6),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(radius),
+            border: Border.all(color: neatieHairline),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.white.withValues(alpha: 0.08),
+                blurRadius: 80,
+                spreadRadius: -18,
+              ),
+              BoxShadow(
+                color: Colors.black.withValues(alpha: 0.55),
+                blurRadius: 36,
+                offset: const Offset(0, 22),
+              ),
+            ],
+          ),
+          child: AppArtwork(
+            thumbnail: playerState.thumbnail,
+            videoId: playerState.videoId,
+            width: artworkSize,
+            height: artworkSize,
+            radius: radius - 7,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _TrackIdentity extends ConsumerWidget {
+  const _TrackIdentity({required this.playerState});
+
+  final PlayerState playerState;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    return Row(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Center(
-          child: Hero(
-            tag: 'album_art_${playerState.currentTrackName}',
-            child: Container(
-              padding: const EdgeInsets.all(10),
-              decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(radiusLarge),
-                border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
-                color: Colors.white.withValues(alpha: 0.03),
-                boxShadow: [
-                  BoxShadow(
-                    color: Colors.black.withValues(alpha: 0.44),
-                    blurRadius: 48,
-                    offset: const Offset(0, 26),
-                  ),
-                ],
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                playerState.currentTrackName,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 26,
+                  fontWeight: FontWeight.w800,
+                  height: 1.08,
+                  letterSpacing: -0.5,
+                ),
               ),
-              child: AppArtwork(
-                thumbnail: playerState.thumbnail,
-                videoId: playerState.videoId,
-                width: layout.artworkSize,
-                height: layout.artworkSize,
-                radius: radiusMedium,
+              const SizedBox(height: 8),
+              Text(
+                playerState.artist ?? 'Artist Unknown',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  color: neatieMutedText,
+                  fontSize: 16,
+                  fontWeight: FontWeight.w500,
+                ),
               ),
-            ),
+            ],
           ),
         ),
-        SizedBox(height: layout.artworkGap),
-        Text(
-          playerState.currentTrackName,
-          style: TextStyle(
-            fontSize: layout.titleSize,
-            fontWeight: FontWeight.w800,
-            color: Colors.white,
-            height: 1.2,
-          ),
-          maxLines: 2,
-          overflow: TextOverflow.ellipsis,
+        IconButton(
+          onPressed: playerState.videoId == null
+              ? null
+              : () {
+                  unawaited(
+                    upsertCloudLibraryTrack({
+                      'id': playerState.videoId,
+                      'videoId': playerState.videoId,
+                      'title': playerState.currentTrackName,
+                      'artist': playerState.artist,
+                      'channel': playerState.artist,
+                      'thumbnail': playerState.thumbnail,
+                      'duration': playerState.duration,
+                    }).then((_) => ref.invalidate(libraryProvider)),
+                  );
+                },
+          icon: const Icon(Icons.favorite_border_rounded),
+          color: Colors.white,
+          iconSize: 27,
+          tooltip: 'Save',
         ),
-        const SizedBox(height: 8),
-        Text(
-          playerState.artist ?? 'Artist Unknown',
-          style: TextStyle(
-            fontSize: layout.artistSize,
-            color: Colors.white.withValues(alpha: 0.7),
-          ),
-        ),
-        SizedBox(height: layout.hasQueuePreview ? layout.cardGap : 0),
       ],
     );
   }
 }
 
-class _NextUpCard extends StatelessWidget {
-  final Map<String, dynamic>? nextUpTrack;
-  final bool queueAwareCompactLayout;
-  final double radiusLarge;
-  final VoidCallback onTap;
-
-  const _NextUpCard({
-    required this.nextUpTrack,
-    required this.queueAwareCompactLayout,
-    required this.radiusLarge,
-    required this.onTap,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return AnimatedSwitcher(
-      duration: const Duration(milliseconds: 280),
-      switchInCurve: Curves.easeOutCubic,
-      switchOutCurve: Curves.easeInCubic,
-      transitionBuilder: (child, animation) {
-        final curved = CurvedAnimation(
-          parent: animation,
-          curve: Curves.easeOutCubic,
-          reverseCurve: Curves.easeInCubic,
-        );
-        return FadeTransition(
-          opacity: curved,
-          child: SlideTransition(
-            position: Tween<Offset>(
-              begin: const Offset(0, 0.08),
-              end: Offset.zero,
-            ).animate(curved),
-            child: child,
-          ),
-        );
-      },
-      child: nextUpTrack == null
-          ? const SizedBox.shrink(key: ValueKey('player-next-up-empty'))
-          : GestureDetector(
-              key: ValueKey(
-                'player-next-up-${extractTrackId(nextUpTrack) ?? nextUpTrack!['title'] ?? 'unknown'}',
-              ),
-              onTap: onTap,
-              child: Container(
-                width: double.infinity,
-                padding: EdgeInsets.symmetric(
-                  horizontal: 14,
-                  vertical: queueAwareCompactLayout ? 10 : 14,
-                ),
-                decoration: BoxDecoration(
-                  color: Colors.white.withValues(alpha: 0.04),
-                  borderRadius: BorderRadius.circular(radiusLarge),
-                  border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
-                ),
-                child: Row(
-                  children: [
-                    Icon(
-                      Icons.queue_music_rounded,
-                      color: Colors.white.withValues(alpha: 0.72),
-                      size: 18,
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: queueAwareCompactLayout
-                          ? Text(
-                              nextUpTrack!['title'] ?? 'More like this',
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontSize: 13,
-                                fontWeight: FontWeight.w600,
-                              ),
-                            )
-                          : Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Text(
-                                  'Up next',
-                                  style: TextStyle(
-                                    color: Colors.white.withValues(alpha: 0.46),
-                                    fontSize: 11,
-                                    fontWeight: FontWeight.w700,
-                                    letterSpacing: 0.5,
-                                  ),
-                                ),
-                                const SizedBox(height: 4),
-                                Text(
-                                  nextUpTrack!['title'] ?? 'More like this',
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: const TextStyle(
-                                    color: Colors.white,
-                                    fontSize: 14,
-                                    fontWeight: FontWeight.w600,
-                                  ),
-                                ),
-                              ],
-                            ),
-                    ),
-                    Icon(
-                      Icons.keyboard_arrow_up_rounded,
-                      color: Colors.white.withValues(alpha: 0.56),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-    );
-  }
-}
-
-class _PlayerProgressSection extends StatelessWidget {
-  final PlayerState playerState;
-  final double? dragValue;
-  final ValueChanged<double> onSeekDragChanged;
-  final ValueChanged<double> onSeekDragEnd;
-
-  const _PlayerProgressSection({
+class _ProgressSection extends StatelessWidget {
+  const _ProgressSection({
     required this.playerState,
+    required this.queueState,
+    required this.nextUpTrack,
     required this.dragValue,
     required this.onSeekDragChanged,
     required this.onSeekDragEnd,
+    required this.onOpenQueueSheet,
   });
+
+  final PlayerState playerState;
+  final PlaybackQueueState queueState;
+  final Map<String, dynamic>? nextUpTrack;
+  final double? dragValue;
+  final ValueChanged<double> onSeekDragChanged;
+  final ValueChanged<double> onSeekDragEnd;
+  final VoidCallback onOpenQueueSheet;
 
   @override
   Widget build(BuildContext context) {
+    final progress = playerState.duration > 0
+        ? dragValue ??
+            (playerState.currentPosition / playerState.duration).clamp(0.0, 1.0)
+        : 0.0;
+
     return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
       children: [
+        _PlaybackContextRow(
+          playingFrom: _playingFromLabel(queueState),
+          nextUpTrack: nextUpTrack,
+          onOpenQueueSheet: onOpenQueueSheet,
+        ),
+        const SizedBox(height: 10),
         SliderTheme(
           data: SliderTheme.of(context).copyWith(
             activeTrackColor: Colors.white,
-            inactiveTrackColor: Colors.white.withValues(alpha: 0.2),
+            inactiveTrackColor: Colors.white.withValues(alpha: 0.18),
             thumbColor: Colors.white,
-            overlayColor: Colors.white.withValues(alpha: 0.1),
-            trackHeight: 4.0,
-            thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
+            overlayColor: Colors.white.withValues(alpha: 0.08),
+            trackHeight: 3,
+            thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 5),
           ),
           child: Slider(
-            value: playerState.duration > 0
-                ? dragValue ??
-                    (playerState.currentPosition / playerState.duration)
-                        .clamp(0.0, 1.0)
-                : 0.0,
+            value: progress,
             onChanged: playerState.duration > 0 ? onSeekDragChanged : null,
             onChangeEnd: playerState.duration > 0 ? onSeekDragEnd : null,
           ),
         ),
         Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 8.0),
+          padding: const EdgeInsets.symmetric(horizontal: 8),
           child: Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Text(
-                '${(playerState.currentPosition / 60).floor()}:${(playerState.currentPosition % 60).toString().padLeft(2, '0')}',
-                style: TextStyle(
-                  color: Colors.white.withValues(alpha: 0.6),
-                  fontSize: 12,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-              Text(
-                '${(playerState.duration / 60).floor()}:${(playerState.duration % 60).toString().padLeft(2, '0')}',
-                style: TextStyle(
-                  color: Colors.white.withValues(alpha: 0.6),
-                  fontSize: 12,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
+              _DurationLabel(seconds: playerState.currentPosition),
+              _DurationLabel(seconds: playerState.duration),
             ],
           ),
         ),
@@ -394,415 +290,299 @@ class _PlayerProgressSection extends StatelessWidget {
   }
 }
 
-class _PlayerToolActionsRow extends ConsumerWidget {
-  final PlayerState playerState;
-  final AudioPlayerNotifier audioNotifier;
-  final PlaybackQueueNotifier queueNotifier;
-  final Color accentColor;
-  final Color surfaceColor;
-  final double radiusLarge;
-  final String Function(int remainingSeconds) sleepTimerBadgeLabel;
-  final DownloadTask? downloadTask;
-
-  const _PlayerToolActionsRow({
-    required this.playerState,
-    required this.audioNotifier,
-    required this.queueNotifier,
-    required this.accentColor,
-    required this.surfaceColor,
-    required this.radiusLarge,
-    required this.sleepTimerBadgeLabel,
-    required this.downloadTask,
+class _PlaybackContextRow extends StatelessWidget {
+  const _PlaybackContextRow({
+    required this.playingFrom,
+    required this.nextUpTrack,
+    required this.onOpenQueueSheet,
   });
 
+  final String playingFrom;
+  final Map<String, dynamic>? nextUpTrack;
+  final VoidCallback onOpenQueueSheet;
+
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  Widget build(BuildContext context) {
+    final nextTitle =
+        (nextUpTrack?['title'] ?? nextUpTrack?['name'] ?? '').toString().trim();
+
     return Row(
-      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        IconButton(
-          visualDensity: VisualDensity.compact,
-          iconSize: 28,
-          padding: EdgeInsets.zero,
-          icon: Icon(
-            Icons.shuffle_rounded,
-            color: Colors.white.withValues(alpha: 0.5),
+        Expanded(
+          child: _ContextLabel(
+            eyebrow: 'PLAYING FROM',
+            value: playingFrom,
           ),
-          onPressed: () {
-            unawaited(queueNotifier.playShuffled());
-          },
         ),
-        Stack(
-          clipBehavior: Clip.none,
-          children: [
-            IconButton(
-              visualDensity: VisualDensity.compact,
-              iconSize: 28,
-              padding: EdgeInsets.zero,
-              icon: Icon(
-                Icons.timer_outlined,
-                color: playerState.sleepTimerRemainingSeconds > 0
-                    ? accentColor
-                    : Colors.white.withValues(alpha: 0.5),
-              ),
-              onPressed: () => showPlayerSleepTimerSheet(
-                context,
-                audioNotifier,
-                playerState,
-                surfaceColor: surfaceColor,
-                accentColor: accentColor,
-                radiusLarge: radiusLarge,
+        if (nextTitle.isNotEmpty) ...[
+          const SizedBox(width: 20),
+          Expanded(
+            child: InkWell(
+              borderRadius: BorderRadius.circular(10),
+              onTap: onOpenQueueSheet,
+              child: _ContextLabel(
+                eyebrow: 'UP NEXT',
+                value: nextTitle,
+                alignEnd: true,
               ),
             ),
-            if (playerState.sleepTimerRemainingSeconds > 0)
-              Positioned(
-                right: -2,
-                top: 2,
-                child: Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 5,
-                    vertical: 2,
-                  ),
-                  decoration: BoxDecoration(
-                    color: Colors.white.withValues(alpha: 0.14),
-                    borderRadius: BorderRadius.circular(999),
-                  ),
-                  child: Text(
-                    sleepTimerBadgeLabel(playerState.sleepTimerRemainingSeconds),
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 9,
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
-                ),
-              ),
-          ],
-        ),
-        IconButton(
-          visualDensity: VisualDensity.compact,
-          iconSize: 28,
-          padding: EdgeInsets.zero,
-          icon: Icon(
-            Icons.loop,
-            color: playerState.isLooping
-                ? accentColor
-                : Colors.white.withValues(alpha: 0.5),
           ),
-          onPressed: () {
-            audioNotifier.toggleLoop(0, playerState.duration * 1000);
-          },
-        ),
-        IconButton(
-          visualDensity: VisualDensity.compact,
-          iconSize: 28,
-          padding: EdgeInsets.zero,
-          tooltip: 'Download',
-          icon: downloadTask?.phase == DownloadPhase.active
-              ? SizedBox(
-                  width: 24,
-                  height: 24,
-                  child: CircularProgressIndicator(
-                    value:
-                        downloadTask!.progress > 0 ? downloadTask!.progress : null,
-                    strokeWidth: 2.3,
-                    color: accentColor,
-                  ),
-                )
-              : Icon(
-                  downloadTask?.phase == DownloadPhase.complete
-                      ? Icons.download_done_rounded
-                      : Icons.download_rounded,
-                  color: downloadTask?.phase == DownloadPhase.complete
-                      ? accentColor
-                      : Colors.white.withValues(alpha: 0.5),
-                ),
-          onPressed: playerState.videoId == null
-              ? null
-              : () {
-                  ref.read(downloadCenterProvider.notifier).downloadTrack({
-                    'id': playerState.videoId,
-                    'videoId': playerState.videoId,
-                    'title': playerState.currentTrackName,
-                    'thumbnail': playerState.thumbnail,
-                    'channel': playerState.artist,
-                    'duration': playerState.duration,
-                  });
-                },
-        ),
-        IconButton(
-          visualDensity: VisualDensity.compact,
-          iconSize: 28,
-          padding: EdgeInsets.zero,
-          icon: Icon(
-            Icons.playlist_add,
-            color: Colors.white.withValues(alpha: 0.5),
-          ),
-          onPressed: () {
-            if (playerState.videoId == null) return;
-            showAddToPlaylistDialog(
-              context: context,
-              track: {
-                'id': playerState.videoId,
-                'videoId': playerState.videoId,
-                'title': playerState.currentTrackName,
-                'thumbnail': playerState.thumbnail,
-                'channel': playerState.artist,
-                'duration': playerState.duration,
-              },
-            );
-          },
-        ),
+        ],
       ],
     );
   }
 }
 
-class _PlayerTransportControls extends StatelessWidget {
-  final PlayerState playerState;
-  final AudioPlayerNotifier audioNotifier;
-  final PlaybackQueueNotifier queueNotifier;
-  final _PlayerPanelLayout layout;
-  final Color surfaceColor;
-
-  const _PlayerTransportControls({
-    required this.playerState,
-    required this.audioNotifier,
-    required this.queueNotifier,
-    required this.layout,
-    required this.surfaceColor,
+class _ContextLabel extends StatelessWidget {
+  const _ContextLabel({
+    required this.eyebrow,
+    required this.value,
+    this.alignEnd = false,
   });
+
+  final String eyebrow;
+  final String value;
+  final bool alignEnd;
 
   @override
   Widget build(BuildContext context) {
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-      crossAxisAlignment: CrossAxisAlignment.center,
-      children: [
-        _TransportIconButton(
-          width: layout.transportButtonWidth,
-          iconSize: layout.transportIconSize,
-          icon: Icons.skip_previous_rounded,
-          onPressed: () {
-            unawaited(queueNotifier.playPrevious());
-          },
-        ),
-        _TransportIconButton(
-          width: layout.transportButtonWidth,
-          iconSize: layout.transportIconSize,
-          icon: Icons.replay_10_rounded,
-          onPressed: () {
-            unawaited(audioNotifier.seek(playerState.currentPosition - 10));
-          },
-        ),
-        SizedBox(
-          width: layout.primaryTransportBox,
-          child: Center(
-            child: GestureDetector(
-              onTap: () {
-                unawaited(
-                  playerState.isPlaying
-                      ? audioNotifier.pause()
-                      : audioNotifier.play(),
-                );
-              },
-              child: Container(
-                width: layout.primaryTransportSize,
-                height: layout.primaryTransportSize,
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  color: surfaceColor,
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.black.withValues(alpha: 0.26),
-                      blurRadius: 24,
-                      offset: const Offset(0, 10),
-                    ),
-                  ],
-                ),
-                alignment: Alignment.center,
-                child: playerState.isDownloading
-                    ? const SizedBox(
-                        width: 38,
-                        height: 38,
-                        child: CircularProgressIndicator(
-                          color: Colors.white,
-                          strokeWidth: 3,
-                        ),
-                      )
-                    : Transform.translate(
-                        offset: Offset(playerState.isPlaying ? 0 : 1, 0),
-                        child: Icon(
-                          playerState.isPlaying
-                              ? Icons.pause_rounded
-                              : Icons.play_arrow_rounded,
-                          color: Colors.white,
-                          size: 42,
-                        ),
-                      ),
-              ),
-            ),
-          ),
-        ),
-        _TransportIconButton(
-          width: layout.transportButtonWidth,
-          iconSize: layout.transportIconSize,
-          icon: Icons.forward_10_rounded,
-          onPressed: () {
-            unawaited(audioNotifier.seek(playerState.currentPosition + 10));
-          },
-        ),
-        _TransportIconButton(
-          width: layout.transportButtonWidth,
-          iconSize: layout.transportIconSize,
-          icon: Icons.skip_next_rounded,
-          onPressed: () {
-            unawaited(queueNotifier.playNext());
-          },
-        ),
-      ],
-    );
-  }
-}
-
-class _TransportIconButton extends StatelessWidget {
-  final double width;
-  final double iconSize;
-  final IconData icon;
-  final VoidCallback onPressed;
-
-  const _TransportIconButton({
-    required this.width,
-    required this.iconSize,
-    required this.icon,
-    required this.onPressed,
-  });
-
-  @override
-  Widget build(BuildContext context) {
+    final alignment =
+        alignEnd ? CrossAxisAlignment.end : CrossAxisAlignment.start;
     return SizedBox(
-      width: width,
-      child: IconButton(
-        visualDensity: VisualDensity.compact,
-        iconSize: iconSize,
-        padding: EdgeInsets.zero,
-        onPressed: onPressed,
-        icon: Icon(
-          icon,
-          color: Colors.white.withValues(alpha: 0.82),
-        ),
+      height: 40,
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.start,
+        crossAxisAlignment: alignment,
+        children: [
+          Text(
+            eyebrow,
+            maxLines: 1,
+            style: const TextStyle(
+              color: neatieMutedText,
+              fontSize: 10,
+              height: 1.2,
+              fontWeight: FontWeight.w800,
+              letterSpacing: 1.8,
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            value,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            textAlign: alignEnd ? TextAlign.end : TextAlign.start,
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 13,
+              height: 1.2,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ],
       ),
     );
   }
 }
 
-class _PlayerPanelLayout {
-  final bool compactLayout;
-  final bool queueAwareCompactLayout;
-  final bool hasQueuePreview;
-  final double artworkSize;
-  final double titleSize;
-  final double artistSize;
-  final double artworkGap;
-  final double cardGap;
-  final double sliderGap;
-  final double toolRowGap;
-  final double transportIconSize;
-  final double transportButtonWidth;
-  final double primaryTransportSize;
-  final double primaryTransportBox;
+String _playingFromLabel(PlaybackQueueState queueState) {
+  final playlistName = queueState.playlistName?.trim();
+  if (playlistName != null && playlistName.isNotEmpty) return playlistName;
+  return switch (queueState.mode) {
+    PlaybackQueueMode.radio => 'Neatie radio',
+    PlaybackQueueMode.playlist => 'Neatie queue',
+    PlaybackQueueMode.none => 'Now playing',
+  };
+}
 
-  const _PlayerPanelLayout({
-    required this.compactLayout,
-    required this.queueAwareCompactLayout,
-    required this.hasQueuePreview,
-    required this.artworkSize,
-    required this.titleSize,
-    required this.artistSize,
-    required this.artworkGap,
-    required this.cardGap,
-    required this.sliderGap,
-    required this.toolRowGap,
-    required this.transportIconSize,
-    required this.transportButtonWidth,
-    required this.primaryTransportSize,
-    required this.primaryTransportBox,
+class _DurationLabel extends StatelessWidget {
+  const _DurationLabel({required this.seconds});
+
+  final int seconds;
+
+  @override
+  Widget build(BuildContext context) {
+    return Text(
+      '${(seconds / 60).floor()}:${(seconds % 60).toString().padLeft(2, '0')}',
+      style: const TextStyle(
+        color: neatieMutedText,
+        fontSize: 12,
+        fontWeight: FontWeight.w600,
+      ),
+    );
+  }
+}
+
+class _TransportRow extends StatelessWidget {
+  const _TransportRow({
+    required this.playerState,
+    required this.audioNotifier,
+    required this.queueNotifier,
   });
 
-  factory _PlayerPanelLayout.from({
-    required BoxConstraints constraints,
-    required MediaQueryData mediaQuery,
-    required bool hasQueuePreview,
-  }) {
-    final compactLayout = constraints.maxHeight < 760;
-    final extraCompactLayout = constraints.maxHeight < 690;
-    final queueAwareCompactLayout = compactLayout && hasQueuePreview;
-    final artworkSize = math.min(
-      mediaQuery.size.width *
-          (queueAwareCompactLayout
-              ? 0.52
-              : compactLayout
-                  ? 0.62
-                  : 0.76),
-      queueAwareCompactLayout
-          ? 244.0
-          : compactLayout
-              ? 296.0
-              : 360.0,
-    ).clamp(
-      queueAwareCompactLayout
-          ? 164.0
-          : extraCompactLayout
-              ? 182.0
-              : 214.0,
-      360.0,
-    ).toDouble();
+  final PlayerState playerState;
+  final AudioPlayerNotifier audioNotifier;
+  final PlaybackQueueNotifier queueNotifier;
 
-    return _PlayerPanelLayout(
-      compactLayout: compactLayout,
-      queueAwareCompactLayout: queueAwareCompactLayout,
-      hasQueuePreview: hasQueuePreview,
-      artworkSize: artworkSize,
-      titleSize: queueAwareCompactLayout
-          ? 22.0
-          : compactLayout
-              ? 24.0
-              : 28.0,
-      artistSize: queueAwareCompactLayout
-          ? 15.0
-          : compactLayout
-              ? 16.0
-              : 18.0,
-      artworkGap: queueAwareCompactLayout
-          ? 16.0
-          : compactLayout
-              ? 24.0
-              : 40.0,
-      cardGap: queueAwareCompactLayout ? 10.0 : compactLayout ? 14.0 : 18.0,
-      sliderGap:
-          queueAwareCompactLayout ? 12.0 : compactLayout ? 18.0 : 26.0,
-      toolRowGap:
-          queueAwareCompactLayout ? 10.0 : compactLayout ? 12.0 : 20.0,
-      transportIconSize: queueAwareCompactLayout
-          ? 28.0
-          : compactLayout
-              ? 30.0
-              : 34.0,
-      transportButtonWidth: queueAwareCompactLayout
-          ? 42.0
-          : compactLayout
-              ? 46.0
-              : 50.0,
-      primaryTransportSize: queueAwareCompactLayout
-          ? 68.0
-          : compactLayout
-              ? 74.0
-              : 84.0,
-      primaryTransportBox: queueAwareCompactLayout
-          ? 76.0
-          : compactLayout
-              ? 82.0
-              : 92.0,
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+      children: [
+        _RoundTransportButton(
+          icon: Icons.skip_previous_rounded,
+          onPressed: () => unawaited(queueNotifier.playPrevious()),
+        ),
+        GestureDetector(
+          onTap: () => unawaited(
+            playerState.isPlaying ? audioNotifier.pause() : audioNotifier.play(),
+          ),
+          child: Container(
+            width: 76,
+            height: 76,
+            decoration: BoxDecoration(
+              color: Colors.white,
+              shape: BoxShape.circle,
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.white.withValues(alpha: 0.16),
+                  blurRadius: 34,
+                ),
+              ],
+            ),
+            child: playerState.isDownloading
+                ? const Padding(
+                    padding: EdgeInsets.all(22),
+                    child: CircularProgressIndicator(
+                      color: Colors.black,
+                      strokeWidth: 3,
+                    ),
+                  )
+                : Icon(
+                    playerState.isPlaying
+                        ? Icons.pause_rounded
+                        : Icons.play_arrow_rounded,
+                    color: Colors.black,
+                    size: 42,
+                  ),
+          ),
+        ),
+        _RoundTransportButton(
+          icon: Icons.skip_next_rounded,
+          onPressed: () => unawaited(queueNotifier.playNext()),
+        ),
+      ],
+    );
+  }
+}
+
+class _SecondaryActionsRow extends StatelessWidget {
+  const _SecondaryActionsRow({
+    required this.playerState,
+    required this.audioNotifier,
+    required this.queueNotifier,
+    required this.onOpenQueueSheet,
+    required this.accentColor,
+  });
+
+  final PlayerState playerState;
+  final AudioPlayerNotifier audioNotifier;
+  final PlaybackQueueNotifier queueNotifier;
+  final VoidCallback onOpenQueueSheet;
+  final Color accentColor;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      children: [
+        _SecondaryIconButton(
+          icon: Icons.shuffle_rounded,
+          onPressed: () => unawaited(queueNotifier.playShuffled()),
+        ),
+        _SecondaryIconButton(
+          icon: Icons.replay_10_rounded,
+          onPressed: () =>
+              unawaited(audioNotifier.seek(playerState.currentPosition - 10)),
+        ),
+        _SecondaryIconButton(
+          icon: Icons.forward_10_rounded,
+          onPressed: () =>
+              unawaited(audioNotifier.seek(playerState.currentPosition + 10)),
+        ),
+        _SecondaryIconButton(
+          icon: Icons.repeat_rounded,
+          color: playerState.isLooping ? accentColor : null,
+          onPressed: () =>
+              audioNotifier.toggleLoop(0, playerState.duration * 1000),
+        ),
+        _SecondaryIconButton(
+          icon: Icons.queue_music_rounded,
+          onPressed: onOpenQueueSheet,
+        ),
+      ],
+    );
+  }
+}
+
+class _RoundTransportButton extends StatelessWidget {
+  const _RoundTransportButton({
+    required this.icon,
+    required this.onPressed,
+  });
+
+  final IconData icon;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return IconButton(
+      onPressed: onPressed,
+      icon: Icon(icon),
+      color: Colors.white,
+      iconSize: 38,
+    );
+  }
+}
+
+class _SecondaryIconButton extends StatelessWidget {
+  const _SecondaryIconButton({
+    required this.icon,
+    required this.onPressed,
+    this.color,
+  });
+
+  final IconData icon;
+  final VoidCallback onPressed;
+  final Color? color;
+
+  @override
+  Widget build(BuildContext context) {
+    return IconButton(
+      visualDensity: VisualDensity.compact,
+      onPressed: onPressed,
+      icon: Icon(icon),
+      color: color ?? Colors.white.withValues(alpha: 0.78),
+      iconSize: 25,
+    );
+  }
+}
+
+class _NowPlayingLayout {
+  const _NowPlayingLayout({
+    required this.artworkSize,
+    required this.infoGap,
+  });
+
+  final double artworkSize;
+  final double infoGap;
+
+  factory _NowPlayingLayout.from(Size size) {
+    final compact = size.height < 760;
+    final artwork = math.min(size.width - 72, compact ? 322.0 : 386.0);
+    return _NowPlayingLayout(
+      artworkSize: artwork.clamp(236.0, 386.0).toDouble(),
+      infoGap: compact ? 28 : 38,
     );
   }
 }

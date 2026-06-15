@@ -135,80 +135,83 @@ class PlayerQueueTile extends StatelessWidget {
       child: AnimatedOpacity(
         duration: const Duration(milliseconds: 220),
         opacity: isDimmed ? 0.34 : 1,
-        child: ListTile(
-          contentPadding:
-              const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-          onTap: onTap,
-          leading: AppArtwork(
-            thumbnail: track['thumbnail'],
-            videoId: videoId,
-            width: 58,
-            height: 58,
-            radius: radiusMedium,
-          ),
-          title: Text(
-            track['title'] ?? 'Unknown Track',
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: TextStyle(
-              color: isDimmed
-                  ? Colors.white.withValues(alpha: 0.48)
-                  : Colors.white,
-              fontWeight: isActive ? FontWeight.w700 : FontWeight.w600,
+        child: Material(
+          type: MaterialType.transparency,
+          child: ListTile(
+            contentPadding:
+                const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+            onTap: onTap,
+            leading: AppArtwork(
+              thumbnail: track['thumbnail'],
+              videoId: videoId,
+              width: 58,
+              height: 58,
+              radius: radiusMedium,
             ),
-          ),
-          subtitle: Text(
-            track['channel'] ?? track['author'] ?? '',
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: TextStyle(
-              color: Colors.white.withValues(alpha: isDimmed ? 0.3 : 0.54),
-              fontSize: 12,
+            title: Text(
+              track['title'] ?? 'Unknown Track',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                color: isDimmed
+                    ? Colors.white.withValues(alpha: 0.48)
+                    : Colors.white,
+                fontWeight: isActive ? FontWeight.w700 : FontWeight.w600,
+              ),
             ),
-          ),
-          trailing: trailing ??
-              Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  if (trailingLabel != null) ...[
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 10,
-                        vertical: 6,
-                      ),
-                      decoration: BoxDecoration(
-                        color: Colors.white.withValues(alpha: 0.08),
-                        borderRadius: BorderRadius.circular(999),
-                      ),
-                      child: Text(
-                        trailingLabel!,
-                        style: TextStyle(
-                          color: Colors.white.withValues(alpha: 0.8),
-                          fontSize: 11,
-                          fontWeight: FontWeight.w700,
+            subtitle: Text(
+              track['channel'] ?? track['author'] ?? '',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                color: Colors.white.withValues(alpha: isDimmed ? 0.3 : 0.54),
+                fontSize: 12,
+              ),
+            ),
+            trailing: trailing ??
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (trailingLabel != null) ...[
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 6,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.white.withValues(alpha: 0.08),
+                          borderRadius: BorderRadius.circular(999),
+                        ),
+                        child: Text(
+                          trailingLabel!,
+                          style: TextStyle(
+                            color: Colors.white.withValues(alpha: 0.8),
+                            fontSize: 11,
+                            fontWeight: FontWeight.w700,
+                          ),
                         ),
                       ),
-                    ),
-                    const SizedBox(width: 6),
+                      const SizedBox(width: 6),
+                    ],
+                    if (onAddToPlaylist != null)
+                      IconButton(
+                        onPressed: onAddToPlaylist,
+                        icon: Icon(
+                          Icons.playlist_add_rounded,
+                          color: Colors.white.withValues(alpha: 0.72),
+                        ),
+                      ),
+                    if (onRemove != null)
+                      IconButton(
+                        onPressed: onRemove,
+                        icon: Icon(
+                          Icons.remove_circle_outline_rounded,
+                          color: Colors.white.withValues(alpha: 0.62),
+                        ),
+                      ),
                   ],
-                  if (onAddToPlaylist != null)
-                    IconButton(
-                      onPressed: onAddToPlaylist,
-                      icon: Icon(
-                        Icons.playlist_add_rounded,
-                        color: Colors.white.withValues(alpha: 0.72),
-                      ),
-                    ),
-                  if (onRemove != null)
-                    IconButton(
-                      onPressed: onRemove,
-                      icon: Icon(
-                        Icons.remove_circle_outline_rounded,
-                        color: Colors.white.withValues(alpha: 0.62),
-                      ),
-                    ),
-                ],
-              ),
+                ),
+          ),
         ),
       ),
     );

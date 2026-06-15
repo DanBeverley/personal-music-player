@@ -1,12 +1,18 @@
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 
+import '../ui/app_theme_tokens.dart';
+
 String preferredArtworkUrl(String? thumbnail, {String? videoId}) {
+  final cleanedThumbnail = thumbnail?.trim();
+  if (cleanedThumbnail != null && cleanedThumbnail.isNotEmpty) {
+    return cleanedThumbnail;
+  }
   final cleanedVideoId = videoId?.trim();
   if (cleanedVideoId != null && cleanedVideoId.isNotEmpty) {
     return 'https://i.ytimg.com/vi/$cleanedVideoId/hqdefault.jpg';
   }
-  return thumbnail ?? '';
+  return '';
 }
 
 int? _cacheDimension(double value, {double multiplier = 1}) {
@@ -88,19 +94,39 @@ class _ArtworkFrame extends StatelessWidget {
             colors: [Color(0xFF1A1A1A), Color(0xFF0D0D0D)],
           ),
         ),
-        child: imageUrl.isEmpty
-            ? const _ArtworkFallback()
-            : CachedNetworkImage(
-                imageUrl: imageUrl,
-                fit: fit,
-                memCacheWidth: _cacheDimension(width, multiplier: 3),
-                memCacheHeight: _cacheDimension(height, multiplier: 3),
-                maxWidthDiskCache: _cacheDimension(width, multiplier: 4),
-                maxHeightDiskCache: _cacheDimension(height, multiplier: 4),
-                fadeInDuration: const Duration(milliseconds: 220),
-                placeholder: (context, url) => const _ArtworkFallback(),
-                errorWidget: (context, url, error) => const _ArtworkFallback(),
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            imageUrl.isEmpty
+                ? const _ArtworkFallback()
+                : CachedNetworkImage(
+                    imageUrl: imageUrl,
+                    fit: fit,
+                    memCacheWidth: _cacheDimension(width, multiplier: 3),
+                    memCacheHeight: _cacheDimension(height, multiplier: 3),
+                    maxWidthDiskCache: _cacheDimension(width, multiplier: 4),
+                    maxHeightDiskCache: _cacheDimension(height, multiplier: 4),
+                    fadeInDuration: const Duration(milliseconds: 220),
+                    placeholder: (context, url) => const _ArtworkFallback(),
+                    errorWidget: (context, url, error) =>
+                        const _ArtworkFallback(),
+                  ),
+            DecoratedBox(
+              decoration: BoxDecoration(
+                borderRadius: borderRadius,
+                border: Border.all(color: neatieHairline),
+                gradient: LinearGradient(
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                  colors: [
+                    Colors.white.withValues(alpha: 0.04),
+                    Colors.black.withValues(alpha: 0.10),
+                  ],
+                ),
               ),
+            ),
+          ],
+        ),
       ),
     );
   }

@@ -97,8 +97,8 @@ class _AddToPlaylistDialogState extends ConsumerState<AddToPlaylistDialog> {
           margin: const EdgeInsets.symmetric(horizontal: 24),
           padding: const EdgeInsets.fromLTRB(24, 22, 24, 18),
           decoration: BoxDecoration(
-            color: Colors.grey[900]?.withValues(alpha: 0.86),
-            borderRadius: BorderRadius.circular(appRadiusLarge),
+            color: neatieGlass,
+            borderRadius: BorderRadius.circular(neatieRadiusLarge),
             border: Border.all(
               color: Colors.white.withValues(alpha: 0.08),
               width: 1,
@@ -147,27 +147,30 @@ class _AddToPlaylistDialogState extends ConsumerState<AddToPlaylistDialog> {
                     ),
                     itemBuilder: (context, index) {
                       final playlist = playlists[index];
-                      return ListTile(
-                        contentPadding: EdgeInsets.zero,
-                        title: Text(
-                          playlist.name,
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontWeight: FontWeight.w600,
+                      return Material(
+                        type: MaterialType.transparency,
+                        child: ListTile(
+                          contentPadding: EdgeInsets.zero,
+                          title: Text(
+                            playlist.name,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontWeight: FontWeight.w600,
+                            ),
                           ),
-                        ),
-                        subtitle: Text(
-                          '${playlist.tracks.length} tracks',
-                          style: TextStyle(
-                            color: Colors.white.withValues(alpha: 0.45),
+                          subtitle: Text(
+                            '${playlist.tracks.length} tracks',
+                            style: TextStyle(
+                              color: Colors.white.withValues(alpha: 0.45),
+                            ),
                           ),
+                          trailing: Icon(
+                            Icons.arrow_forward_ios_rounded,
+                            color: Colors.white.withValues(alpha: 0.4),
+                            size: 16,
+                          ),
+                          onTap: () => _addTrackToPlaylist(playlist),
                         ),
-                        trailing: Icon(
-                          Icons.arrow_forward_ios_rounded,
-                          color: Colors.white.withValues(alpha: 0.4),
-                          size: 16,
-                        ),
-                        onTap: () => _addTrackToPlaylist(playlist),
                       );
                     },
                   ),
@@ -199,7 +202,7 @@ class _AddToPlaylistDialogState extends ConsumerState<AddToPlaylistDialog> {
                   ),
                   focusedBorder: OutlineInputBorder(
                     borderRadius: BorderRadius.circular(16),
-                    borderSide: const BorderSide(color: appAccentGrey),
+                    borderSide: const BorderSide(color: neatieActive),
                   ),
                 ),
               ),
@@ -217,7 +220,7 @@ class _AddToPlaylistDialogState extends ConsumerState<AddToPlaylistDialog> {
                   const SizedBox(width: 8),
                   ElevatedButton(
                     style: ElevatedButton.styleFrom(
-                      backgroundColor: appSurfaceGreyAlt,
+                      backgroundColor: neatieRaised,
                       foregroundColor: Colors.white,
                       shape: RoundedRectangleBorder(
                         borderRadius: BorderRadius.circular(14),

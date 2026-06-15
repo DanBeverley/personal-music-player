@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 
 import '../../logic/download_provider.dart';
+import '../../ui/app_theme_tokens.dart';
+import '../../ui/neatie_components.dart';
 import '../app_artwork.dart';
 import '../playlist/add_to_playlist_dialog.dart';
 
@@ -117,7 +119,7 @@ class AlbumHeroSection extends StatelessWidget {
             if ((album['year'] ?? '').toString().isNotEmpty)
               album['year'].toString(),
             if (tracks.isNotEmpty) '${tracks.length} tracks',
-          ].join(' • '),
+          ].join(' / '),
           style: TextStyle(
             color: Colors.white.withValues(alpha: 0.56),
             fontSize: 14,
@@ -187,22 +189,7 @@ class DetailsStatsWrap extends StatelessWidget {
       children: stats.map((stat) {
         final label = (stat['label'] ?? '').toString();
         final value = (stat['value'] ?? '').toString();
-        return Container(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-          decoration: BoxDecoration(
-            color: Colors.white.withValues(alpha: 0.05),
-            borderRadius: BorderRadius.circular(999),
-            border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
-          ),
-          child: Text(
-            '$label • $value',
-            style: TextStyle(
-              color: Colors.white.withValues(alpha: 0.82),
-              fontSize: 12,
-              fontWeight: FontWeight.w600,
-            ),
-          ),
-        );
+        return NeatiePill(label: '$label / $value');
       }).toList(growable: false),
     );
   }
@@ -250,15 +237,11 @@ class ArtistAlbumsSection extends StatelessWidget {
                   child: InkWell(
                     borderRadius: BorderRadius.circular(radiusLarge),
                     onTap: () => onOpenAlbum(album),
-                    child: Ink(
+                    child: NeatieSurface(
                       padding: const EdgeInsets.all(12),
-                      decoration: BoxDecoration(
-                        color: Colors.white.withValues(alpha: 0.03),
-                        borderRadius: BorderRadius.circular(radiusLarge),
-                        border: Border.all(
-                          color: Colors.white.withValues(alpha: 0.08),
-                        ),
-                      ),
+                      radius: radiusLarge,
+                      color: Colors.white.withValues(alpha: 0.035),
+                      blur: false,
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
@@ -286,7 +269,7 @@ class ArtistAlbumsSection extends StatelessWidget {
                                 album['year'].toString(),
                               if ((album['track_count'] ?? 0) > 0)
                                 '${album['track_count']} tracks',
-                            ].join(' • '),
+                            ].join(' / '),
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
                             style: TextStyle(
@@ -436,48 +419,66 @@ class DetailsTrackListSection extends StatelessWidget {
             itemBuilder: (context, index) {
               final track = Map<String, dynamic>.from(tracks[index] as Map);
               final videoId = (track['id'] ?? track['videoId'])?.toString();
-              return Container(
+              return NeatieSurface(
                 margin: const EdgeInsets.only(bottom: 12),
-                decoration: BoxDecoration(
-                  color: Colors.white.withValues(alpha: 0.03),
-                  borderRadius: BorderRadius.circular(18),
-                  border: Border.all(color: Colors.white.withValues(alpha: 0.06)),
-                ),
-                child: ListTile(
-                  onTap: () => onPlayTrack(track),
-                  leading: AppArtwork(
-                    thumbnail: track['thumbnail'] ?? fallbackThumbnail,
-                    videoId: videoId,
-                    width: 56,
-                    height: 56,
-                    radius: 14,
-                  ),
-                  title: Text(
-                    track['title'] ?? 'Unknown Track',
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                  subtitle: Text(
-                    track['channel'] ?? track['author'] ?? fallbackSubtitle,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      color: Colors.white.withValues(alpha: 0.52),
-                      fontSize: 12,
-                    ),
-                  ),
-                  trailing: IconButton(
-                    onPressed: () => showAddToPlaylistDialog(
-                      context: context,
-                      track: track,
-                    ),
-                    icon: Icon(
-                      Icons.playlist_add_rounded,
-                      color: Colors.white.withValues(alpha: 0.68),
+                padding: const EdgeInsets.all(10),
+                radius: neatieRadiusMedium,
+                color: Colors.white.withValues(alpha: 0.035),
+                blur: false,
+                child: Material(
+                  color: Colors.transparent,
+                  child: InkWell(
+                    borderRadius: BorderRadius.circular(neatieRadiusMedium),
+                    onTap: () => onPlayTrack(track),
+                    child: Row(
+                      children: [
+                        AppArtwork(
+                          thumbnail: track['thumbnail'] ?? fallbackThumbnail,
+                          videoId: videoId,
+                          width: 56,
+                          height: 56,
+                          radius: 14,
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                track['title'] ?? 'Unknown Track',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                              const SizedBox(height: 4),
+                              Text(
+                                track['channel'] ??
+                                    track['author'] ??
+                                    fallbackSubtitle,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  color: neatieMutedText,
+                                  fontSize: 12,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        IconButton(
+                          onPressed: () => showAddToPlaylistDialog(
+                            context: context,
+                            track: track,
+                          ),
+                          icon: const Icon(
+                            Icons.playlist_add_rounded,
+                            color: neatieMutedText,
+                          ),
+                        ),
+                      ],
                     ),
                   ),
                 ),
@@ -565,7 +566,7 @@ class TrackDetailsHeaderSection extends StatelessWidget {
                             }
                             final text = [artist, releaseDate]
                                 .where((entry) => entry.isNotEmpty)
-                                .join(' • ');
+                                .join(' / ');
                             return Text(
                               text,
                               style: const TextStyle(
@@ -610,13 +611,11 @@ class TrackAlbumLinkCard extends StatelessWidget {
         child: InkWell(
           borderRadius: BorderRadius.circular(radiusLarge),
           onTap: onTap,
-          child: Ink(
+          child: NeatieSurface(
             padding: const EdgeInsets.all(18),
-            decoration: BoxDecoration(
-              color: Colors.white.withValues(alpha: 0.04),
-              borderRadius: BorderRadius.circular(radiusLarge),
-              border: Border.all(color: Colors.white.withValues(alpha: 0.07)),
-            ),
+            radius: radiusLarge,
+            color: Colors.white.withValues(alpha: 0.04),
+            blur: false,
             child: Row(
               children: [
                 Container(
@@ -781,28 +780,52 @@ class SimilarTracksSection extends StatelessWidget {
           itemCount: tracks.length,
           itemBuilder: (context, index) {
             final similarTrack = Map<String, dynamic>.from(tracks[index] as Map);
-            return ListTile(
-              onTap: () => onOpenTrack(similarTrack),
-              leading: ClipRRect(
-                borderRadius: BorderRadius.circular(4),
-                child: AppArtwork(
-                  thumbnail: similarTrack['thumbnail'],
-                  videoId: similarTrack['id']?.toString(),
-                  width: 48,
-                  height: 48,
-                  radius: 10,
+            return NeatieSurface(
+              margin: const EdgeInsets.only(bottom: 10),
+              padding: const EdgeInsets.all(10),
+              radius: neatieRadiusMedium,
+              color: Colors.white.withValues(alpha: 0.035),
+              blur: false,
+              child: Material(
+                color: Colors.transparent,
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(neatieRadiusMedium),
+                  onTap: () => onOpenTrack(similarTrack),
+                  child: Row(
+                    children: [
+                      AppArtwork(
+                        thumbnail: similarTrack['thumbnail'],
+                        videoId: similarTrack['id']?.toString(),
+                        width: 48,
+                        height: 48,
+                        radius: 10,
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              similarTrack['title'] ?? '',
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontWeight: FontWeight.w700,
+                              ),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              similarTrack['channel'] ?? '',
+                              style: const TextStyle(color: neatieMutedText),
+                              maxLines: 1,
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
-              ),
-              title: Text(
-                similarTrack['title'] ?? '',
-                style: const TextStyle(color: Colors.white),
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-              ),
-              subtitle: Text(
-                similarTrack['channel'] ?? '',
-                style: const TextStyle(color: Colors.white54),
-                maxLines: 1,
               ),
             );
           },

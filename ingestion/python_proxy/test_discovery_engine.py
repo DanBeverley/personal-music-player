@@ -814,6 +814,76 @@ def test_album_enrichment_uses_release_date_and_canonical_identity() -> None:
     assert album["normalized_artist_name"] == "queen"
 
 
+def test_track_enrichment_preserves_artist_graph_and_audio_trait_provenance() -> None:
+    track = normalize_track(
+        _FeatureServer(),
+        {
+            "id": "neighbor-track",
+            "title": "Rock Neighbor",
+            "artist": "Adjacent Band - Topic",
+            "album": "Neighbor Album",
+            "related_to_artist": "Queen",
+            "mood_axes": {"energy": 0.88, "drive": 0.8},
+            "language": "english",
+            "region": "uk",
+            "popularity": 0.72,
+        },
+    )
+    assert track is not None
+    assert track["audio_traits"]["energy"] == 0.88
+    assert track["mood_axes"]["drive"] == 0.8
+    assert track["language"] == "english"
+    assert track["region"] == "uk"
+    assert track["popularity"] == 0.72
+    assert "Queen" in track["peer_artist_ids"]
+    assert track["source_authority"] == "official"
+
+
+def test_discovery_ranking_prefers_supported_language_and_authoritative_source() -> None:
+    taste = _taste()
+    taste.source_profile = {
+        "supported_languages": ["english"],
+        "supported_regions": ["global"],
+    }
+    tracks = rank_tracks(
+        {
+            "similarity": [
+                DiscoveryCandidate(
+                    item={
+                        "id": "weak-foreign",
+                        "title": "Unrelated Track",
+                        "artist": "Unknown Artist",
+                        "language": "spanish",
+                        "region": "latin_america",
+                        "source_authority": "unknown",
+                    },
+                    source="similarity",
+                    score=5.0,
+                ),
+                DiscoveryCandidate(
+                    item={
+                        "id": "official-neighbor",
+                        "title": "Rock Neighbor",
+                        "artist": "Known Band - Topic",
+                        "language": "english",
+                        "region": "global",
+                        "source_authority": "official",
+                    },
+                    source="similarity",
+                    score=5.0,
+                ),
+            ]
+        },
+        taste,
+        ROW_RECIPES["made_for_you"],
+        limit=2,
+    )
+    assert [track["id"] for track in tracks] == [
+        "official-neighbor",
+        "weak-foreign",
+    ]
+
+
 def test_home_response_keeps_existing_contract_shape() -> None:
     now = time.time()
     artifact = DiscoveryArtifact(

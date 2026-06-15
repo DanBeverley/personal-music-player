@@ -9,9 +9,13 @@ if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
 
 from auralis_backend.domain.catalog import (
+    catalog_source_authority,
+    canonical_source_identity,
     canonical_album_identity,
     canonical_artist_identity,
     canonical_title_artist_identity,
+    normalized_album_payload,
+    normalized_audio_traits,
     normalize_album_title,
     normalize_artist_name,
     normalize_track_title,
@@ -86,6 +90,71 @@ class CatalogNormalizationTests(unittest.TestCase):
         self.assertEqual(
             canonical_artist_identity({"id": "artist_1", "name": "Anything"}),
             "artist_1",
+        )
+
+    def test_normalized_payload_preserves_release_region_popularity_and_audio_traits(self) -> None:
+        payload = normalized_track_payload(
+            {
+                "id": "track_2",
+                "title": "Fast Song",
+                "artist": "Band",
+                "album": "Album",
+                "release_date": "2024-03-15",
+                "language": "English",
+                "region": "US",
+                "popularity": 0.82,
+                "mood_axes": {"energy": 0.91, "drive": 0.84},
+                "provider": "youtube_music",
+            }
+        )
+        self.assertEqual(payload["release_year"], 2024)
+        self.assertEqual(payload["language"], "english")
+        self.assertEqual(payload["region"], "us")
+        self.assertEqual(payload["popularity"], 0.82)
+        self.assertEqual(payload["audio_traits"]["energy"], 0.91)
+        self.assertEqual(
+            payload["canonical_source_identity"],
+            "youtube music:track_2",
+        )
+
+    def test_source_authority_separates_official_catalog_and_search_only_media(self) -> None:
+        self.assertEqual(
+            catalog_source_authority(
+                {
+                    "id": "official",
+                    "title": "Song",
+                    "artist": "Band - Topic",
+                }
+            ),
+            "official",
+        )
+        self.assertEqual(
+            catalog_source_authority(
+                {
+                    "id": "cover",
+                    "title": "Song Acoustic Cover",
+                    "artist": "Tribute Band",
+                }
+            ),
+            "search_only",
+        )
+
+    def test_album_payload_has_stable_canonical_source_identity(self) -> None:
+        payload = normalized_album_payload(
+            {
+                "id": "album_1",
+                "title": "Purple Rain",
+                "artist": "Prince",
+                "source_name": "artist_discography",
+            }
+        )
+        self.assertEqual(
+            payload["canonical_source_identity"],
+            "artist discography:album_1",
+        )
+        self.assertEqual(
+            normalized_audio_traits({"energy": 2.0, "softness": -1.0}),
+            {"energy": 1.0, "softness": 0.0},
         )
 
 

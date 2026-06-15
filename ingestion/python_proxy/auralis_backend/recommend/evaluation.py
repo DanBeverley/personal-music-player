@@ -48,6 +48,43 @@ def _recent_track_keys(profile: Dict[str, Any]) -> set[str]:
     return keys
 
 
+def artifact_repetition_reasons(
+    rows: Sequence[Dict[str, Any]] | None,
+    *,
+    visible_items_per_row: int = 6,
+    max_visible_same_artist: int = 4,
+) -> List[str]:
+    visible_track_keys: set[str] = set()
+    duplicate_tracks = 0
+    artist_counts: Dict[str, int] = {}
+    for item in _visible_items(
+        rows,
+        visible_items_per_row=visible_items_per_row,
+    ):
+        track_key = canonical_title_artist_identity(item) or str(item.get("id") or "").strip()
+        if track_key:
+            if track_key in visible_track_keys:
+                duplicate_tracks += 1
+            else:
+                visible_track_keys.add(track_key)
+        artist_key = canonical_artist_identity(
+            {
+                "id": item.get("artist_id"),
+                "name": item.get("channel") or item.get("artist") or item.get("author"),
+            }
+        )
+        if artist_key:
+            artist_counts[artist_key] = int(artist_counts.get(artist_key) or 0) + 1
+
+    reasons: List[str] = []
+    if duplicate_tracks:
+        reasons.append(f"visible_duplicate_tracks:{duplicate_tracks}")
+    max_artist_count = max(artist_counts.values(), default=0)
+    if max_artist_count >= int(max_visible_same_artist):
+        reasons.append(f"visible_artist_concentration:{max_artist_count}")
+    return reasons
+
+
 def evaluate_home_fixture(
     *,
     profile: Dict[str, Any],

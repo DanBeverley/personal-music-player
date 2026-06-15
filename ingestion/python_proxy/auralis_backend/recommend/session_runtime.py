@@ -16,7 +16,7 @@ def feed_session_key(server: Any, session_id: str) -> str:
     return f"reco:feed:{server._recommendation_trim_text(session_id)}"
 
 
-def store_feed_session(server: Any, session: Dict[str, Any]) -> None:
+def _store_feed_session(server: Any, session: Dict[str, Any]) -> None:
     if not isinstance(session, dict):
         return
     session_id = server._recommendation_trim_text(session.get("session_id"))

@@ -36,6 +36,14 @@ def _recommendation_event_weight(event_type: Optional[str]) -> float:
         return 3.0
     if normalized == "library":
         return 3.2
+    if normalized == "playlist_add":
+        return 3.3
+    if normalized == "repeat":
+        return 2.4
+    if normalized == "impression":
+        return 0.0
+    if normalized == "tab_tap":
+        return 0.0
     if normalized == "skip":
         return -2.0
     return 1.0
@@ -1843,6 +1851,12 @@ def _recommendation_materialize_feature_store(artifact):
 
 @_with_server_globals
 def _recommendation_export_model_artifact(artifact):
+    export_enabled = os.environ.get(
+        "AURALIS_RECOMMEND_EXPORT_MODEL_JSON",
+        "0",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if not export_enabled:
+        return
     if not isinstance(artifact, dict) or not artifact.get("ready"):
         return
     model_id = _recommendation_trim_text(artifact.get("model_id"))
@@ -1856,6 +1870,25 @@ def _recommendation_export_model_artifact(artifact):
             encoding="utf-8",
         ) as handle:
             json.dump(artifact, handle, ensure_ascii=False)
+        retention_count = max(
+            1,
+            int(os.environ.get("AURALIS_RECOMMEND_MODEL_JSON_RETENTION", "10") or "10"),
+        )
+        json_files = []
+        for filename in os.listdir(RECOMMENDATION_MODEL_EXPORT_DIR):
+            if not filename.lower().endswith(".json"):
+                continue
+            path = os.path.join(RECOMMENDATION_MODEL_EXPORT_DIR, filename)
+            try:
+                json_files.append((os.path.getmtime(path), path))
+            except Exception:
+                continue
+        json_files.sort(reverse=True)
+        for _mtime, path in json_files[retention_count:]:
+            try:
+                os.remove(path)
+            except Exception:
+                continue
     except Exception:
         pass
 

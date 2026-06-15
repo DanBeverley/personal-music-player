@@ -645,7 +645,11 @@ def derive_album_feature(server: Any, album: Dict[str, Any]) -> Dict[str, Any]:
     text = _album_text(server, payload)
     script = script_bucket(text)
     primary_genre, secondary_genres, subgenre = _infer_genre_bundle(text)
-    year = extract_year(payload.get("year"))
+    year = None
+    for key in ("year", "release_year", "release_date", "releaseDate", "published"):
+        year = extract_year(payload.get(key))
+        if year is not None:
+            break
     era = era_bucket(year)
     language, region = _infer_language_region(text, script)
     return {
@@ -1216,7 +1220,10 @@ def _store_sqlite_taste_profile(
     source_signature: str,
     payload: Dict[str, Any],
 ) -> None:
-    connection = open_recommendation_store_connection(server)
+    try:
+        connection = open_recommendation_store_connection(server)
+    except Exception:
+        return
     try:
         connection.execute(
             """
@@ -1240,6 +1247,8 @@ def _store_sqlite_taste_profile(
             ],
         )
         connection.commit()
+    except Exception:
+        return
     finally:
         connection.close()
 
@@ -1327,7 +1336,10 @@ def _cleanup_pg_feedback(user_scope_id: str, now_ts: float) -> None:
 
 
 def _cleanup_sqlite_feedback(server: Any, user_scope_id: str, now_ts: float) -> None:
-    connection = open_recommendation_store_connection(server)
+    try:
+        connection = open_recommendation_store_connection(server)
+    except Exception:
+        return
     try:
         connection.execute(
             """
@@ -1337,6 +1349,8 @@ def _cleanup_sqlite_feedback(server: Any, user_scope_id: str, now_ts: float) -> 
             [user_scope_id, float(now_ts)],
         )
         connection.commit()
+    except Exception:
+        return
     finally:
         connection.close()
 

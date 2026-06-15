@@ -144,7 +144,6 @@ def schedule_profile_feature_warmup(
         _finish_warmup(warmup_key)
         return False
 
-
 def schedule_search_warmup(
     *,
     user_scope_id: str,
@@ -180,128 +179,6 @@ def schedule_search_warmup(
 
     try:
         _search_executor(srv).submit(_warm)
-        return True
-    except Exception:
-        _finish_warmup(warmup_key)
-        return False
-
-
-def schedule_home_warmup(
-    *,
-    user_scope_id: str,
-    profile: Dict[str, Any] | None = None,
-    force: bool = False,
-    server: Any | None = None,
-) -> bool:
-    srv = resolve_server(server)
-    normalized_scope = srv._assistant_safe_scope_id(user_scope_id or "guest")
-    warmup_key = f"home:{normalized_scope}"
-    started, _stale_reset = _begin_warmup(warmup_key)
-    if not started:
-        return False
-
-    def _warm() -> None:
-        try:
-            from .precompute import build_home_snapshot
-
-            build_home_snapshot(
-                server=srv,
-                user_scope_id=normalized_scope,
-                force=bool(force),
-                profile=profile if isinstance(profile, dict) and profile else None,
-            )
-        except Exception:
-            return
-        finally:
-            _finish_warmup(warmup_key)
-
-    try:
-        _precompute_executor(srv).submit(_warm)
-        return True
-    except Exception:
-        _finish_warmup(warmup_key)
-        return False
-
-
-def schedule_home_artifact_warmup(
-    *,
-    user_scope_id: str,
-    profile: Dict[str, Any] | None = None,
-    force: bool = False,
-    server: Any | None = None,
-) -> bool:
-    srv = resolve_server(server)
-    normalized_scope = srv._assistant_safe_scope_id(user_scope_id or "guest")
-    warmup_key = f"home_artifact:{normalized_scope}"
-    started, stale_reset = _begin_warmup(warmup_key)
-    if not started:
-        _log_warmup_event(
-            "home_artifact",
-            warmup_key,
-            "skipped",
-            force=bool(force),
-            reason="inflight",
-        )
-        return False
-    if stale_reset:
-        _log_warmup_event(
-            "home_artifact",
-            warmup_key,
-            "stale_reset",
-            force=bool(force),
-            stale_after_seconds=_WARMUP_INFLIGHT_STALE_SECONDS,
-        )
-
-    def _warm() -> None:
-        started_at = time.perf_counter()
-        _log_warmup_event(
-            "home_artifact",
-            warmup_key,
-            "started",
-            force=bool(force),
-            stale_reset=stale_reset,
-        )
-        try:
-            from .precompute import build_home_launch_artifacts
-
-            result = build_home_launch_artifacts(
-                server=srv,
-                user_scope_id=normalized_scope,
-                force=bool(force),
-                profile=profile if isinstance(profile, dict) and profile else None,
-            )
-            duration_ms = int((time.perf_counter() - started_at) * 1000)
-            result_map = dict(result or {})
-            _log_warmup_event(
-                "home_artifact",
-                warmup_key,
-                "completed",
-                force=bool(force),
-                duration_ms=duration_ms,
-                promotion_status=result_map.get("promotion_status") or "",
-                launch_acceptable=bool(result_map.get("launch_acceptable")),
-                row_builder_mode=result_map.get("row_builder_mode") or "",
-                rich_rows_forced=bool(result_map.get("artifact_rich_rows_forced")),
-                force_snapshot_retry=bool(result_map.get("artifact_force_snapshot_retry")),
-                retry_reason=result_map.get("artifact_force_snapshot_retry_reason") or "",
-                launch_rows=int(result_map.get("launch_row_count") or 0),
-            )
-        except Exception as exc:
-            duration_ms = int((time.perf_counter() - started_at) * 1000)
-            _log_warmup_event(
-                "home_artifact",
-                warmup_key,
-                "failed",
-                force=bool(force),
-                duration_ms=duration_ms,
-                error=str(exc)[:240],
-            )
-            return
-        finally:
-            _finish_warmup(warmup_key)
-
-    try:
-        _precompute_executor(srv).submit(_warm)
         return True
     except Exception:
         _finish_warmup(warmup_key)

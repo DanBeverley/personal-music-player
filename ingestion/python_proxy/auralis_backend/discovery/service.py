@@ -69,6 +69,86 @@ class DiscoveryService:
             return 0.0
         return len(previous_ids & current_ids) / max(len(previous_ids | current_ids), 1)
 
+    def _changed_row_kinds(
+        self,
+        previous: DiscoveryArtifact | None,
+        current: DiscoveryArtifact,
+    ) -> list[str]:
+        def row_signatures(artifact: DiscoveryArtifact | None) -> Dict[str, tuple[str, ...]]:
+            if artifact is None:
+                return {}
+            return {
+                row.kind: tuple(
+                    str(
+                        item.get("id")
+                        or item.get("videoId")
+                        or item.get("canonical_source_identity")
+                        or item.get("title")
+                        or ""
+                    ).strip()
+                    for item in row.items or []
+                    if str(
+                        item.get("id")
+                        or item.get("videoId")
+                        or item.get("canonical_source_identity")
+                        or item.get("title")
+                        or ""
+                    ).strip()
+                )
+                for row in artifact.rows or []
+            }
+
+        previous_rows = row_signatures(previous)
+        current_rows = row_signatures(current)
+        return [
+            kind
+            for kind, signature in current_rows.items()
+            if previous_rows.get(kind) != signature
+        ]
+
+    def _tier_rank(self, tier: str) -> int:
+        return {
+            "rejected": 0,
+            "partial": 1,
+            "launchable": 2,
+            "canonical": 3,
+        }.get(str(tier or "").strip().lower(), 0)
+
+    def _explicit_refresh_comparable(
+        self,
+        *,
+        changed_row_kinds: list[str],
+        previous_tier: str,
+        new_tier: str,
+        previous_score: float,
+        new_score: float,
+    ) -> bool:
+        if not changed_row_kinds:
+            return False
+        # Pull-to-refresh is an explicit user action: if the new artifact is in
+        # the same quality family and rotates visible rows, allow a modest score
+        # dip instead of making the first pull feel inert.
+        if self._tier_rank(new_tier) + 1 < self._tier_rank(previous_tier):
+            return False
+        important_rows = {
+            "todays_pick",
+            "featured_new_albums",
+            "made_for_you",
+            "because_you_played",
+            "trending_by_genre",
+            "recommended_albums",
+            "recommended_artists",
+            "quiet_picks",
+            "hidden_gems",
+        }
+        important_change_count = len(set(changed_row_kinds) & important_rows)
+        if important_change_count >= 3 and self._tier_rank(new_tier) >= max(
+            1,
+            self._tier_rank(previous_tier) - 1,
+        ):
+            return new_score >= max(previous_score - 320.0, previous_score * 0.72)
+        return new_score >= max(previous_score - 220.0, previous_score * 0.8)
+
     def _claim_background_build(self, fingerprint: str) -> bool:
         with self._background_build_lock:
             last_build = self._last_background_builds.get(fingerprint, 0.0)
@@ -146,6 +226,7 @@ class DiscoveryService:
         if artifact.accepted:
             overlap = self._refresh_overlap(previous, artifact)
             changed = self._artifact_signature(previous) != self._artifact_signature(artifact)
+            changed_row_kinds = self._changed_row_kinds(previous, artifact)
             previous_score = artifact_score(previous)
             new_score = artifact_score(artifact)
             artifact.diagnostics = dict(artifact.diagnostics or {})
@@ -154,6 +235,9 @@ class DiscoveryService:
                     "refresh_outcome": "changed" if changed else "unchanged",
                     "refresh_changed": changed,
                     "refresh_overlap": round(overlap, 4),
+                    "changed_row_kinds": changed_row_kinds,
+                    "todays_pick_changed": "todays_pick" in changed_row_kinds,
+                    "featured_albums_changed": "featured_new_albums" in changed_row_kinds,
                     "refresh_fingerprint": background_fingerprint,
                     "previous_artifact_quality_score": previous_score,
                     "new_artifact_quality_score": new_score,
@@ -171,7 +255,17 @@ class DiscoveryService:
                     request_id=request_id,
                     page_size=page_size,
                 )
-            if previous is not None and new_score < previous_score:
+            previous_tier = artifact_quality_tier(previous)
+            new_tier = artifact_quality_tier(artifact)
+            user_requested_refresh = force_refresh and changed
+            comparable_refresh = user_requested_refresh and self._explicit_refresh_comparable(
+                changed_row_kinds=changed_row_kinds,
+                previous_tier=previous_tier,
+                new_tier=new_tier,
+                previous_score=previous_score,
+                new_score=new_score,
+            )
+            if previous is not None and new_score < previous_score and not comparable_refresh:
                 previous.diagnostics = dict(previous.diagnostics or {})
                 previous.diagnostics.update(
                     {
@@ -179,8 +273,8 @@ class DiscoveryService:
                         "refresh_outcome": "kept_previous",
                         "refresh_changed": False,
                         "refresh_fingerprint": background_fingerprint,
-                        "previous_artifact_quality_tier": artifact_quality_tier(previous),
-                        "rejected_artifact_quality_tier": artifact_quality_tier(artifact),
+                        "previous_artifact_quality_tier": previous_tier,
+                        "rejected_artifact_quality_tier": new_tier,
                         "previous_artifact_quality_score": previous_score,
                         "new_artifact_quality_score": new_score,
                         "rejected_refresh_reasons": [
@@ -195,6 +289,11 @@ class DiscoveryService:
                     request_id=request_id,
                     page_size=page_size,
                 )
+            if comparable_refresh:
+                artifact.diagnostics["refresh_outcome"] = "changed_user_requested"
+                artifact.diagnostics["refresh_changed"] = True
+                artifact.diagnostics["accepted_refresh_despite_lower_score"] = True
+                artifact.diagnostics["explicit_refresh_comparable"] = True
             store_accepted_artifact(self._server, artifact)
             self._store_session(artifact)
             return home_response_from_artifact(
@@ -321,6 +420,9 @@ class DiscoveryService:
         diagnostics["model_version"] = ENGINE_MODEL_VERSION
         diagnostics["client_signal_tier"] = taste.signal_tier
         diagnostics["profile_key"] = taste.profile_key
+        diagnostics["refresh_requested"] = bool(taste.force_refresh)
+        diagnostics["avoid_ids_count"] = len(taste.avoid_ids or [])
+        diagnostics["refresh_token_present"] = bool(str(taste.refresh_token or "").strip())
         return DiscoveryArtifact(
             session_id=str(uuid.uuid4()),
             user_scope_id=taste.user_scope_id,

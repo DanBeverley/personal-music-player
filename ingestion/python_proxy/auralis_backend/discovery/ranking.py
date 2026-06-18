@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from dataclasses import replace
 from typing import Any, Dict, Iterable, List, Sequence, Set, Tuple
+import hashlib
 
 from .candidates import album_name, artist_name, item_signature, metadata_text, normalize_text, track_id
 from .config import LANE_ORDER, LANE_RECIPES, ROW_RECIPES
@@ -16,6 +17,7 @@ SOURCE_WEIGHTS = {
     "genre_mood": 0.95,
     "album": 1.0,
     "freshness": 1.1,
+    "ytmusic_home": 0.65,
     "popularity": 0.55,
     "collaborative": 0.25,
     "lane_chill": 1.15,
@@ -43,12 +45,76 @@ DISCOVERY_ROWS = {
     "hidden_gems",
 }
 
+EXPLORATORY_SOURCES = {
+    "ytmusic_home",
+    "popularity",
+    "collaborative",
+    "discovery_universe",
+    "genre_mood",
+    "lane_chill",
+    "lane_workout",
+    "lane_focus",
+    "lane_mood",
+}
+
+GLOBAL_REGION_KEYS = {"global", "world", "international"}
+REFRESH_MUTABLE_ROWS = {
+    "todays_pick",
+    "featured_new_albums",
+    "made_for_you",
+    "because_you_played",
+    "trending_by_genre",
+    "recommended_albums",
+    "recommended_artists",
+    "quiet_picks",
+    "hidden_gems",
+    "home_lane",
+    "personal_mix_slice",
+}
+
 
 def _number(value: Any) -> float:
     try:
         return float(value or 0.0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _avoid_ids(taste: TasteProfile) -> Set[str]:
+    output: Set[str] = set()
+    for value in taste.avoid_ids or []:
+        raw = str(value or "").strip()
+        if not raw:
+            continue
+        output.add(raw)
+        normalized = normalize_text(raw)
+        if normalized:
+            output.add(normalized)
+    return output
+
+
+def _refresh_jitter(taste: TasteProfile, identity: Any) -> float:
+    token = str(taste.refresh_token or "").strip()
+    key = str(identity or "").strip()
+    if not token or not key:
+        return 0.0
+    digest = hashlib.sha256(f"{token}:{key}".encode("utf-8")).digest()
+    return (int.from_bytes(digest[:2], "big") / 65535.0) - 0.5
+
+
+def _album_identity_keys(item: Dict[str, Any]) -> Set[str]:
+    title = normalize_text(item.get("title") or item.get("album"))
+    artist = normalize_text(item.get("artist") or item.get("artist_name") or item.get("channel"))
+    keys = {
+        normalize_text(item.get("id")),
+        normalize_text(item.get("album_id")),
+        normalize_text(item.get("albumId")),
+        normalize_text(item.get("canonical_album_identity")),
+        normalize_text(item.get("canonical_source_identity")),
+        normalize_text(f"{title}|{artist}"),
+    }
+    keys.discard("")
+    return keys
 
 
 def _candidate_sources(candidates: Iterable[DiscoveryCandidate]) -> Dict[str, DiscoveryCandidate]:
@@ -187,12 +253,55 @@ def _taste_language_keys(taste: TasteProfile) -> Set[str]:
 
 
 def _taste_region_keys(taste: TasteProfile) -> Set[str]:
-    values = _profile_string_set(taste, "regions", "dominant_region", "region")
+    values = _profile_string_set(
+        taste,
+        "supported_regions",
+        "regions",
+        "dominant_region",
+        "region",
+    )
     for track in taste.recent_tracks + taste.top_tracks + taste.last_played_tracks:
         value = normalize_text(track.get("region"))
         if value and value != "unknown":
             values.add(value)
     return values
+
+
+def _candidate_strong_personal_match(
+    candidate: DiscoveryCandidate,
+    taste: TasteProfile,
+) -> bool:
+    artist_key = normalize_text(artist_name(candidate.item))
+    if artist_key and artist_key in _taste_artist_keys(taste):
+        return True
+    if candidate.item.get("artist_neighborhood") is True:
+        return True
+    item_id = track_id(candidate.item)
+    return bool(item_id and item_id in _history_track_ids(taste))
+
+
+def _candidate_language_compatible(
+    candidate: DiscoveryCandidate,
+    taste: TasteProfile,
+) -> bool:
+    supported_languages = _taste_language_keys(taste)
+    language = normalize_text(candidate.item.get("language"))
+    if not supported_languages or not language or language == "unknown":
+        return True
+    return language in supported_languages
+
+
+def _candidate_region_compatible(
+    candidate: DiscoveryCandidate,
+    taste: TasteProfile,
+) -> bool:
+    supported_regions = _taste_region_keys(taste)
+    region = normalize_text(candidate.item.get("region"))
+    if not supported_regions or not region or region == "unknown":
+        return True
+    if region in supported_regions:
+        return True
+    return bool(region in GLOBAL_REGION_KEYS)
 
 
 def _candidate_matches_taste(candidate: DiscoveryCandidate, taste: TasteProfile) -> bool:
@@ -208,6 +317,13 @@ def _candidate_matches_taste(candidate: DiscoveryCandidate, taste: TasteProfile)
         "peer_artist_keys",
     )
     if artist_key and artist_key in related_artist_keys:
+        return True
+    item_artist_graph = {
+        normalize_text(value)
+        for value in candidate.item.get("artist_graph_keys") or []
+        if normalize_text(value)
+    }
+    if item_artist_graph & (_taste_artist_keys(taste) | related_artist_keys):
         return True
     candidate_genres = {
         normalize_text(candidate.item.get("genre")),
@@ -233,13 +349,37 @@ def _candidate_is_admitted(
     if normalize_text(candidate.item.get("source_authority")) == "search_only":
         return False
     sources = set(candidate.source.split("+"))
+    exploratory = bool(sources & EXPLORATORY_SOURCES)
+    if exploratory and not taste.is_cold_start:
+        source_authority = normalize_text(candidate.item.get("source_authority"))
+        if (
+            source_authority in {"", "unknown"}
+            and not _candidate_strong_personal_match(candidate, taste)
+            and not _candidate_matches_taste(candidate, taste)
+        ):
+            return False
+        if (
+            not _candidate_language_compatible(candidate, taste)
+            or not _candidate_region_compatible(candidate, taste)
+        ) and not _candidate_strong_personal_match(candidate, taste):
+            return False
     universe_origin = normalize_text(candidate.item.get("discovery_origin"))
     weak_only = bool(sources) and sources.issubset(
-        {"popularity", "collaborative", "discovery_universe"}
+        {"ytmusic_home", "popularity", "collaborative", "discovery_universe"}
     )
     if "discovery_universe" in sources and universe_origin:
-        weak_only = universe_origin in {"popularity", "collaborative"}
+        weak_only = universe_origin in {"ytmusic_home", "popularity", "collaborative"}
     if not weak_only:
+        return True
+    if not (
+        taste.recent_tracks
+        or taste.top_tracks
+        or taste.anchor_tracks
+        or taste.artist_hints
+        or taste.top_artists
+        or taste.listened_artists
+        or taste.taste_queries
+    ):
         return True
     return _candidate_matches_taste(candidate, taste)
 
@@ -265,7 +405,7 @@ def _lane_score(
     text = metadata_text(candidate.item)
     score = _hint_score(text, lane.positive_hints, lane.negative_hints)
     strong_history = candidate.source.startswith("history") or track_id(candidate.item) in _history_track_ids(taste)
-    mood_axes = candidate.item.get("mood_axes")
+    mood_axes = candidate.item.get("mood_axes") or candidate.item.get("audio_traits")
     mood_axes = mood_axes if isinstance(mood_axes, dict) else {}
     energy = _number(mood_axes.get("energy"))
     drive = _number(mood_axes.get("drive"))
@@ -345,6 +485,12 @@ def _score_candidate(
     in_history = item_id and item_id in _history_track_ids(taste)
     if row.kind in DISCOVERY_ROWS and in_history:
         score -= 1.1
+    if taste.force_refresh and row.kind in REFRESH_MUTABLE_ROWS:
+        avoid = _avoid_ids(taste)
+        if item_id and item_id in avoid:
+            score -= 4.5
+        identity = candidate.item.get("canonical_track_identity") or candidate.item.get("canonical_source_identity")
+        score += _refresh_jitter(taste, identity or item_id or item_signature(candidate.item)) * 0.55
     if row.kind == "last_played" and "last_played" in candidate.reasons:
         score += 2.0
     if row.kind == "frequently_listened" and ("frequent" in candidate.reasons or candidate.item in taste.top_tracks):
@@ -570,6 +716,15 @@ def rank_albums(
             score += 0.45
         if release:
             score += 0.35
+        if taste.force_refresh and row.kind in REFRESH_MUTABLE_ROWS:
+            if _album_identity_keys(item) & _avoid_ids(taste):
+                score -= 4.5
+            score += _refresh_jitter(
+                taste,
+                item.get("canonical_album_identity")
+                or item.get("canonical_source_identity")
+                or signature,
+            ) * 0.65
         if lane is not None and lane.lane_id != "all":
             lane_text = metadata_text(item)
             preview_track = item.get("preview_track")

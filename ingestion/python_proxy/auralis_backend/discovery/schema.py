@@ -54,6 +54,9 @@ class TasteProfile:
     recent_queries: List[str] = field(default_factory=list)
     taste_queries: List[str] = field(default_factory=list)
     collaborative_track_ids: List[str] = field(default_factory=list)
+    avoid_ids: List[str] = field(default_factory=list)
+    force_refresh: bool = False
+    refresh_token: str = ""
     source_profile: JsonDict = field(default_factory=dict)
 
     @property

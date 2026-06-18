@@ -11,6 +11,7 @@ from ..domain.catalog import (
     catalog_source_authority,
     is_unofficial_catalog_item,
     normalized_album_payload,
+    normalized_artist_payload,
     normalized_track_payload,
 )
 from ..search.upstream_runtime import search_artists_direct
@@ -24,6 +25,7 @@ _STRICT_RECOMMENDATION_SOURCES = {
     "collaborative",
     "genre_mood",
     "popularity",
+    "ytmusic_home",
 }
 
 
@@ -513,9 +515,17 @@ def _artist_graph_pool(server: Any, taste: TasteProfile) -> Tuple[List[Discovery
             signature = normalize_text(artist.get("id") or artist.get("name"))
             if not signature:
                 continue
+            artist_item = normalized_artist_payload(
+                {
+                    **dict(artist),
+                    "source_authority": artist.get("source_authority") or "verified_catalog",
+                    "artist_graph": True,
+                    "related_to_artist": artist.get("related_to_artist") or "",
+                }
+            )
             pool.append(
                 DiscoveryCandidate(
-                    item=dict(artist),
+                    item=artist_item,
                     source="artist_graph",
                     score=float(artist.get("score") or 2.0),
                     reasons=["related_artist_neighborhood"],
@@ -969,6 +979,38 @@ def _popularity_pool(server: Any) -> Tuple[List[DiscoveryCandidate], Dict[str, i
     return pool, timings
 
 
+def _ytmusic_home_pool(server: Any, taste: TasteProfile) -> Tuple[List[DiscoveryCandidate], Dict[str, int]]:
+    pool: List[DiscoveryCandidate] = []
+    timings: Dict[str, int] = {}
+    seen: set[str] = set()
+    results, elapsed, timed_out = _bounded_call(
+        "ytmusic_home",
+        lambda: server._fallback_home_candidates(160),
+        fallback=[],
+    )
+    timings["ytmusic_home:home"] = elapsed
+    if timed_out:
+        return pool, timings
+    for index, raw in enumerate(results or []):
+        track = raw[0] if isinstance(raw, tuple) and raw else raw
+        if not isinstance(track, dict):
+            continue
+        item = dict(track)
+        item["discovery_origin"] = "ytmusic_home"
+        item["ytmusic_home"] = True
+        score = raw[1] if isinstance(raw, tuple) and len(raw) > 1 else 1.0
+        _add_candidate(
+            server,
+            pool,
+            seen,
+            item,
+            source="ytmusic_home",
+            score=max(float(score or 1.0) - (index * 0.01), 0.35),
+            reason="ytmusic_home_seed",
+        )
+    return pool, timings
+
+
 def _collaborative_pool(server: Any, taste: TasteProfile) -> Tuple[List[DiscoveryCandidate], Dict[str, int]]:
     pool: List[DiscoveryCandidate] = []
     timings: Dict[str, int] = {}
@@ -1062,6 +1104,7 @@ def build_candidate_pools(server: Any, taste: TasteProfile) -> Tuple[Dict[str, L
         "similarity": _ORCHESTRATOR_EXECUTOR.submit(_similarity_pool, server, taste),
         "artist_graph": _ORCHESTRATOR_EXECUTOR.submit(_artist_graph_pool, server, taste),
         "genre_mood": _ORCHESTRATOR_EXECUTOR.submit(_genre_mood_pool, server, taste),
+        "ytmusic_home": _ORCHESTRATOR_EXECUTOR.submit(_ytmusic_home_pool, server, taste),
         "popularity": _ORCHESTRATOR_EXECUTOR.submit(_popularity_pool, server),
         "collaborative": _ORCHESTRATOR_EXECUTOR.submit(_collaborative_pool, server, taste),
     }
@@ -1096,6 +1139,7 @@ def build_candidate_pools(server: Any, taste: TasteProfile) -> Tuple[Dict[str, L
         if lane_id != "all"
     }
     popularity = provider_results["popularity"]
+    ytmusic_home = provider_results["ytmusic_home"]
     collaborative = provider_results["collaborative"]
 
     all_track_candidates = (
@@ -1104,6 +1148,7 @@ def build_candidate_pools(server: Any, taste: TasteProfile) -> Tuple[Dict[str, L
         + artist_graph
         + genre_mood
         + [candidate for items in lane_pools.values() for candidate in items]
+        + ytmusic_home
         + popularity
         + collaborative
     )
@@ -1122,6 +1167,7 @@ def build_candidate_pools(server: Any, taste: TasteProfile) -> Tuple[Dict[str, L
         "genre_mood": genre_mood,
         "album": album,
         "freshness": freshness,
+        "ytmusic_home": ytmusic_home,
         "popularity": popularity,
         "collaborative": collaborative,
         **lane_pools,

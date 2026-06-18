@@ -139,5 +139,15 @@ def build_taste_profile(server: Any, req: Any) -> TasteProfile:
             24,
         ),
         collaborative_track_ids=_collaborative_track_ids(profile),
+        avoid_ids=_strings(
+            _as_list(getattr(req, "avoid_ids", []))
+            + _as_list(profile.get("avoid_ids")),
+            96,
+        ),
+        force_refresh=bool(
+            getattr(req, "force_refresh", False)
+            or getattr(req, "prefer_fresh_rows", False)
+        ),
+        refresh_token=_trim(getattr(req, "refresh_token", "")),
         source_profile=dict(profile),
     )

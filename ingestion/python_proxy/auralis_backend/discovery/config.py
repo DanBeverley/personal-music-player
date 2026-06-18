@@ -6,9 +6,9 @@ from .schema import LaneRecipe, RowRecipe
 
 
 ENGINE_NAME = "discovery_engine"
-ENGINE_MODEL_VERSION = "discovery-engine:home_orchestrator_v4"
+ENGINE_MODEL_VERSION = "discovery-engine:home_orchestrator_v5"
 
-ARTIFACT_VERSION = "discovery_home_artifact_v4"
+ARTIFACT_VERSION = "discovery_home_artifact_v5"
 ARTIFACT_NAMESPACE = "discovery_home_artifact"
 ARTIFACT_TTL_SECONDS = 60 * 60 * 24
 
@@ -19,6 +19,7 @@ PROVIDER_BUDGETS_MS: Dict[str, int] = {
     "genre_mood": 2500,
     "album": 2500,
     "freshness": 400,
+    "ytmusic_home": 1200,
     "popularity": 1200,
     "collaborative": 800,
 }
@@ -32,6 +33,7 @@ TRACK_POOL_QUOTAS: Dict[str, int] = {
     "lane_workout": 40,
     "lane_focus": 40,
     "lane_mood": 40,
+    "ytmusic_home": 96,
     "popularity": 96,
     "collaborative": 48,
 }
@@ -49,7 +51,7 @@ ROW_RECIPES: Dict[str, RowRecipe] = {
         max_items=8,
         page_size=6,
         can_page=False,
-        candidate_sources=("similarity", "artist_graph", "genre_mood", "popularity", "history"),
+        candidate_sources=("similarity", "artist_graph", "genre_mood", "ytmusic_home", "popularity", "history"),
         ranking_intent="daily_pick",
     ),
     "featured_new_albums": RowRecipe(
@@ -109,7 +111,7 @@ ROW_RECIPES: Dict[str, RowRecipe] = {
         max_items=5,
         page_size=5,
         can_page=False,
-        candidate_sources=("discovery_universe", "similarity", "artist_graph", "genre_mood", "collaborative", "popularity"),
+        candidate_sources=("discovery_universe", "similarity", "artist_graph", "genre_mood", "ytmusic_home", "collaborative", "popularity"),
         ranking_intent="personal_mix",
         row_style="mix_cards",
     ),
@@ -123,7 +125,7 @@ ROW_RECIPES: Dict[str, RowRecipe] = {
         max_items=48,
         page_size=12,
         can_page=True,
-        candidate_sources=("similarity", "artist_graph", "history", "popularity", "discovery_universe"),
+        candidate_sources=("similarity", "artist_graph", "history", "ytmusic_home", "popularity", "discovery_universe"),
         ranking_intent="anchor_recommendation",
     ),
     "trending_by_genre": RowRecipe(
@@ -136,7 +138,7 @@ ROW_RECIPES: Dict[str, RowRecipe] = {
         max_items=64,
         page_size=12,
         can_page=True,
-        candidate_sources=("genre_mood", "popularity", "similarity", "discovery_universe"),
+        candidate_sources=("genre_mood", "ytmusic_home", "popularity", "similarity", "discovery_universe"),
         ranking_intent="genre_discovery",
         row_style="genre_tabs",
     ),
@@ -170,7 +172,7 @@ ROW_RECIPES: Dict[str, RowRecipe] = {
         max_items=30,
         page_size=10,
         can_page=True,
-        candidate_sources=("artist_graph", "similarity", "popularity", "discovery_universe"),
+        candidate_sources=("artist_graph", "similarity", "ytmusic_home", "popularity", "discovery_universe"),
         ranking_intent="artist_discovery",
     ),
     "quiet_picks": RowRecipe(
@@ -183,7 +185,7 @@ ROW_RECIPES: Dict[str, RowRecipe] = {
         max_items=96,
         page_size=20,
         can_page=True,
-        candidate_sources=("similarity", "artist_graph", "genre_mood", "collaborative", "popularity", "discovery_universe"),
+        candidate_sources=("similarity", "artist_graph", "genre_mood", "ytmusic_home", "collaborative", "popularity", "discovery_universe"),
         ranking_intent="taste_discovery",
     ),
     "hidden_gems": RowRecipe(
@@ -196,7 +198,7 @@ ROW_RECIPES: Dict[str, RowRecipe] = {
         max_items=48,
         page_size=12,
         can_page=True,
-        candidate_sources=("similarity", "artist_graph", "genre_mood", "popularity", "discovery_universe"),
+        candidate_sources=("similarity", "artist_graph", "genre_mood", "ytmusic_home", "popularity", "discovery_universe"),
         ranking_intent="novelty_discovery",
     ),
 }
@@ -209,7 +211,7 @@ LANE_RECIPES: Dict[str, LaneRecipe] = {
         title="All",
         min_items=12,
         target_items=24,
-        candidate_sources=("similarity", "artist_graph", "genre_mood", "collaborative", "popularity"),
+        candidate_sources=("similarity", "artist_graph", "genre_mood", "ytmusic_home", "collaborative", "popularity"),
     ),
     "chill": LaneRecipe(
         lane_id="chill",

@@ -1112,14 +1112,32 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     );
     if (loadVersion != _streamLoadVersion) return;
 
-    final resolvedQueue = await _resolveManagedQueueSources(
-      [currentTrack],
+    final bootstrapTracks = <Map<String, dynamic>>[
+      currentTrack,
+      ...remainingTracks.take(8),
+    ];
+    var resolvedQueue = await _resolveManagedQueueSources(
+      bootstrapTracks,
       preferredInitialIndex: 0,
     );
     final playableTracks =
         List<Map<String, dynamic>>.from(resolvedQueue['tracks'] as List);
-    final sources = List<AudioSource>.from(resolvedQueue['sources'] as List);
-    final resolvedInitialIndex = (resolvedQueue['initialIndex'] as int?) ?? 0;
+    var sources = List<AudioSource>.from(resolvedQueue['sources'] as List);
+    var resolvedInitialIndex = (resolvedQueue['initialIndex'] as int?) ?? 0;
+    if ((playableTracks.isEmpty || sources.isEmpty) &&
+        remainingTracks.length > 8) {
+      resolvedQueue = await _resolveManagedQueueSources(
+        remainingTracks.skip(8).take(12).toList(growable: false),
+        preferredInitialIndex: 0,
+      );
+      playableTracks
+        ..clear()
+        ..addAll(List<Map<String, dynamic>>.from(
+          resolvedQueue['tracks'] as List,
+        ));
+      sources = List<AudioSource>.from(resolvedQueue['sources'] as List);
+      resolvedInitialIndex = (resolvedQueue['initialIndex'] as int?) ?? 0;
+    }
     if (playableTracks.isEmpty || sources.isEmpty) {
       _streamTransitionInProgress = false;
       _managedQueueActive = false;
@@ -1137,6 +1155,11 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
 
     _cachedStreamVideoId = extractTrackId(playableTracks[resolvedInitialIndex]);
     _managedQueueTracks = playableTracks;
+    final resolvedBootstrapIds = playableTracks
+        .map(extractTrackId)
+        .whereType<String>()
+        .where((id) => id.isNotEmpty)
+        .toSet();
 
     await _runStreamCommand(() async {
       if (loadVersion != _streamLoadVersion) return;
@@ -1161,10 +1184,17 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     if (_desiredStreamPlaying) {
       await _resumeStreamPlayback(allowCompletedRecovery: false);
     }
-    if (remainingTracks.isNotEmpty && loadVersion == _streamLoadVersion) {
+    final deferredRemainingTracks = remainingTracks
+        .where((track) {
+          final id = extractTrackId(track);
+          return id == null || !resolvedBootstrapIds.contains(id);
+        })
+        .toList(growable: false);
+    if (deferredRemainingTracks.isNotEmpty &&
+        loadVersion == _streamLoadVersion) {
       unawaited(
         appendManagedQueueTracks(
-          remainingTracks,
+          deferredRemainingTracks,
           expectedLoadVersion: loadVersion,
         ),
       );
@@ -1871,7 +1901,8 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
             throw StateError('stream_source_missing');
           }
           await streamPlayer.setLoopMode(_streamLoopMode);
-          await _seekActiveStreamPlayer(Duration(seconds: boundedSeconds));
+          await _seekActiveStreamPlayer(Duration(seconds: boundedSeconds))
+              .timeout(const Duration(seconds: 4));
         });
       } catch (_) {
         // A newer seek supersedes this failure; recovering the stale position
@@ -1880,7 +1911,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         await _recoverStreamAfterSeekFailure(
           boundedSeconds: boundedSeconds,
           shouldResume: shouldResume,
-        );
+        ).timeout(const Duration(seconds: 10));
       }
       if (_pendingStreamSeekSeconds != null) return;
       if (shouldResume && !streamPlayer.playing) {

@@ -662,7 +662,11 @@ class LyricsNotifier extends StateNotifier<TrackLyricsState> {
 
   LyricsNotifier() : super(const TrackLyricsState());
 
-  Future<void> fetchLyrics(String? videoId) async {
+  Future<void> fetchLyrics(
+    String? videoId, {
+    String? title,
+    String? artist,
+  }) async {
     if (videoId == null || videoId.isEmpty) {
       clear();
       return;
@@ -674,8 +678,16 @@ class LyricsNotifier extends StateNotifier<TrackLyricsState> {
     final requestVersion = ++_requestVersion;
     state = TrackLyricsState(isLoading: true, videoId: videoId);
     try {
+      final query = <String, String>{
+        if (title != null && title.trim().isNotEmpty) 'title': title.trim(),
+        if (artist != null && artist.trim().isNotEmpty)
+          'artist': artist.trim(),
+      };
+      final uri = buildProxyUri('/lyrics/$videoId').replace(
+        queryParameters: query.isEmpty ? null : query,
+      );
       final res = await appHttpClient
-          .get(buildProxyUri('/lyrics/$videoId'))
+          .get(uri)
           .timeout(const Duration(seconds: 12));
       if (requestVersion != _requestVersion) return;
 

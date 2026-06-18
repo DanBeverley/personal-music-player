@@ -190,6 +190,35 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
     );
   }
 
+  String _feedSignature(RecommendationFeedState feedState) {
+    final rowSignatures = feedState.rows.map((row) {
+      final itemKeys = row.items
+          .take(24)
+          .map((item) => recommendationRowItemKey(row.itemType, item))
+          .where((key) => key.trim().isNotEmpty)
+          .join(',');
+      return '${row.kind}:${row.itemType}:$itemKeys';
+    }).join('|');
+    return rowSignatures;
+  }
+
+  String _preparedFeedDiscardReason({
+    required RecommendationFeedState prepared,
+    required bool cacheable,
+    required String artifactQuality,
+    required String refreshOutcome,
+    required bool refreshChanged,
+    required bool differsFromVisibleFeed,
+  }) {
+    if (!prepared.hasRows) return 'empty_payload';
+    if (artifactQuality == 'rejected') return 'rejected_artifact';
+    if (!cacheable) return 'not_cacheable';
+    if (!refreshChanged && !differsFromVisibleFeed) {
+      return refreshOutcome.isEmpty ? 'unchanged_visible_feed' : refreshOutcome;
+    }
+    return '';
+  }
+
   Future<void> refreshFromSignals({bool forceRefresh = false}) async {
     final seed = await HistoryManager.getRecommendationSeed();
     if (!mounted) return;
@@ -402,17 +431,30 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
       final refreshOutcome =
           diagnostics['refresh_outcome']?.toString().trim().toLowerCase() ?? '';
       final refreshChanged = diagnostics['refresh_changed'] == true;
-      if (prepared.hasRows &&
-          artifactQuality != 'rejected' &&
-          artifactQuality != 'kept_previous' &&
-          refreshOutcome != 'kept_previous' &&
-          refreshOutcome != 'unchanged' &&
-          refreshOutcome != 'suppressed_same_fingerprint' &&
-          (!explicitRefresh || refreshChanged) &&
-          home_feed_cache.shouldCacheHomeFeed(prepared)) {
+      final cacheable = home_feed_cache.shouldCacheHomeFeed(prepared);
+      final differsFromVisibleFeed = prepared.hasRows &&
+          _feedSignature(prepared) != _feedSignature(state);
+      final discardReason = _preparedFeedDiscardReason(
+        prepared: prepared,
+        cacheable: cacheable,
+        artifactQuality: artifactQuality,
+        refreshOutcome: refreshOutcome,
+        refreshChanged: refreshChanged,
+        differsFromVisibleFeed: differsFromVisibleFeed,
+      );
+      final shouldStagePrepared = discardReason.isEmpty;
+      if (shouldStagePrepared) {
         final stagedFeed = prepared.copyWith(
           requestState: 'complete',
           clearError: true,
+          diagnostics: <String, dynamic>{
+            ...prepared.diagnostics,
+            'prepared_applied_from_background': true,
+            'prepared_refresh_changed': refreshChanged,
+            'prepared_refresh_outcome': refreshOutcome,
+            'prepared_differs_from_visible_feed': differsFromVisibleFeed,
+            'prepared_applied_at': DateTime.now().toIso8601String(),
+          },
         );
         _preparedFeedState = stagedFeed;
         _preparedFeedScopeId = responseScope;
@@ -424,7 +466,11 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
           state = stagedFeed;
           _primeRecommendationRows(stagedFeed.rows);
         }
-      } else if (explicitRefresh && mounted) {
+      } else if (mounted) {
+        debugProxyLog(
+          'recommend',
+          'background prepare discarded reason=$discardReason quality=$artifactQuality outcome=$refreshOutcome changed=$refreshChanged differs=$differsFromVisibleFeed rows=${prepared.rows.length} cacheable=$cacheable',
+        );
         state = state.copyWith(
           requestState: 'complete',
           clearError: true,
@@ -434,6 +480,13 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
                 ? artifactQuality
                 : refreshOutcome,
             'refresh_changed': false,
+            'prepared_discard_reason': discardReason,
+            'prepared_artifact_quality': artifactQuality,
+            'prepared_refresh_outcome': refreshOutcome,
+            'prepared_refresh_changed': refreshChanged,
+            'prepared_differs_from_visible_feed': differsFromVisibleFeed,
+            'prepared_row_count': prepared.rows.length,
+            'prepared_cacheable': cacheable,
             'refresh_completed_at': DateTime.now().toIso8601String(),
           },
         );

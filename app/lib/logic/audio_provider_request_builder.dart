@@ -22,10 +22,12 @@ enum RecommendationRequestMode {
 
 class _RecommendationRequestBehavior {
   final bool prepareNextSession;
+  final bool forceRefresh;
   final bool preferFreshRows;
 
   const _RecommendationRequestBehavior({
     this.prepareNextSession = false,
+    this.forceRefresh = false,
     this.preferFreshRows = false,
   });
 }
@@ -37,7 +39,7 @@ _RecommendationRequestBehavior _recommendationRequestBehavior(
   switch (requestMode) {
     case RecommendationRequestMode.pullToRefresh:
       return const _RecommendationRequestBehavior(
-        prepareNextSession: true,
+        forceRefresh: true,
         preferFreshRows: true,
       );
     case RecommendationRequestMode.backgroundPrepare:
@@ -235,7 +237,7 @@ Future<Map<String, dynamic>> buildRecommendationRequestBody(
     'user_scope_id': storageScopeId,
     'client_signal_tier': hasUserSignals ? 'personalized' : 'cold_start',
     'fresh_account_empty_home': !hasUserSignals,
-    'force_refresh': false,
+    'force_refresh': behavior.forceRefresh,
     'prepare_next_session': behavior.prepareNextSession,
     'prefer_fresh_rows': behavior.preferFreshRows,
     if (behavior.preferFreshRows)

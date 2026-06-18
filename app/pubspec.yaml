@@ -35,6 +35,7 @@ flutter:
   uses-material-design: true
   assets:
     - assets/branding/neatie_app_icon.png
+    - assets/branding/neatie_login_wave_bg.png
     - assets/branding/neatie_intro_mark.png
     - assets/branding/neatie_intro_icon.png
 

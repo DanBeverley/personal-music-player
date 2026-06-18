@@ -111,8 +111,12 @@ def get_track_details(req: DownloadRequest):
 
 
 @router.get("/lyrics/{video_id}")
-def get_track_lyrics(video_id: str):
-    return _require_media_service().get_track_lyrics(video_id)
+def get_track_lyrics(video_id: str, title: str = "", artist: str = ""):
+    return _require_media_service().get_track_lyrics(
+        video_id,
+        title=title,
+        artist=artist,
+    )
 
 
 @router.post("/search")

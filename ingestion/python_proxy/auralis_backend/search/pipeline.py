@@ -8,6 +8,11 @@ from ..domain.result_quality import (
     artist_result_penalty,
     track_result_penalty,
 )
+from ..domain.catalog import (
+    catalog_source_authority,
+    normalize_track_title,
+    normalized_popularity,
+)
 from ..recommend.feature_layer import (
     album_catalog_alignment,
     artist_catalog_alignment,
@@ -193,6 +198,19 @@ def _finalize_ranked_tracks(
     return results
 
 
+def _track_source_authority_bonus(track: Dict[str, Any]) -> float:
+    authority = catalog_source_authority(track)
+    if authority == "official":
+        return 1.15
+    if authority == "canonical":
+        return 0.9
+    if authority == "verified_catalog":
+        return 0.45
+    if authority == "search_only":
+        return -2.8
+    return -0.25
+
+
 def rank_track_candidates_fast_path(
     server: Any,
     req,
@@ -206,7 +224,22 @@ def rank_track_candidates_fast_path(
     if not track_candidates:
         return []
     normalized_query = server.normalize_text(query)
+    normalized_canonical_query = normalize_track_title(query)
     normalized_anchor_artists = retrieval_payload.get("normalized_anchor_artists") or set()
+    exact_title_artist_counts: Dict[str, int] = {}
+    for entry in track_candidates.values():
+        payload = (entry or {}).get("payload")
+        if not isinstance(payload, dict):
+            continue
+        if normalize_track_title(payload.get("title") or "") != normalized_canonical_query:
+            continue
+        artist_key = server.normalize_text(
+            payload.get("channel") or payload.get("artist") or ""
+        )
+        if artist_key:
+            exact_title_artist_counts[artist_key] = (
+                exact_title_artist_counts.get(artist_key, 0) + 1
+            )
     ranked: List[Dict[str, Any]] = []
     for entry in track_candidates.values():
         payload = (entry or {}).get("payload")
@@ -235,6 +268,12 @@ def rank_track_candidates_fast_path(
             if server.normalize_text(artist or "") in normalized_anchor_artists
             else 0.0
         )
+        authority_bonus = _track_source_authority_bonus(track)
+        popularity_bonus = normalized_popularity(track)
+        ambiguity_penalty = 0.0
+        if exact_title_match and len(exact_title_artist_counts) >= 3:
+            if authority_bonus < 0.8 and not anchor_artist_match:
+                ambiguity_penalty = 1.25
         ranking_score = (
             (float(source_score) * 1.2)
             + (float(retrieval_votes) * 0.45)
@@ -242,6 +281,9 @@ def rank_track_candidates_fast_path(
             + (float(title_lexical) * 5.4)
             + (float(exact_title_match) * 2.4)
             + (float(anchor_artist_match) * 0.65)
+            + (float(authority_bonus) * 1.15)
+            + (float(popularity_bonus) * 0.85)
+            - ambiguity_penalty
         )
         ranking_score -= track_result_penalty(
             server,
@@ -259,6 +301,9 @@ def rank_track_candidates_fast_path(
             "title_lexical": round(float(title_lexical), 4),
             "exact_title_match": round(float(exact_title_match), 4),
             "anchor_artist_match": round(float(anchor_artist_match), 4),
+            "source_authority_bonus": round(float(authority_bonus), 4),
+            "popularity": round(float(popularity_bonus), 4),
+            "ambiguity_penalty": round(float(ambiguity_penalty), 4),
         }
         track["ml_similarities"] = {
             "lexical": round(float(lexical_score + title_lexical), 4),

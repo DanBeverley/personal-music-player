@@ -102,11 +102,13 @@ class _ArtworkFrame extends StatelessWidget {
                 : CachedNetworkImage(
                     imageUrl: imageUrl,
                     fit: fit,
-                    memCacheWidth: _cacheDimension(width, multiplier: 3),
-                    memCacheHeight: _cacheDimension(height, multiplier: 3),
-                    maxWidthDiskCache: _cacheDimension(width, multiplier: 4),
-                    maxHeightDiskCache: _cacheDimension(height, multiplier: 4),
-                    fadeInDuration: const Duration(milliseconds: 220),
+                    memCacheWidth: _cacheDimension(width, multiplier: 2.2),
+                    memCacheHeight: _cacheDimension(height, multiplier: 2.2),
+                    maxWidthDiskCache: _cacheDimension(width, multiplier: 3),
+                    maxHeightDiskCache: _cacheDimension(height, multiplier: 3),
+                    fadeInDuration: const Duration(milliseconds: 120),
+                    useOldImageOnUrlChange: true,
+                    filterQuality: FilterQuality.low,
                     placeholder: (context, url) => const _ArtworkFallback(),
                     errorWidget: (context, url, error) =>
                         const _ArtworkFallback(),

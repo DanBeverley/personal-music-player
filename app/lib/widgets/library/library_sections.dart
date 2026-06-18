@@ -12,7 +12,7 @@ import '../../logic/playlist_provider.dart';
 import '../../logic/track_metadata.dart';
 import '../../main_details.dart';
 import '../../main_dialogs.dart';
-import '../../main_player.dart';
+import '../../navigation/player_navigation.dart';
 import '../../ui/app_theme_tokens.dart';
 import '../../ui/neatie_components.dart';
 import '../app_artwork.dart';
@@ -173,6 +173,190 @@ class LibraryQuickAccessSection extends StatelessWidget {
   }
 }
 
+class LibraryAlbumShelfSection extends StatelessWidget {
+  const LibraryAlbumShelfSection({
+    super.key,
+    required this.albums,
+    required this.onOpenAlbum,
+  });
+
+  final List<Map<String, dynamic>> albums;
+  final ValueChanged<Map<String, dynamic>> onOpenAlbum;
+
+  @override
+  Widget build(BuildContext context) {
+    if (albums.isEmpty) {
+      return const LibraryEmptyStateCard(
+        title: 'No albums yet',
+        body: 'Save or download tracks and their albums will collect here.',
+      );
+    }
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text(
+          'Albums',
+          style: TextStyle(
+            color: Colors.white,
+            fontSize: 20,
+            fontWeight: FontWeight.w800,
+          ),
+        ),
+        const SizedBox(height: 14),
+        ListView.separated(
+          shrinkWrap: true,
+          physics: const NeverScrollableScrollPhysics(),
+          itemCount: albums.length,
+          separatorBuilder: (_, __) => const SizedBox(height: 10),
+          itemBuilder: (context, index) {
+            final album = albums[index];
+            final title = album['title']?.toString() ?? 'Unknown album';
+            final artist =
+                album['artist']?.toString() ?? album['artist_name']?.toString() ?? '';
+            final count = (album['track_count'] as num?)?.toInt() ?? 0;
+            return NeatieSurface(
+              radius: neatieRadiusMedium,
+              color: Colors.white.withValues(alpha: 0.03),
+              padding: const EdgeInsets.all(10),
+              child: InkWell(
+                borderRadius: BorderRadius.circular(neatieRadiusMedium),
+                onTap: () => onOpenAlbum(album),
+                child: Row(
+                  children: [
+                    AppArtwork(
+                      thumbnail: album['thumbnail'],
+                      videoId: album['id']?.toString(),
+                      width: 58,
+                      height: 58,
+                      radius: 12,
+                    ),
+                    const SizedBox(width: 14),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            title,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 15,
+                              fontWeight: FontWeight.w800,
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            [
+                              if (artist.trim().isNotEmpty) artist,
+                              if (count > 0) '$count tracks',
+                            ].join(' • '),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              color: neatieMutedText,
+                              fontSize: 12,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const Icon(
+                      Icons.chevron_right_rounded,
+                      color: neatieMutedText,
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        ),
+      ],
+    );
+  }
+}
+
+class LibraryArtistShelfSection extends StatelessWidget {
+  const LibraryArtistShelfSection({
+    super.key,
+    required this.title,
+    required this.artists,
+    required this.onOpenArtist,
+    this.emptyTitle = 'No artists yet',
+    this.emptyBody = 'Artists from your listening and follows will appear here.',
+  });
+
+  final String title;
+  final List<Map<String, dynamic>> artists;
+  final ValueChanged<Map<String, dynamic>> onOpenArtist;
+  final String emptyTitle;
+  final String emptyBody;
+
+  @override
+  Widget build(BuildContext context) {
+    if (artists.isEmpty) {
+      return LibraryEmptyStateCard(title: emptyTitle, body: emptyBody);
+    }
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          title,
+          style: const TextStyle(
+            color: Colors.white,
+            fontSize: 20,
+            fontWeight: FontWeight.w800,
+          ),
+        ),
+        const SizedBox(height: 14),
+        SizedBox(
+          height: 112,
+          child: ListView.separated(
+            scrollDirection: Axis.horizontal,
+            physics: const BouncingScrollPhysics(),
+            itemCount: artists.length,
+            separatorBuilder: (_, __) => const SizedBox(width: 14),
+            itemBuilder: (context, index) {
+              final artist = artists[index];
+              final name = artist['name']?.toString() ?? 'Artist';
+              return GestureDetector(
+                onTap: () => onOpenArtist(artist),
+                child: SizedBox(
+                  width: 78,
+                  child: Column(
+                    children: [
+                      AppArtwork(
+                        thumbnail: artist['thumbnail'],
+                        videoId: artist['id']?.toString(),
+                        width: 66,
+                        height: 66,
+                        radius: 33,
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        name,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w700,
+                          height: 1.05,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            },
+          ),
+        ),
+      ],
+    );
+  }
+}
+
 class _LibraryQuickAccessTile extends StatelessWidget {
   const _LibraryQuickAccessTile({
     required this.title,
@@ -274,9 +458,7 @@ class LibraryHistoryLane extends ConsumerWidget {
         return;
       }
     }
-    Navigator.of(context).push(
-      MaterialPageRoute(builder: (_) => const FullPlayerScreen()),
-    );
+    unawaited(openFullPlayer(context));
   }
 
   void _openTrackDetails(
@@ -428,6 +610,14 @@ class LibraryHistoryLane extends ConsumerWidget {
                                       task?.phase == DownloadPhase.active;
                                   return InkWell(
                                     borderRadius: BorderRadius.circular(999),
+                                    onTap: videoId == null
+                                        ? null
+                                        : () {
+                                            ref
+                                                .read(downloadCenterProvider
+                                                    .notifier)
+                                                .downloadTrack(track);
+                                          },
                                     child: Container(
                                       width: 30,
                                       height: 30,
@@ -457,14 +647,6 @@ class LibraryHistoryLane extends ConsumerWidget {
                                               size: 18,
                                             ),
                                     ),
-                                    onTap: videoId == null
-                                        ? null
-                                        : () {
-                                            ref
-                                                .read(downloadCenterProvider
-                                                    .notifier)
-                                                .downloadTrack(track);
-                                          },
                                   );
                                 },
                               ),
@@ -787,11 +969,7 @@ class SavedTracksSection extends ConsumerWidget {
                                 currentTrack: track,
                               );
                           if (!context.mounted) return;
-                          Navigator.of(context).push(
-                            MaterialPageRoute(
-                              builder: (_) => const FullPlayerScreen(),
-                            ),
-                          );
+                          unawaited(openFullPlayer(context));
                           return;
                         }
 
@@ -814,11 +992,7 @@ class SavedTracksSection extends ConsumerWidget {
                           );
                           return;
                         }
-                        Navigator.of(context).push(
-                          MaterialPageRoute(
-                            builder: (_) => const FullPlayerScreen(),
-                          ),
-                        );
+                        unawaited(openFullPlayer(context));
                       },
                       child: Padding(
                         padding: const EdgeInsets.all(12),

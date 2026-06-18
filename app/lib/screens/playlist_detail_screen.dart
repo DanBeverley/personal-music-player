@@ -7,7 +7,7 @@ import '../logic/audio_provider.dart';
 import '../logic/audio_provider_queue.dart';
 import '../logic/playlist_provider.dart';
 import '../main_dialogs.dart';
-import '../main_player.dart';
+import '../navigation/player_navigation.dart';
 import '../ui/app_theme_tokens.dart';
 import '../ui/neatie_components.dart';
 import '../widgets/app_artwork.dart';
@@ -92,9 +92,7 @@ class _PlaylistDetailScreenState extends ConsumerState<PlaylistDetailScreen> {
           currentTrack: track,
         );
     if (!mounted) return;
-    Navigator.of(
-      context,
-    ).push(MaterialPageRoute(builder: (_) => const FullPlayerScreen()));
+    unawaited(openFullPlayer(context));
   }
 
   void _addSearchResultToPlaylist(Playlist playlist, dynamic track) {

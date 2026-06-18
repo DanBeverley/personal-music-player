@@ -4,7 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../logic/app_update_provider.dart';
 import '../../ui/neatie_components.dart';
 
-class LibraryUpdatePanel extends ConsumerWidget {
+class LibraryUpdatePanel extends ConsumerStatefulWidget {
   final double radiusLarge;
 
   const LibraryUpdatePanel({
@@ -13,7 +13,28 @@ class LibraryUpdatePanel extends ConsumerWidget {
   });
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<LibraryUpdatePanel> createState() => _LibraryUpdatePanelState();
+}
+
+class _LibraryUpdatePanelState extends ConsumerState<LibraryUpdatePanel> {
+  bool _queuedInitialCheck = false;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (_queuedInitialCheck) return;
+    _queuedInitialCheck = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final state = ref.read(appUpdateProvider);
+      if (state.phase == AppUpdatePhase.idle) {
+        ref.read(appUpdateProvider.notifier).checkForUpdate();
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
     final updateState = ref.watch(appUpdateProvider);
     final manifest = updateState.manifest;
     final selectedAsset = updateState.selectedAsset;
@@ -25,7 +46,7 @@ class LibraryUpdatePanel extends ConsumerWidget {
     return NeatieSurface(
       width: double.infinity,
       padding: const EdgeInsets.all(18),
-      radius: radiusLarge,
+      radius: widget.radiusLarge,
       color: Colors.white.withValues(alpha: 0.035),
       blur: false,
       child: Column(

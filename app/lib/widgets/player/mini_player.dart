@@ -4,7 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../logic/audio_provider.dart';
-import '../../main_player.dart';
+import '../../navigation/player_navigation.dart';
 import '../../ui/app_theme_tokens.dart';
 import '../../ui/neatie_components.dart';
 import '../app_artwork.dart';
@@ -23,8 +23,7 @@ class MiniPlayer extends ConsumerWidget {
         : 0.0;
 
     void openPlayer() {
-      Navigator.of(context)
-          .push(MaterialPageRoute(builder: (_) => const FullPlayerScreen()));
+      unawaited(openFullPlayer(context));
     }
 
     return GestureDetector(

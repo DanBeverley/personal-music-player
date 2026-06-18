@@ -48,6 +48,8 @@ class PlayerNowPlayingPanel extends ConsumerWidget {
     final nextUpTrack = playerNextUpTrack(queueState);
     final mediaQuery = MediaQuery.of(context);
     final layout = _NowPlayingLayout.from(mediaQuery.size);
+    final bottomInset =
+        math.max(mediaQuery.padding.bottom, mediaQuery.viewPadding.bottom);
 
     return GestureDetector(
       behavior: HitTestBehavior.translucent,
@@ -68,7 +70,7 @@ class PlayerNowPlayingPanel extends ConsumerWidget {
             28,
             26,
             28,
-            math.max(mediaQuery.padding.bottom + 86, 128),
+            math.max(bottomInset + 108, 144),
           ),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,

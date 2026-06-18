@@ -6,6 +6,7 @@ import '../../logic/recommendation_feed_models.dart';
 import '../../ui/app_theme_tokens.dart';
 import '../../ui/neatie_components.dart';
 import '../app_artwork.dart';
+import 'track_menu_button.dart';
 
 enum NeatieHomeTab {
   all('all', 'All', Icons.graphic_eq_rounded),
@@ -590,6 +591,8 @@ class NeatieTrackStrip extends StatelessWidget {
     required this.tracks,
     required this.onPlay,
     required this.onMenuDetails,
+    required this.onAddToPlaylist,
+    required this.onStartStation,
     this.onViewAll,
   });
 
@@ -597,6 +600,8 @@ class NeatieTrackStrip extends StatelessWidget {
   final List<Map<String, dynamic>> tracks;
   final ValueChanged<Map<String, dynamic>> onPlay;
   final ValueChanged<Map<String, dynamic>> onMenuDetails;
+  final TrackActionCallback onAddToPlaylist;
+  final TrackActionCallback onStartStation;
   final VoidCallback? onViewAll;
 
   @override
@@ -621,6 +626,8 @@ class NeatieTrackStrip extends StatelessWidget {
                   track: track,
                   onPlay: () => onPlay(track),
                   onMenuDetails: () => onMenuDetails(track),
+                  onAddToPlaylist: onAddToPlaylist,
+                  onStartStation: onStartStation,
                 ),
               );
             },
@@ -636,11 +643,15 @@ class _SquareTrackCard extends StatelessWidget {
     required this.track,
     required this.onPlay,
     required this.onMenuDetails,
+    required this.onAddToPlaylist,
+    required this.onStartStation,
   });
 
   final Map<String, dynamic> track;
   final VoidCallback onPlay;
   final VoidCallback onMenuDetails;
+  final TrackActionCallback onAddToPlaylist;
+  final TrackActionCallback onStartStation;
 
   @override
   Widget build(BuildContext context) {
@@ -671,7 +682,7 @@ class _SquareTrackCard extends StatelessWidget {
         ),
         const SizedBox(height: 8),
         InkWell(
-          onTap: onMenuDetails,
+          onTap: onPlay,
           child: Text(
             title?.isNotEmpty == true ? title! : 'Unknown track',
             maxLines: 1,
@@ -697,13 +708,13 @@ class _SquareTrackCard extends StatelessWidget {
                 ),
               ),
             ),
-            GestureDetector(
-              onTap: onMenuDetails,
-              child: const Icon(
-                Icons.more_vert_rounded,
-                color: neatieMutedText,
-                size: 18,
-              ),
+            TrackMenuButton(
+              track: track,
+              onOpenDetails: onMenuDetails,
+              onAddToPlaylist: onAddToPlaylist,
+              onStartStation: onStartStation,
+              buttonSize: 24,
+              iconSize: 17,
             ),
           ],
         ),
@@ -844,12 +855,16 @@ class NeatieTrendingCompactRow extends StatelessWidget {
     required this.tracks,
     required this.onPlay,
     required this.onMenuDetails,
+    required this.onAddToPlaylist,
+    required this.onStartStation,
   });
 
   final String title;
   final List<Map<String, dynamic>> tracks;
   final ValueChanged<Map<String, dynamic>> onPlay;
   final ValueChanged<Map<String, dynamic>> onMenuDetails;
+  final TrackActionCallback onAddToPlaylist;
+  final TrackActionCallback onStartStation;
 
   @override
   Widget build(BuildContext context) {
@@ -872,6 +887,8 @@ class NeatieTrendingCompactRow extends StatelessWidget {
                   track: visible[index],
                   onPlay: () => onPlay(visible[index]),
                   onMenuDetails: () => onMenuDetails(visible[index]),
+                  onAddToPlaylist: onAddToPlaylist,
+                  onStartStation: onStartStation,
                 ),
               ),
           ],
@@ -890,6 +907,8 @@ class NeatieGenreTabsRow extends StatelessWidget {
     required this.onSelectedTab,
     required this.onPlay,
     required this.onMenuDetails,
+    required this.onAddToPlaylist,
+    required this.onStartStation,
     this.onViewAll,
   });
 
@@ -899,6 +918,8 @@ class NeatieGenreTabsRow extends StatelessWidget {
   final ValueChanged<String> onSelectedTab;
   final ValueChanged<Map<String, dynamic>> onPlay;
   final ValueChanged<Map<String, dynamic>> onMenuDetails;
+  final TrackActionCallback onAddToPlaylist;
+  final TrackActionCallback onStartStation;
   final VoidCallback? onViewAll;
 
   List<Map<String, dynamic>> _tabTracks(Map<String, dynamic> tab) {
@@ -956,6 +977,8 @@ class NeatieGenreTabsRow extends StatelessWidget {
                   track: tracks[index],
                   onPlay: () => onPlay(tracks[index]),
                   onMenuDetails: () => onMenuDetails(tracks[index]),
+                  onAddToPlaylist: onAddToPlaylist,
+                  onStartStation: onStartStation,
                 ),
               ),
           ],
@@ -971,12 +994,16 @@ class _RankedTrackTile extends StatelessWidget {
     required this.track,
     required this.onPlay,
     required this.onMenuDetails,
+    required this.onAddToPlaylist,
+    required this.onStartStation,
   });
 
   final int rank;
   final Map<String, dynamic> track;
   final VoidCallback onPlay;
   final VoidCallback onMenuDetails;
+  final TrackActionCallback onAddToPlaylist;
+  final TrackActionCallback onStartStation;
 
   @override
   Widget build(BuildContext context) {
@@ -1011,7 +1038,7 @@ class _RankedTrackTile extends StatelessWidget {
         const SizedBox(width: 11),
         Expanded(
           child: InkWell(
-            onTap: onMenuDetails,
+            onTap: onPlay,
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
@@ -1037,10 +1064,13 @@ class _RankedTrackTile extends StatelessWidget {
             ),
           ),
         ),
-        IconButton(
-          onPressed: onMenuDetails,
-          icon: const Icon(Icons.more_vert_rounded),
-          color: neatieMutedText,
+        TrackMenuButton(
+          track: track,
+          onOpenDetails: onMenuDetails,
+          onAddToPlaylist: onAddToPlaylist,
+          onStartStation: onStartStation,
+          buttonSize: 36,
+          iconSize: 18,
         ),
       ],
     );
@@ -1054,6 +1084,8 @@ class NeatieLongTrackList extends StatelessWidget {
     required this.tracks,
     required this.onPlay,
     required this.onMenuDetails,
+    required this.onAddToPlaylist,
+    required this.onStartStation,
     this.maxItems = 48,
     this.onViewAll,
   });
@@ -1062,6 +1094,8 @@ class NeatieLongTrackList extends StatelessWidget {
   final List<Map<String, dynamic>> tracks;
   final ValueChanged<Map<String, dynamic>> onPlay;
   final ValueChanged<Map<String, dynamic>> onMenuDetails;
+  final TrackActionCallback onAddToPlaylist;
+  final TrackActionCallback onStartStation;
   final int maxItems;
   final VoidCallback? onViewAll;
 
@@ -1086,37 +1120,13 @@ class NeatieLongTrackList extends StatelessWidget {
                   track: visible[index],
                   onPlay: () => onPlay(visible[index]),
                   onMenuDetails: () => onMenuDetails(visible[index]),
+                  onAddToPlaylist: onAddToPlaylist,
+                  onStartStation: onStartStation,
                 ),
               ),
           ],
         ),
       ],
-    );
-  }
-}
-
-class _RoundPlayButton extends StatelessWidget {
-  const _RoundPlayButton({required this.onTap});
-
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    return GestureDetector(
-      onTap: onTap,
-      child: Container(
-        width: 32,
-        height: 32,
-        decoration: const BoxDecoration(
-          color: Colors.white,
-          shape: BoxShape.circle,
-        ),
-        child: const Icon(
-          Icons.play_arrow_rounded,
-          color: Colors.black,
-          size: 21,
-        ),
-      ),
     );
   }
 }

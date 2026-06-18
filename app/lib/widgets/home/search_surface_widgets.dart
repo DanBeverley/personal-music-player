@@ -1,8 +1,16 @@
-import 'package:flutter/material.dart';
+import 'dart:async';
 
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import '../../logic/audio_provider_queue.dart';
+import '../../logic/track_metadata.dart';
+import '../../navigation/player_navigation.dart';
 import '../../ui/app_theme_tokens.dart';
 import '../../ui/neatie_components.dart';
 import '../app_artwork.dart';
+import '../playlist/add_to_playlist_dialog.dart';
+import 'track_menu_button.dart';
 
 class NeatieSearchMasthead extends StatelessWidget {
   const NeatieSearchMasthead({
@@ -334,6 +342,7 @@ class NeatieSearchResultsSection extends StatelessWidget {
   const NeatieSearchResultsSection({
     super.key,
     required this.query,
+    required this.queryIntent,
     required this.selectedTab,
     required this.isLoading,
     required this.tracks,
@@ -352,6 +361,7 @@ class NeatieSearchResultsSection extends StatelessWidget {
   });
 
   final String query;
+  final String queryIntent;
   final String selectedTab;
   final bool isLoading;
   final List<Map<String, dynamic>> tracks;
@@ -371,17 +381,29 @@ class NeatieSearchResultsSection extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final normalizedTab = selectedTab.toLowerCase();
+    final normalizedIntent = queryIntent.trim().toLowerCase();
+    final preferTrackTop = normalizedIntent == 'track' ||
+        (normalizedIntent == 'exact' && tracks.isNotEmpty);
     final sections = <Widget>[];
     if (normalizedTab == 'top') {
-      final top = artists.isNotEmpty
-          ? _TopArtistResult(artist: artists.first, onTap: () => onOpenArtist(artists.first))
-          : tracks.isNotEmpty
-              ? _TopTrackResult(
-                  track: tracks.first,
-                  onPlay: () => onPlayTrack(tracks.first),
-                  onOpen: () => onOpenTrack(tracks.first),
+      final top = preferTrackTop && tracks.isNotEmpty
+          ? _TopTrackResult(
+              track: tracks.first,
+              onPlay: () => onPlayTrack(tracks.first),
+              onOpen: () => onOpenTrack(tracks.first),
+            )
+          : artists.isNotEmpty
+              ? _TopArtistResult(
+                  artist: artists.first,
+                  onTap: () => onOpenArtist(artists.first),
                 )
-              : null;
+              : tracks.isNotEmpty
+                  ? _TopTrackResult(
+                      track: tracks.first,
+                      onPlay: () => onPlayTrack(tracks.first),
+                      onOpen: () => onOpenTrack(tracks.first),
+                    )
+                  : null;
       if (top != null) sections.add(top);
       if (tracks.isNotEmpty) {
         sections.add(_SearchTrackSection(title: 'Songs', tracks: tracks.take(5).toList(growable: false), onPlay: onPlayTrack, onOpen: onOpenTrack));
@@ -652,7 +674,7 @@ class _SearchTrackSection extends StatelessWidget {
   }
 }
 
-class _SearchTrackTile extends StatelessWidget {
+class _SearchTrackTile extends ConsumerWidget {
   const _SearchTrackTile({
     required this.track,
     required this.onPlay,
@@ -664,7 +686,7 @@ class _SearchTrackTile extends StatelessWidget {
   final VoidCallback onOpen;
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     final artist = (track['channel'] ?? track['artist'] ?? track['author'] ?? '').toString();
     return InkWell(
       onTap: onPlay,
@@ -682,36 +704,50 @@ class _SearchTrackTile extends StatelessWidget {
             ),
             const SizedBox(width: 12),
             Expanded(
-              child: InkWell(
-                onTap: onOpen,
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      track['title']?.toString() ?? 'Unknown',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 15,
-                        fontWeight: FontWeight.w700,
-                      ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    track['title']?.toString() ?? 'Unknown',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 15,
+                      fontWeight: FontWeight.w700,
                     ),
-                    const SizedBox(height: 3),
-                    Text(
-                      artist,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(color: neatieMutedText, fontSize: 12),
-                    ),
-                  ],
-                ),
+                  ),
+                  const SizedBox(height: 3),
+                  Text(
+                    artist,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(color: neatieMutedText, fontSize: 12),
+                  ),
+                ],
               ),
             ),
-            IconButton(
-              onPressed: onOpen,
-              icon: const Icon(Icons.more_vert_rounded),
-              color: neatieMutedText,
+            TrackMenuButton(
+              track: track,
+              onOpenDetails: onOpen,
+              onAddToPlaylist: (selectedTrack) async {
+                if (!context.mounted) return;
+                showAddToPlaylistDialog(
+                  context: context,
+                  track: Map<String, dynamic>.from(selectedTrack),
+                );
+              },
+              onStartStation: (selectedTrack) async {
+                final trackId = extractTrackId(selectedTrack);
+                if (trackId == null || trackId.isEmpty) return;
+                await ref
+                    .read(playbackQueueProvider.notifier)
+                    .startRadioSession(selectedTrack);
+                if (!context.mounted) return;
+                unawaited(openFullPlayer(context));
+              },
+              buttonSize: 36,
+              iconSize: 18,
             ),
           ],
         ),

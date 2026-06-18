@@ -9,6 +9,13 @@ import '../app_artwork.dart';
 
 typedef TrackActionCallback = Future<void> Function(Map<String, dynamic> track);
 
+enum _TrackMenuAction {
+  addToPlaylist,
+  startStation,
+  download,
+  details,
+}
+
 String _trackActionTitle(Map<String, dynamic> track) {
   final title =
       (track['title'] ?? track['name'] ?? track['song'])?.toString().trim() ??
@@ -201,7 +208,7 @@ Future<void> showTrackActionSheet({
   );
 }
 
-class TrackMenuButton extends ConsumerWidget {
+class TrackMenuButton extends ConsumerStatefulWidget {
   final Map<String, dynamic> track;
   final VoidCallback onOpenDetails;
   final TrackActionCallback onAddToPlaylist;
@@ -220,33 +227,162 @@ class TrackMenuButton extends ConsumerWidget {
   });
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    return IconButton(
-      onPressed: () => showTrackActionSheet(
-        context: context,
-        ref: ref,
-        track: track,
-        onOpenDetails: onOpenDetails,
-        onAddToPlaylist: onAddToPlaylist,
-        onStartStation: onStartStation,
+  ConsumerState<TrackMenuButton> createState() => _TrackMenuButtonState();
+}
+
+class _TrackMenuButtonState extends ConsumerState<TrackMenuButton> {
+  bool _isOpen = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final normalizedTrack = Map<String, dynamic>.from(widget.track);
+    final videoId = extractTrackId(normalizedTrack);
+    final task = videoId == null ? null : ref.watch(downloadTaskProvider(videoId));
+    final isDownloadActive = task?.phase == DownloadPhase.active;
+    final isDownloaded = task?.phase == DownloadPhase.complete;
+
+    Future<void> runAction(_TrackMenuAction action) async {
+      switch (action) {
+        case _TrackMenuAction.addToPlaylist:
+          await widget.onAddToPlaylist(normalizedTrack);
+          return;
+        case _TrackMenuAction.startStation:
+          await widget.onStartStation(normalizedTrack);
+          return;
+        case _TrackMenuAction.download:
+          if (videoId == null || videoId.isEmpty || isDownloadActive) return;
+          await ref
+              .read(downloadCenterProvider.notifier)
+              .downloadTrack(normalizedTrack);
+          if (context.mounted) {
+            _showTrackActionFeedback(
+              context,
+              isDownloaded ? 'Track already downloaded' : 'Download started',
+            );
+          }
+          return;
+        case _TrackMenuAction.details:
+          widget.onOpenDetails();
+          return;
+      }
+    }
+
+    return PopupMenuButton<_TrackMenuAction>(
+      tooltip: 'Track options',
+      position: PopupMenuPosition.under,
+      offset: const Offset(-8, 6),
+      color: const Color(0xFF171717),
+      elevation: 16,
+      onOpened: () {
+        if (mounted) setState(() => _isOpen = true);
+      },
+      onCanceled: () {
+        if (mounted) setState(() => _isOpen = false);
+      },
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(18),
+        side: BorderSide(color: Colors.white.withValues(alpha: 0.10)),
       ),
-      icon: Container(
-        width: buttonSize,
-        height: buttonSize,
+      onSelected: (action) {
+        if (mounted) setState(() => _isOpen = false);
+        runAction(action);
+      },
+      itemBuilder: (context) => [
+        const PopupMenuItem<_TrackMenuAction>(
+          value: _TrackMenuAction.addToPlaylist,
+          child: _TrackMenuPopupItem(
+            icon: Icons.playlist_add_rounded,
+            label: 'Add to playlist',
+          ),
+        ),
+        const PopupMenuItem<_TrackMenuAction>(
+          value: _TrackMenuAction.startStation,
+          child: _TrackMenuPopupItem(
+            icon: Icons.radio_rounded,
+            label: 'Start radio',
+          ),
+        ),
+        PopupMenuItem<_TrackMenuAction>(
+          value: _TrackMenuAction.download,
+          enabled: videoId != null && !isDownloadActive,
+          child: _TrackMenuPopupItem(
+            icon: isDownloaded
+                ? Icons.check_circle_outline_rounded
+                : Icons.download_rounded,
+            label: isDownloadActive
+                ? 'Downloading'
+                : isDownloaded
+                    ? 'Downloaded'
+                    : 'Download',
+            muted: videoId == null || isDownloadActive,
+          ),
+        ),
+        PopupMenuItem<_TrackMenuAction>(
+          value: _TrackMenuAction.details,
+          enabled: videoId != null && videoId.isNotEmpty,
+          child: _TrackMenuPopupItem(
+            icon: Icons.info_outline_rounded,
+            label: 'View details',
+            muted: videoId == null || videoId.isEmpty,
+          ),
+        ),
+      ],
+      child: Container(
+        width: widget.buttonSize,
+        height: widget.buttonSize,
         decoration: BoxDecoration(
           color: Colors.white.withValues(alpha: 0.05),
           shape: BoxShape.circle,
         ),
-        child: Icon(
-          Icons.more_horiz_rounded,
-          color: Colors.white70,
-          size: iconSize,
+        child: AnimatedSwitcher(
+          duration: const Duration(milliseconds: 180),
+          switchInCurve: Curves.easeOutCubic,
+          switchOutCurve: Curves.easeInCubic,
+          transitionBuilder: (child, animation) => RotationTransition(
+            turns: Tween<double>(begin: -0.08, end: 0).animate(animation),
+            child: FadeTransition(opacity: animation, child: child),
+          ),
+          child: Icon(
+            _isOpen ? Icons.more_horiz_rounded : Icons.more_vert_rounded,
+            key: ValueKey<bool>(_isOpen),
+            color: Colors.white70,
+            size: widget.iconSize,
+          ),
         ),
       ),
-      padding: EdgeInsets.zero,
-      constraints: const BoxConstraints(),
-      splashRadius: buttonSize * 0.6,
-      visualDensity: VisualDensity.compact,
+    );
+  }
+}
+
+class _TrackMenuPopupItem extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final bool muted;
+
+  const _TrackMenuPopupItem({
+    required this.icon,
+    required this.label,
+    this.muted = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final foreground =
+        muted ? Colors.white.withValues(alpha: 0.38) : Colors.white;
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(icon, color: foreground, size: 19),
+        const SizedBox(width: 12),
+        Text(
+          label,
+          style: TextStyle(
+            color: foreground,
+            fontSize: 13.5,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+      ],
     );
   }
 }

@@ -6,8 +6,9 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'logic/audio_provider_queue.dart';
 import 'logic/details_provider.dart';
 import 'logic/download_provider.dart';
+import 'logic/followed_artists_provider.dart';
 import 'logic/playlist_provider.dart';
-import 'main_player.dart';
+import 'navigation/player_navigation.dart';
 import 'ui/app_theme_tokens.dart';
 import 'ui/neatie_components.dart';
 import 'widgets/details/details_sections.dart';
@@ -50,7 +51,6 @@ class _ArtistDetailsScreenState extends ConsumerState<ArtistDetailsScreen> {
     bool shuffle = false,
   }) async {
     if (tracks.isEmpty) return;
-    final navigator = Navigator.of(context);
     final currentTrack = shuffle
         ? tracks[DateTime.now().microsecondsSinceEpoch % tracks.length]
         : tracks.first;
@@ -63,9 +63,7 @@ class _ArtistDetailsScreenState extends ConsumerState<ArtistDetailsScreen> {
           shuffle: shuffle,
         );
     if (!mounted) return;
-    navigator.push(
-      MaterialPageRoute(builder: (_) => const FullPlayerScreen()),
-    );
+    unawaited(openFullPlayer(context));
   }
 
   Future<void> _openAlbum(Map<String, dynamic> album) async {
@@ -117,6 +115,24 @@ class _ArtistDetailsScreenState extends ConsumerState<ArtistDetailsScreen> {
             .map((entry) => Map<String, dynamic>.from(entry))
             .toList(growable: false);
     final description = (artist['description'] ?? '').toString().trim();
+    final isFollowing =
+        ref.watch(followedArtistsProvider.select((artists) {
+      final id = (artist['id'] ?? artist['browseId'] ?? artist['artist_id'])
+              ?.toString()
+              .trim() ??
+          '';
+      final name = artist['name']?.toString().trim().toLowerCase() ?? '';
+      return artists.any((entry) {
+        final entryId = (entry['id'] ?? entry['browseId'] ?? entry['artist_id'])
+                ?.toString()
+                .trim() ??
+            '';
+        final entryName =
+            entry['name']?.toString().trim().toLowerCase() ?? '';
+        return (id.isNotEmpty && entryId == id) ||
+            (name.isNotEmpty && entryName == name);
+      });
+    }));
 
     return Scaffold(
       backgroundColor: _voidBlack,
@@ -151,6 +167,34 @@ class _ArtistDetailsScreenState extends ConsumerState<ArtistDetailsScreen> {
                             shuffle: true,
                           ),
                 ),
+                const SizedBox(height: 12),
+                SizedBox(
+                  width: double.infinity,
+                  child: OutlinedButton.icon(
+                    onPressed: () {
+                      unawaited(
+                        ref
+                            .read(followedArtistsProvider.notifier)
+                            .toggle(artist),
+                      );
+                    },
+                    icon: Icon(
+                      isFollowing
+                          ? Icons.check_circle_rounded
+                          : Icons.person_add_alt_1_rounded,
+                    ),
+                    label: Text(isFollowing ? 'Following' : 'Follow artist'),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: Colors.white,
+                      side: BorderSide(
+                        color: Colors.white.withValues(alpha: 0.2),
+                      ),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(18),
+                      ),
+                    ),
+                  ),
+                ),
                 if (albums.isNotEmpty) ...[
                   const SizedBox(height: 28),
                   ArtistAlbumsSection(
@@ -170,7 +214,7 @@ class _ArtistDetailsScreenState extends ConsumerState<ArtistDetailsScreen> {
                   fallbackSubtitle:
                       artist['name']?.toString() ?? 'Unknown Artist',
                   onPlayTrack: (track) async {
-                    final navigator = Navigator.of(context);
+                    final playerContext = context;
                     await ref
                         .read(playbackQueueProvider.notifier)
                         .startPlaylistSession(
@@ -180,12 +224,8 @@ class _ArtistDetailsScreenState extends ConsumerState<ArtistDetailsScreen> {
                           tracks: topSongs,
                           currentTrack: track,
                         );
-                    if (!mounted) return;
-                    navigator.push(
-                      MaterialPageRoute(
-                        builder: (_) => const FullPlayerScreen(),
-                      ),
-                    );
+                    if (!playerContext.mounted) return;
+                    unawaited(openFullPlayer(playerContext));
                   },
                 ),
                 if (relatedArtists.isNotEmpty) ...[
@@ -234,7 +274,6 @@ class _AlbumDetailsScreenState extends ConsumerState<AlbumDetailsScreen> {
     bool shuffle = false,
   }) async {
     if (tracks.isEmpty) return;
-    final navigator = Navigator.of(context);
     final currentTrack = shuffle
         ? tracks[DateTime.now().microsecondsSinceEpoch % tracks.length]
         : tracks.first;
@@ -247,9 +286,7 @@ class _AlbumDetailsScreenState extends ConsumerState<AlbumDetailsScreen> {
           shuffle: shuffle,
         );
     if (!mounted) return;
-    navigator.push(
-      MaterialPageRoute(builder: (_) => const FullPlayerScreen()),
-    );
+    unawaited(openFullPlayer(context));
   }
 
   void _saveAlbumAsPlaylist(Map<String, dynamic> album, List<dynamic> tracks) {
@@ -333,7 +370,7 @@ class _AlbumDetailsScreenState extends ConsumerState<AlbumDetailsScreen> {
                   fallbackSubtitle: album['artist']?.toString() ?? '',
                   fallbackThumbnail: album['thumbnail']?.toString(),
                   onPlayTrack: (track) async {
-                    final navigator = Navigator.of(context);
+                    final playerContext = context;
                     await ref
                         .read(playbackQueueProvider.notifier)
                         .startPlaylistSession(
@@ -343,12 +380,8 @@ class _AlbumDetailsScreenState extends ConsumerState<AlbumDetailsScreen> {
                           tracks: tracks,
                           currentTrack: track,
                         );
-                    if (!mounted) return;
-                    navigator.push(
-                      MaterialPageRoute(
-                        builder: (_) => const FullPlayerScreen(),
-                      ),
-                    );
+                    if (!playerContext.mounted) return;
+                    unawaited(openFullPlayer(playerContext));
                   },
                 ),
               ],
@@ -440,9 +473,7 @@ class TrackDetailsScreen extends ConsumerWidget {
                           track,
                         ),
                   );
-                  Navigator.of(context).push(
-                    MaterialPageRoute(builder: (_) => const FullPlayerScreen()),
-                  );
+                  unawaited(openFullPlayer(context));
                 },
                 onDownload: videoId == null
                     ? null

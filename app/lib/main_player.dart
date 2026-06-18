@@ -254,7 +254,14 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
         ref.read(lyricsProvider.notifier).clear();
         return;
       }
-      unawaited(ref.read(lyricsProvider.notifier).fetchLyrics(videoId));
+      final playerState = ref.read(audioPlayerProvider);
+      unawaited(
+        ref.read(lyricsProvider.notifier).fetchLyrics(
+              videoId,
+              title: playerState.currentTrackName,
+              artist: playerState.artist,
+            ),
+      );
     });
   }
 

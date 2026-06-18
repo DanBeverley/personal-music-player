@@ -21,8 +21,6 @@ import 'widgets/download_hud.dart';
 import 'widgets/player/mini_player.dart';
 
 const _voidBlack = neatieInk;
-const double _radiusLarge = neatieRadiusLarge;
-const double _radiusMedium = neatieRadiusMedium;
 
 class AuthGateScreen extends ConsumerStatefulWidget {
   const AuthGateScreen({super.key});
@@ -44,143 +42,307 @@ class _AuthGateScreenState extends ConsumerState<AuthGateScreen> {
   Widget build(BuildContext context) {
     final authState = ref.watch(authProvider);
     final authNotifier = ref.read(authProvider.notifier);
+    final authControlsLocked =
+        authState.isBusy || authState.isRedirectSettling || authState.canUseApp;
+    final statusText = authState.canUseApp
+        ? 'Opening your feed...'
+        : authState.isRedirectSettling
+            ? 'Finishing sign in...'
+            : authState.isBusy
+                ? 'Contacting Neatie...'
+                : '';
 
     return Scaffold(
       backgroundColor: _voidBlack,
-      body: NeatieBackground(
-        child: SafeArea(
-          child: Center(
-            child: SingleChildScrollView(
-              padding: const EdgeInsets.all(24),
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 420),
-                child: NeatieSurface(
-                  padding: const EdgeInsets.fromLTRB(24, 28, 24, 24),
-                  radius: _radiusLarge,
-                  color: Colors.white.withValues(alpha: 0.035),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        'Neatie',
-                        style: GoogleFonts.spaceGrotesk(
-                          fontSize: 34,
-                          fontWeight: FontWeight.w700,
-                          color: Colors.white,
-                          letterSpacing: -1.1,
-                        ),
-                      ),
-                      const SizedBox(height: 10),
-                      Text(
-                        'Sign in to keep playlists, listening memory, and offline ownership scoped to your account.',
-                        style: TextStyle(
-                          color: Colors.white.withValues(alpha: 0.68),
-                          fontSize: 14,
-                          height: 1.45,
-                        ),
-                      ),
-                      const SizedBox(height: 24),
-                      if (authState.error != null && authState.error!.isNotEmpty)
-                        Container(
-                          width: double.infinity,
-                          margin: const EdgeInsets.only(bottom: 16),
-                          padding: const EdgeInsets.all(14),
-                          decoration: BoxDecoration(
-                            color: Colors.white.withValues(alpha: 0.04),
-                            borderRadius: BorderRadius.circular(_radiusMedium),
-                            border: Border.all(
-                              color: Colors.white.withValues(alpha: 0.08),
-                            ),
-                          ),
-                          child: Text(
-                            authState.error!,
-                            style: TextStyle(
-                              color: Colors.white.withValues(alpha: 0.78),
-                              fontSize: 13,
-                              height: 1.4,
-                            ),
-                          ),
-                        ),
-                      SizedBox(
-                        width: double.infinity,
-                        child: ElevatedButton.icon(
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: neatieRaised,
-                            foregroundColor: Colors.white,
-                            padding: const EdgeInsets.symmetric(vertical: 16),
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(_radiusMedium),
-                            ),
-                          ),
-                          onPressed: authState.isBusy
-                              ? null
-                              : () => authNotifier.signInWithGoogle(),
-                          icon: const Icon(Icons.login_rounded),
-                          label: const Text('Continue With Google'),
-                        ),
-                      ),
-                      const SizedBox(height: 12),
-                      SizedBox(
-                        width: double.infinity,
-                        child: OutlinedButton.icon(
-                          style: OutlinedButton.styleFrom(
-                            foregroundColor: Colors.white,
-                            side: BorderSide(
-                              color: Colors.white.withValues(alpha: 0.14),
-                            ),
-                            padding: const EdgeInsets.symmetric(vertical: 16),
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(_radiusMedium),
-                            ),
-                          ),
-                          onPressed: authState.isBusy
-                              ? null
-                              : () => authNotifier.signInWithGitHub(),
-                          icon: const Icon(Icons.code_rounded),
-                          label: const Text('Continue With GitHub'),
-                        ),
-                      ),
-                      const SizedBox(height: 20),
-                      TextField(
-                        controller: _emailController,
-                        keyboardType: TextInputType.emailAddress,
-                        style: const TextStyle(color: Colors.white),
-                        decoration: InputDecoration(
-                          hintText: 'Email for magic link',
-                          hintStyle: TextStyle(
-                            color: Colors.white.withValues(alpha: 0.36),
-                          ),
-                          filled: true,
-                          fillColor: Colors.white.withValues(alpha: 0.04),
-                          border: OutlineInputBorder(
-                            borderRadius: BorderRadius.circular(_radiusMedium),
-                            borderSide: BorderSide.none,
-                          ),
-                        ),
-                      ),
-                      const SizedBox(height: 12),
-                      SizedBox(
-                        width: double.infinity,
-                        child: TextButton(
-                          onPressed: authState.isBusy
-                              ? null
-                              : () {
-                                  final email = _emailController.text.trim();
-                                  if (email.isEmpty) return;
-                                  authNotifier.sendMagicLink(email);
-                                },
-                          child: const Text(
-                            'Send Magic Link',
-                            style: TextStyle(color: Colors.white),
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
+      body: Stack(
+        children: [
+          Positioned.fill(
+            child: Image.asset(
+              'assets/branding/neatie_login_wave_bg.png',
+              fit: BoxFit.cover,
+              alignment: Alignment.bottomCenter,
+            ),
+          ),
+          Positioned.fill(
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                  colors: [
+                    Colors.black.withValues(alpha: 0.96),
+                    Colors.black.withValues(alpha: 0.82),
+                    Colors.black.withValues(alpha: 0.38),
+                  ],
+                  stops: const [0, 0.56, 1],
                 ),
               ),
             ),
           ),
+          SafeArea(
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                return SingleChildScrollView(
+                  padding: const EdgeInsets.fromLTRB(26, 44, 26, 42),
+                  child: ConstrainedBox(
+                    constraints: BoxConstraints(
+                      minHeight: constraints.maxHeight - 86,
+                      maxWidth: 520,
+                    ),
+                    child: Center(
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Image.asset(
+                            'assets/branding/neatie_intro_mark.png',
+                            width: 88,
+                            height: 58,
+                            fit: BoxFit.contain,
+                          ),
+                          const SizedBox(height: 54),
+                          Text(
+                            'Welcome back',
+                            textAlign: TextAlign.center,
+                            style: GoogleFonts.spaceGrotesk(
+                              fontSize: 42,
+                              height: 1.05,
+                              fontWeight: FontWeight.w800,
+                              color: Colors.white,
+                              letterSpacing: -1.4,
+                            ),
+                          ),
+                          const SizedBox(height: 14),
+                          Text(
+                            'Sign in to continue listening.',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(
+                              color: Colors.white.withValues(alpha: 0.58),
+                              fontSize: 18,
+                              height: 1.35,
+                            ),
+                          ),
+                          const SizedBox(height: 48),
+                          _AuthTextField(
+                            controller: _emailController,
+                            enabled: !authControlsLocked,
+                            icon: Icons.mail_outline_rounded,
+                            hintText: 'Email for magic link',
+                          ),
+                          const SizedBox(height: 18),
+                          if (statusText.isNotEmpty)
+                            _AuthStatusPill(text: statusText)
+                          else
+                            const SizedBox(height: 54),
+                          if (authState.error != null &&
+                              authState.error!.isNotEmpty) ...[
+                            const SizedBox(height: 14),
+                            Text(
+                              authState.error!,
+                              textAlign: TextAlign.center,
+                              style: TextStyle(
+                                color: Colors.white.withValues(alpha: 0.7),
+                                fontSize: 13,
+                                height: 1.35,
+                              ),
+                            ),
+                          ],
+                          const SizedBox(height: 26),
+                          SizedBox(
+                            width: double.infinity,
+                            height: 62,
+                            child: FilledButton(
+                              onPressed: authControlsLocked
+                                  ? null
+                                  : () => authNotifier.signInWithGoogle(),
+                              style: FilledButton.styleFrom(
+                                backgroundColor: Colors.white,
+                                disabledBackgroundColor:
+                                    Colors.white.withValues(alpha: 0.2),
+                                foregroundColor: Colors.black,
+                                disabledForegroundColor:
+                                    Colors.white.withValues(alpha: 0.38),
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(999),
+                                ),
+                              ),
+                              child: const Text(
+                                'Continue with Google',
+                                style: TextStyle(
+                                  fontSize: 17,
+                                  fontWeight: FontWeight.w800,
+                                ),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(height: 20),
+                          TextButton(
+                            onPressed: authControlsLocked
+                                ? null
+                                : () {
+                                    final email = _emailController.text.trim();
+                                    if (email.isEmpty) return;
+                                    authNotifier.sendMagicLink(email);
+                                  },
+                            child: Text(
+                              'Send magic link',
+                              style: TextStyle(
+                                color: Colors.white.withValues(alpha: 0.86),
+                                fontSize: 15,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(height: 26),
+                          Row(
+                            children: [
+                              Expanded(
+                                child: Divider(
+                                  color: Colors.white.withValues(alpha: 0.14),
+                                ),
+                              ),
+                              Padding(
+                                padding:
+                                    const EdgeInsets.symmetric(horizontal: 20),
+                                child: Text(
+                                  'or',
+                                  style: TextStyle(
+                                    color: Colors.white.withValues(alpha: 0.58),
+                                    fontSize: 15,
+                                  ),
+                                ),
+                              ),
+                              Expanded(
+                                child: Divider(
+                                  color: Colors.white.withValues(alpha: 0.14),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 26),
+                          SizedBox(
+                            width: double.infinity,
+                            height: 58,
+                            child: OutlinedButton.icon(
+                              onPressed: authControlsLocked
+                                  ? null
+                                  : () => authNotifier.signInWithGitHub(),
+                              style: OutlinedButton.styleFrom(
+                                foregroundColor: Colors.white,
+                                disabledForegroundColor:
+                                    Colors.white.withValues(alpha: 0.36),
+                                side: BorderSide(
+                                  color: Colors.white.withValues(alpha: 0.22),
+                                ),
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(999),
+                                ),
+                              ),
+                              icon: const Icon(Icons.code_rounded),
+                              label: const Text(
+                                'Continue with GitHub',
+                                style: TextStyle(
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _AuthStatusPill extends StatelessWidget {
+  const _AuthStatusPill({required this.text});
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      height: 54,
+      padding: const EdgeInsets.symmetric(horizontal: 18),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.1)),
+      ),
+      child: Row(
+        children: [
+          const SizedBox(
+            width: 18,
+            height: 18,
+            child: CircularProgressIndicator(
+              strokeWidth: 2,
+              color: Colors.white,
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Text(
+              text,
+              style: TextStyle(
+                color: Colors.white.withValues(alpha: 0.72),
+                fontSize: 14,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _AuthTextField extends StatelessWidget {
+  const _AuthTextField({
+    required this.controller,
+    required this.enabled,
+    required this.icon,
+    required this.hintText,
+  });
+
+  final TextEditingController controller;
+  final bool enabled;
+  final IconData icon;
+  final String hintText;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      height: 68,
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.24),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.18)),
+      ),
+      child: TextField(
+        controller: controller,
+        enabled: enabled,
+        keyboardType: TextInputType.emailAddress,
+        style: const TextStyle(color: Colors.white, fontSize: 17),
+        decoration: InputDecoration(
+          border: InputBorder.none,
+          prefixIcon: Icon(
+            icon,
+            color: Colors.white.withValues(alpha: 0.7),
+            size: 25,
+          ),
+          hintText: hintText,
+          hintStyle: TextStyle(
+            color: Colors.white.withValues(alpha: 0.42),
+            fontSize: 17,
+          ),
+          contentPadding: const EdgeInsets.symmetric(vertical: 22),
         ),
       ),
     );

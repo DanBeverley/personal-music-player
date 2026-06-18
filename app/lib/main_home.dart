@@ -11,12 +11,12 @@ import 'logic/audio_provider_queue.dart';
 import 'logic/audio_provider_recommendation.dart';
 import 'logic/auth_provider.dart';
 import 'logic/details_provider.dart';
-import 'logic/interaction_events.dart';
 import 'logic/playlist_provider.dart';
 import 'logic/search_provider.dart';
 import 'logic/song_match_provider.dart';
 import 'main_details.dart';
 import 'main_player.dart';
+import 'navigation/player_navigation.dart';
 import 'screens/assistant_screen.dart';
 import 'screens/personal_mix_detail_screen.dart';
 import 'screens/playlist_detail_screen.dart';
@@ -57,6 +57,10 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   final FocusNode _searchFocusNode = FocusNode();
   final ScrollController _homeScrollController = ScrollController();
   bool _isSearching = false;
+  bool _isEditingSearchQuery = false;
+  bool _isProgrammaticSearchTextChange = false;
+  bool _hasSubmittedSearch = false;
+  String _submittedSearchQuery = '';
   bool _refreshRecommendationsOnSearchExit = false;
   String _lastSearchRecommendationQuery = '';
   List<String> _lastSearchRecommendationArtistHints = const <String>[];
@@ -87,12 +91,26 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     _homeScrollController.addListener(_handleHomeScroll);
     unawaited(_loadRecentSearchHistory());
     _urlController.addListener(() {
-      if (_isClearingSearch) {
+      if (_isClearingSearch || _isProgrammaticSearchTextChange) {
         return;
       }
       final text = _urlController.text.trim();
       if (mounted) {
-        setState(() {});
+        setState(() {
+          if (_isSearching && text.isNotEmpty) {
+            _isEditingSearchQuery = true;
+          }
+          if (_hasSubmittedSearch && text != _submittedSearchQuery) {
+            _hasSubmittedSearch = false;
+            _submittedSearchQuery = '';
+            _selectedSearchTab = 'Top';
+          }
+        });
+      }
+      if (!_hasSubmittedSearch &&
+          text.isNotEmpty &&
+          ref.read(searchPageProvider).requestState != 'idle') {
+        ref.read(searchPageProvider.notifier).clear();
       }
       _syncControllerCanHandleBack();
       if (text.isNotEmpty) {
@@ -106,11 +124,21 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         _suggestDebounce?.cancel();
         ref.read(suggestProvider.notifier).clear();
         ref.read(searchPageProvider.notifier).clear();
+        if (mounted) {
+          setState(() => _isEditingSearchQuery = false);
+        }
         if (widget.searchOnly) {
           _setSearchMode(true);
         } else if (_isSearching) {
           _setSearchMode(false);
         }
+      }
+    });
+    _searchFocusNode.addListener(() {
+      if (!mounted || !_searchFocusNode.hasFocus) return;
+      final text = _urlController.text.trim();
+      if (_isSearching && text.isNotEmpty) {
+        setState(() => _isEditingSearchQuery = true);
       }
     });
     if (widget.searchOnly) {
@@ -313,7 +341,11 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       sessionQueries: query.isEmpty ? const <String>[] : <String>[query],
     );
     if (!mounted) return;
+    await notifier.applyPreparedFeedOnHomeReturn();
+    if (!mounted) return;
     await notifier.applyQueuedSessionIntent();
+    if (!mounted) return;
+    await notifier.applyPreparedFeedOnHomeReturn();
   }
 
   Future<void> _performSearch(WidgetRef ref, [String? query]) async {
@@ -323,8 +355,16 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       _setSearchMode(widget.searchOnly);
       return;
     }
+    _isProgrammaticSearchTextChange = true;
     _urlController.text = q;
+    _isProgrammaticSearchTextChange = false;
     _searchFocusNode.unfocus();
+    setState(() {
+      _isEditingSearchQuery = false;
+      _hasSubmittedSearch = true;
+      _submittedSearchQuery = q;
+      _selectedSearchTab = 'Top';
+    });
     _setSearchMode(true);
     ref.read(suggestProvider.notifier).clear();
     await ref.read(searchPageProvider.notifier).search(q);
@@ -348,6 +388,10 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     _searchFocusNode.unfocus();
     ref.read(suggestProvider.notifier).clear();
     ref.read(searchPageProvider.notifier).clear();
+    _hasSubmittedSearch = false;
+    _submittedSearchQuery = '';
+    _isEditingSearchQuery = false;
+    _selectedSearchTab = 'Top';
     _setSearchMode(widget.searchOnly);
     if (!widget.searchOnly &&
         refreshRecommendations &&
@@ -955,9 +999,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
               'Inspired by ${track['title']?.toString() ?? 'this track'}',
         );
     if (!mounted) return;
-    await Navigator.of(context).push(
-      MaterialPageRoute(builder: (_) => const FullPlayerScreen()),
-    );
+    await openFullPlayer(context);
   }
 
   Widget _buildNeatieHomeExperience({
@@ -1115,6 +1157,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                 playTrack(track, todaysPickTracks, "Today's pick"),
             onMenuDetails: (track) =>
                 unawaited(_openTrackDetails(track, extractTrackId(track))),
+            onAddToPlaylist: _addTrackToPlaylistFromMenu,
+            onStartStation: _startTrackStationFromMenu,
             onViewAll: () => unawaited(_openRecommendationRow(todaysPickRow)),
           ),
         ],
@@ -1126,6 +1170,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
             onPlay: (track) => playTrack(track, recentTracks, 'Recently played'),
             onMenuDetails: (track) =>
                 unawaited(_openTrackDetails(track, extractTrackId(track))),
+            onAddToPlaylist: _addTrackToPlaylistFromMenu,
+            onStartStation: _startTrackStationFromMenu,
             onViewAll: () => unawaited(_openRecommendationRow(lastPlayedRow)),
           )
         else
@@ -1136,6 +1182,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                 playTrack(track, tabTracks, 'Discoveries'),
             onMenuDetails: (track) =>
                 unawaited(_openTrackDetails(track, extractTrackId(track))),
+            onAddToPlaylist: _addTrackToPlaylistFromMenu,
+            onStartStation: _startTrackStationFromMenu,
             onViewAll: () => unawaited(_openRecommendationRow(laneDiscoveryRow)),
           ),
         if (selectedTab == NeatieHomeTab.all && madeForYou.isNotEmpty) ...[
@@ -1156,6 +1204,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                 playTrack(track, becauseYouPlayedTracks, 'Because you played'),
             onMenuDetails: (track) =>
                 unawaited(_openTrackDetails(track, extractTrackId(track))),
+            onAddToPlaylist: _addTrackToPlaylistFromMenu,
+            onStartStation: _startTrackStationFromMenu,
             onViewAll: () =>
                 unawaited(_openRecommendationRow(becauseYouPlayedRow)),
           ),
@@ -1168,6 +1218,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
             onPlay: (track) => playTrack(track, hiddenGemTracks, 'Hidden gems'),
             onMenuDetails: (track) =>
                 unawaited(_openTrackDetails(track, extractTrackId(track))),
+            onAddToPlaylist: _addTrackToPlaylistFromMenu,
+            onStartStation: _startTrackStationFromMenu,
             onViewAll: () => unawaited(_openRecommendationRow(hiddenGemsRow)),
           ),
         ],
@@ -1185,6 +1237,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                 playTrack(track, selectedGenreTracks, 'Trending by genre'),
             onMenuDetails: (track) =>
                 unawaited(_openTrackDetails(track, extractTrackId(track))),
+            onAddToPlaylist: _addTrackToPlaylistFromMenu,
+            onStartStation: _startTrackStationFromMenu,
             onViewAll: () => unawaited(_openRecommendationRow(genreRow)),
           ),
         ] else if (selectedTab == NeatieHomeTab.all &&
@@ -1197,6 +1251,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                 playTrack(track, trendingTracks, trendingTitle),
             onMenuDetails: (track) =>
                 unawaited(_openTrackDetails(track, extractTrackId(track))),
+            onAddToPlaylist: _addTrackToPlaylistFromMenu,
+            onStartStation: _startTrackStationFromMenu,
           ),
         ],
         if (visibleAlbums.isNotEmpty) ...[
@@ -1231,6 +1287,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                 playTrack(track, frequentTracks, 'Frequently listened'),
             onMenuDetails: (track) =>
                 unawaited(_openTrackDetails(track, extractTrackId(track))),
+            onAddToPlaylist: _addTrackToPlaylistFromMenu,
+            onStartStation: _startTrackStationFromMenu,
             onViewAll: () => unawaited(_openRecommendationRow(frequentRow)),
           ),
         ],
@@ -1242,6 +1300,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
             onPlay: (track) => playTrack(track, quietPickTracks, 'Quiet Picks'),
             onMenuDetails: (track) =>
                 unawaited(_openTrackDetails(track, extractTrackId(track))),
+            onAddToPlaylist: _addTrackToPlaylistFromMenu,
+            onStartStation: _startTrackStationFromMenu,
             onViewAll: () => unawaited(_openRecommendationRow(quietPicksRow)),
           ),
         ],
@@ -1272,9 +1332,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   Future<void> _startTrackStationFromMenu(Map<String, dynamic> track) async {
     await ref.read(playbackQueueProvider.notifier).startRadioSession(track);
     if (!mounted) return;
-    Navigator.of(context).push(
-      MaterialPageRoute(builder: (_) => const FullPlayerScreen()),
-    );
+    unawaited(openFullPlayer(context));
   }
 
   Future<void> _playTrackFromCollection({
@@ -1291,8 +1349,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
           currentTrack: track,
         );
     if (!mounted) return;
-    Navigator.of(context)
-        .push(MaterialPageRoute(builder: (_) => const FullPlayerScreen()));
+    unawaited(openFullPlayer(context));
   }
 
   Future<void> _openAlbum(Map<String, dynamic> album) async {
@@ -1461,9 +1518,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         builder: (_) => AssistantScreen(
           onOpenAlbum: _openAlbum,
           onOpenPlayer: () {
-            Navigator.of(context).push(
-              MaterialPageRoute(builder: (_) => const FullPlayerScreen()),
-            );
+            unawaited(openFullPlayer(context));
           },
         ),
       ),
@@ -1544,9 +1599,16 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         ? const <Map<String, dynamic>>[]
         : ref.watch(frequentlyPlayedProvider);
     final suggestState = ref.watch(suggestProvider);
+    final searchInput = _urlController.text.trim();
+    final submittedQuery = _submittedSearchQuery.trim();
+    final submittedQueryMatchesInput = submittedQuery.isNotEmpty &&
+        submittedQuery.toLowerCase() == searchInput.toLowerCase();
+    final hasSubmittedSearchForCurrentQuery =
+        _isSearching && _hasSubmittedSearch && submittedQueryMatchesInput;
     final showSearchSuggestions = _isSearching &&
         suggestState.isNotEmpty &&
-        _urlController.text.trim().isNotEmpty &&
+        searchInput.isNotEmpty &&
+        !hasSubmittedSearchForCurrentQuery &&
         searchPage.requestState != 'complete' &&
         !searchPage.hasResults &&
         !isSearchLoading;
@@ -1554,7 +1616,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         _isSearching ? searchPage.tracks : recState.visibleTracks;
     final songMatchState = ref.watch(songMatchProvider);
     final showRecentSearchHistory = _isSearching &&
-        _urlController.text.trim().isEmpty &&
+        searchInput.isEmpty &&
         !isSearchLoading &&
         !searchPage.hasResults &&
         _recentSearchHistory.isNotEmpty;
@@ -1566,8 +1628,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     );
     final matchingPlaylists = _isSearching
         ? [
-            ..._searchLocalPlaylists(playlists, _urlController.text),
-            ..._searchDiscoveryPlaylists(searchPage, _urlController.text),
+            ..._searchLocalPlaylists(playlists, submittedQuery),
+            ..._searchDiscoveryPlaylists(searchPage, submittedQuery),
           ]
         : const <Map<String, dynamic>>[];
     final neatieHomeExperience = _buildNeatieHomeExperience(
@@ -1664,7 +1726,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
 
                 // Content Area (Search vs Recommendations)
                 if (_isSearching) ...[
-                  if (_urlController.text.trim().isEmpty &&
+                  if (searchInput.isEmpty &&
                       !searchPage.hasResults &&
                       !isSearchLoading)
                     NeatieSearchLanding(
@@ -1674,6 +1736,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                       onBrowseSelected: (surface) =>
                           _openBrowseSurface(ref, surface),
                     )
+                  else if (!hasSubmittedSearchForCurrentQuery)
+                    const SizedBox.shrink()
                   else ...[
                     NeatieSearchTabBar(
                       selected: _selectedSearchTab,
@@ -1682,7 +1746,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                     ),
                     const SizedBox(height: 12),
                     NeatieSearchResultsSection(
-                      query: _urlController.text.trim(),
+                      query: submittedQuery,
+                      queryIntent: searchPage.queryIntent,
                       selectedTab: _selectedSearchTab,
                       isLoading: isSearchLoading,
                       tracks: searchPage.tracks,

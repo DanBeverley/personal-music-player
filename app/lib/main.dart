@@ -88,15 +88,24 @@ class _AuralisAppState extends ConsumerState<AuralisApp>
   Widget build(BuildContext context) {
     final authState = ref.watch(authProvider);
     final Widget home;
-    if (authState.isRestoring) {
-      home = const _AuthRestoringScreen();
+    if (authState.canUseApp) {
+      home = const MainLayout();
     } else if (authState.requiresAuthGate) {
       home = const AuthGateScreen();
+    } else if (authState.isRestoring || authState.isAuthRedirectSettling) {
+      home = const _AuthRestoringScreen();
     } else {
-      home = const MainLayout();
+      home = const AuthGateScreen();
     }
 
+    final appShellKey = authState.canUseApp
+        ? ValueKey('app:${authState.storageScopeId}')
+        : ValueKey(
+            authState.isAuthRedirectSettling ? 'auth:redirect' : 'auth:gate',
+          );
+
     return MaterialApp(
+      key: appShellKey,
       title: 'Neatie',
       onGenerateRoute: (settings) {
         final routeName = settings.name ?? '';

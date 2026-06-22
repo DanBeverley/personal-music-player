@@ -14,6 +14,8 @@ from ..domain.catalog import (
     canonical_album_identity,
     canonical_artist_identity,
     canonical_title_artist_identity,
+    normalize_catalog_language,
+    normalize_catalog_region,
     normalized_audio_traits,
 )
 from ..storage.postgres import db_available, get_connection
@@ -174,20 +176,20 @@ _TYPE_PATTERNS = {
 }
 
 _GENRE_RULES: Sequence[Tuple[str, str, re.Pattern[str]]] = (
-    ("rock", "hard_rock", re.compile(r"\b(guns n roses|guns n' roses|acdc|ac/dc|aerosmith|hard rock|arena rock|appetite for destruction)\b", re.IGNORECASE)),
-    ("rock", "classic_rock", re.compile(r"\b(classic rock|led zeppelin|eagles|queen|bon jovi|scorpions|poison|journey|fleetwood mac|foreigner)\b", re.IGNORECASE)),
-    ("rock", "alternative_rock", re.compile(r"\b(alternative rock|alt rock|radiohead|coldplay|the killers|foo fighters)\b", re.IGNORECASE)),
-    ("rock", "grunge", re.compile(r"\b(grunge|nirvana|soundgarden|pearl jam|alice in chains)\b", re.IGNORECASE)),
-    ("metal", "heavy_metal", re.compile(r"\b(metal|heavy metal|black sabbath|iron maiden|metallica|megadeth|slayer)\b", re.IGNORECASE)),
-    ("pop", "synth_pop", re.compile(r"\b(pop|synth pop|synth-pop|taylor swift|katy perry|dua lipa|madonna)\b", re.IGNORECASE)),
-    ("hip_hop", "rap", re.compile(r"\b(hip hop|hip-hop|rap|kanye west|kendrick lamar|drake|eminem|jay z|jay-z)\b", re.IGNORECASE)),
-    ("rnb", "soul", re.compile(r"\b(rnb|r&b|soul|neo soul|neo-soul|marvin gaye|sza|the weeknd)\b", re.IGNORECASE)),
-    ("electronic", "edm", re.compile(r"\b(edm|electronic|house|techno|trance|club mix|dance mix|daft punk|calvin harris)\b", re.IGNORECASE)),
+    ("rock", "hard_rock", re.compile(r"\b(hard rock|arena rock|glam rock|blues rock|southern rock)\b", re.IGNORECASE)),
+    ("rock", "classic_rock", re.compile(r"\b(classic rock|rock and roll|rock n roll|progressive rock|psychedelic rock)\b", re.IGNORECASE)),
+    ("rock", "alternative_rock", re.compile(r"\b(alternative rock|alt rock|indie rock|post rock)\b", re.IGNORECASE)),
+    ("rock", "grunge", re.compile(r"\b(grunge)\b", re.IGNORECASE)),
+    ("metal", "heavy_metal", re.compile(r"\b(metal|heavy metal|thrash metal|doom metal|power metal)\b", re.IGNORECASE)),
+    ("pop", "synth_pop", re.compile(r"\b(pop|synth pop|synth-pop|dance pop|electropop)\b", re.IGNORECASE)),
+    ("hip_hop", "rap", re.compile(r"\b(hip hop|hip-hop|rap|trap|drill)\b", re.IGNORECASE)),
+    ("rnb", "soul", re.compile(r"\b(rnb|r&b|soul|neo soul|neo-soul|funk)\b", re.IGNORECASE)),
+    ("electronic", "edm", re.compile(r"\b(edm|electronic|house|techno|trance|club mix|dance mix|dubstep|drum and bass)\b", re.IGNORECASE)),
     ("electronic", "ambient", re.compile(r"\b(ambient|sleep|focus|chillout|downtempo|meditation)\b", re.IGNORECASE)),
-    ("country", "country", re.compile(r"\b(country|nashville|americana|morgan wallen|johnny cash)\b", re.IGNORECASE)),
-    ("jazz", "jazz", re.compile(r"\b(jazz|bebop|swing|miles davis|coltrane|ella fitzgerald)\b", re.IGNORECASE)),
-    ("blues", "blues", re.compile(r"\b(blues|bb king|b\\.b\\. king|muddy waters|eric clapton)\b", re.IGNORECASE)),
-    ("folk", "folk", re.compile(r"\b(folk|singer songwriter|singer-songwriter|bob dylan|joan baez|acoustic)\b", re.IGNORECASE)),
+    ("country", "country", re.compile(r"\b(country|nashville|americana|bluegrass|honky tonk)\b", re.IGNORECASE)),
+    ("jazz", "jazz", re.compile(r"\b(jazz|bebop|swing|modal jazz|cool jazz|vocal jazz)\b", re.IGNORECASE)),
+    ("blues", "blues", re.compile(r"\b(blues|delta blues|electric blues|chicago blues)\b", re.IGNORECASE)),
+    ("folk", "folk", re.compile(r"\b(folk|singer songwriter|singer-songwriter|acoustic)\b", re.IGNORECASE)),
     ("latin", "latin_pop", re.compile(r"\b(latin|reggaeton|bachata|salsa|corridos|spanish|en espa[ñn]ol|gipsy kings)\b", re.IGNORECASE)),
     ("devotional", "devotional", re.compile(r"\b(bhajan|devotional|qawwali|worship|gospel|nasheed)\b", re.IGNORECASE)),
     ("soundtrack", "soundtrack", re.compile(r"\b(soundtrack|original score|motion picture|ost)\b", re.IGNORECASE)),
@@ -197,6 +199,10 @@ _LANGUAGE_HINTS: Sequence[Tuple[str, str, re.Pattern[str]]] = (
     ("spanish", "latin_america", re.compile(r"\b(hola|amor|corazon|corazón|vida|canci[oó]n|en espa[ñn]ol|latino|gipsy kings)\b", re.IGNORECASE)),
     ("portuguese", "brazil", re.compile(r"\b(saudade|brasil|sertanejo|mpb)\b", re.IGNORECASE)),
     ("french", "francophone", re.compile(r"\b(amour|bonjour|chanson|paris)\b", re.IGNORECASE)),
+    ("vietnamese", "vietnam", re.compile(r"\b(viet|v-pop|vpop|saigon|hanoi)\b|[\u0102\u0103\u00C2\u00E2\u00CA\u00EA\u00D4\u00F4\u01A0\u01A1\u01AF\u01B0\u0110\u0111]", re.IGNORECASE)),
+    ("korean", "korea", re.compile(r"\b(k-pop|kpop|korean)\b|[\uAC00-\uD7AF]", re.IGNORECASE)),
+    ("japanese", "japan", re.compile(r"\b(j-pop|jpop|japanese)\b|[\u3040-\u30FF]", re.IGNORECASE)),
+    ("hindi", "india", re.compile(r"\b(hindi|bollywood|hindustani|punjabi|bhojpuri|tamil|telugu|malayalam|kannada)\b", re.IGNORECASE)),
     ("hindi", "india", re.compile(r"[\u0900-\u097F]")),
     ("arabic", "mena", re.compile(r"[\u0600-\u06FF]")),
     ("cyrillic", "cis", re.compile(r"[\u0400-\u04FF]")),
@@ -579,6 +585,8 @@ def derive_track_feature(server: Any, track: Dict[str, Any]) -> Dict[str, Any]:
         language = inferred_language
     if not region or region == "unknown":
         region = inferred_region
+    language = normalize_catalog_language(language)
+    region = normalize_catalog_region(region)
     inferred_mood_axes = _infer_mood_axes(primary_genre, subgenre, type_tags)
     mood_axes = {**inferred_mood_axes, **normalized_audio_traits(normalized_track)}
     popularity = float(normalized_track.get("popularity") or 0.0)
@@ -628,6 +636,8 @@ def derive_artist_feature(server: Any, artist: Dict[str, Any] | str) -> Dict[str
     script = script_bucket(text)
     primary_genre, secondary_genres, subgenre = _infer_genre_bundle(text)
     language, region = _infer_language_region(text, script)
+    language = normalize_catalog_language(language)
+    region = normalize_catalog_region(region)
     peer_artist_ids = _normalize_sequence(
         [
             server._recommendation_trim_text((item or {}).get("id"))
@@ -676,6 +686,8 @@ def derive_album_feature(server: Any, album: Dict[str, Any]) -> Dict[str, Any]:
         language = inferred_language
     if not region or region == "unknown":
         region = inferred_region
+    language = normalize_catalog_language(language)
+    region = normalize_catalog_region(region)
     popularity = float(payload.get("popularity") or 0.0)
     if popularity <= 0:
         popularity = 0.46

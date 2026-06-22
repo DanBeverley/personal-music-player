@@ -835,6 +835,43 @@ def _recommendation_store_search_event(req: RecommendationSearchEventRequest):
         connection.commit()
     finally:
         connection.close()
+    selected_item = {}
+    selected_type = ""
+    for key in (
+        "selected_item",
+        "clicked_item",
+        "top_result_item",
+        "track",
+        "item",
+        "entity",
+    ):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            selected_item = dict(value)
+            break
+    selected_type = _recommendation_trim_text(
+        payload.get("selected_entity_type")
+        or payload.get("clicked_entity_type")
+        or payload.get("entity_type")
+        or ("track" if selected_item else "")
+    )
+    if selected_item:
+        try:
+            from ..search.intelligence import remember_search_resolution
+
+            remember_search_resolution(
+                resolve_server(),
+                user_scope_id=user_scope_id,
+                query=query,
+                entity_type=selected_type or "track",
+                item=selected_item,
+                confidence=float(payload.get("confidence") or 0.8),
+                event_weight=max(_recommendation_event_weight(payload.get("event_type") or req.source), 1.0),
+                event_type=_recommendation_trim_text(payload.get("event_type") or req.source),
+                source="search_interaction",
+            )
+        except Exception:
+            pass
     _recommendation_invalidate_collaborative_cache()
     _nearline_invalidate_user(user_scope_id)
     _nearline_invalidate_user_query(user_scope_id, query)
@@ -1978,6 +2015,7 @@ def _recommendation_run_maintenance_cycle(
         "source_signature": "",
         "experiment_evaluation": None,
         "nearline_precompute": None,
+        "canonical_catalog_backfill": None,
     }
     try:
         if force_sync or bool(RECOMMENDATION_SYNC_DATABASE_DSN):
@@ -2036,6 +2074,40 @@ def _recommendation_run_maintenance_cycle(
             force=bool(force_train),
         )
         result["nearline_precompute"] = nearline_result
+        try:
+            from ..search.catalog_pipeline import run_catalog_warmup
+
+            catalog_warmup = run_catalog_warmup(
+                resolve_server(),
+                user_scope_id="catalog",
+                max_queries=32 if force_train else 16,
+                batch_size=4,
+                time_budget_seconds=60.0 if force_train else 35.0,
+                min_interval_seconds=0.0 if force_train else 300.0,
+                force=bool(force_train),
+                source="maintenance_catalog_warmup",
+            )
+            result["catalog_warmup"] = catalog_warmup
+            result["canonical_catalog_backfill"] = catalog_warmup
+            _recommendation_sync_state_set(
+                "catalog_warmup_last_at",
+                str(time.time()),
+            )
+            _recommendation_sync_state_set(
+                "catalog_warmup_last_result",
+                json.dumps(catalog_warmup, ensure_ascii=False)[:1000],
+            )
+            _recommendation_sync_state_set(
+                "canonical_catalog_backfill_last_at",
+                str(time.time()),
+            )
+            _recommendation_sync_state_set(
+                "canonical_catalog_backfill_last_result",
+                json.dumps(catalog_warmup, ensure_ascii=False)[:1000],
+            )
+        except Exception as exc:
+            result["catalog_warmup"] = {"error": str(exc)[:240]}
+            result["canonical_catalog_backfill"] = {"error": str(exc)[:240]}
         try:
             _recommendation_sync_state_set(
                 "nearline_last_cycle_at",

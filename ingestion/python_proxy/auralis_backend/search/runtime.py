@@ -750,13 +750,28 @@ def _semantic_album_suggestion_text(
 
 def _fast_suggestion_cache_key(req, *, server: Any | None = None) -> str:
     server = _resolve_server(server)
+    recent_track_ids: List[str] = []
+    for raw_track in [
+        *(getattr(req, "last_played_tracks", []) or []),
+        *(getattr(req, "recent_tracks", []) or []),
+        *(getattr(req, "recent_track_snapshots", []) or []),
+        *(getattr(req, "top_track_snapshots", []) or []),
+        *(getattr(req, "anchor_track_snapshots", []) or []),
+    ]:
+        if isinstance(raw_track, dict):
+            track_id = _suggestion_track_id(raw_track)
+            if track_id and track_id not in recent_track_ids:
+                recent_track_ids.append(track_id)
+        if len(recent_track_ids) >= 24:
+            break
     payload = {
-        "namespace": "fast_suggestions_v1",
+        "namespace": "fast_suggestions_v2",
         "query": server.normalize_text(req.query),
         "user_scope_id": server.safe_scope_id(
             getattr(req, "user_scope_id", "guest") or "guest"
         ),
         "limit": max(int(req.limit or 0), 0),
+        "recent_track_ids": recent_track_ids,
     }
     return hashlib.sha1(
         json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -784,7 +799,84 @@ def _fast_lexical_suggestion_score(
     return score
 
 
-def semantic_search_suggestions(req, *, server: Any | None = None):
+def _suggestion_track_id(track: Dict[str, Any]) -> str:
+    for key in ("id", "videoId", "video_id", "track_id"):
+        value = trim_text(track.get(key))
+        if value:
+            return value
+    return ""
+
+
+def _track_suggestion_payload(track: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        key: value
+        for key, value in dict(track).items()
+        if key not in {"raw", "raw_track", "raw_payload"}
+    }
+
+
+def _recent_track_suggestion_items(
+    req,
+    query: str,
+    *,
+    server: Any | None = None,
+    limit: int = 2,
+) -> List[Dict[str, Any]]:
+    server = _resolve_server(server)
+    normalized_query = server.normalize_text(query)
+    query_tokens = server.query_tokens(query)
+    if not normalized_query and not query_tokens:
+        return []
+    raw_tracks = [
+        *(getattr(req, "last_played_tracks", []) or []),
+        *(getattr(req, "recent_tracks", []) or []),
+        *(getattr(req, "recent_track_snapshots", []) or []),
+        *(getattr(req, "top_track_snapshots", []) or []),
+        *(getattr(req, "anchor_track_snapshots", []) or []),
+    ]
+    ranked: List[Dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for index, raw_track in enumerate(raw_tracks):
+        if not isinstance(raw_track, dict):
+            continue
+        track = dict(raw_track)
+        track_id = _suggestion_track_id(track)
+        title = _semantic_suggestion_text(track.get("title") or track.get("name"))
+        artist = _semantic_suggestion_text(
+            track.get("artist") or track.get("channel") or track.get("author")
+        )
+        if not title or not track_id or track_id in seen_ids:
+            continue
+        haystack = server.normalize_text(" ".join([title, artist]))
+        title_key = server.normalize_text(title)
+        token_hits = sum(1 for token in query_tokens if token and token in haystack)
+        matched = (
+            normalized_query
+            and (normalized_query in haystack or haystack.startswith(normalized_query))
+        ) or (query_tokens and token_hits >= max(1, min(len(query_tokens), 2)))
+        if not matched:
+            continue
+        exact_bonus = 1.2 if normalized_query and normalized_query == title_key else 0.0
+        prefix_bonus = 0.55 if title_key.startswith(normalized_query) else 0.0
+        score = 8.0 + exact_bonus + prefix_bonus + min(token_hits, 4) * 0.18 - index * 0.035
+        seen_ids.add(track_id)
+        ranked.append(
+            {
+                "text": _semantic_track_suggestion_text(track, server=server),
+                "source_score": score,
+                "source_name": "recently_played",
+                "suggestion_type": "track_play",
+                "direct_play": True,
+                "track": _track_suggestion_payload(track),
+                "score": round(score, 3),
+                "lexical_score": 1.0,
+            }
+        )
+    ranked.sort(key=lambda item: item.get("score", 0.0), reverse=True)
+    return ranked[: max(0, int(limit or 0))]
+
+
+def semantic_search_suggestion_items(req, *, server: Any | None = None):
     server = _resolve_server(server)
     query = server.trim_text(req.query)
     limit = max(1, min(req.limit or 5, 8))
@@ -794,10 +886,32 @@ def semantic_search_suggestions(req, *, server: Any | None = None):
     cache_key = _fast_suggestion_cache_key(req, server=server)
     cached = lookup_search_result("suggestions", cache_key)
     if cached is not None:
-        return list(cached[:limit])
+        if cached and isinstance(cached[0], dict):
+            return list(cached[:limit])
+        return [
+            {
+                "text": _semantic_suggestion_text(value),
+                "source_score": 1.0,
+                "source_name": "suggestion_cache",
+                "suggestion_type": "query",
+                "direct_play": False,
+            }
+            for value in list(cached[:limit])
+            if _semantic_suggestion_text(value)
+        ]
 
     normalized_query = server.normalize_text(query)
     candidates = {}
+    direct_play_items = _recent_track_suggestion_items(
+        req,
+        query,
+        server=server,
+        limit=min(3, limit),
+    )
+    if direct_play_items and float(direct_play_items[0].get("score") or 0.0) >= 8.55:
+        fast_results = direct_play_items[:limit]
+        store_search_result("suggestions", cache_key, fast_results)
+        return list(fast_results)
 
     def add_candidate(
         raw_text: Optional[str],
@@ -897,7 +1011,7 @@ def semantic_search_suggestions(req, *, server: Any | None = None):
             "query",
         )
 
-    if not candidates:
+    if not candidates and not direct_play_items:
         return []
 
     ranked = []
@@ -934,19 +1048,31 @@ def semantic_search_suggestions(req, *, server: Any | None = None):
     )
 
     results = []
+    seen_texts = set()
     type_counts = {}
     type_caps = {
         "query": 3,
         "artist": 2,
         "track": 2,
+        "track_play": 2,
         "album": 2,
     }
+    for item in direct_play_items:
+        normalized = server.normalize_text(item.get("text"))
+        if normalized:
+            seen_texts.add(normalized)
+        results.append(item)
     for item in ranked:
         suggestion_type = item.get("suggestion_type") or "query"
         if type_counts.get(suggestion_type, 0) >= type_caps.get(suggestion_type, limit):
             if len(results) + 1 < limit:
                 continue
-        results.append(item["text"])
+        normalized = server.normalize_text(item.get("text"))
+        if normalized and normalized in seen_texts:
+            continue
+        if normalized:
+            seen_texts.add(normalized)
+        results.append(item)
         type_counts[suggestion_type] = type_counts.get(suggestion_type, 0) + 1
         if len(results) >= limit:
             break
@@ -960,3 +1086,11 @@ def semantic_search_suggestions(req, *, server: Any | None = None):
             f"elapsed_ms={int((time.perf_counter() - search_started_at) * 1000)}"
         )
     return list(results)
+
+
+def semantic_search_suggestions(req, *, server: Any | None = None):
+    return [
+        item.get("text") if isinstance(item, dict) else str(item)
+        for item in semantic_search_suggestion_items(req, server=server)
+        if (item.get("text") if isinstance(item, dict) else str(item))
+    ]

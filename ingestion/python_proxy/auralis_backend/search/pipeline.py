@@ -8,11 +8,7 @@ from ..domain.result_quality import (
     artist_result_penalty,
     track_result_penalty,
 )
-from ..domain.catalog import (
-    catalog_source_authority,
-    normalize_track_title,
-    normalized_popularity,
-)
+from ..domain.catalog import normalize_track_title, normalized_popularity
 from ..recommend.feature_layer import (
     album_catalog_alignment,
     artist_catalog_alignment,
@@ -20,6 +16,7 @@ from ..recommend.feature_layer import (
     candidate_catalog_alignment,
 )
 from .server_adapter import adapt_search_server
+from .canonical import source_quality_score
 from .runtime import (
     semantic_search_lexical_score,
     semantic_search_vector_similarities,
@@ -198,19 +195,6 @@ def _finalize_ranked_tracks(
     return results
 
 
-def _track_source_authority_bonus(track: Dict[str, Any]) -> float:
-    authority = catalog_source_authority(track)
-    if authority == "official":
-        return 1.15
-    if authority == "canonical":
-        return 0.9
-    if authority == "verified_catalog":
-        return 0.45
-    if authority == "search_only":
-        return -2.8
-    return -0.25
-
-
 def rank_track_candidates_fast_path(
     server: Any,
     req,
@@ -268,7 +252,7 @@ def rank_track_candidates_fast_path(
             if server.normalize_text(artist or "") in normalized_anchor_artists
             else 0.0
         )
-        authority_bonus = _track_source_authority_bonus(track)
+        authority_bonus = source_quality_score(server, track)
         popularity_bonus = normalized_popularity(track)
         ambiguity_penalty = 0.0
         if exact_title_match and len(exact_title_artist_counts) >= 3:

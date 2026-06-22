@@ -3,14 +3,13 @@ from __future__ import annotations
 import os
 import re
 import time
-from collections import Counter
 from concurrent.futures import wait
 from typing import Any
 from typing import Dict, List
 
 from ..domain.catalog import (
     cache_search_payload,
-    catalog_source_authority,
+    normalize_artist_name,
     normalize_track_title,
 )
 from ..domain.features import build_search_profile
@@ -38,10 +37,35 @@ from .runtime import (
     search_canonical_album_for_track,
     search_query_intent,
     search_tracks_direct,
-    semantic_search_suggestions,
+    semantic_search_suggestion_items,
 )
 from .server_adapter import SearchServerAdapter
-from .upstream_runtime import ytdlp_song_search
+from .canonical import (
+    has_trusted_exact_source,
+    resolve_canonical_tracks,
+    source_artist_key,
+    source_exact_title_diversity,
+    source_is_self_labeled_official,
+    source_official_artist_score,
+    source_popularity_score,
+    source_quality_score,
+)
+from .catalog_pipeline import (
+    catalog_playable_tracks_for_query,
+    enqueue_external_catalog_seeds,
+    run_external_catalog_import,
+    schedule_catalog_population,
+)
+from .intelligence import (
+    annotate_source_identities,
+    load_catalog_entity_memories,
+    load_query_aliases,
+    load_query_memory,
+    remember_candidate_observations,
+    remember_catalog_entity,
+    remember_search_resolution,
+    remember_source_identities,
+)
 
 SEARCH_DISABLE_RANKING_PIPELINE = (
     os.environ.get("AURALIS_SEARCH_DISABLE_RANKING_PIPELINE", "0").strip().lower()
@@ -57,15 +81,16 @@ DIRECT_SIDE_SURFACE_BUDGET_SECONDS = max(
     0.25,
     float(os.environ.get("AURALIS_SEARCH_SIDE_SURFACE_BUDGET_SECONDS", "2.8")),
 )
-DIRECT_TRACK_RESCUE_BUDGET_SECONDS = max(
-    0.35,
-    float(os.environ.get("AURALIS_SEARCH_DIRECT_RESCUE_BUDGET_SECONDS", "3.2")),
+SEARCH_MUSICBRAINZ_ENRICHMENT_ENABLED = (
+    os.environ.get("AURALIS_SEARCH_MUSICBRAINZ_ENRICHMENT", "1").strip().lower()
+    in {"1", "true", "yes", "on"}
 )
 
 
 class SearchService:
     def __init__(self, server: Any) -> None:
         self._server = server
+        self._musicbrainz_attempted_queries: dict[str, float] = {}
 
     def _search_server(self) -> SearchServerAdapter:
         return SearchServerAdapter(self._server)
@@ -91,6 +116,68 @@ class SearchService:
         except Exception:
             return req
         return req
+
+    def _maybe_enrich_query_with_musicbrainz(
+        self,
+        query: str,
+        *,
+        user_scope_id: str,
+    ) -> Dict[str, Any]:
+        if not SEARCH_MUSICBRAINZ_ENRICHMENT_ENABLED:
+            return {"attempted": False, "disabled": True}
+        query_key = normalize_track_title(query)
+        if not query_key:
+            return {"attempted": False, "reason": "empty_query"}
+        has_track_memory = bool(load_catalog_entity_memories(
+            self._server,
+            query=query,
+            entity_type="track",
+            limit=1,
+        ))
+        has_artist_memory = bool(load_catalog_entity_memories(
+            self._server,
+            query=query,
+            entity_type="artist",
+            limit=1,
+        ))
+        has_album_memory = bool(load_catalog_entity_memories(
+            self._server,
+            query=query,
+            entity_type="album",
+            limit=1,
+        ))
+        if has_track_memory and has_artist_memory and has_album_memory:
+            return {"attempted": False, "reason": "catalog_memory_hit"}
+        now = time.time()
+        last_attempt = self._musicbrainz_attempted_queries.get(query_key, 0.0)
+        if now - last_attempt < 3600:
+            return {"attempted": False, "reason": "recently_attempted"}
+        self._musicbrainz_attempted_queries[query_key] = now
+        executor = self._search_executor()
+        enqueue_external_catalog_seeds(
+            self._server,
+            [{"query": query, "seed_type": "live_search_query", "priority": 1.0}],
+            user_scope_id=user_scope_id,
+            provider="musicbrainz",
+            source="live_search_query",
+        )
+        if executor is not None:
+            try:
+                executor.submit(
+                    run_external_catalog_import,
+                    self._server,
+                    user_scope_id=user_scope_id,
+                    provider="musicbrainz",
+                    batch_size=2,
+                )
+            except Exception:
+                pass
+        return {
+            "attempted": False,
+            "queued": True,
+            "background_continues": executor is not None,
+            "foreground": False,
+        }
 
     def _should_try_direct_track_path(self, query: str, *, intent_hint: str) -> bool:
         server = self._search_server()
@@ -153,332 +240,149 @@ class SearchService:
         self,
         query: str,
         tracks: List[Dict[str, Any]],
+        *,
+        user_scope_id: str = "guest",
     ) -> List[Dict[str, Any]]:
-        search = self._search_server()
-        normalized_query = normalize_track_title(query)
-        canonical_artist_hint = self._canonical_direct_artist_hint(query, tracks)
-        exact_title_artists = Counter(
-            self._direct_track_artist_key(query, track)
-            for track in tracks
-            if normalize_track_title(track.get("title") or "") == normalized_query
+        catalog_tracks = catalog_playable_tracks_for_query(
+            self._server,
+            user_scope_id=user_scope_id,
+            query=query,
+            limit=4,
         )
-        exact_title_artists.pop("", None)
-
-        def score(indexed_track):
-            index, track = indexed_track
-            title = normalize_track_title(track.get("title") or "")
-            artist = self._direct_track_artist_key(query, track)
-            album = search.normalize_text(track.get("album") or "")
-            exact_title = title == normalized_query
-            authority_score = self._direct_track_authority_score(track)
-            popularity_score = self._direct_track_popularity_score(track)
-            official_artist_score = self._direct_track_official_artist_score(track)
-            match_score = self._direct_track_match_score(query, track)
-            self_labeled_official_penalty = (
-                -1.2 if self._direct_track_self_labeled_official(track) else 0.0
-            )
-            partial_title_penalty = 0.0
-            if normalized_query and title != normalized_query and normalized_query in title:
-                query_tokens = search.query_tokens(query)
-                if len(query_tokens) <= 1:
-                    partial_title_penalty = -0.45
-            canonical_artist_score = self._direct_track_artist_hint_score(
-                query,
-                track,
-                canonical_artist_hint,
-            )
-            return (
-                match_score,
-                canonical_artist_score,
-                authority_score,
-                official_artist_score,
-                self_labeled_official_penalty,
-                partial_title_penalty,
-                popularity_score,
-                1 if exact_title and album == normalized_query else 0,
-                min(exact_title_artists.get(artist, 0), 3) if exact_title else 0,
-                1 if exact_title else 0,
-                -index,
-            )
-
-        return [
-            dict(track)
-            for _index, track in sorted(
-                enumerate(tracks),
-                key=score,
-                reverse=True,
-            )
-        ]
-
-    def _direct_track_authority_score(self, track: Dict[str, Any]) -> float:
-        authority = catalog_source_authority(track)
-        if authority == "search_only":
-            return -4.0
-        if authority == "official":
-            if self._direct_track_self_labeled_official(track):
-                return -0.15
-            return 1.4
-        if authority == "canonical":
-            return 1.15
-        if authority == "verified_catalog":
-            return 0.65
-        return -0.35
-
-    def _direct_track_has_authoritative_source_marker(self, track: Dict[str, Any]) -> bool:
-        search = self._search_server()
-        text = search.normalize_text(
-            " ".join(
-                str(track.get(key) or "")
-                for key in (
-                    "artist",
-                    "channel",
-                    "author",
-                    "uploader",
-                    "uploader_id",
-                    "description",
-                    "source",
-                    "source_type",
-                )
-            )
-        )
-        if any(
-            str(track.get(key) or "").strip()
-            for key in (
-                "album_id",
-                "albumId",
-                "browseId",
-                "artist_id",
-                "artistId",
-                "channel_id",
-                "channelId",
-            )
-        ):
-            return True
-        return any(
-            marker in text
-            for marker in (
-                "vevo",
-                " topic",
-                "- topic",
-                "provided to youtube",
-                "auto generated by youtube",
-                "auto-generated by youtube",
-            )
-        )
-
-    def _direct_track_self_labeled_official(self, track: Dict[str, Any]) -> bool:
-        search = self._search_server()
-        text = search.normalize_text(
-            " ".join(
-                str(track.get(key) or "")
-                for key in (
-                    "artist",
-                    "channel",
-                    "author",
-                    "uploader",
-                    "uploader_id",
-                    "description",
-                )
-            )
-        )
-        return "official" in text and not self._direct_track_has_authoritative_source_marker(track)
-
-    def _direct_track_popularity_score(self, track: Dict[str, Any]) -> float:
-        for key in ("popularity", "view_count", "viewCount", "views", "play_count", "playCount"):
-            value = track.get(key)
-            try:
-                number = float(value or 0.0)
-            except (TypeError, ValueError):
-                number = 0.0
-            if number <= 0:
-                continue
-            if number <= 1.0:
-                return number
-            return min(1.0, max(0.0, (len(str(int(number))) - 3) / 7.0))
-        text = search_text = self._search_server().normalize_text(
-            " ".join(
-                str(track.get(key) or "")
-                for key in ("title", "artist", "channel", "author", "album", "description")
-            )
-        )
-        if "official" in text or "vevo" in search_text or "topic" in search_text:
-            return 0.72
-        return 0.0
-
-    def _direct_track_official_artist_score(self, track: Dict[str, Any]) -> float:
-        search = self._search_server()
-        text = search.normalize_text(
-            " ".join(
-                str(track.get(key) or "")
-                for key in ("artist", "channel", "author", "uploader", "uploader_id")
-            )
-        )
-        if not text:
-            return 0.0
-        score = 0.0
-        if "vevo" in text:
-            score += 1.35
-        if "official" in text:
-            score += 0.15 if self._direct_track_self_labeled_official(track) else 0.95
-        if "topic" in text:
-            score += 0.9
-        if any(token in text for token in ("cover", "karaoke", "tribute", "piano", "instrumental")):
-            score -= 1.25
-        if self._direct_track_self_labeled_official(track):
-            score -= 0.35
-        return score
-
-    def _direct_track_artist_key(self, query: str, track: Dict[str, Any] | None) -> str:
-        if not isinstance(track, dict):
-            return ""
-        search = self._search_server()
-        normalized_query = normalize_track_title(query)
-        raw_title = str(track.get("title") or track.get("name") or "")
-        title_parts = re.split(r"\s+[-–—]\s+", raw_title, maxsplit=1)
-        if len(title_parts) == 2 and normalized_query:
-            prefix = normalize_track_title(title_parts[0])
-            suffix = normalize_track_title(title_parts[1])
-            if prefix and (suffix == normalized_query or normalized_query in suffix):
-                return prefix
-        artist = search.normalize_text(
-            track.get("channel")
-            or track.get("artist")
-            or track.get("author")
-            or track.get("uploader")
-            or ""
-        )
-        if not artist:
-            return ""
-        artist = re.sub(r"\b(official|topic|vevo|records|recordings|music)\b", " ", artist)
-        artist = re.sub(r"\s+", " ", artist).strip()
-        return artist
-
-    def _compact_key(self, value: str) -> str:
-        return re.sub(r"[^a-z0-9]+", "", self._search_server().normalize_text(value))
-
-    def _direct_track_artist_hint_score(
-        self,
-        query: str,
-        track: Dict[str, Any],
-        artist_hint: str,
-    ) -> float:
-        if not artist_hint:
-            return 0.0
-        artist_key = self._direct_track_artist_key(query, track)
-        if not artist_key:
-            return 0.0
-        if artist_key == artist_hint:
-            return 2.6
-        compact_artist = self._compact_key(artist_key)
-        compact_hint = self._compact_key(artist_hint)
-        if compact_artist and compact_hint and compact_artist == compact_hint:
-            return 2.35
-        if compact_artist and compact_hint and (
-            compact_artist in compact_hint or compact_hint in compact_artist
-        ):
-            return 1.35
-        return 0.0
-
-    def _canonical_direct_artist_hint(
-        self,
-        query: str,
-        tracks: List[Dict[str, Any]],
-    ) -> str:
-        votes: Dict[str, float] = {}
-        normalized_query = normalize_track_title(query)
-        if not normalized_query:
-            return ""
-        for index, track in enumerate(tracks or []):
+        merged_tracks: List[Dict[str, Any]] = []
+        seen_track_ids: set[str] = set()
+        for track in [*catalog_tracks, *(tracks or [])]:
             if not isinstance(track, dict):
                 continue
-            match_score = self._direct_track_match_score(query, track)
-            if match_score < 0.9:
-                continue
-            artist_key = self._direct_track_artist_key(query, track)
-            if not artist_key:
-                continue
-            vote = (
-                1.0
-                + (match_score * 1.1)
-                + max(self._direct_track_authority_score(track), 0.0)
-                + max(self._direct_track_official_artist_score(track), 0.0)
-                + (self._direct_track_popularity_score(track) * 0.9)
-                + max(0.0, 0.7 - (index * 0.05))
+            track_id = str(track.get("id") or track.get("videoId") or "").strip()
+            identity = track_id or self._search_server().normalize_text(
+                f"{track.get('title') or ''}|{track.get('artist') or track.get('channel') or ''}"
             )
-            title = normalize_track_title(track.get("title") or "")
-            if title == normalized_query:
-                vote += 0.35
-            if self._direct_track_authority_score(track) < -1.0:
-                vote -= 1.2
-            votes[artist_key] = votes.get(artist_key, 0.0) + max(vote, 0.0)
-        if not votes:
-            return ""
-        ranked = sorted(votes.items(), key=lambda item: item[1], reverse=True)
-        if len(ranked) == 1:
-            return ranked[0][0] if ranked[0][1] >= 2.2 else ""
-        best_artist, best_score = ranked[0]
-        second_score = ranked[1][1]
-        if best_score >= 3.2 and best_score >= second_score * 1.15:
-            return best_artist
-        return ""
-
-    def _has_trusted_exact_direct_track(
-        self,
-        query: str,
-        tracks: List[Dict[str, Any]],
-    ) -> bool:
-        normalized_query = normalize_track_title(query)
-        if not normalized_query:
-            return False
-        for track in tracks or []:
-            if normalize_track_title(track.get("title") or "") != normalized_query:
+            if not identity or identity in seen_track_ids:
                 continue
-            if self._direct_track_authority_score(track) >= 1.0:
-                return True
-            if self._direct_track_popularity_score(track) >= 0.72:
-                return True
-        return False
+            seen_track_ids.add(identity)
+            merged_tracks.append(dict(track))
+        query_memory = load_query_memory(
+            self._server,
+            user_scope_id=user_scope_id,
+            query=query,
+        )
+        query_memory.extend(load_query_aliases(self._server, query=query))
+        query_memory.extend(
+            load_catalog_entity_memories(
+                self._server,
+                query=query,
+                entity_type="track",
+            )
+        )
+        remember_source_identities(
+            self._server,
+            merged_tracks,
+            confidence_floor=0.55,
+            limit=32,
+        )
+        annotated_tracks = annotate_source_identities(self._server, merged_tracks)
+        canonical = resolve_canonical_tracks(
+            self._search_server(),
+            query,
+            annotated_tracks,
+            limit=max(len(merged_tracks), 1),
+            memories=query_memory,
+        )
+        self._remember_playable_catalog_matches(
+            query,
+            canonical.tracks,
+            memories=query_memory,
+            user_scope_id=user_scope_id,
+        )
+        return canonical.tracks
 
-    def _direct_track_exact_title_diversity(
+    def _remember_playable_catalog_matches(
         self,
         query: str,
         tracks: List[Dict[str, Any]],
+        *,
+        memories: List[Dict[str, Any]],
+        user_scope_id: str,
     ) -> int:
-        search = self._search_server()
-        normalized_query = normalize_track_title(query)
-        artists = {
-            search.normalize_text(track.get("channel") or track.get("artist") or "")
-            for track in tracks or []
-            if normalize_track_title(track.get("title") or "") == normalized_query
-        }
-        artists.discard("")
-        return len(artists)
-
-    def _needs_direct_track_rescue(
-        self,
-        query: str,
-        tracks: List[Dict[str, Any]],
-    ) -> bool:
-        if not tracks:
-            return False
-        top_track = tracks[0]
-        if self._direct_track_match_score(query, top_track) < 0.92:
-            return False
-        if self._direct_track_exact_title_diversity(query, tracks[:12]) >= 2:
-            return True
-        normalized_query = normalize_track_title(query)
-        normalized_title = normalize_track_title(top_track.get("title") or "")
-        query_tokens = self._search_server().query_tokens(query)
-        if (
-            len(query_tokens) <= 1
-            and normalized_query
-            and normalized_title != normalized_query
-            and normalized_query in normalized_title
-        ):
-            return True
-        if self._direct_track_self_labeled_official(top_track):
-            return True
-        return False
+        verified_memories = [
+            memory
+            for memory in memories or []
+            if isinstance(memory, dict)
+            and str(memory.get("entity_type") or "track") == "track"
+            and memory.get("title_key")
+            and memory.get("artist_key")
+            and (
+                str((memory.get("payload") or {}).get("source_provider") or "").lower()
+                == "musicbrainz"
+                or str((memory.get("payload") or {}).get("source_authority") or "").lower()
+                in {"verified_catalog", "canonical"}
+            )
+        ]
+        if not verified_memories:
+            return 0
+        stored = 0
+        query_key = normalize_track_title(query)
+        for track in (tracks or [])[:6]:
+            if not isinstance(track, dict):
+                continue
+            provider = str(track.get("source_provider") or track.get("provider") or "").lower()
+            track_id = str(track.get("id") or track.get("videoId") or "").strip()
+            if provider == "musicbrainz" or track_id.startswith("musicbrainz:"):
+                continue
+            title_key = normalize_track_title(track.get("title") or track.get("name") or "")
+            artist_key = normalize_artist_name(
+                source_artist_key(self._search_server(), query, track)
+                or track.get("artist")
+                or track.get("artist_name")
+                or track.get("channel")
+                or track.get("author")
+                or ""
+            )
+            if not title_key or not artist_key:
+                continue
+            source_quality = source_quality_score(self._search_server(), track)
+            if source_quality < 0.7:
+                continue
+            for memory in verified_memories:
+                expected_title = str(memory.get("title_key") or "")
+                expected_artist = str(memory.get("artist_key") or "")
+                title_match = (
+                    title_key == expected_title
+                    or expected_title in title_key
+                    or (query_key and query_key == expected_title and query_key in title_key)
+                )
+                artist_match = (
+                    artist_key == expected_artist
+                    or expected_artist in artist_key
+                    or artist_key in expected_artist
+                )
+                if not title_match or not artist_match:
+                    continue
+                item = dict(track)
+                item["playable"] = True
+                item["source_provider"] = provider or "ytmusic"
+                item["matched_catalog_entity_key"] = memory.get("entity_key") or ""
+                item["matched_catalog_source"] = "musicbrainz"
+                confidence = max(
+                    0.76,
+                    min(0.96, float(memory.get("confidence") or 0.0) + 0.08),
+                    min(0.94, 0.62 + source_quality * 0.22),
+                )
+                if remember_catalog_entity(
+                    self._server,
+                    user_scope_id=user_scope_id or "guest",
+                    query=query,
+                    entity_type="track",
+                    item=item,
+                    confidence=confidence,
+                    event_weight=max(0.5, source_quality),
+                    event_type="playable_source_match",
+                    source="playable_source_match",
+                ):
+                    stored += 1
+                break
+        return stored
 
     def _direct_fast_path_confident(
         self,
@@ -489,12 +393,13 @@ class SearchService:
     ) -> bool:
         if not tracks or direct_match_score < 0.72:
             return False
-        if self._direct_track_exact_title_diversity(query, tracks[:12]) >= 2:
+        search_server = self._search_server()
+        if source_exact_title_diversity(search_server, query, tracks[:12]) >= 2:
             top_track = tracks[0]
             return (
-                self._direct_track_authority_score(top_track) >= 1.0
-                or self._direct_track_official_artist_score(top_track) >= 0.9
-                or self._direct_track_popularity_score(top_track) >= 0.78
+                source_quality_score(search_server, top_track) >= 1.0
+                or source_official_artist_score(search_server, top_track) >= 0.9
+                or source_popularity_score(search_server, top_track) >= 0.78
             )
         normalized_query = normalize_track_title(query)
         top_title = normalize_track_title(tracks[0].get("title") or "")
@@ -505,96 +410,70 @@ class SearchService:
             and normalized_query in top_title
         ):
             return (
-                self._direct_track_authority_score(tracks[0]) >= 1.0
-                or self._direct_track_popularity_score(tracks[0]) >= 0.78
+                source_quality_score(search_server, tracks[0]) >= 1.0
+                or source_popularity_score(search_server, tracks[0]) >= 0.78
             )
         if direct_match_score >= 0.96:
-            return not self._direct_track_self_labeled_official(tracks[0])
+            return not source_is_self_labeled_official(search_server, tracks[0])
         if direct_match_score >= 0.92:
-            return self._has_trusted_exact_direct_track(query, tracks[:8])
-        return self._direct_track_authority_score(tracks[0]) >= 0.65
+            return has_trusted_exact_source(search_server, query, tracks[:8])
+        if direct_match_score >= 0.82 and len(self._search_server().query_tokens(query)) <= 3:
+            return True
+        return source_quality_score(search_server, tracks[0]) >= 0.65
 
-    def _rescue_direct_tracks(
+    def _direct_fast_path_rejection_reason(
         self,
         query: str,
         tracks: List[Dict[str, Any]],
         *,
-        limit: int,
-    ) -> List[Dict[str, Any]]:
-        variants = [
-            f"{query} official",
-            f"{query} original",
-            f"{query} music video",
-            f"{query} official audio",
-            f"{query} official music video",
-            f"{query} vevo",
-            f"{query} artist",
-        ]
-        normalized_query = self._search_server().normalize_text(query)
-        if normalized_query.endswith("in") and not normalized_query.endswith("ing"):
-            variants.extend(
-                [
-                    f"{query}g",
-                    f"{query}g official",
-                    f"{query}g song",
-                ]
-            )
-        executor = self._search_executor()
-        if executor is None:
-            return tracks
-        futures = {}
-        for variant in variants:
-            futures[
-                executor.submit(
-                    search_tracks_direct,
-                    variant,
-                    max(limit, 12),
-                    server=self._server,
-                )
-            ] = f"ytmusic:{variant}"
-            futures[
-                executor.submit(
-                    ytdlp_song_search,
-                    self._server,
-                    variant,
-                    max(limit, 12),
-                )
-            ] = f"youtube:{variant}"
-        done, pending = wait(set(futures), timeout=DIRECT_TRACK_RESCUE_BUDGET_SECONDS)
-        for future in pending:
-            future.cancel()
-        rescued = list(tracks or [])
-        for future in done:
-            try:
-                rescued.extend(list(future.result() or []))
-            except Exception:
-                continue
-        deduped: List[Dict[str, Any]] = []
-        seen: set[str] = set()
-        for track in rescued:
-            if not isinstance(track, dict):
-                continue
-            track_id = str(track.get("id") or track.get("videoId") or "").strip()
-            identity = track_id or self._search_server().normalize_text(
-                f"{track.get('title') or ''}|{track.get('artist') or track.get('channel') or ''}"
-            )
-            if not identity or identity in seen:
-                continue
-            seen.add(identity)
-            deduped.append(dict(track))
-        canonicalized = self._canonicalize_direct_tracks(query, deduped)
-        if self._direct_track_exact_title_diversity(query, canonicalized) >= 2:
-            canonicalized = sorted(
-                canonicalized,
-                key=lambda track: (
-                    self._direct_track_authority_score(track),
-                    self._direct_track_official_artist_score(track),
-                    self._direct_track_popularity_score(track),
-                    self._direct_track_match_score(query, track),
-                ),
-                reverse=True,
-            )
-        return canonicalized[: max(limit, 16)]
+        direct_match_score: float,
+    ) -> str:
+        if not tracks:
+            return "no_direct_tracks"
+        if direct_match_score < 0.72:
+            return "low_title_match"
+        search_server = self._search_server()
+        if source_exact_title_diversity(search_server, query, tracks[:12]) >= 2:
+            top_track = tracks[0]
+            if (
+                source_quality_score(search_server, top_track) < 1.0
+                and source_official_artist_score(search_server, top_track) < 0.9
+                and source_popularity_score(search_server, top_track) < 0.78
+                and direct_match_score < 0.98
+            ):
+                return "ambiguous_exact_title_without_authority"
+        normalized_query = normalize_track_title(query)
+        top_title = normalize_track_title(tracks[0].get("title") or "")
+        if (
+            len(self._search_server().query_tokens(query)) <= 1
+            and normalized_query
+            and top_title != normalized_query
+            and normalized_query in top_title
+            and source_quality_score(search_server, tracks[0]) < 1.0
+            and source_popularity_score(search_server, tracks[0]) < 0.78
+        ):
+            return "short_partial_title_without_authority"
+        if source_is_self_labeled_official(search_server, tracks[0]):
+            return "self_labeled_official_without_source_identity"
+        return "not_enough_direct_confidence"
+
+    def _should_return_ambiguous_direct_response(
+        self,
+        query: str,
+        tracks: List[Dict[str, Any]],
+        *,
+        direct_match_score: float,
+        rescued: bool,
+        search_mode: str,
+    ) -> bool:
+        if not tracks or direct_match_score < 0.72:
+            return False
+        query_tokens = self._search_server().query_tokens(query)
+        if search_mode == "exact" and len(query_tokens) <= 3:
+            return True
+        if rescued and len(query_tokens) <= 3 and direct_match_score >= 0.82:
+            return True
+        return False
 
     def _track_similar_tracks(
         self,
@@ -918,6 +797,9 @@ class SearchService:
         tracks: List[Dict[str, Any]],
         direct_lookup_ms: int,
         direct_match_score: float,
+        direct_resolution_status: str = "confident",
+        direct_rejection_reason: str = "",
+        memory_confidence: float | None = None,
     ) -> Dict[str, Any]:
         server = self._server
         search = self._search_server()
@@ -969,7 +851,7 @@ class SearchService:
             "artist_tracks": artist_tracks[: max(1, min(8, limit))],
             "related_albums": related_albums[: max(1, min(8, limit))],
             "diagnostics": {
-                "ranking_backend": "search_service_direct_v1",
+                "ranking_backend": "canonical_search_direct_v1",
                 "query_mode": self._resolve_search_mode(
                     query,
                     intent_hint="track",
@@ -979,6 +861,17 @@ class SearchService:
                 "direct_track_fast_path": True,
                 "direct_lookup_ms": direct_lookup_ms,
                 "direct_match_score": round(direct_match_score, 4),
+                "direct_resolution_status": direct_resolution_status,
+                "direct_rejection_reason": direct_rejection_reason,
+                "canonical_backend": "canonical_entity_resolver_v1",
+                "canonical_query_key": top_track.get("canonical_track_title_key") or normalize_track_title(query),
+                "canonical_resolved_title": top_track.get("canonical_track_title_key") or "",
+                "canonical_resolved_artist": top_track.get("canonical_artist_key") or "",
+                "canonical_entity_confidence": top_track.get("canonical_entity_confidence") or 0.0,
+                "canonical_top_source_quality": top_track.get("source_quality_score") or 0.0,
+                "query_memory_boost": (
+                    (top_track.get("ranking_features") or {}).get("query_memory_boost") or 0.0
+                ),
                 "enrichment_applied": bool(enrichment.get("applied")),
                 "enrichment_elapsed_ms": int(enrichment.get("elapsed_ms") or 0),
                 "enrichment_completed_surfaces": list(
@@ -996,6 +889,34 @@ class SearchService:
         response["diagnostics"].update(
             search.success_diagnostics(trace)
         )
+        safe_memory_confidence = (
+            float(memory_confidence)
+            if memory_confidence is not None
+            else float(top_track.get("canonical_entity_confidence") or direct_match_score)
+        )
+        memory_written = False
+        if safe_memory_confidence >= 0.68 and direct_resolution_status == "confident":
+            memory_written = remember_search_resolution(
+                self._server,
+                user_scope_id=req.user_scope_id or "guest",
+                query=query,
+                entity_type="track",
+                item=top_track,
+                confidence=safe_memory_confidence,
+                event_weight=1.0,
+                source="direct_track_response",
+            )
+        observed_candidates = remember_candidate_observations(
+            self._server,
+            user_scope_id=req.user_scope_id or "guest",
+            query=query,
+            entity_type="track",
+            items=tracks[: max(8, min(16, limit))],
+            confidence_floor=0.72,
+            limit=8,
+        )
+        response["diagnostics"]["query_memory_written"] = memory_written
+        response["diagnostics"]["trusted_candidate_observations"] = observed_candidates
         search.trace_log_request(
             trace,
             request_type="search",
@@ -1172,6 +1093,17 @@ class SearchService:
         response["diagnostics"].update(
             search.success_diagnostics(trace)
         )
+        if top_result and isinstance(top_result.get("item"), dict):
+            response["diagnostics"]["query_memory_written"] = remember_search_resolution(
+                self._server,
+                user_scope_id=req.user_scope_id or "guest",
+                query=req.query or "",
+                entity_type=str(top_result.get("entity_type") or "track"),
+                item=dict(top_result.get("item") or {}),
+                confidence=max(0.35, float(enrichment_quality_score or 0.0)),
+                event_weight=0.75,
+                source="direct_search_response",
+            )
         search.trace_log_request(
             trace,
             request_type="search",
@@ -1195,6 +1127,11 @@ class SearchService:
         defer_side_surfaces = bool(getattr(req, "defer_side_surfaces", False))
         direct_started_at = time.perf_counter()
         tracks = list(search_tracks_direct(query, limit, server=server) or [])
+        tracks = self._canonicalize_direct_tracks(
+            query,
+            tracks,
+            user_scope_id=req.user_scope_id or "guest",
+        )
         artists, albums = self._cheap_track_side_surfaces(tracks[0]) if tracks else ([], [])
         similar_artists: List[Dict[str, Any]] = []
         similar_tracks: List[Dict[str, Any]] = []
@@ -1451,6 +1388,15 @@ class SearchService:
                     )
                     return response
 
+                schedule_catalog_population(
+                    self._server,
+                    user_scope_id=req.user_scope_id or "guest",
+                    req=req,
+                    reason="search_request",
+                    run_musicbrainz=False,
+                    min_interval_seconds=90.0,
+                )
+
                 parse_started_at = time.perf_counter()
                 url_match = re.search(
                     r"(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/shorts\/)([a-zA-Z0-9_-]{11})",
@@ -1522,6 +1468,17 @@ class SearchService:
                         f"intent={intent_hint} mode={search_mode}",
                         flush=True,
                     )
+                    musicbrainz_enrichment = self._maybe_enrich_query_with_musicbrainz(
+                        query,
+                        user_scope_id=req.user_scope_id or "guest",
+                    )
+                    if musicbrainz_enrichment.get("attempted") or musicbrainz_enrichment.get("imported"):
+                        search.trace_put(
+                            trace,
+                            "search",
+                            "musicbrainz_enrichment",
+                            musicbrainz_enrichment,
+                        )
                     direct_tracks = search_tracks_direct(
                         query,
                         max(limit, 8),
@@ -1530,15 +1487,9 @@ class SearchService:
                     direct_tracks = self._canonicalize_direct_tracks(
                         query,
                         direct_tracks,
+                        user_scope_id=req.user_scope_id or "guest",
                     )
                     rescued_direct = False
-                    if self._needs_direct_track_rescue(query, direct_tracks):
-                        direct_tracks = self._rescue_direct_tracks(
-                            query,
-                            direct_tracks,
-                            limit=limit,
-                        )
-                        rescued_direct = True
                     direct_lookup_ms = int((time.perf_counter() - direct_started_at) * 1000)
                     direct_match_score = self._direct_track_match_score(
                         query,
@@ -1566,7 +1517,61 @@ class SearchService:
                             tracks=direct_tracks,
                             direct_lookup_ms=direct_lookup_ms,
                             direct_match_score=direct_match_score,
+                            direct_resolution_status="confident",
+                            memory_confidence=float(
+                                (direct_tracks[0].get("canonical_entity_confidence") or direct_match_score)
+                            ),
                         )
+                    direct_rejection_reason = self._direct_fast_path_rejection_reason(
+                        query,
+                        direct_tracks,
+                        direct_match_score=direct_match_score,
+                    )
+                    if self._should_return_ambiguous_direct_response(
+                        query,
+                        direct_tracks,
+                        direct_match_score=direct_match_score,
+                        rescued=rescued_direct,
+                        search_mode=search_mode,
+                    ):
+                        print(
+                            "[EBB:search][progress] "
+                            f"request_id={trace.get('request_id') or ''} "
+                            f"stage=direct_track_fast_path ambiguous tracks={len(direct_tracks)} "
+                            f"lookup_ms={direct_lookup_ms} score={round(direct_match_score, 4)} "
+                            f"rescued={int(rescued_direct)} reason={direct_rejection_reason}",
+                            flush=True,
+                        )
+                        return self._build_direct_track_response(
+                            req=req,
+                            trace=trace,
+                            query=query,
+                            limit=limit,
+                            track_model_version=track_model_version,
+                            tracks=direct_tracks,
+                            direct_lookup_ms=direct_lookup_ms,
+                            direct_match_score=direct_match_score,
+                            direct_resolution_status="ambiguous",
+                            direct_rejection_reason=direct_rejection_reason,
+                            memory_confidence=min(0.55, direct_match_score),
+                        )
+                    if direct_tracks:
+                        observed = remember_candidate_observations(
+                            self._server,
+                            user_scope_id=req.user_scope_id or "guest",
+                            query=query,
+                            entity_type="track",
+                            items=direct_tracks[: max(8, min(16, limit))],
+                            confidence_floor=0.74,
+                            limit=8,
+                        )
+                        if observed:
+                            search.trace_put(
+                                trace,
+                                "search",
+                                "trusted_candidate_observations",
+                                observed,
+                            )
                 if SEARCH_DISABLE_RANKING_PIPELINE and search_mode == "exact":
                     response = self._search_without_ranking(
                         req=req,
@@ -1947,7 +1952,12 @@ class SearchService:
         server = self._server
         search = self._search_server()
         try:
-            results = semantic_search_suggestions(req, server=server)
+            suggestion_items = semantic_search_suggestion_items(req, server=server)
+            results = [
+                item.get("text") if isinstance(item, dict) else str(item)
+                for item in suggestion_items
+                if (item.get("text") if isinstance(item, dict) else str(item))
+            ]
             normalized_query = search.trim_text(req.query)
             suggestion_mode = self._resolve_search_mode(
                 normalized_query,
@@ -1964,6 +1974,7 @@ class SearchService:
             return {
                 "status": "success",
                 "results": results[: max(1, min(req.limit or 5, 8))],
+                "suggestions": suggestion_items[: max(1, min(req.limit or 5, 8))],
                 "diagnostics": {
                     "ranking_backend": "search_service_v41",
                     "warmup_scheduled": len(normalized_query) >= 3,

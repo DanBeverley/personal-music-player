@@ -10,6 +10,7 @@ import uuid
 from fastapi import HTTPException
 
 from ..recommend.session_runtime import _store_feed_session, load_feed_session
+from ..search.catalog_pipeline import schedule_catalog_population
 from .adapters import artifact_to_session, home_response_from_artifact, row_page_response_from_artifact
 from .artifact import (
     ARTIFACT_TTL_SECONDS,
@@ -179,6 +180,15 @@ class DiscoveryService:
 
         force_refresh = bool(getattr(req, "force_refresh", False) or getattr(req, "prefer_fresh_rows", False))
         taste = build_taste_profile(self._server, req)
+        schedule_catalog_population(
+            self._server,
+            user_scope_id=taste.user_scope_id,
+            req=req,
+            taste=taste,
+            reason=f"discovery_{request_mode}",
+            run_musicbrainz=request_mode == "background_prepare",
+            min_interval_seconds=45.0 if request_mode == "background_prepare" else 120.0,
+        )
         previous = load_cached_artifact(self._server, taste.user_scope_id)
         if request_mode == "full_feed" and not force_refresh:
             if previous is not None:

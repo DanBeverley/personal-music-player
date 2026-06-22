@@ -158,7 +158,17 @@ def _collect_candidates(
     for source in sources or ():
         for candidate in pools.get(source, []) or []:
             if candidate.item_type == item_type:
-                candidates.append(candidate)
+                item = dict(candidate.item)
+                item.setdefault("candidate_pool_source", source)
+                candidates.append(
+                    DiscoveryCandidate(
+                        item=item,
+                        source=candidate.source,
+                        score=candidate.score,
+                        reasons=list(candidate.reasons or []),
+                        item_type=candidate.item_type,
+                    )
+                )
     return list(_candidate_sources(candidates).values())
 
 
@@ -336,6 +346,94 @@ def _candidate_matches_taste(candidate: DiscoveryCandidate, taste: TasteProfile)
     }
     candidate_genres.discard("")
     return bool(candidate_genres & _taste_genre_keys(taste))
+
+
+def _item_genre_keys(item: Dict[str, Any]) -> Set[str]:
+    genres = {
+        normalize_text(item.get("genre")),
+        normalize_text(item.get("subgenre")),
+        *{
+            normalize_text(value)
+            for value in item.get("genres") or []
+            if normalize_text(value)
+        },
+    }
+    genres.discard("")
+    return genres
+
+
+def _album_taste_relation(
+    candidate: DiscoveryCandidate,
+    item: Dict[str, Any],
+    taste: TasteProfile,
+    *,
+    history_ids: Set[str],
+    preferred_track_ids: Set[str] | None = None,
+) -> Tuple[bool, str, float]:
+    """Return whether an album is connected enough for home album rows.
+
+    Album discovery can be broader than track rows, but it still needs a clear
+    bridge to the listener. Editorial/popularity-only albums without artist,
+    genre, or source-track evidence belong in explicit explore surfaces, not
+    Albums For You.
+    """
+
+    artist_key = normalize_text(artist_name(item))
+    taste_artists = _taste_artist_keys(taste)
+    related_artist_keys = _profile_string_set(
+        taste,
+        "artist_neighborhood_preferences",
+        "peer_scene_keys",
+        "peer_artist_keys",
+    )
+    source_track_id = str(item.get("source_track_id") or "").strip()
+    source_authority = normalize_text(item.get("source_authority"))
+    album_segment = normalize_text(item.get("album_segment"))
+    pool_source = normalize_text(item.get("candidate_pool_source"))
+    album_source = normalize_text(item.get("album_source"))
+    sources = set(str(candidate.source or "").split("+"))
+    candidate_genres = _item_genre_keys(item)
+    genre_match = bool(candidate_genres & _taste_genre_keys(taste))
+    preferred_track_ids = set(preferred_track_ids or set())
+
+    if artist_key and artist_key in taste_artists:
+        return True, "known_artist", 1.6
+    if source_track_id and source_track_id in history_ids:
+        return True, "history_track_album", 1.25
+    if source_track_id and source_track_id in preferred_track_ids:
+        return True, "lane_track_album", 1.15
+    if item.get("artist_neighborhood") is True:
+        return True, "artist_neighborhood", 1.15
+    if artist_key and artist_key in related_artist_keys:
+        return True, "related_artist", 1.05
+    item_artist_graph = {
+        normalize_text(value)
+        for value in item.get("artist_graph_keys") or []
+        if normalize_text(value)
+    }
+    if item_artist_graph & (taste_artists | related_artist_keys):
+        return True, "artist_graph", 1.0
+    if genre_match and _candidate_language_compatible(candidate, taste) and _candidate_region_compatible(candidate, taste):
+        return True, "genre_match", 0.65
+    if genre_match and source_authority in {"official", "canonical", "verified_catalog"}:
+        return True, "verified_genre_match", 0.85
+    if (
+        album_segment in {"known_artist_albums", "adjacent_artist_albums", "classic_neighbor_albums"}
+        or pool_source in {"known_artist_albums", "adjacent_artist_albums", "classic_neighbor_albums"}
+    ) and (
+        genre_match
+        or source_authority in {"official", "canonical", "verified_catalog"}
+        or pool_source == "adjacent_artist_albums"
+    ):
+        return True, album_segment or pool_source, 0.5
+    if (
+        pool_source == "fresh_or_recent_albums"
+        and (genre_match or source_authority in {"official", "canonical", "verified_catalog"})
+    ):
+        return True, "fresh_genre_match", 0.45
+    if album_source == "artist_catalog" and artist_key:
+        return False, "artist_catalog_not_in_taste_graph", -1.75
+    return False, "off_profile_album", -2.25
 
 
 def _candidate_is_admitted(
@@ -685,7 +783,6 @@ def rank_albums(
         album_keys.discard("")
         if album_keys & exclude_album_keys:
             continue
-        seen.add(signature)
         release = str(item.get("release_date") or item.get("year") or "").strip()
         has_release_metadata = has_release_metadata or bool(release)
         score = candidate.score + SOURCE_WEIGHTS.get(candidate.source, 0.0)
@@ -704,6 +801,18 @@ def rank_albums(
             score -= 2.25
         source_track_id = str(item.get("source_track_id") or "").strip()
         if row.kind in {"featured_new_albums", "recommended_albums"}:
+            admitted, relation_reason, relation_bonus = _album_taste_relation(
+                candidate,
+                item,
+                taste,
+                history_ids=history_ids,
+                preferred_track_ids=preferred_track_ids,
+            )
+            item["album_relation_reason"] = relation_reason
+            item["album_relation_score"] = round(relation_bonus, 4)
+            if not admitted and not taste.is_cold_start:
+                continue
+            score += relation_bonus
             if item.get("album_source") == "artist_catalog":
                 score += 1.5
             if artist and artist in taste_artists:
@@ -738,6 +847,7 @@ def rank_albums(
             if lane_delta <= 0 and not preferred_album:
                 continue
             score += lane_delta
+        seen.add(signature)
         scored.append((score, DiscoveryCandidate(item=item, source=candidate.source, score=score, item_type="album")))
     scored.sort(key=lambda item: item[0], reverse=True)
     output: List[Dict[str, Any]] = []

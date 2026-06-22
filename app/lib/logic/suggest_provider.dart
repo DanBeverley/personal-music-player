@@ -12,29 +12,81 @@ Map<String, dynamic> buildSuggestRequestBody(
   String query, {
   required int limit,
   List<String> recentQueries = const <String>[],
+  List<Map<String, dynamic>> recentTracks = const <Map<String, dynamic>>[],
 }) {
   final normalizedQuery = query.trim();
   final storageScopeId = ref.read(authProvider).storageScopeId;
+  final lastPlayedTracks = recentTracks
+      .take(8)
+      .map((track) => Map<String, dynamic>.from(track))
+      .toList(growable: false);
   return {
     'query': normalizedQuery,
     'limit': limit,
     'user_scope_id': storageScopeId,
     'recent_queries': recentQueries,
+    'recent_tracks': lastPlayedTracks,
+    'last_played_tracks': lastPlayedTracks,
     'context_surface': 'suggest',
     'force_refresh': false,
   };
 }
 
-class SuggestNotifier extends StateNotifier<List<String>> {
+class SearchSuggestion {
+  const SearchSuggestion({
+    required this.text,
+    this.type = 'query',
+    this.source = '',
+    this.directPlay = false,
+    this.track,
+  });
+
+  final String text;
+  final String type;
+  final String source;
+  final bool directPlay;
+  final Map<String, dynamic>? track;
+
+  bool get isDirectPlayTrack => directPlay && track != null;
+
+  factory SearchSuggestion.query(String text) => SearchSuggestion(text: text);
+
+  factory SearchSuggestion.fromJson(dynamic value) {
+    if (value is String) {
+      return SearchSuggestion.query(value.trim());
+    }
+    if (value is! Map) {
+      return const SearchSuggestion(text: '');
+    }
+    final map = Map<String, dynamic>.from(value);
+    final text = (map['text'] ?? map['query'] ?? '').toString().trim();
+    final rawTrack = map['track'];
+    final track = rawTrack is Map
+        ? Map<String, dynamic>.from(rawTrack)
+        : null;
+    return SearchSuggestion(
+      text: text,
+      type: (map['suggestion_type'] ?? map['type'] ?? 'query').toString(),
+      source: (map['source_name'] ?? map['source'] ?? '').toString(),
+      directPlay: map['direct_play'] == true || map['directPlay'] == true,
+      track: track,
+    );
+  }
+}
+
+class SuggestNotifier extends StateNotifier<List<SearchSuggestion>> {
   final Ref ref;
   int _requestVersion = 0;
   static const Duration _suggestDebounce = Duration(milliseconds: 80);
 
-  SuggestNotifier(this.ref) : super(const <String>[]);
+  SuggestNotifier(this.ref) : super(const <SearchSuggestion>[]);
 
-  List<String> _localSuggestions(String query, List<String> recentQueries) {
+  List<SearchSuggestion> _localSuggestions(
+    String query,
+    List<String> recentQueries,
+  ) {
     final normalized = query.trim();
-    if (normalized.isEmpty) return const <String>[];
+    if (normalized.isEmpty) return const <SearchSuggestion>[];
     final needle = normalized.toLowerCase();
     final suggestions = <String>[];
     for (final recent in recentQueries) {
@@ -50,12 +102,18 @@ class SuggestNotifier extends StateNotifier<List<String>> {
     if (!suggestions.any((entry) => entry.toLowerCase() == needle)) {
       suggestions.insert(0, normalized);
     }
-    return suggestions.take(5).toList(growable: false);
+    return suggestions
+        .take(5)
+        .map(SearchSuggestion.query)
+        .toList(growable: false);
   }
 
-  Future<void> fetchSuggestions(String query) async {
+  Future<void> fetchSuggestions(
+    String query, {
+    List<Map<String, dynamic>> recentTracks = const <Map<String, dynamic>>[],
+  }) async {
     if (query.isEmpty) {
-      state = const <String>[];
+      state = const <SearchSuggestion>[];
       return;
     }
     final requestVersion = ++_requestVersion;
@@ -72,6 +130,7 @@ class SuggestNotifier extends StateNotifier<List<String>> {
         query,
         limit: 5,
         recentQueries: recentQueries,
+        recentTracks: recentTracks,
       );
       final res = await proxyControlHttpClient
           .post(
@@ -82,7 +141,16 @@ class SuggestNotifier extends StateNotifier<List<String>> {
           .timeout(const Duration(seconds: 2));
       if (requestVersion != _requestVersion) return;
       if (res.statusCode == 200) {
-        final remote = List<String>.from(jsonDecode(res.body)['results']);
+        final decoded = jsonDecode(res.body);
+        final rawSuggestions = decoded is Map
+            ? (decoded['suggestions'] ?? decoded['results'])
+            : null;
+        final remote = rawSuggestions is List
+            ? rawSuggestions
+                .map(SearchSuggestion.fromJson)
+                .where((suggestion) => suggestion.text.isNotEmpty)
+                .toList(growable: false)
+            : const <SearchSuggestion>[];
         state = remote.isEmpty ? localSuggestions : remote;
       }
     } catch (_) {
@@ -92,11 +160,11 @@ class SuggestNotifier extends StateNotifier<List<String>> {
 
   void clear() {
     _requestVersion++;
-    state = const <String>[];
+    state = const <SearchSuggestion>[];
   }
 }
 
 final suggestProvider =
-    StateNotifierProvider<SuggestNotifier, List<String>>((ref) {
+    StateNotifierProvider<SuggestNotifier, List<SearchSuggestion>>((ref) {
   return SuggestNotifier(ref);
 });

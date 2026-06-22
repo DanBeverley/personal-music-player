@@ -117,7 +117,10 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         _suggestDebounce?.cancel();
         _suggestDebounce = Timer(const Duration(milliseconds: 280), () {
           if (mounted) {
-            ref.read(suggestProvider.notifier).fetchSuggestions(text);
+            ref.read(suggestProvider.notifier).fetchSuggestions(
+                  text,
+                  recentTracks: ref.read(lastPlayedProvider),
+                );
           }
         });
       } else if (text.isEmpty) {
@@ -993,6 +996,12 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   }
 
   Future<void> _playSearchDiscoveryTrack(Map<String, dynamic> track) async {
+    unawaited(_recordSearchSelection(
+      eventType: 'play_start',
+      entityType: 'track',
+      item: track,
+      confidence: 0.94,
+    ));
     await ref.read(playbackQueueProvider.notifier).startDiscoverySession(
           track,
           sessionName:
@@ -1000,6 +1009,97 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         );
     if (!mounted) return;
     await openFullPlayer(context);
+  }
+
+  Future<void> _playSearchSuggestion(SearchSuggestion suggestion) async {
+    final track = suggestion.track;
+    if (track == null || track.isEmpty) {
+      await _performSearch(ref, suggestion.text);
+      return;
+    }
+    unawaited(_recordSearchSelection(
+      eventType: 'suggestion_play_start',
+      entityType: 'track',
+      item: track,
+      confidence: 0.9,
+    ));
+    final trackId = extractTrackId(track) ?? suggestion.text;
+    await _playTrackFromCollection(
+      tracks: [track],
+      track: track,
+      playlistId: 'neatie:search_suggestion:$trackId',
+      playlistName: 'Recently played suggestion',
+    );
+  }
+
+  Future<void> _recordSearchSelection({
+    required String eventType,
+    required String entityType,
+    required Map<String, dynamic> item,
+    double confidence = 0.85,
+  }) async {
+    final query = _submittedSearchQuery.trim().isNotEmpty
+        ? _submittedSearchQuery.trim()
+        : _urlController.text.trim();
+    if (query.isEmpty || item.isEmpty) return;
+    final searchPage = ref.read(searchPageProvider);
+    final resultCount = searchPage.tracks.length +
+        searchPage.artists.length +
+        searchPage.albums.length +
+        searchPage.similarTracks.length +
+        searchPage.similarArtists.length;
+    await recordProxySearchEvent(
+      query,
+      resultCount: resultCount,
+      searchScope: 'search_page',
+      metadata: <String, dynamic>{
+        'event_type': eventType,
+        'selected_entity_type': entityType,
+        'selected_item': Map<String, dynamic>.from(item),
+        'confidence': confidence,
+        'selected_tab': _selectedSearchTab,
+      },
+    );
+  }
+
+  Future<void> _openSearchTrackDetails(Map<String, dynamic> track) async {
+    unawaited(_recordSearchSelection(
+      eventType: 'detail_open',
+      entityType: 'track',
+      item: track,
+      confidence: 0.82,
+    ));
+    await _openTrackDetails(track, extractTrackId(track));
+  }
+
+  Future<void> _openSearchArtist(Map<String, dynamic> artist) async {
+    unawaited(_recordSearchSelection(
+      eventType: 'artist_open',
+      entityType: 'artist',
+      item: artist,
+      confidence: 0.86,
+    ));
+    await _openArtist(artist);
+  }
+
+  Future<void> _openSearchAlbum(Map<String, dynamic> album) async {
+    unawaited(_recordSearchSelection(
+      eventType: 'album_open',
+      entityType: 'album',
+      item: album,
+      confidence: 0.84,
+    ));
+    await _openAlbum(album);
+  }
+
+  Future<void> _openSearchPlaylist(Map<String, dynamic> playlist) async {
+    unawaited(_recordSearchSelection(
+      eventType: 'playlist_open',
+      entityType: 'playlist',
+      item: playlist,
+      confidence: 0.72,
+    ));
+    await _openPlaylist(playlist);
   }
 
   Widget _buildNeatieHomeExperience({
@@ -1720,6 +1820,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                   SearchSuggestionPanel(
                     suggestions: suggestState,
                     onSelectSuggestion: (query) => _performSearch(ref, query),
+                    onPlaySuggestion: (suggestion) =>
+                        unawaited(_playSearchSuggestion(suggestion)),
                   ),
 
                 SizedBox(height: showSearchSuggestions ? 4 : 20),
@@ -1764,11 +1866,13 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                       onPlayTrack: (track) =>
                           unawaited(_playSearchDiscoveryTrack(track)),
                       onOpenTrack: (track) =>
-                          _openTrackDetails(track, extractTrackId(track)),
-                      onOpenArtist: (artist) => unawaited(_openArtist(artist)),
-                      onOpenAlbum: (album) => unawaited(_openAlbum(album)),
+                          unawaited(_openSearchTrackDetails(track)),
+                      onOpenArtist: (artist) =>
+                          unawaited(_openSearchArtist(artist)),
+                      onOpenAlbum: (album) =>
+                          unawaited(_openSearchAlbum(album)),
                       onOpenPlaylist: (playlist) =>
-                          unawaited(_openPlaylist(playlist)),
+                          unawaited(_openSearchPlaylist(playlist)),
                     ),
                   ],
                 ] else ...[

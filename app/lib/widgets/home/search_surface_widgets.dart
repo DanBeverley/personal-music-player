@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../logic/audio_provider_queue.dart';
+import '../../logic/suggest_provider.dart';
 import '../../logic/track_metadata.dart';
 import '../../navigation/player_navigation.dart';
 import '../../ui/app_theme_tokens.dart';
@@ -151,10 +152,12 @@ class SearchSuggestionPanel extends StatelessWidget {
     super.key,
     required this.suggestions,
     required this.onSelectSuggestion,
+    this.onPlaySuggestion,
   });
 
-  final List<String> suggestions;
+  final List<SearchSuggestion> suggestions;
   final ValueChanged<String> onSelectSuggestion;
+  final ValueChanged<SearchSuggestion>? onPlaySuggestion;
 
   @override
   Widget build(BuildContext context) {
@@ -166,8 +169,69 @@ class SearchSuggestionPanel extends StatelessWidget {
         itemCount: suggestions.length,
         itemBuilder: (context, index) {
           final suggestion = suggestions[index];
+          if (suggestion.isDirectPlayTrack) {
+            final track = suggestion.track!;
+            final title = (track['title'] ?? suggestion.text).toString();
+            final artist = (track['artist'] ??
+                    track['channel'] ??
+                    track['author'] ??
+                    'Recently played')
+                .toString();
+            final videoId = extractTrackId(track);
+            return InkWell(
+              onTap: () => onPlaySuggestion?.call(suggestion),
+              child: Padding(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                child: Row(
+                  children: [
+                    AppArtwork(
+                      thumbnail: track['thumbnail']?.toString(),
+                      videoId: videoId,
+                      width: 46,
+                      height: 46,
+                      radius: 10,
+                    ),
+                    const SizedBox(width: 14),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            title,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontWeight: FontWeight.w800,
+                            ),
+                          ),
+                          const SizedBox(height: 3),
+                          Text(
+                            artist,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              color: Colors.white60,
+                              fontSize: 13,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    const Icon(
+                      Icons.play_arrow_rounded,
+                      color: Colors.white,
+                      size: 28,
+                    ),
+                  ],
+                ),
+              ),
+            );
+          }
           return InkWell(
-            onTap: () => onSelectSuggestion(suggestion),
+            onTap: () => onSelectSuggestion(suggestion.text),
             child: Padding(
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 13),
               child: Row(
@@ -176,7 +240,7 @@ class SearchSuggestionPanel extends StatelessWidget {
                   const SizedBox(width: 16),
                   Expanded(
                     child: Text(
-                      suggestion,
+                      suggestion.text,
                       style: const TextStyle(color: Colors.white),
                     ),
                   ),

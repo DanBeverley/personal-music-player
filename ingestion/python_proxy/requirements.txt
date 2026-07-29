@@ -8,3 +8,4 @@ langgraph
 langchain-core
 ddgs
 psycopg[binary]
+boto3

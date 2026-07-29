@@ -4,9 +4,11 @@ import hashlib
 import json
 import re
 import time
+from difflib import SequenceMatcher
 from typing import Any, Dict, Iterable, List
 
 from ..domain.catalog import (
+    catalog_thumbnail_url,
     catalog_source_authority,
     canonical_title_artist_identity,
     normalize_album_title,
@@ -51,6 +53,50 @@ def search_query_key(query: str) -> str:
     return normalize_track_title(query)
 
 
+def search_text_similarity(query: str, candidate: str) -> float:
+    """Order-tolerant lexical similarity for canonical search entities."""
+    query_key = search_query_key(query)
+    candidate_key = search_query_key(candidate)
+    if not query_key or not candidate_key:
+        return 0.0
+    if query_key == candidate_key:
+        return 1.0
+    if query_key in candidate_key or candidate_key in query_key:
+        shorter = min(len(query_key), len(candidate_key))
+        longer = max(len(query_key), len(candidate_key))
+        return min(0.98, 0.86 + (0.12 * shorter / max(longer, 1)))
+
+    query_tokens = query_key.split()
+    candidate_tokens = candidate_key.split()
+    ordered = SequenceMatcher(None, query_key, candidate_key).ratio()
+    reordered = SequenceMatcher(
+        None,
+        " ".join(sorted(query_tokens)),
+        " ".join(sorted(candidate_tokens)),
+    ).ratio()
+    token_scores = [
+        max(
+            (
+                SequenceMatcher(None, query_token, candidate_token).ratio()
+                for candidate_token in candidate_tokens
+            ),
+            default=0.0,
+        )
+        for query_token in query_tokens
+    ]
+    token_match = sum(token_scores) / max(len(token_scores), 1)
+    coverage = min(len(query_tokens), len(candidate_tokens)) / max(
+        len(query_tokens),
+        len(candidate_tokens),
+        1,
+    )
+    return max(
+        ordered,
+        reordered * 0.96,
+        token_match * (0.82 + (0.18 * coverage)),
+    )
+
+
 def _entity_display_fields(item: Dict[str, Any]) -> Dict[str, str]:
     title = _text(item.get("title") or item.get("name"))
     artist = _text(
@@ -71,9 +117,26 @@ def _entity_display_fields(item: Dict[str, Any]) -> Dict[str, str]:
 def catalog_entity_key(entity_type: str, item: Dict[str, Any], *, query: str = "") -> str:
     normalized_type = _text(entity_type).lower() or "track"
     if normalized_type == "track":
-        mbid = _text(item.get("musicbrainz_recording_id") or item.get("mb_recording_id"))
+        mbid = _text(
+            item.get("musicbrainz_recording_id")
+            or item.get("recording_mbid")
+            or item.get("mb_recording_id")
+        )
         if mbid:
-            return f"musicbrainz:recording:{mbid}"
+            return f"musicbrainz:recording:{mbid.casefold()}"
+        isrcs = item.get("isrcs") or []
+        if isinstance(isrcs, str):
+            isrcs = [isrcs]
+        isrc = re.sub(
+            r"[^A-Z0-9]",
+            "",
+            _text(item.get("isrc") or next(iter(isrcs), "")).upper(),
+        )
+        if isrc:
+            return f"isrc:{isrc}"
+        canonical = _text(item.get("canonical_entity_id"))
+        if canonical.startswith(("musicbrainz:recording:", "isrc:")):
+            return canonical
         title_key, artist_key, _album_key = canonical_track_fields(item, query=query)
         if title_key and artist_key:
             return f"{title_key}|{artist_key}"
@@ -82,6 +145,16 @@ def catalog_entity_key(entity_type: str, item: Dict[str, Any], *, query: str = "
         mbid = _text(item.get("musicbrainz_artist_id") or item.get("mb_artist_id"))
         if mbid:
             return f"musicbrainz:artist:{mbid}"
+        provider_id = _text(
+            item.get("provider_artist_id")
+            or item.get("browseId")
+            or item.get("artist_id")
+            or item.get("id")
+        )
+        if provider_id and not provider_id.startswith(
+            ("musicbrainz:artist:", "artist-name:", "derived:")
+        ):
+            return f"provider:artist:{provider_id.casefold()}"
         return normalize_artist_name(
             item.get("name")
             or item.get("artist")
@@ -123,7 +196,12 @@ def _source_provider(item: Dict[str, Any]) -> str:
     combined = f"{provider} {source}".lower()
     if "youtube" in combined or "ytmusic" in combined:
         return "youtube"
-    return provider.lower() or "ytmusic"
+    if (
+        "musicbrainz" in combined
+        or _text(item.get("metadata_source")).lower() == "musicbrainz"
+    ):
+        return "musicbrainz"
+    return provider.lower()
 
 
 def _source_name(item: Dict[str, Any]) -> str:
@@ -138,7 +216,10 @@ def _source_name(item: Dict[str, Any]) -> str:
 
 def _source_key(item: Dict[str, Any]) -> str:
     explicit = _text(
-        item.get("channel_id")
+        item.get("playback_source_id")
+        or item.get("videoId")
+        or item.get("video_id")
+        or item.get("channel_id")
         or item.get("channelId")
         or item.get("uploader_id")
         or item.get("uploaderId")
@@ -382,6 +463,16 @@ def _entity_key(entity_type: str, item: Dict[str, Any]) -> str:
         mbid = _text(item.get("musicbrainz_artist_id") or item.get("mb_artist_id"))
         if mbid:
             return f"musicbrainz:artist:{mbid}"
+        provider_id = _text(
+            item.get("provider_artist_id")
+            or item.get("browseId")
+            or item.get("artist_id")
+            or item.get("id")
+        )
+        if provider_id and not provider_id.startswith(
+            ("musicbrainz:artist:", "artist-name:", "derived:")
+        ):
+            return f"provider:artist:{provider_id.casefold()}"
     elif entity_type == "album":
         mbid = _text(
             item.get("musicbrainz_release_group_id")
@@ -650,6 +741,168 @@ def load_catalog_entity_memories(
             }
         )
     return memories
+
+
+def load_catalog_artist_records(
+    server: Any,
+    *,
+    artist_names: Iterable[str],
+) -> Dict[str, Dict[str, Any]]:
+    """Load canonical artist records by normalized identity in one SQLite query."""
+    artist_keys = list(
+        dict.fromkeys(
+            normalize_artist_name(name)
+            for name in artist_names
+            if normalize_artist_name(name)
+        )
+    )
+    if not artist_keys:
+        return {}
+    placeholders = ",".join("?" for _ in artist_keys)
+    try:
+        connection = open_recommendation_store_connection(server)
+    except Exception:
+        return {}
+    try:
+        rows = connection.execute(
+            f"""
+            SELECT e.entity_key, e.confidence, e.learned_popularity,
+                   e.popularity, e.payload_json, e.updated_at,
+                   coalesce(a.alias_key, e.entity_key) AS matched_key
+            FROM catalog_entities e
+            LEFT JOIN catalog_entity_aliases a
+              ON a.entity_type = e.entity_type
+             AND a.entity_key = e.entity_key
+             AND a.alias_key IN ({placeholders})
+            WHERE e.entity_type = 'artist'
+              AND (
+                e.entity_key IN ({placeholders})
+                OR a.alias_key IS NOT NULL
+              )
+            ORDER BY e.confidence DESC, e.learned_popularity DESC,
+                     e.popularity DESC, e.updated_at DESC
+            """,
+            [*artist_keys, *artist_keys],
+        ).fetchall()
+    except Exception:
+        return {}
+    finally:
+        connection.close()
+    records: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        key = normalize_artist_name(row["matched_key"])
+        payload = _json_loads(row["payload_json"])
+        if not key or not isinstance(payload, dict):
+            continue
+        payload["_catalog_confidence"] = float(row["confidence"] or 0.0)
+        payload["_catalog_updated_at"] = float(row["updated_at"] or 0.0)
+        previous = records.get(key)
+        payload_has_cached_artwork = str(
+            payload.get("thumbnail") or ""
+        ).startswith("/artist_artwork/")
+        previous_has_cached_artwork = str(
+            (previous or {}).get("thumbnail") or ""
+        ).startswith("/artist_artwork/")
+        if previous is None or (
+            payload_has_cached_artwork,
+            float(payload.get("_catalog_confidence") or 0.0),
+            float(payload.get("_catalog_updated_at") or 0.0),
+        ) > (
+            previous_has_cached_artwork,
+            float(previous.get("_catalog_confidence") or 0.0),
+            float(previous.get("_catalog_updated_at") or 0.0),
+        ):
+            records[key] = payload
+    return records
+
+
+def load_fuzzy_catalog_entity_memories(
+    server: Any,
+    *,
+    query: str,
+    entity_type: str = "",
+    limit: int = 12,
+    scan_limit: int = 1200,
+) -> List[Dict[str, Any]]:
+    """Return the best typo/partial/alias matches from the existing catalog."""
+    query_key = search_query_key(query)
+    normalized_type = _text(entity_type).lower()
+    if not query_key:
+        return []
+    try:
+        connection = open_recommendation_store_connection(server)
+    except Exception:
+        return []
+    try:
+        type_clause = "WHERE a.entity_type = ?" if normalized_type else ""
+        parameters: List[Any] = []
+        if normalized_type:
+            parameters.append(normalized_type)
+        parameters.append(max(int(scan_limit or 0), 1))
+        rows = connection.execute(
+            f"""
+            SELECT a.alias_key, a.entity_type, a.entity_key, a.score,
+                   a.confidence, a.source, e.display_title,
+                   e.display_artist, e.display_album, e.learned_popularity,
+                   e.popularity, e.payload_json, e.updated_at
+            FROM catalog_entity_aliases a
+            JOIN catalog_entities e
+              ON e.entity_type = a.entity_type AND e.entity_key = a.entity_key
+            {type_clause}
+            ORDER BY a.score DESC, a.confidence DESC,
+                     e.learned_popularity DESC, e.popularity DESC,
+                     a.updated_at DESC
+            LIMIT ?
+            """,
+            parameters,
+        ).fetchall()
+    except Exception:
+        return []
+    finally:
+        connection.close()
+
+    best_by_entity: Dict[tuple[str, str], Dict[str, Any]] = {}
+    for row in rows:
+        alias_key = _text(row["alias_key"])
+        similarity = search_text_similarity(query_key, alias_key)
+        if similarity < 0.62:
+            continue
+        payload = _json_loads(row["payload_json"])
+        entity_key = (str(row["entity_type"]), str(row["entity_key"]))
+        memory = {
+            "user_scope_id": GLOBAL_SEARCH_SCOPE,
+            "entity_type": row["entity_type"],
+            "entity_key": row["entity_key"],
+            "title_key": normalize_track_title(row["display_title"]),
+            "artist_key": normalize_artist_name(row["display_artist"]),
+            "score": (
+                similarity * 6.0
+                + min(float(row["score"] or 0.0), 6.0) * 0.15
+                + float(row["learned_popularity"] or 0.0)
+                + float(row["popularity"] or 0.0) * 0.4
+            ),
+            "confidence": max(
+                similarity,
+                min(float(row["confidence"] or 0.0), 1.0) * 0.85,
+            ),
+            "event_count": 1,
+            "source": "catalog_entity_fuzzy",
+            "matched_alias": alias_key,
+            "match_similarity": similarity,
+            "payload": payload,
+            "updated_at": float(row["updated_at"] or 0.0),
+        }
+        previous = best_by_entity.get(entity_key)
+        if previous is None or float(memory["score"]) > float(previous["score"]):
+            best_by_entity[entity_key] = memory
+    return sorted(
+        best_by_entity.values(),
+        key=lambda item: (
+            float(item.get("score") or 0.0),
+            float(item.get("confidence") or 0.0),
+        ),
+        reverse=True,
+    )[: max(int(limit or 0), 1)]
 
 
 def remember_candidate_observations(
@@ -1158,6 +1411,7 @@ def _alias_keys_for_entity(
     *,
     title_key: str,
     artist_key: str,
+    extra_aliases: Iterable[Any] = (),
 ) -> List[str]:
     aliases: List[str] = []
 
@@ -1167,6 +1421,8 @@ def _alias_keys_for_entity(
             aliases.append(key)
 
     add(query_key)
+    for alias in extra_aliases or []:
+        add(_text(alias))
     if title_key:
         add(title_key)
     if title_key and artist_key:
@@ -1197,6 +1453,53 @@ def _alias_keys_for_entity(
     return aliases
 
 
+def _item_alias_values(item: Dict[str, Any]) -> List[str]:
+    aliases: List[str] = []
+
+    def add(value: Any) -> None:
+        text = _text(value)
+        if text and text not in aliases:
+            aliases.append(text)
+
+    title = _text(item.get("title") or item.get("name"))
+    artist = _text(
+        item.get("artist")
+        or item.get("artist_name")
+        or item.get("channel")
+        or item.get("author")
+    )
+    album = _text(item.get("album") or item.get("album_name"))
+    add(title)
+    add(artist)
+    add(album)
+    if title and artist:
+        add(f"{artist} {title}")
+        add(f"{title} {artist}")
+    if album and artist:
+        add(f"{artist} {album}")
+        add(f"{album} {artist}")
+    stripped_title = re.sub(r"\([^)]*\)|\[[^\]]*\]", " ", title)
+    stripped_title = re.sub(
+        r"\b(official|audio|video|lyrics?|remaster(?:ed)?|deluxe|edition|single|live)\b",
+        " ",
+        stripped_title,
+        flags=re.IGNORECASE,
+    )
+    stripped_title = re.sub(r"\s+", " ", stripped_title).strip()
+    if stripped_title and stripped_title != title:
+        add(stripped_title)
+        if artist:
+            add(f"{artist} {stripped_title}")
+            add(f"{stripped_title} {artist}")
+    raw_aliases = item.get("aliases") or item.get("search_aliases") or []
+    if isinstance(raw_aliases, str):
+        add(raw_aliases)
+    elif isinstance(raw_aliases, (list, tuple, set)):
+        for alias in raw_aliases:
+            add(alias)
+    return aliases
+
+
 def _catalog_alias_keys(
     query_key: str,
     *,
@@ -1205,6 +1508,7 @@ def _catalog_alias_keys(
     title_key: str,
     artist_key: str,
     album_key: str,
+    include_query_alias: bool = True,
 ) -> List[str]:
     normalized_type = _text(entity_type) or "track"
     aliases: List[str] = []
@@ -1215,20 +1519,28 @@ def _catalog_alias_keys(
             aliases.append(key)
 
     if normalized_type == "track":
-        for key in _alias_keys_for_entity(query_key, title_key=title_key, artist_key=artist_key):
+        for key in _alias_keys_for_entity(
+            query_key if include_query_alias else "",
+            title_key=title_key,
+            artist_key=artist_key,
+            extra_aliases=_item_alias_values(item),
+        ):
             add(key)
     elif normalized_type == "artist":
-        add(query_key)
+        if include_query_alias:
+            add(query_key)
         add(artist_key)
         add(_text(item.get("name") or item.get("artist") or item.get("channel")))
     elif normalized_type == "album":
-        add(query_key)
+        if include_query_alias:
+            add(query_key)
         add(album_key)
         if album_key and artist_key:
             add(f"{artist_key} {album_key}")
             add(f"{album_key} {artist_key}")
     else:
-        add(query_key)
+        if include_query_alias:
+            add(query_key)
     raw_aliases = item.get("aliases") or item.get("search_aliases") or []
     if isinstance(raw_aliases, (list, tuple, set)):
         for alias in raw_aliases:
@@ -1236,6 +1548,162 @@ def _catalog_alias_keys(
     elif isinstance(raw_aliases, str):
         add(raw_aliases)
     return aliases
+
+
+def remove_untrusted_catalog_query_aliases(
+    server: Any,
+    *,
+    query: str,
+) -> int:
+    """Remove broad response aliases while retaining intrinsic entity aliases.
+
+    Search-result hydration previously attached the submitted query to every
+    returned track and album. That made an unrelated lower-ranked result a
+    future exact match. Clean only those hydration aliases; selected-result
+    and interaction aliases remain authoritative.
+    """
+
+    alias_key = search_query_key(query)
+    if not alias_key:
+        return 0
+    try:
+        connection = open_recommendation_store_connection(server)
+    except Exception:
+        return 0
+    removed = 0
+    try:
+        rows = connection.execute(
+            """
+            SELECT a.entity_type, a.entity_key, e.payload_json
+            FROM catalog_entity_aliases a
+            JOIN catalog_entities e
+              ON e.entity_type = a.entity_type AND e.entity_key = a.entity_key
+            WHERE a.alias_key = ? AND a.source = ?
+            """,
+            [alias_key, "canonical_search_result"],
+        ).fetchall()
+        for row in rows:
+            entity_type = _text(row["entity_type"]) or "track"
+            item = _json_loads(row["payload_json"])
+            title_key, artist_key, album_key = canonical_track_fields(
+                item,
+                query="",
+            )
+            safe_aliases = _catalog_alias_keys(
+                "",
+                entity_type=entity_type,
+                item=item,
+                title_key=title_key,
+                artist_key=artist_key,
+                album_key=album_key,
+                include_query_alias=False,
+            )
+            if alias_key in safe_aliases:
+                continue
+            cursor = connection.execute(
+                """
+                DELETE FROM catalog_entity_aliases
+                WHERE alias_key = ? AND entity_type = ? AND entity_key = ?
+                  AND source = ?
+                """,
+                [
+                    alias_key,
+                    entity_type,
+                    row["entity_key"],
+                    "canonical_search_result",
+                ],
+            )
+            removed += max(int(cursor.rowcount or 0), 0)
+        connection.commit()
+    except Exception:
+        return 0
+    finally:
+        connection.close()
+    return removed
+
+
+def _merge_entity_metadata_payload(
+    existing: Dict[str, Any],
+    incoming: Dict[str, Any],
+    *,
+    entity_type: str,
+) -> Dict[str, Any]:
+    """Preserve rich catalog metadata when a thinner search row arrives."""
+    merged = dict(existing or {})
+    for key, value in dict(incoming or {}).items():
+        if value not in (None, "", [], {}):
+            merged[key] = value
+
+    incoming_thumbnail = catalog_thumbnail_url(
+        incoming,
+        entity_type=entity_type,
+    )
+    existing_thumbnail = catalog_thumbnail_url(
+        existing,
+        entity_type=entity_type,
+    )
+    incoming_has_explicit_artwork = any(
+        incoming.get(key) not in (None, "", [], {})
+        for key in (
+            "thumbnail",
+            "thumbnails",
+            "artwork_url",
+            "artwork",
+            "cover_url",
+            "cover",
+            "image_url",
+            "image",
+            "images",
+        )
+    )
+    if incoming_thumbnail and (
+        incoming_has_explicit_artwork or not existing_thumbnail
+    ):
+        merged["thumbnail"] = incoming_thumbnail
+    elif existing_thumbnail:
+        merged["thumbnail"] = existing_thumbnail
+    else:
+        merged.pop("thumbnail", None)
+
+    if entity_type != "artist":
+        return merged
+
+    existing_thumbnail = _text(existing.get("thumbnail"))
+    incoming_thumbnail = _text(incoming.get("thumbnail"))
+    if existing_thumbnail.startswith("/artist_artwork/") and not (
+        incoming_thumbnail.startswith("/artist_artwork/")
+    ):
+        merged["thumbnail"] = existing_thumbnail
+        if incoming_thumbnail.startswith(("http://", "https://")):
+            merged["artwork_source_url"] = incoming_thumbnail
+
+    aliases: List[str] = []
+    for payload in (existing, incoming):
+        for value in (
+            payload.get("name"),
+            payload.get("artist"),
+            *(payload.get("artist_aliases") or []),
+            *(payload.get("aliases") or []),
+        ):
+            alias = normalize_artist_name(value)
+            if alias and alias not in aliases:
+                aliases.append(alias)
+    if aliases:
+        merged["artist_aliases"] = aliases
+
+    existing_canonical_id = _text(
+        existing.get("canonical_artist_id")
+        or existing.get("canonical_artist_key")
+    )
+    incoming_canonical_id = _text(
+        incoming.get("canonical_artist_id")
+        or incoming.get("canonical_artist_key")
+    )
+    if existing_canonical_id.startswith("musicbrainz:artist:") and not (
+        incoming_canonical_id.startswith("musicbrainz:artist:")
+    ):
+        merged["canonical_artist_id"] = existing_canonical_id
+    return merged
 
 
 def remember_catalog_entity(
@@ -1249,6 +1717,7 @@ def remember_catalog_entity(
     event_weight: float = 1.0,
     event_type: str = "",
     source: str = "search_catalog",
+    learn_query_alias: bool = True,
 ) -> bool:
     if not isinstance(item, dict):
         return False
@@ -1274,6 +1743,7 @@ def remember_catalog_entity(
         title_key=title_key,
         artist_key=artist_key,
         album_key=album_key,
+        include_query_alias=learn_query_alias,
     )
     now = time.time()
     try:
@@ -1281,6 +1751,22 @@ def remember_catalog_entity(
     except Exception:
         return False
     try:
+        stored_item = dict(item)
+        existing_row = connection.execute(
+            """
+            SELECT payload_json
+            FROM catalog_entities
+            WHERE entity_type = ? AND entity_key = ?
+            """,
+            [normalized_type, entity_key],
+        ).fetchone()
+        if existing_row:
+            existing_payload = _json_loads(existing_row["payload_json"])
+            stored_item = _merge_entity_metadata_payload(
+                existing_payload,
+                stored_item,
+                entity_type=normalized_type,
+            )
         connection.execute(
             """
             INSERT INTO catalog_entities(
@@ -1323,7 +1809,7 @@ def remember_catalog_entity(
                 safe_confidence,
                 normalized_popularity(item),
                 popularity_delta,
-                _json_dumps(item),
+                _json_dumps(stored_item),
                 now,
             ],
         )
@@ -1567,6 +2053,12 @@ def remember_search_resolution(
     normalized_event_type = _text(event_type) or _text(source) or "search_resolution"
     popularity_delta = _event_popularity_delta(normalized_event_type, weight)
     click_delta, play_delta, skip_delta = _event_counter_columns(normalized_event_type)
+    selected_result_bonus = (
+        1.25
+        if normalized_event_type in {"result_click", "result_play", "play", "search_result_play"}
+        or "search" in _text(source)
+        else 0.0
+    )
     entity_payload = dict(item)
     canonical_query_key = title_key or query_key
     source_identity = infer_source_identity(item)
@@ -1688,7 +2180,7 @@ def remember_search_resolution(
                     entity_key,
                     title_key,
                     artist_key,
-                    (safe_confidence * 1.5) + weight,
+                    (safe_confidence * 1.8) + weight + selected_result_bonus,
                     safe_confidence,
                     _json_dumps(memory_payload),
                     now,
@@ -1698,6 +2190,7 @@ def remember_search_resolution(
             query_key,
             title_key=title_key,
             artist_key=artist_key,
+            extra_aliases=_item_alias_values(item),
         ):
             connection.execute(
                 """
@@ -1725,7 +2218,7 @@ def remember_search_resolution(
                     entity_key,
                     title_key,
                     artist_key,
-                    (safe_confidence * 1.8) + weight,
+                    (safe_confidence * 2.4) + weight + selected_result_bonus,
                     safe_confidence,
                     source,
                     _json_dumps(memory_payload),

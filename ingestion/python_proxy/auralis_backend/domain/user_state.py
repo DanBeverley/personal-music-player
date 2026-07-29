@@ -1,15 +1,13 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from copy import deepcopy
 import json
+import threading
+import time
 from typing import Any, Dict, List, Tuple, TypedDict
 
-from ..contracts import (
-    RecommendationHomeV3Request,
-    SearchV3Request,
-    SimilarArtistsV3Request,
-    SuggestV2Request,
-)
+from ..contracts import SearchRequest
 from .server_adapter import DomainServerAdapter, adapt_domain_server
 from ..recommend.profile_runtime import build_profile_key, hydrate_state_profile
 from ..recommend.store_runtime import open_recommendation_store_connection
@@ -40,6 +38,14 @@ _NOISY_QUERY_TOKENS = {
     "version",
 }
 
+_HISTORY_SNAPSHOT_NAMESPACE = "history_profile_snapshot"
+_HISTORY_SNAPSHOT_MODEL = "history-profile-snapshot"
+_HISTORY_SNAPSHOT_CACHE: Dict[str, Dict[str, Any]] = {}
+_HISTORY_SNAPSHOT_LOCK = threading.RLock()
+_HISTORY_SNAPSHOT_BUILDS: Dict[str, threading.RLock] = {}
+_HISTORY_SNAPSHOT_INFLIGHT: set[str] = set()
+_HISTORY_SNAPSHOT_PENDING: set[str] = set()
+
 
 class UserStateSnapshot(TypedDict, total=False):
     profile_key: str
@@ -51,6 +57,8 @@ class UserStateSnapshot(TypedDict, total=False):
     recent_track_snapshots: List[Dict[str, Any]]
     top_track_snapshots: List[Dict[str, Any]]
     anchor_track_snapshots: List[Dict[str, Any]]
+    history_track_snapshots: List[Dict[str, Any]]
+    frequent_track_snapshots: List[Dict[str, Any]]
     last_played_tracks: List[Dict[str, Any]]
     recent_queries: List[str]
     taste_queries: List[str]
@@ -203,8 +211,22 @@ def _snapshot_from_event_payload(
     normalized_track_id = trim_text(track_id)
     if not normalized_track_id:
         return None
+    playback = payload.get("playback") if isinstance(payload.get("playback"), dict) else {}
+    playback_source_id = trim_text(
+        playback.get("source_id")
+        or payload.get("playback_source_id")
+        or payload.get("videoId")
+        or payload.get("video_id")
+    )
+    playback_provider = trim_text(
+        playback.get("provider")
+        or payload.get("source_provider")
+        or payload.get("provider")
+        or "youtube"
+    ).lower()
     snapshot = {
         "id": normalized_track_id,
+        "track_key": trim_text(payload.get("track_key")) or normalized_track_id,
         "title": trim_text(payload.get("title") or payload.get("name")),
         "channel": trim_text(
             payload.get("channel")
@@ -218,12 +240,33 @@ def _snapshot_from_event_payload(
         "thumbnail": _metadata_thumbnail_url(payload),
         "duration": _metadata_duration(payload),
     }
+    if playback_source_id:
+        snapshot["playback_source_id"] = playback_source_id
+        snapshot["playback"] = {
+            **playback,
+            "provider": playback_provider,
+            "source_id": playback_source_id,
+        }
+        if playback_provider == "youtube":
+            snapshot["videoId"] = playback_source_id
+    for key in (
+        "canonical_entity_id",
+        "canonical_track_identity",
+        "musicbrainz_recording_id",
+        "recording_mbid",
+        "isrc",
+        "release_year",
+        "year",
+    ):
+        value = payload.get(key)
+        if value not in (None, ""):
+            snapshot[key] = value
     if not snapshot["title"] and not snapshot["channel"] and not snapshot["artist"]:
         return None
     return snapshot
 
 
-def _load_scope_history_seed(
+def _build_scope_history_seed_from_events(
     server: DomainServerAdapter,
     user_scope_id: str,
 ) -> Dict[str, Any]:
@@ -248,7 +291,6 @@ def _load_scope_history_seed(
             WHERE user_scope_id = ?
               AND LOWER(COALESCE(event_type, 'play')) NOT IN ('impression', 'tab_tap')
             ORDER BY occurred_at DESC
-            LIMIT 180
             """,
             [normalized_scope],
         ).fetchall()
@@ -277,6 +319,10 @@ def _load_scope_history_seed(
     library_track_ids: List[str] = []
     artist_hints: List[str] = []
     track_payload_by_id: Dict[str, Dict[str, Any]] = {}
+    history_snapshot_by_identity: Dict[str, Dict[str, Any]] = {}
+    play_count_by_identity: Dict[str, int] = defaultdict(int)
+    latest_play_by_identity: Dict[str, float] = {}
+    last_counted_play_by_identity: Dict[str, float] = {}
     recent_track_snapshots: List[Dict[str, Any]] = []
     seen_recent_ids = set()
     seen_library_ids = set()
@@ -304,7 +350,7 @@ def _load_scope_history_seed(
             base_weight = float(row["weight"] or 0.0)
         except Exception:
             base_weight = 0.0
-        is_negative_event = event_type in {"skip", "dislike", "hide", "remove"}
+        is_negative_event = event_type in {"skip", "dislike", "hide", "remove", "remove_from_feed"}
         if is_negative_event or base_weight < 0.0:
             if track_id not in seen_negative_ids:
                 seen_negative_ids.add(track_id)
@@ -328,6 +374,31 @@ def _load_scope_history_seed(
             payload=payload,
         )
         if snapshot is not None:
+            canonical_identity = trim_text(
+                snapshot.get("canonical_entity_id")
+                or snapshot.get("canonical_track_identity")
+                or snapshot.get("musicbrainz_recording_id")
+                or snapshot.get("recording_mbid")
+                or snapshot.get("isrc")
+            )
+            if not canonical_identity:
+                title_key = " ".join(trim_text(snapshot.get("title")).casefold().split())
+                artist_key = " ".join(
+                    trim_text(snapshot.get("artist") or snapshot.get("channel")).casefold().split()
+                )
+                canonical_identity = f"{title_key}|{artist_key}" if title_key and artist_key else track_id
+            snapshot["canonical_entity_id"] = canonical_identity
+            if canonical_identity not in history_snapshot_by_identity:
+                history_snapshot_by_identity[canonical_identity] = dict(snapshot)
+            if event_type == "play":
+                last_counted = last_counted_play_by_identity.get(canonical_identity)
+                if last_counted is None or last_counted - occurred_at >= 30.0:
+                    play_count_by_identity[canonical_identity] += 1
+                    last_counted_play_by_identity[canonical_identity] = occurred_at
+                latest_play_by_identity[canonical_identity] = max(
+                    latest_play_by_identity.get(canonical_identity, 0.0),
+                    occurred_at,
+                )
             track_payload_by_id[track_id] = snapshot
             recent_track_snapshots.append(snapshot)
             if snapshot.get("album"):
@@ -387,6 +458,25 @@ def _load_scope_history_seed(
         16,
     )
     last_played_tracks = unique_snapshot_tracks(recent_track_snapshots[:12], 12)
+    history_track_snapshots: List[Dict[str, Any]] = []
+    for identity, snapshot in sorted(
+        history_snapshot_by_identity.items(),
+        key=lambda item: latest_play_by_identity.get(item[0], 0.0),
+        reverse=True,
+    ):
+        enriched = dict(snapshot)
+        enriched["canonical_entity_id"] = identity
+        enriched["play_count"] = int(play_count_by_identity.get(identity, 0))
+        enriched["last_played_at"] = float(latest_play_by_identity.get(identity, 0.0))
+        history_track_snapshots.append(enriched)
+    frequent_track_snapshots = sorted(
+        [track for track in history_track_snapshots if int(track.get("play_count") or 0) > 0],
+        key=lambda track: (
+            int(track.get("play_count") or 0),
+            float(track.get("last_played_at") or 0.0),
+        ),
+        reverse=True,
+    )
     anchor_track_snapshots = unique_snapshot_tracks(
         [*last_played_tracks[:4], *top_track_snapshots[:4]],
         8,
@@ -406,6 +496,8 @@ def _load_scope_history_seed(
         "top_track_snapshots": top_track_snapshots,
         "last_played_tracks": last_played_tracks,
         "anchor_track_snapshots": anchor_track_snapshots,
+        "history_track_snapshots": history_track_snapshots,
+        "frequent_track_snapshots": frequent_track_snapshots,
         "recent_queries": recent_queries,
         "taste_queries": taste_queries,
         "artist_hints": unique_strings(artist_hints, 12),
@@ -413,6 +505,173 @@ def _load_scope_history_seed(
         "negative_track_ids": server.unique_track_ids(negative_track_ids, 28),
         "_diagnostics": diagnostics,
     }
+
+
+def _history_snapshot_copy(seed: Dict[str, Any], *, source: str) -> Dict[str, Any]:
+    output = deepcopy(seed)
+    diagnostics = dict(output.get("_diagnostics") or {})
+    diagnostics["history_snapshot_source"] = source
+    output["_diagnostics"] = diagnostics
+    return output
+
+
+def _load_persisted_history_snapshot(
+    server: DomainServerAdapter,
+    user_scope_id: str,
+) -> Dict[str, Any] | None:
+    try:
+        connection = open_recommendation_store_connection(server)
+    except Exception:
+        return None
+    try:
+        row = connection.execute(
+            """
+            SELECT payload_json
+            FROM recommendation_feature_store
+            WHERE namespace = ? AND entity_id = ?
+            """,
+            [_HISTORY_SNAPSHOT_NAMESPACE, user_scope_id],
+        ).fetchone()
+        if row is None:
+            return None
+        payload = json.loads(row["payload_json"] or "{}")
+        if (
+            not isinstance(payload, dict)
+            or payload.get("snapshot_model") != _HISTORY_SNAPSHOT_MODEL
+            or not isinstance(payload.get("seed"), dict)
+        ):
+            return None
+        return dict(payload["seed"])
+    except Exception:
+        return None
+    finally:
+        connection.close()
+
+
+def _store_history_snapshot(
+    server: DomainServerAdapter,
+    user_scope_id: str,
+    seed: Dict[str, Any],
+) -> bool:
+    payload = {
+        "snapshot_model": _HISTORY_SNAPSHOT_MODEL,
+        "user_scope_id": user_scope_id,
+        "seed": seed,
+        "updated_at": time.time(),
+    }
+    try:
+        connection = open_recommendation_store_connection(server)
+    except Exception:
+        return False
+    try:
+        connection.execute(
+            """
+            INSERT INTO recommendation_feature_store(
+                namespace, entity_id, model_id, payload_json, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(namespace, entity_id) DO UPDATE SET
+                model_id = excluded.model_id,
+                payload_json = excluded.payload_json,
+                updated_at = excluded.updated_at
+            """,
+            [
+                _HISTORY_SNAPSHOT_NAMESPACE,
+                user_scope_id,
+                _HISTORY_SNAPSHOT_MODEL,
+                json.dumps(payload, ensure_ascii=False),
+                payload["updated_at"],
+            ],
+        )
+        connection.commit()
+    except Exception:
+        return False
+    finally:
+        connection.close()
+    with _HISTORY_SNAPSHOT_LOCK:
+        _HISTORY_SNAPSHOT_CACHE[user_scope_id] = deepcopy(seed)
+    return True
+
+
+def _history_build_lock(user_scope_id: str) -> threading.RLock:
+    with _HISTORY_SNAPSHOT_LOCK:
+        return _HISTORY_SNAPSHOT_BUILDS.setdefault(user_scope_id, threading.RLock())
+
+
+def _load_scope_history_seed(
+    server: DomainServerAdapter,
+    user_scope_id: str,
+) -> Dict[str, Any]:
+    normalized_scope = trim_text(user_scope_id or "guest") or "guest"
+    if normalized_scope == "guest":
+        return {}
+    with _HISTORY_SNAPSHOT_LOCK:
+        cached = _HISTORY_SNAPSHOT_CACHE.get(normalized_scope)
+    if isinstance(cached, dict):
+        return _history_snapshot_copy(cached, source="memory")
+
+    with _history_build_lock(normalized_scope):
+        with _HISTORY_SNAPSHOT_LOCK:
+            cached = _HISTORY_SNAPSHOT_CACHE.get(normalized_scope)
+        if isinstance(cached, dict):
+            return _history_snapshot_copy(cached, source="memory")
+        persisted = _load_persisted_history_snapshot(server, normalized_scope)
+        if isinstance(persisted, dict):
+            with _HISTORY_SNAPSHOT_LOCK:
+                _HISTORY_SNAPSHOT_CACHE[normalized_scope] = deepcopy(persisted)
+            return _history_snapshot_copy(persisted, source="persistent")
+        seed = _build_scope_history_seed_from_events(server, normalized_scope)
+        if seed:
+            _store_history_snapshot(server, normalized_scope, seed)
+        return _history_snapshot_copy(seed, source="rebuilt") if seed else {}
+
+
+def schedule_history_seed_snapshot_refresh(
+    server: Any,
+    user_scope_id: str,
+) -> bool:
+    domain_server = adapt_domain_server(server)
+    normalized_scope = trim_text(user_scope_id or "guest") or "guest"
+    if normalized_scope == "guest":
+        return False
+    with _HISTORY_SNAPSHOT_LOCK:
+        if normalized_scope in _HISTORY_SNAPSHOT_INFLIGHT:
+            _HISTORY_SNAPSHOT_PENDING.add(normalized_scope)
+            return False
+        _HISTORY_SNAPSHOT_INFLIGHT.add(normalized_scope)
+
+    def refresh() -> None:
+        try:
+            seed = _build_scope_history_seed_from_events(
+                domain_server,
+                normalized_scope,
+            )
+            if seed:
+                _store_history_snapshot(domain_server, normalized_scope, seed)
+        finally:
+            rerun = False
+            with _HISTORY_SNAPSHOT_LOCK:
+                _HISTORY_SNAPSHOT_INFLIGHT.discard(normalized_scope)
+                if normalized_scope in _HISTORY_SNAPSHOT_PENDING:
+                    _HISTORY_SNAPSHOT_PENDING.discard(normalized_scope)
+                    rerun = True
+            if rerun:
+                schedule_history_seed_snapshot_refresh(
+                    domain_server.raw,
+                    normalized_scope,
+                )
+
+    executor = getattr(domain_server.raw, "precompute_executor", None)
+    if executor is None:
+        with _HISTORY_SNAPSHOT_LOCK:
+            _HISTORY_SNAPSHOT_INFLIGHT.discard(normalized_scope)
+        return False
+    try:
+        executor.submit(refresh)
+        return True
+    except Exception:
+        with _HISTORY_SNAPSHOT_LOCK:
+            _HISTORY_SNAPSHOT_INFLIGHT.discard(normalized_scope)
+        return False
 
 
 def _build_state_snapshot(legacy_req, *, server: Any | None = None) -> UserStateSnapshot:
@@ -486,6 +745,8 @@ def _build_state_snapshot(legacy_req, *, server: Any | None = None) -> UserState
         trim_text(legacy_req.user_scope_id or "guest") or "guest",
     )
     persisted_diagnostics = dict(persisted.get("_diagnostics") or {}) if persisted else {}
+    history_track_snapshots: List[Dict[str, Any]] = []
+    frequent_track_snapshots: List[Dict[str, Any]] = []
     if persisted:
         recent_track_snapshots = server.unique_snapshot_tracks(
             [
@@ -515,6 +776,16 @@ def _build_state_snapshot(legacy_req, *, server: Any | None = None) -> UserState
             ],
             8,
         )
+        history_track_snapshots = [
+            dict(track)
+            for track in persisted.get("history_track_snapshots") or []
+            if isinstance(track, dict)
+        ]
+        frequent_track_snapshots = [
+            dict(track)
+            for track in persisted.get("frequent_track_snapshots") or []
+            if isinstance(track, dict)
+        ]
         recent_track_ids = server.unique_track_ids(
             [
                 *(recent_track_ids or []),
@@ -583,6 +854,16 @@ def _build_state_snapshot(legacy_req, *, server: Any | None = None) -> UserState
         anchor_track_snapshots = [
             track
             for track in anchor_track_snapshots
+            if trim_text(track.get("id")) not in negative_ids
+        ]
+        history_track_snapshots = [
+            track
+            for track in history_track_snapshots
+            if trim_text(track.get("id")) not in negative_ids
+        ]
+        frequent_track_snapshots = [
+            track
+            for track in frequent_track_snapshots
             if trim_text(track.get("id")) not in negative_ids
         ]
     anchor_artist_hints = unique_strings(
@@ -663,6 +944,8 @@ def _build_state_snapshot(legacy_req, *, server: Any | None = None) -> UserState
         "recent_track_snapshots": recent_track_snapshots,
         "top_track_snapshots": top_track_snapshots,
         "anchor_track_snapshots": anchor_track_snapshots,
+        "history_track_snapshots": history_track_snapshots,
+        "frequent_track_snapshots": frequent_track_snapshots,
         "last_played_tracks": last_played_tracks,
         "recent_queries": recent_queries,
         "taste_queries": taste_queries,
@@ -704,67 +987,8 @@ def _build_state_snapshot(legacy_req, *, server: Any | None = None) -> UserState
     )
 
 
-def build_search_state(
-    req: SearchV3Request | SuggestV2Request,
-    *,
-    server: Any | None = None,
-) -> Tuple[Any, UserStateSnapshot]:
-    raw_recent_tracks = (
-        getattr(req, "recent_tracks", None)
-        or getattr(req, "recent_track_snapshots", None)
-        or []
-    )
-    raw_top_tracks = (
-        getattr(req, "top_tracks", None)
-        or getattr(req, "top_track_snapshots", None)
-        or []
-    )
-    raw_last_played_tracks = getattr(req, "last_played_tracks", None) or raw_recent_tracks
-    recent_tracks = _normalize_track_snapshots(
-        [
-            *(raw_last_played_tracks or []),
-            *(raw_recent_tracks or []),
-        ],
-        16,
-    )
-    top_tracks = _normalize_track_snapshots(raw_top_tracks, 12)
-    last_played_tracks = _normalize_track_snapshots(
-        raw_last_played_tracks or [],
-        8,
-    )
-    recent_queries = _clean_query_values(
-        [*(req.recent_queries or []), *(getattr(req, "taste_queries", []) or [])],
-        limit=12,
-    )
-    legacy_req = build_search_request(
-        query=req.query,
-        limit=req.limit,
-        user_scope_id=req.user_scope_id or "guest",
-        session_id=req.session_id,
-        surface=getattr(req, "context_surface", "search") or "search",
-        force_refresh=bool(getattr(req, "force_refresh", False)),
-        recent_queries=recent_queries,
-        taste_queries=_clean_query_values(
-            [*(getattr(req, "taste_queries", []) or []), *recent_queries],
-            limit=8,
-        ),
-        recent_track_ids=list(getattr(req, "recent_track_ids", []) or []),
-        top_track_ids=list(getattr(req, "top_track_ids", []) or []),
-        recent_track_snapshots=recent_tracks,
-        top_track_snapshots=top_tracks or recent_tracks[:8],
-        last_played_tracks=last_played_tracks or recent_tracks[:8],
-        artist_hints=list(getattr(req, "artist_hints", []) or []),
-        album_hints=list(getattr(req, "album_hints", []) or []),
-        playlist_names=list(getattr(req, "playlist_names", []) or []),
-        library_track_ids=list(getattr(req, "library_track_ids", []) or []),
-        offline_track_ids=list(getattr(req, "offline_track_ids", []) or []),
-        search_mode=str(getattr(req, "search_mode", "") or ""),
-    )
-    return legacy_req, _build_state_snapshot(legacy_req, server=server)
-
-
 def build_home_state(
-    req: RecommendationHomeV3Request,
+    req: SearchRequest,
     *,
     server: Any | None = None,
 ) -> Tuple[Any, UserStateSnapshot]:
@@ -815,7 +1039,7 @@ def build_home_state(
 
 
 def build_similar_artists_state(
-    req: SimilarArtistsV3Request,
+    req: SearchRequest,
     *,
     server: Any | None = None,
 ) -> Tuple[Any, UserStateSnapshot]:

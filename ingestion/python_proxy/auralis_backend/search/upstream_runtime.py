@@ -18,8 +18,40 @@ def normalize_song_result(server: Any, entry: Optional[Dict[str, Any]]):
     if not video_id:
         return None
     album_info = server.extract_album_info(entry) or {}
+    raw_artists = entry.get("artists")
+    artist_entities: List[Dict[str, Any]] = []
+    if isinstance(raw_artists, list):
+        for raw_artist in raw_artists:
+            if not isinstance(raw_artist, dict):
+                continue
+            artist_name = (
+                raw_artist.get("name")
+                or raw_artist.get("artist")
+                or raw_artist.get("title")
+            )
+            artist_id = (
+                raw_artist.get("id")
+                or raw_artist.get("browseId")
+                or raw_artist.get("browse_id")
+            )
+            if not artist_name:
+                continue
+            artist_entities.append(
+                {
+                    "id": artist_id,
+                    "name": artist_name,
+                    "thumbnail": server.extract_thumbnail(raw_artist),
+                }
+            )
+    primary_artist = artist_entities[0] if artist_entities else {}
     return {
         "id": video_id,
+        "videoId": video_id,
+        "playback_source_id": video_id,
+        "playback": {
+            "provider": "youtube",
+            "source_id": video_id,
+        },
         "title": entry.get("title") or entry.get("name") or "Unknown Track",
         "duration": server.parse_duration_seconds(
             entry.get("duration_seconds")
@@ -29,10 +61,26 @@ def normalize_song_result(server: Any, entry: Optional[Dict[str, Any]]):
         ),
         "thumbnail": server.extract_thumbnail(entry),
         "channel": server.extract_artist(entry),
+        "artist_id": primary_artist.get("id"),
+        "artist_ids": [
+            artist.get("id")
+            for artist in artist_entities
+            if artist.get("id")
+        ],
+        "artist_entities": artist_entities,
         "album": album_info.get("title"),
         "album_id": album_info.get("id"),
         "year": entry.get("year") or "",
         "release_date": entry.get("releaseDate") or entry.get("release_date") or "",
+        "result_type": entry.get("resultType") or entry.get("type") or "",
+        "video_type": entry.get("videoType") or "",
+        "views": entry.get("views") or entry.get("viewCount") or 0,
+        "is_explicit": bool(entry.get("isExplicit")),
+        # A YTMusic `songs` result is provider-scoped catalog evidence. Preserve
+        # that fact so later canonical normalization can derive source authority.
+        "provider": "ytmusic",
+        "source_provider": "youtube",
+        "source_name": "ytmusic",
     }
 
 
@@ -109,6 +157,9 @@ def ytdlp_song_search(server: Any, query: str, limit: int):
                 "channel": server.extract_artist(entry),
                 "album": None,
                 "album_id": None,
+                "provider": "youtube_search",
+                "source_name": "youtube_search",
+                "source_authority": "search_only",
             }
         )
         if len(results) >= limit:

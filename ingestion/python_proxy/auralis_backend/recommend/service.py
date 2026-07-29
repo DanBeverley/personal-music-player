@@ -14,6 +14,7 @@ from .admin_runtime import (
     interaction_event as interaction_event_runtime,
     model_status as model_status_runtime,
     model_versions as model_versions_runtime,
+    recent_search_picks as recent_search_picks_runtime,
     recommended_artists as recommended_artists_runtime,
     search_interaction as search_interaction_runtime,
     train_model as train_model_runtime,
@@ -181,8 +182,39 @@ class RecommendationService:
     def search_interaction(self, req: Any):
         return search_interaction_runtime(self._server, req)
 
+    def recent_search_picks(self, *, user_scope_id: str, limit: int = 8):
+        return recent_search_picks_runtime(
+            self._server,
+            user_scope_id=user_scope_id,
+            limit=limit,
+        )
+
     def history_seed(self, req: Any):
         return history_seed_runtime(self._server, req)
+
+    def recommendation_preferences(self, *, user_scope_id: str):
+        from ..discovery.preferences import load_recommendation_preferences
+
+        return load_recommendation_preferences(self._server, user_scope_id)
+
+    def update_recommendation_preferences(self, req: Any):
+        from ..discovery.feed_state import FeedState, load_feed_state, mark_feed_dirty
+        from ..discovery.preferences import save_recommendation_preferences
+
+        try:
+            payload = save_recommendation_preferences(
+                self._server,
+                user_scope_id=req.user_scope_id,
+                taste_mode=req.taste_mode,
+                listenbrainz_username=req.listenbrainz_username,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        state = load_feed_state(self._server, req.user_scope_id)
+        if state is None:
+            state = FeedState(user_scope_id=req.user_scope_id)
+        mark_feed_dirty(self._server, state, "recommendation_preferences_changed")
+        return payload
 
     def model_status(self):
         return model_status_runtime(self._server)

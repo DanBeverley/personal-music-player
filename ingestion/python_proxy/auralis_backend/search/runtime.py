@@ -7,18 +7,15 @@ import time
 from typing import Any, Dict, List, Optional
 
 from .cache_runtime import lookup_search_result, store_search_result
+from .intelligence import load_fuzzy_catalog_entity_memories
 from .server_adapter import SearchServerAdapter, adapt_search_server
 from .upstream_runtime import (
     search_artists as resolve_search_artists,
     search_artists_direct as resolve_search_artists_direct,
-    ytdlp_song_search as resolve_ytdlp_song_search,
     ytmusic_song_search as resolve_ytmusic_song_search,
 )
 
-_SEARCH_BLEND_TIMEOUT_SECONDS = 1.2
 _SUGGEST_UPSTREAM_TIMEOUT_SECONDS = 0.55
-_SUGGEST_ARTIST_TIMEOUT_SECONDS = 0.45
-_SUGGEST_TRACK_TIMEOUT_SECONDS = 0.55
 
 def _resolve_server(server: Any | None = None) -> SearchServerAdapter:
     return adapt_search_server(server)
@@ -94,23 +91,6 @@ def search_artist_seed_tracks(query: str, limit: int, *, server: Any | None = No
     return tracks
 
 
-def search_albums_for_artist_name(artist_name: str, *, server: Any | None = None):
-    server = _resolve_server(server)
-    normalized_artist = trim_text(artist_name)
-    if not normalized_artist:
-        return {}
-    direct_artists = resolve_search_artists_direct(server, normalized_artist, 1)
-    if not direct_artists:
-        return {}
-    artist_id = trim_text(direct_artists[0].get("id"))
-    if not artist_id:
-        return {}
-    try:
-        return server.build_artist_details_payload(artist_id)
-    except Exception:
-        return {}
-
-
 def _search_cache_key(query: str, limit: int, *, server: Any | None = None) -> str:
     server = _resolve_server(server)
     normalized_query = server.normalize_text(query)
@@ -133,7 +113,10 @@ def _resolved_albums(server: Any, albums: Any) -> List[Dict[str, Any]]:
 def search_tracks_direct(query: str, limit: int, *, server: Any | None = None):
     server = _resolve_server(server)
     query = (query or "").strip()
-    limit = max(1, min(limit, 24))
+    # Search pages ask for 24 visible tracks and need headroom for canonical
+    # deduplication and relevance admission. The old 24-result provider cap
+    # guaranteed a thin shelf whenever even one upload was rejected.
+    limit = max(1, min(limit, 48))
     if not query:
         return []
     cache_key = _search_cache_key(query, limit, server=server)
@@ -149,21 +132,57 @@ def search_tracks_direct(query: str, limit: int, *, server: Any | None = None):
         f"results={len(results or [])}",
         flush=True,
     )
-    if not results:
-        ytdlp_started = time.perf_counter()
-        results = server.search_upstream_call_with_retry(
-            lambda: resolve_ytdlp_song_search(server, query, max(limit, 12)),
-            default=[],
-        )
-        print(
-            "[EBB:search][direct] "
-            f"query={query[:48]} stage=ytdlp_fallback done elapsed_ms={int((time.perf_counter() - ytdlp_started) * 1000)} "
-            f"results={len(results or [])}",
-            flush=True,
-        )
     final_results = [dict(item) for item in list(results or [])[:limit] if isinstance(item, dict)]
     store_search_result("tracks_direct", cache_key, final_results)
     return [dict(item) for item in final_results]
+
+
+def _normalize_playlist_entries(
+    server: Any,
+    entries: Any,
+    *,
+    limit: int,
+) -> List[Dict[str, Any]]:
+    output: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        result_type = str(
+            entry.get("resultType") or entry.get("type") or ""
+        ).strip().lower()
+        if result_type and result_type not in {"playlist", "playlists"}:
+            continue
+        playlist_id = trim_text(
+            entry.get("browseId")
+            or entry.get("playlistId")
+            or entry.get("id")
+        )
+        title = trim_text(entry.get("title") or entry.get("name"))
+        if not playlist_id or not title or playlist_id in seen:
+            continue
+        seen.add(playlist_id)
+        try:
+            track_count = int(
+                str(entry.get("itemCount") or "0").replace(",", "")
+            )
+        except (TypeError, ValueError):
+            track_count = 0
+        output.append(
+            {
+                "id": playlist_id,
+                "name": title,
+                "title": title,
+                "thumbnail": server.extract_thumbnail(entry),
+                "author": server.extract_artist(entry),
+                "track_count": track_count,
+                "result_type": "playlist",
+                "provider": "ytmusic",
+            }
+        )
+        if len(output) >= limit:
+            break
+    return output
 
 
 def search_artists_direct_cached(query: str, limit: int, *, server: Any | None = None):
@@ -208,6 +227,31 @@ def search_albums_direct(query: str, limit: int, *, server: Any | None = None):
     final_results = _resolved_albums(server, albums)[:limit]
     store_search_result("albums_direct", cache_key, final_results)
     return [dict(item) for item in final_results]
+
+
+def search_playlists_direct(
+    query: str,
+    limit: int,
+    *,
+    server: Any | None = None,
+):
+    server = _resolve_server(server)
+    query = (query or "").strip()
+    limit = max(1, min(int(limit or 1), 36))
+    if not query:
+        return []
+    cache_key = _search_cache_key(query, limit, server=server)
+    cached = lookup_search_result("playlists_direct", cache_key)
+    if cached is not None:
+        return [dict(item) for item in cached[:limit] if isinstance(item, dict)]
+
+    raw_results = server.search_upstream_call_with_retry(
+        lambda: server.ytmusic.search(query, filter="playlists", limit=limit),
+        default=[],
+    )
+    output = _normalize_playlist_entries(server, raw_results, limit=limit)
+    store_search_result("playlists_direct", cache_key, output)
+    return [dict(item) for item in output]
 
 
 def album_matches_track_anchor(
@@ -263,241 +307,6 @@ def search_canonical_album_for_track(
                 resolved[key] = value
         return resolved
     return canonical
-
-
-def search_albums_blended(query: str, limit: int, *, server: Any | None = None):
-    server = _resolve_server(server)
-    query = (query or "").strip()
-    limit = max(1, min(limit, 18))
-    if not query:
-        return []
-    cache_key = _search_cache_key(query, limit, server=server)
-    cached = lookup_search_result("albums", cache_key)
-    if cached is not None:
-        return _resolved_albums(server, cached)[:limit]
-
-    results = []
-    seen = set()
-
-    def add_albums(albums, max_to_add: Optional[int] = None):
-        added = 0
-        for raw_album in _resolved_albums(server, albums):
-            album_id = trim_text(raw_album.get("id"))
-            title = trim_text(raw_album.get("title"))
-            artist = trim_text(raw_album.get("artist"))
-            key = album_id or f"{server.normalize_text(title)}|{server.normalize_text(artist)}"
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            results.append(raw_album)
-            added += 1
-            if len(results) >= limit:
-                break
-            if max_to_add is not None and added >= max_to_add:
-                break
-
-    direct_results = server.upstream_call_with_retry(
-        lambda: server.ytmusic.search(query, filter="albums", limit=max(limit, 8)),
-        default=[],
-    )
-    direct_albums = server.normalize_album_results(direct_results)
-    add_albums(direct_albums, max_to_add=min(max(4, limit // 2), 8))
-
-    track_anchor_future = _search_executor(server).submit(
-        resolve_ytmusic_song_search,
-        server,
-        query,
-        max(6, limit),
-    )
-    query_artist_future = _search_executor(server).submit(
-        resolve_search_artists,
-        server,
-        query,
-        2,
-    )
-
-    try:
-        track_anchor_results = track_anchor_future.result(timeout=_SEARCH_BLEND_TIMEOUT_SECONDS)
-    except Exception:
-        track_anchor_results = []
-
-    anchor_artist_payload_futures = {}
-    for index, track in enumerate(track_anchor_results[:4]):
-        artist_name = trim_text(track.get("channel"))
-        if not artist_name:
-            continue
-        anchor_artist_payload_futures[index] = _search_executor(server).submit(
-            search_albums_for_artist_name,
-            artist_name,
-            server=server,
-        )
-
-    for index, track in enumerate(track_anchor_results[:4]):
-        album_title = trim_text(track.get("album"))
-        album_id = trim_text(track.get("album_id"))
-        if album_title:
-            add_albums(
-                [
-                    {
-                        "id": album_id or None,
-                        "title": album_title,
-                        "artist": track.get("channel"),
-                        "thumbnail": track.get("thumbnail"),
-                    }
-                ],
-                max_to_add=1,
-            )
-        try:
-            artist_payload = anchor_artist_payload_futures[index].result(timeout=_SEARCH_BLEND_TIMEOUT_SECONDS)
-        except Exception:
-            artist_payload = {}
-        add_albums(
-            artist_payload.get("albums") or [],
-            max_to_add=max(2, 4 - index),
-        )
-        if len(results) >= limit:
-            return results[:limit]
-
-    if len(results) < limit:
-        try:
-            direct_artists = query_artist_future.result(timeout=_SEARCH_BLEND_TIMEOUT_SECONDS)
-        except Exception:
-            direct_artists = []
-        for artist in direct_artists:
-            artist_id = trim_text(artist.get("id"))
-            if not artist_id:
-                continue
-            try:
-                artist_payload = server.build_artist_details_payload(artist_id)
-            except Exception:
-                artist_payload = {}
-            add_albums(artist_payload.get("albums") or [], max_to_add=4)
-            if len(results) >= limit:
-                break
-
-    if len(results) < limit:
-        fallback_results = server.upstream_call_with_retry(
-            lambda: server.ytmusic.search(query, limit=max(limit * 3, 12)),
-            default=[],
-        )
-        add_albums(server.normalize_album_results(fallback_results))
-
-    final_results = results[:limit]
-    store_search_result("albums", cache_key, final_results)
-    return [dict(item) for item in final_results]
-
-
-def search_tracks_blended(query: str, limit: int, *, server: Any | None = None):
-    server = _resolve_server(server)
-    query = (query or "").strip()
-    limit = max(1, min(limit, 30))
-    if not query:
-        return []
-    cache_key = _search_cache_key(query, limit, server=server)
-    cached = lookup_search_result("tracks", cache_key)
-    if cached is not None:
-        return [dict(item) for item in cached]
-
-    direct_pool = resolve_ytmusic_song_search(server, query, max(limit, 14))
-    if not direct_pool:
-        direct_pool = resolve_ytdlp_song_search(server, query, max(limit, 14))
-
-    results = []
-    seen = set()
-
-    def add_tracks(tracks, max_to_add: Optional[int] = None):
-        added = 0
-        for raw_track in tracks or []:
-            normalized = server.normalize_track(raw_track)
-            if normalized is None:
-                continue
-            track_id = trim_text(normalized.get("id"))
-            if not track_id or track_id in seen:
-                continue
-            seen.add(track_id)
-            results.append(normalized)
-            added += 1
-            if len(results) >= limit:
-                break
-            if max_to_add is not None and added >= max_to_add:
-                break
-
-    add_tracks(direct_pool, max_to_add=min(max(6, limit // 3), 10))
-
-    anchor_track = results[0] if results else (direct_pool[0] if direct_pool else None)
-    query_tokens = server.query_tokens(query)
-    similar_tracks_future = None
-    if anchor_track is not None and anchor_track.get("id"):
-        anchor_text = server.normalize_text(
-            f"{anchor_track.get('title') or ''} {anchor_track.get('channel') or ''}"
-        )
-        if not query_tokens or any(token in anchor_text for token in query_tokens):
-            similar_tracks_future = _search_executor(server).submit(
-                server.assistant_tool_get_similar_tracks,
-                anchor_track["id"],
-                max(6, min(10, limit // 2)),
-            )
-    artist_seed_future = _search_executor(server).submit(
-        search_artist_seed_tracks,
-        query,
-        max(4, min(8, limit // 3)),
-        server=server,
-    )
-
-    if similar_tracks_future is not None:
-        try:
-            similar_tracks = similar_tracks_future.result(timeout=_SEARCH_BLEND_TIMEOUT_SECONDS)
-        except Exception:
-            similar_tracks = []
-        add_tracks(
-            similar_tracks,
-            max_to_add=max(6, min(10, limit // 2)),
-        )
-
-    if len(results) < limit:
-        try:
-            artist_seed_tracks = artist_seed_future.result(timeout=_SEARCH_BLEND_TIMEOUT_SECONDS)
-        except Exception:
-            artist_seed_tracks = []
-        add_tracks(
-            artist_seed_tracks,
-            max_to_add=max(4, min(8, limit // 3)),
-        )
-
-    if len(results) < limit:
-        add_tracks(direct_pool)
-
-    if len(results) < limit:
-        broad_results = server.upstream_call_with_retry(
-            lambda: server.ytmusic.search(query, limit=max(limit * 4, 24)),
-            default=[],
-        )
-        filtered = []
-        for entry in broad_results:
-            result_type = (entry.get("resultType") or entry.get("type") or "").lower()
-            if result_type and result_type not in {"song", "video"}:
-                continue
-            filtered.append(entry)
-        add_tracks(filtered)
-
-    if len(results) < limit:
-        add_tracks(resolve_ytdlp_song_search(server, query, limit))
-
-    final_results = results[:limit]
-    store_search_result("tracks", cache_key, final_results)
-    return [dict(item) for item in final_results]
-
-
-def semantic_search_cache_key(req, namespace: str, *, server: Any | None = None) -> str:
-    server = _resolve_server(server)
-    payload = {
-        "namespace": namespace,
-        "limit": max(int(req.limit or 0), 0),
-        "profile_key": server.recommendation_profile_key(req),
-    }
-    return hashlib.sha1(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
-    ).hexdigest()
 
 
 def semantic_search_lexical_score(query: str, *texts, server: Any | None = None) -> float:
@@ -622,92 +431,6 @@ def semantic_search_anchor_artist_names(anchor_tracks, limit: int = 6, *, server
     )
 
 
-def semantic_search_vectors(req, profile, *, server: Any | None = None):
-    server = _resolve_server(server)
-    query_text = server.trim_text(req.query)
-    query_vector = []
-    if query_text:
-        query_key = server.recommendation_text_embedding_key("semantic_search_query", query_text)
-        if query_key:
-            text_embeddings = server.recommendation_embed_entries(
-                "text",
-                [(query_key, query_text)],
-            )
-            query_vector = text_embeddings.get(query_key) or []
-
-    vectors = profile.get("vectors") or {}
-    semantic_query_vector = server.vector_weighted_average(
-        [
-            (query_vector, 2.2),
-            (vectors.get("query_vector") or [], 0.95),
-            (vectors.get("artist_vector") or [], 0.35),
-        ]
-    )
-    semantic_context_vector = server.vector_weighted_average(
-        [
-            (semantic_query_vector, 1.55),
-            (vectors.get("taste_vector") or [], 0.75),
-            (vectors.get("short_term_vector") or [], 0.35),
-        ]
-    )
-    return {
-        "current_query_vector": query_vector,
-        "semantic_query_vector": semantic_query_vector,
-        "semantic_context_vector": semantic_context_vector,
-    }
-
-
-def semantic_search_vector_similarities(
-    candidate_vector,
-    search_vectors,
-    profile,
-    *,
-    server: Any | None = None,
-):
-    server = _resolve_server(server)
-    vectors = profile.get("vectors") or {}
-    if not candidate_vector:
-        return {
-            "query": 0.0,
-            "semantic_query": 0.0,
-            "context": 0.0,
-            "taste": 0.0,
-            "artist": 0.0,
-            "short": 0.0,
-            "long": 0.0,
-        }
-    return {
-        "query": server.cosine_similarity(
-            candidate_vector,
-            search_vectors.get("current_query_vector") or [],
-        ),
-        "semantic_query": server.cosine_similarity(
-            candidate_vector,
-            search_vectors.get("semantic_query_vector") or [],
-        ),
-        "context": server.cosine_similarity(
-            candidate_vector,
-            search_vectors.get("semantic_context_vector") or [],
-        ),
-        "taste": server.cosine_similarity(
-            candidate_vector,
-            vectors.get("taste_vector") or [],
-        ),
-        "artist": server.cosine_similarity(
-            candidate_vector,
-            vectors.get("artist_vector") or [],
-        ),
-        "short": server.cosine_similarity(
-            candidate_vector,
-            vectors.get("short_term_vector") or [],
-        ),
-        "long": server.cosine_similarity(
-            candidate_vector,
-            vectors.get("long_term_vector") or [],
-        ),
-    }
-
-
 def _semantic_suggestion_text(value: Optional[str]) -> str:
     return re.sub(r"\s+", " ", trim_text(value))
 
@@ -724,23 +447,6 @@ def _semantic_track_suggestion_text(
     artist = _semantic_suggestion_text(
         track.get("channel") or track.get("author") or track.get("artist")
     )
-    if not title:
-        return ""
-    if artist and server.normalize_text(artist) not in server.normalize_text(title):
-        return f"{title} - {artist}"
-    return title
-
-
-def _semantic_album_suggestion_text(
-    album: Optional[Dict[str, Any]],
-    *,
-    server: Any | None = None,
-) -> str:
-    server = _resolve_server(server)
-    if not isinstance(album, dict):
-        return ""
-    title = _semantic_suggestion_text(album.get("title"))
-    artist = _semantic_suggestion_text(album.get("artist"))
     if not title:
         return ""
     if artist and server.normalize_text(artist) not in server.normalize_text(title):
@@ -932,25 +638,41 @@ def semantic_search_suggestion_items(req, *, server: Any | None = None):
                 "suggestion_type": suggestion_type,
             }
 
+    for memory in load_fuzzy_catalog_entity_memories(
+        server,
+        query=query,
+        limit=max(limit * 2, 8),
+        scan_limit=600,
+    ):
+        payload = dict(memory.get("payload") or {})
+        entity_type = str(memory.get("entity_type") or "")
+        if entity_type == "artist":
+            text = payload.get("name") or payload.get("artist")
+        elif entity_type == "album":
+            text = payload.get("title") or payload.get("name")
+        else:
+            title = payload.get("title") or payload.get("name")
+            artist = payload.get("artist") or payload.get("channel")
+            text = f"{title} — {artist}" if title and artist else title
+        add_candidate(
+            text,
+            3.8 + min(float(memory.get("confidence") or 0.0), 1.0),
+            "canonical_prefix_index",
+            entity_type if entity_type in {"track", "artist", "album"} else "query",
+        )
+
     search_started_at = time.perf_counter()
-    upstream_future = _search_upstream_executor(server).submit(
-        server.ytmusic.get_search_suggestions,
-        query,
-    )
-    artist_future = _search_executor(server).submit(
-        resolve_search_artists_direct,
-        server,
-        query,
-        3,
-    )
-    track_future = _search_executor(server).submit(
-        resolve_ytmusic_song_search,
-        server,
-        query,
-        4,
-    )
+    upstream_future = None
+    if len(candidates) + len(direct_play_items) < limit:
+        upstream_future = _search_upstream_executor(server).submit(
+            server.ytmusic.get_search_suggestions,
+            query,
+        )
 
     try:
+        if upstream_future is None:
+            upstream_suggestions = []
+        else:
             upstream_suggestions = upstream_future.result(timeout=_SUGGEST_UPSTREAM_TIMEOUT_SECONDS)
     except Exception:
         upstream_suggestions = []
@@ -965,30 +687,6 @@ def semantic_search_suggestion_items(req, *, server: Any | None = None):
             max(4.1 - (index * 0.18), 1.2),
             "upstream_suggestion",
             "query",
-        )
-
-    try:
-            direct_artists = artist_future.result(timeout=_SUGGEST_ARTIST_TIMEOUT_SECONDS)
-    except Exception:
-        direct_artists = []
-    for index, artist in enumerate(direct_artists[:3]):
-        add_candidate(
-            artist.get("name"),
-            max(3.7 - (index * 0.16), 1.0),
-            "direct_artist_search",
-            "artist",
-        )
-
-    try:
-            direct_tracks = track_future.result(timeout=_SUGGEST_TRACK_TIMEOUT_SECONDS)
-    except Exception:
-        direct_tracks = []
-    for index, track in enumerate(direct_tracks[:4]):
-        add_candidate(
-            _semantic_track_suggestion_text(track, server=server),
-            max(3.2 - (index * 0.15), 0.9),
-            "direct_song_search",
-            "track",
         )
 
     request_recent_queries = unique_strings(
@@ -1086,11 +784,3 @@ def semantic_search_suggestion_items(req, *, server: Any | None = None):
             f"elapsed_ms={int((time.perf_counter() - search_started_at) * 1000)}"
         )
     return list(results)
-
-
-def semantic_search_suggestions(req, *, server: Any | None = None):
-    return [
-        item.get("text") if isinstance(item, dict) else str(item)
-        for item in semantic_search_suggestion_items(req, server=server)
-        if (item.get("text") if isinstance(item, dict) else str(item))
-    ]

@@ -33,7 +33,6 @@ class LaneRecipe:
     positive_hints: tuple[str, ...] = ()
     negative_hints: tuple[str, ...] = ()
     allow_acoustic: bool = True
-    retrieval_queries: tuple[str, ...] = ()
     candidate_sources: tuple[str, ...] = ()
 
 
@@ -46,6 +45,8 @@ class TasteProfile:
     top_tracks: List[JsonDict] = field(default_factory=list)
     last_played_tracks: List[JsonDict] = field(default_factory=list)
     anchor_tracks: List[JsonDict] = field(default_factory=list)
+    full_history_tracks: List[JsonDict] = field(default_factory=list)
+    frequent_tracks: List[JsonDict] = field(default_factory=list)
     artist_hints: List[str] = field(default_factory=list)
     album_hints: List[str] = field(default_factory=list)
     top_artists: List[str] = field(default_factory=list)
@@ -57,7 +58,10 @@ class TasteProfile:
     avoid_ids: List[str] = field(default_factory=list)
     force_refresh: bool = False
     refresh_token: str = ""
+    rotation_epoch: int = 0
     source_profile: JsonDict = field(default_factory=dict)
+    taste_mode: str = "neatie"
+    listenbrainz_username: str = ""
 
     @property
     def is_cold_start(self) -> bool:

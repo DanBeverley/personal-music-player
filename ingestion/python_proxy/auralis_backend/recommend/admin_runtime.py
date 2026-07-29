@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from typing import Any
+import json
 
 from fastapi import HTTPException
+
+from .store_runtime import open_recommendation_store_connection
 
 
 def recommended_artists(server: Any, req: Any):
@@ -26,6 +29,87 @@ def search_interaction(server: Any, req: Any):
         return {"status": "success", "stored": bool(stored)}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+def recent_search_picks(server: Any, *, user_scope_id: str, limit: int = 8):
+    scope = str(user_scope_id or "guest").strip() or "guest"
+    resolved_limit = max(1, min(int(limit or 8), 24))
+    try:
+        connection = open_recommendation_store_connection(server)
+        try:
+            rows = connection.execute(
+                """
+                SELECT query, metadata_json, occurred_at
+                FROM recommendation_search_events
+                WHERE user_scope_id = ?
+                  AND (
+                    metadata_json LIKE '%"selected_item"%'
+                    OR metadata_json LIKE '%"clicked_item"%'
+                    OR metadata_json LIKE '%"track"%'
+                    OR metadata_json LIKE '%"entity"%'
+                  )
+                ORDER BY occurred_at DESC
+                LIMIT ?
+                """,
+                [scope, resolved_limit * 30],
+            ).fetchall()
+        finally:
+            connection.close()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    picks = []
+    seen = set()
+    for row in rows:
+        try:
+            payload = json.loads(row["metadata_json"] or "{}")
+        except Exception:
+            payload = {}
+        selected = {}
+        for key in ("selected_item", "clicked_item", "track", "item", "entity"):
+            value = payload.get(key)
+            if isinstance(value, dict):
+                selected = dict(value)
+                break
+        entity_type = str(
+            payload.get("selected_entity_type")
+            or payload.get("clicked_entity_type")
+            or payload.get("entity_type")
+            or ("track" if selected else "")
+            or ""
+        ).strip().lower()
+        if entity_type and entity_type != "track":
+            continue
+        if not selected:
+            continue
+        track_id = str(
+            selected.get("id")
+            or selected.get("videoId")
+            or selected.get("track_id")
+            or selected.get("video_id")
+            or ""
+        ).strip()
+        title = str(selected.get("title") or selected.get("name") or "").strip()
+        artist = str(
+            selected.get("artist")
+            or selected.get("channel")
+            or selected.get("author")
+            or ""
+        ).strip()
+        key = track_id or f"{title.lower()}|{artist.lower()}"
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        picks.append(
+            {
+                "query": str(row["query"] or "").strip(),
+                "track": selected,
+                "selected_at": float(row["occurred_at"] or 0.0),
+            }
+        )
+        if len(picks) >= resolved_limit:
+            break
+    return {"status": "success", "picks": picks}
 
 
 def model_status(server: Any):
@@ -69,9 +153,6 @@ def model_status(server: Any):
 def model_versions(server: Any):
     try:
         tracked_model_keys = [
-            "search_track_reranker_v2",
-            "search_artist_reranker_v2",
-            "search_album_reranker_v2",
             "home_global_ranker_v4",
             "home_continue_ranker_v1",
             "home_because_played_ranker_v1",

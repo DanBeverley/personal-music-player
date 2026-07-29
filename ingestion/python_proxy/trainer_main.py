@@ -10,9 +10,6 @@ from auralis_backend.domain.ranking import (
     HOME_GLOBAL_DEFAULT_WEIGHTS,
     HOME_QUIET_DEFAULT_WEIGHTS,
     HOME_TRENDING_DEFAULT_WEIGHTS,
-    SEARCH_ALBUM_DEFAULT_WEIGHTS,
-    SEARCH_ARTIST_DEFAULT_WEIGHTS,
-    SEARCH_TRACK_DEFAULT_WEIGHTS,
 )
 from auralis_backend.runtime_context import resolve_server
 from auralis_backend.storage.object_store import get_object_store
@@ -24,27 +21,6 @@ from auralis_backend.storage.postgres import (
 
 
 def _register_linear_models(model_id: str) -> None:
-    upsert_default_model_weights(
-        model_key="search_track_reranker_v2",
-        version=model_id,
-        model_type="linear_reranker",
-        weights=SEARCH_TRACK_DEFAULT_WEIGHTS,
-        metadata={"surface": "search", "entity_type": "track"},
-    )
-    upsert_default_model_weights(
-        model_key="search_artist_reranker_v2",
-        version=model_id,
-        model_type="linear_reranker",
-        weights=SEARCH_ARTIST_DEFAULT_WEIGHTS,
-        metadata={"surface": "search", "entity_type": "artist"},
-    )
-    upsert_default_model_weights(
-        model_key="search_album_reranker_v2",
-        version=model_id,
-        model_type="linear_reranker",
-        weights=SEARCH_ALBUM_DEFAULT_WEIGHTS,
-        metadata={"surface": "search", "entity_type": "album"},
-    )
     upsert_default_model_weights(
         model_key="recommendation_home_reranker_v2",
         version=model_id,
@@ -130,9 +106,6 @@ def main() -> int:
         "generated_at": time.time(),
         "model": model or {},
         "registered_models": [
-            "search_track_reranker_v2",
-            "search_artist_reranker_v2",
-            "search_album_reranker_v2",
             "recommendation_home_reranker_v2",
             "home_global_ranker_v4",
             "home_continue_ranker_v1",

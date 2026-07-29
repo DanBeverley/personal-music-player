@@ -19,7 +19,7 @@ from auralis_backend.contracts import (
     AssistantSessionCreateRequest,
     DownloadRequest,
     SearchRequest,
-    WarmStreamRequest,
+    PrepareSessionRequest,
 )
 
 
@@ -215,10 +215,12 @@ class _FakeMediaService:
         self.last_track_details_request = req
         return {"status": "success", "video_id": req.video_id}
 
-    def get_track_lyrics(self, video_id: str):
+    def get_track_lyrics(self, video_id: str, *, title: str = "", artist: str = ""):
         return {
             "status": "success",
             "video_id": video_id,
+            "title": title,
+            "artist": artist,
             "has_lyrics": False,
             "has_timestamps": False,
             "source": None,
@@ -304,7 +306,6 @@ class ApiContractTests(unittest.TestCase):
         assistant_chat_hints = get_type_hints(routes.assistant_chat)
         assistant_create_hints = get_type_hints(routes.assistant_create_session)
         prepare_hints = get_type_hints(routes.prepare_session)
-        warm_hints = get_type_hints(routes.warm_streams)
         download_hints = get_type_hints(routes.download_audio)
 
         self.assertIs(search_hints["req"], SearchRequest)
@@ -317,9 +318,60 @@ class ApiContractTests(unittest.TestCase):
             assistant_create_hints["req"],
             AssistantSessionCreateRequest,
         )
-        self.assertIs(prepare_hints["req"], WarmStreamRequest)
-        self.assertIs(warm_hints["req"], WarmStreamRequest)
+        self.assertIs(prepare_hints["req"], PrepareSessionRequest)
         self.assertIs(download_hints["req"], DownloadRequest)
+
+    @patch("auralis_backend.api.routes.catalog_import_coverage_report")
+    @patch("auralis_backend.api.routes.load_catalog_acceptance_fixtures")
+    def test_catalog_coverage_endpoint_exposes_readiness_report(
+        self,
+        load_fixtures,
+        coverage_report,
+    ) -> None:
+        load_fixtures.return_value = [
+            {
+                "query": "bring me to life",
+                "expected_title": "Bring Me To Life",
+                "expected_artist": "Evanescence",
+            }
+        ]
+        coverage_report.return_value = {
+            "production_usable": False,
+            "fixture_total": 1,
+            "fixture_passed": 0,
+            "fixture_pass_rate": 0.0,
+            "catalog_total": 0,
+            "alias_total": 0,
+        }
+
+        response = self.client.get("/admin/catalog_coverage")
+
+        self.assertEqual(200, response.status_code)
+        payload = response.json()
+        self.assertFalse(payload["production_usable"])
+        self.assertEqual(1, payload["fixture_total"])
+        load_fixtures.assert_called_once()
+        coverage_report.assert_called_once_with(
+            self.fake_server,
+            fixtures=load_fixtures.return_value,
+        )
+
+    @patch("auralis_backend.api.routes.catalog_import_coverage_report")
+    def test_catalog_coverage_endpoint_can_skip_fixture_probe(self, coverage_report) -> None:
+        coverage_report.return_value = {
+            "production_usable": True,
+            "fixture_total": 0,
+            "fixture_passed": 0,
+            "fixture_pass_rate": 0.0,
+            "catalog_total": 42,
+            "alias_total": 80,
+        }
+
+        response = self.client.get("/admin/catalog_coverage?include_fixtures=false")
+
+        self.assertEqual(200, response.status_code)
+        self.assertTrue(response.json()["production_usable"])
+        coverage_report.assert_called_once_with(self.fake_server, fixtures=[])
 
     def test_search_endpoint_contract_matches_flutter_payload_shape(self) -> None:
         response = self.client.post(
@@ -396,6 +448,7 @@ class ApiContractTests(unittest.TestCase):
                 "offset": 0,
                 "force_refresh": True,
                 "prefer_fresh_rows": True,
+                "session_intent": True,
                 "refresh_token": "manual-refresh-1",
                 "seed_id": "track_1",
                 "seed_ids": ["track_1", "track_2"],
@@ -432,6 +485,7 @@ class ApiContractTests(unittest.TestCase):
         req = self.fake_recommendation_service.last_recommend_request
         self.assertEqual(["Led Zeppelin"], req.artist_hints)
         self.assertEqual(["hard rock"], req.taste_queries)
+        self.assertTrue(req.session_intent)
         self.assertEqual(["track_4"], req.library_track_ids)
         self.assertEqual(["track_4"], req.offline_track_ids)
         payload = response.json()
@@ -524,17 +578,12 @@ class ApiContractTests(unittest.TestCase):
     def test_stream_endpoint_contracts_accept_current_payloads(self) -> None:
         captured = {}
 
-        def fake_warm_streams(server, req):
-            captured["warm_server"] = server
-            captured["warm_req"] = req
-            return {"status": "success", "queued": list(req.video_ids)}
-
         def fake_download(server, req):
             captured["download_server"] = server
             captured["download_req"] = req
             return {"status": "success", "video_id": req.video_id}
 
-        with patch.object(routes, "warm_streams_runtime", side_effect=fake_warm_streams), patch.object(
+        with patch.object(
             routes,
             "download_audio_runtime",
             side_effect=fake_download,
@@ -542,19 +591,10 @@ class ApiContractTests(unittest.TestCase):
             prepare_response = self.client.post(
                 "/prepare_session",
                 json={
-                    "video_ids": ["track_1", "track_2"],
-                    "current_video_id": "track_1",
+                    "track_keys": ["recording:track_1", "recording:track_2"],
+                    "current_track_key": "recording:track_1",
                     "active_queue": True,
                     "lookahead": 2,
-                },
-            )
-            warm_response = self.client.post(
-                "/warm_streams",
-                json={
-                    "video_ids": ["track_1"],
-                    "current_video_id": "track_1",
-                    "active_queue": False,
-                    "lookahead": 1,
                 },
             )
             download_response = self.client.post(
@@ -566,14 +606,12 @@ class ApiContractTests(unittest.TestCase):
             )
 
         self.assertEqual(200, prepare_response.status_code)
-        self.assertEqual(200, warm_response.status_code)
         self.assertEqual(200, download_response.status_code)
-        self.assertIsInstance(self.fake_media_service.last_prepare_request, WarmStreamRequest)
-        self.assertIsInstance(captured["warm_req"], WarmStreamRequest)
+        self.assertIsInstance(self.fake_media_service.last_prepare_request, PrepareSessionRequest)
         self.assertIsInstance(captured["download_req"], DownloadRequest)
         self.assertEqual(
-            ["track_1", "track_2"],
-            self.fake_media_service.last_prepare_request.video_ids,
+            ["recording:track_1", "recording:track_2"],
+            self.fake_media_service.last_prepare_request.track_keys,
         )
         self.assertEqual("track_1", captured["download_req"].video_id)
 

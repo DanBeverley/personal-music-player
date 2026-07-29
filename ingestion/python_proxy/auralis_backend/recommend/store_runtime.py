@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+import os
 import sqlite3
 
 from ..runtime_context import resolve_server as _resolve_runtime_server
@@ -10,11 +11,31 @@ def resolve_server(server: Any | None = None) -> Any:
     return _resolve_runtime_server(server)
 
 
+def _store_path(server: Any) -> str:
+    raw = str(server.RECOMMENDATION_STORE_DB_PATH or "").strip()
+    return raw if raw == ":memory:" else os.path.abspath(raw)
+
+
+def _store_is_initialized(server: Any) -> bool:
+    path = _store_path(server)
+    if str(getattr(server, "_recommendation_store_initialized_path", "")) != path:
+        return False
+    return path == ":memory:" or os.path.exists(path)
+
+
 def init_recommendation_store(server: Any | None = None) -> Any:
     resolved = resolve_server(server)
+    if _store_is_initialized(resolved):
+        return resolved
     with resolved.recommendation_store_lock:
+        if _store_is_initialized(resolved):
+            return resolved
         connection = open_recommendation_store_connection_raw(resolved)
         try:
+            if _store_path(resolved) != ":memory:":
+                connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA synchronous=NORMAL")
+            connection.execute("PRAGMA busy_timeout=15000")
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS recommendation_events (
@@ -498,14 +519,19 @@ def init_recommendation_store(server: Any | None = None) -> Any:
                 """
             )
             connection.commit()
+            resolved._recommendation_store_initialized_path = _store_path(resolved)
         finally:
             connection.close()
     return resolved
 
 
 def open_recommendation_store_connection_raw(server: Any):
-    connection = sqlite3.connect(server.RECOMMENDATION_STORE_DB_PATH)
+    connection = sqlite3.connect(
+        server.RECOMMENDATION_STORE_DB_PATH,
+        timeout=15.0,
+    )
     connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA busy_timeout=15000")
     return connection
 
 

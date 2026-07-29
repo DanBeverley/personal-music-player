@@ -4,14 +4,33 @@ from collections import Counter, defaultdict
 from dataclasses import replace
 from typing import Any, Dict, Iterable, List, Sequence, Set, Tuple
 import hashlib
+import re
 
+from .admission import (
+    DISCOVERY_ROWS,
+    TRUSTED_AUTHORITIES,
+    candidate_profile_compatibility,
+)
+from .allocation import allocate_home_rows
 from .candidates import album_name, artist_name, item_signature, metadata_text, normalize_text, track_id
 from .config import LANE_ORDER, LANE_RECIPES, ROW_RECIPES
 from .schema import DiscoveryCandidate, DiscoveryRow, LaneRecipe, RowRecipe, TasteProfile
 
 
+def _contains_token_phrase(text: str, phrase: Any) -> bool:
+    normalized_text = normalize_text(text)
+    normalized_phrase = normalize_text(phrase)
+    if not normalized_text or not normalized_phrase:
+        return False
+    pattern = r"(?<![a-z0-9])" + r"\s+".join(
+        re.escape(part) for part in normalized_phrase.split()
+    ) + r"(?![a-z0-9])"
+    return re.search(pattern, normalized_text) is not None
+
+
 SOURCE_WEIGHTS = {
     "history": 0.9,
+    "profile_spine": 1.35,
     "similarity": 1.25,
     "artist_graph": 1.0,
     "genre_mood": 0.95,
@@ -31,43 +50,19 @@ ROW_INTENT_HINTS = {
     "daily_pick": ("favorite", "hit", "best", "classic", "official", "popular"),
     "personal_mix": ("favorite", "mix", "best", "hit", "popular"),
     "anchor_recommendation": ("similar", "classic", "radio", "official"),
-    "genre_discovery": ("rock", "pop", "soul", "dance", "blues", "metal", "jazz"),
+    "artist_radio": ("radio", "artist", "similar", "classic", "official", "popular"),
     "taste_discovery": ("favorite", "classic", "official", "hit", "session", "live", "popular"),
-    "novelty_discovery": ("indie", "deep", "rare", "hidden", "cover", "live", "session"),
 }
 
-DISCOVERY_ROWS = {
-    "todays_pick",
-    "made_for_you",
-    "because_you_played",
-    "trending_by_genre",
-    "quiet_picks",
-    "hidden_gems",
-}
-
-EXPLORATORY_SOURCES = {
-    "ytmusic_home",
-    "popularity",
-    "collaborative",
-    "discovery_universe",
-    "genre_mood",
-    "lane_chill",
-    "lane_workout",
-    "lane_focus",
-    "lane_mood",
-}
-
-GLOBAL_REGION_KEYS = {"global", "world", "international"}
 REFRESH_MUTABLE_ROWS = {
     "todays_pick",
     "featured_new_albums",
     "made_for_you",
     "because_you_played",
-    "trending_by_genre",
+    "popular_radio",
     "recommended_albums",
     "recommended_artists",
     "quiet_picks",
-    "hidden_gems",
     "home_lane",
     "personal_mix_slice",
 }
@@ -78,6 +73,85 @@ def _number(value: Any) -> float:
         return float(value or 0.0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _negative_feedback_by_type(taste: TasteProfile) -> Dict[str, Dict[str, float]]:
+    profile = dict(taste.source_profile or {})
+    raw = profile.get("negative_feedback") or {}
+    if isinstance(raw, dict) and isinstance(raw.get("by_type"), dict):
+        raw = raw.get("by_type") or {}
+    output: Dict[str, Dict[str, float]] = {}
+    if not isinstance(raw, dict):
+        return output
+    for feedback_type, entries in raw.items():
+        if not isinstance(entries, dict):
+            continue
+        typed: Dict[str, float] = {}
+        for key, value in entries.items():
+            normalized = normalize_text(key)
+            if not normalized:
+                continue
+            typed[normalized] = _number(value)
+        if typed:
+            output[str(feedback_type or "")] = typed
+    return output
+
+
+def _item_feedback_keys(item: Dict[str, Any]) -> Dict[str, Set[str]]:
+    title_key = normalize_text(item.get("title_key") or item.get("title") or item.get("name"))
+    artist_key = normalize_text(item.get("artist_key") or artist_name(item))
+    album_key = normalize_text(album_name(item))
+    primary_genre = normalize_text(item.get("primary_genre") or item.get("genre"))
+    subgenre = normalize_text(item.get("subgenre"))
+    language = normalize_text(item.get("language"))
+    script = normalize_text(item.get("script"))
+    scene_clusters = {
+        normalize_text(value)
+        for value in item.get("scene_cluster_ids") or []
+        if normalize_text(value)
+    }
+    duplicate = f"{title_key}|{artist_key}" if title_key and artist_key else ""
+    return {
+        "exact_track": {normalize_text(track_id(item))},
+        "duplicate_track": {duplicate},
+        "artist_cluster": {artist_key},
+        "genre_cluster": {primary_genre},
+        "subgenre_cluster": {subgenre},
+        "language_cluster": {language},
+        "script_cluster": {script},
+        "scene_cluster": scene_clusters,
+        "album_cluster": {album_key},
+    }
+
+
+def _negative_feedback_penalty(item: Dict[str, Any], taste: TasteProfile) -> Tuple[float, bool]:
+    feedback = _negative_feedback_by_type(taste)
+    if not feedback:
+        return 0.0, False
+    weights = {
+        "exact_track": 3.4,
+        "duplicate_track": 2.2,
+        "artist_cluster": 1.05,
+        "album_cluster": 0.8,
+        "genre_cluster": 0.82,
+        "subgenre_cluster": 0.62,
+        "language_cluster": 0.75,
+        "script_cluster": 0.45,
+        "scene_cluster": 0.7,
+    }
+    penalty = 0.0
+    hard_suppressed = False
+    for feedback_type, keys in _item_feedback_keys(item).items():
+        keys.discard("")
+        entries = feedback.get(feedback_type) or {}
+        for key in keys:
+            strength = _number(entries.get(key))
+            if strength <= 0:
+                continue
+            penalty += strength * weights.get(feedback_type, 0.5)
+            if feedback_type in {"exact_track", "duplicate_track"} and strength >= 0.85:
+                hard_suppressed = True
+    return penalty, hard_suppressed
 
 
 def _avoid_ids(taste: TasteProfile) -> Set[str]:
@@ -194,6 +268,27 @@ def _history_track_ids(taste: TasteProfile) -> Set[str]:
     return ids
 
 
+def _history_track_identity_keys(taste: TasteProfile) -> Set[str]:
+    keys: Set[str] = set()
+    for track in taste.recent_tracks + taste.top_tracks + taste.last_played_tracks + taste.anchor_tracks:
+        item_id = track_id(track)
+        title = normalize_text(track.get("title") or track.get("name"))
+        artist = normalize_text(artist_name(track))
+        album = normalize_text(album_name(track))
+        for value in (
+            item_id,
+            track.get("canonical_track_identity"),
+            track.get("canonical_source_identity"),
+            f"{title}|{artist}",
+        ):
+            normalized = normalize_text(value)
+            if normalized:
+                keys.add(normalized)
+        if album and artist:
+            keys.add(f"album:{album}|{artist}")
+    return keys
+
+
 def _listened_album_keys(taste: TasteProfile) -> Tuple[Set[str], Set[str]]:
     titles = {
         normalize_text(value)
@@ -234,47 +329,36 @@ def _profile_string_set(taste: TasteProfile, *keys: str) -> Set[str]:
 def _taste_genre_keys(taste: TasteProfile) -> Set[str]:
     genres: Set[str] = set()
     for track in taste.recent_tracks + taste.top_tracks + taste.last_played_tracks:
-        for key in ("genre", "subgenre"):
+        for key in ("genre", "subgenre", "primary_genre"):
             value = normalize_text(track.get(key))
             if value:
                 genres.add(value)
-        for value in track.get("genres") or []:
-            normalized = normalize_text(value)
-            if normalized:
-                genres.add(normalized)
+        for key in ("genres", "discovery_genres", "styles", "tags", "track_type_tags"):
+            values = track.get(key) or []
+            if isinstance(values, str):
+                values = [values]
+            for value in values:
+                normalized = normalize_text(value)
+                if normalized:
+                    genres.add(normalized)
+    for value in _profile_string_set(
+        taste,
+        "top_genres",
+        "genres",
+        "genre",
+        "dominant_genres",
+        "supported_genres",
+        "discovery_genres",
+        "styles",
+        "tags",
+    ):
+        normalized = normalize_text(value)
+        if normalized:
+            genres.add(normalized)
     for cluster in _profile_string_set(taste, "scene_cluster_scores", "scene_cluster_ids"):
         if cluster.startswith("genre:"):
             genres.add(cluster.split(":", 1)[1])
     return genres
-
-
-def _taste_language_keys(taste: TasteProfile) -> Set[str]:
-    values = _profile_string_set(
-        taste,
-        "supported_languages",
-        "dominant_language",
-        "languages",
-    )
-    for track in taste.recent_tracks + taste.top_tracks + taste.last_played_tracks:
-        value = normalize_text(track.get("language"))
-        if value and value != "unknown":
-            values.add(value)
-    return values
-
-
-def _taste_region_keys(taste: TasteProfile) -> Set[str]:
-    values = _profile_string_set(
-        taste,
-        "supported_regions",
-        "regions",
-        "dominant_region",
-        "region",
-    )
-    for track in taste.recent_tracks + taste.top_tracks + taste.last_played_tracks:
-        value = normalize_text(track.get("region"))
-        if value and value != "unknown":
-            values.add(value)
-    return values
 
 
 def _candidate_strong_personal_match(
@@ -284,41 +368,44 @@ def _candidate_strong_personal_match(
     artist_key = normalize_text(artist_name(candidate.item))
     if artist_key and artist_key in _taste_artist_keys(taste):
         return True
-    if candidate.item.get("artist_neighborhood") is True:
-        return True
     item_id = track_id(candidate.item)
     return bool(item_id and item_id in _history_track_ids(taste))
 
 
-def _candidate_language_compatible(
-    candidate: DiscoveryCandidate,
-    taste: TasteProfile,
-) -> bool:
-    supported_languages = _taste_language_keys(taste)
-    language = normalize_text(candidate.item.get("language"))
-    if not supported_languages or not language or language == "unknown":
-        return True
-    return language in supported_languages
-
-
-def _candidate_region_compatible(
-    candidate: DiscoveryCandidate,
-    taste: TasteProfile,
-) -> bool:
-    supported_regions = _taste_region_keys(taste)
-    region = normalize_text(candidate.item.get("region"))
-    if not supported_regions or not region or region == "unknown":
-        return True
-    if region in supported_regions:
-        return True
-    return bool(region in GLOBAL_REGION_KEYS)
+def _candidate_recommendation_path(candidate: DiscoveryCandidate) -> str:
+    path = normalize_text(candidate.item.get("recommendation_path"))
+    if path:
+        return path
+    source = normalize_text(candidate.source)
+    origin = normalize_text(candidate.item.get("discovery_origin"))
+    if source == "discovery_universe" and origin:
+        return {
+            "history": "direct_history",
+            "profile_spine": "profile_history_anchor",
+            "similarity": "track_radio",
+            "artist_graph": "artist_neighbor",
+            "collaborative": "collaborative_neighbor",
+            "genre_mood": "structured_tag",
+            "ytmusic_home": "broad_global",
+            "popularity": "broad_global",
+        }.get(origin, "unproven")
+    if source.startswith("lane_"):
+        return "structured_tag"
+    return {
+        "history": "direct_history",
+        "profile_spine": "profile_history_anchor",
+        "similarity": "track_radio",
+        "artist_graph": "artist_neighbor",
+        "collaborative": "collaborative_neighbor",
+        "genre_mood": "structured_tag",
+        "ytmusic_home": "broad_global",
+        "popularity": "broad_global",
+    }.get(source, "unproven")
 
 
 def _candidate_matches_taste(candidate: DiscoveryCandidate, taste: TasteProfile) -> bool:
     artist_key = normalize_text(artist_name(candidate.item))
     if artist_key and artist_key in _taste_artist_keys(taste):
-        return True
-    if candidate.item.get("artist_neighborhood") is True:
         return True
     related_artist_keys = _profile_string_set(
         taste,
@@ -343,9 +430,109 @@ def _candidate_matches_taste(candidate: DiscoveryCandidate, taste: TasteProfile)
             for value in candidate.item.get("genres") or []
             if normalize_text(value)
         },
+        *{
+            normalize_text(value)
+            for value in candidate.item.get("discovery_genres") or []
+            if normalize_text(value)
+        },
+        *{
+            normalize_text(value)
+            for value in candidate.item.get("styles") or []
+            if normalize_text(value)
+        },
+        *{
+            normalize_text(value)
+            for value in candidate.item.get("tags") or []
+            if normalize_text(value)
+        },
     }
     candidate_genres.discard("")
     return bool(candidate_genres & _taste_genre_keys(taste))
+
+
+def _because_you_played_relation(
+    candidate: DiscoveryCandidate,
+    taste: TasteProfile,
+) -> tuple[bool, str]:
+    """Validate anchor rows by entity relation, never title text alone."""
+
+    item = dict(candidate.item or {})
+    artist_key = normalize_text(artist_name(item))
+    taste_artists = _taste_artist_keys(taste)
+    related_artist_keys = _profile_string_set(
+        taste,
+        "artist_neighborhood_preferences",
+        "peer_scene_keys",
+        "peer_artist_keys",
+    )
+    if artist_key and artist_key in taste_artists:
+        return True, "same_artist"
+    if artist_key and artist_key in related_artist_keys:
+        return True, "artist_neighbor"
+
+    item_artist_graph = {
+        normalize_text(value)
+        for value in item.get("artist_graph_keys") or []
+        if normalize_text(value)
+    }
+    if item_artist_graph & (taste_artists | related_artist_keys):
+        return True, "artist_neighbor"
+
+    item_id = track_id(item)
+    title = normalize_text(item.get("title") or item.get("name"))
+    album = normalize_text(album_name(item))
+    item_keys = {
+        normalize_text(item_id),
+        normalize_text(item.get("canonical_track_identity")),
+        normalize_text(item.get("canonical_source_identity")),
+        normalize_text(f"{title}|{artist_key}"),
+    }
+    if album and artist_key:
+        item_keys.add(f"album:{album}|{artist_key}")
+    item_keys.discard("")
+    history_keys = _history_track_identity_keys(taste)
+    related_track_id = str(item.get("related_to_track") or "").strip()
+    if (
+        _candidate_recommendation_path(candidate) == "track_radio"
+        and related_track_id
+        and related_track_id in _history_track_ids(taste)
+    ):
+        return True, "track_radio"
+    if item_keys & history_keys:
+        return True, "same_album" if any(key.startswith("album:") for key in item_keys & history_keys) else "track_radio"
+
+    candidate_genres = _item_genre_keys(item)
+    if candidate_genres & _taste_genre_keys(taste):
+        authority = normalize_text(item.get("source_authority"))
+        sources = set(str(candidate.source or "").split("+"))
+        graph_bridge = bool(
+            item_artist_graph & (taste_artists | related_artist_keys)
+            or sources & {"artist_graph"}
+        )
+        if graph_bridge and authority in TRUSTED_AUTHORITIES:
+            return True, "same_genre_family"
+
+    compatibility = candidate_profile_compatibility(
+        candidate,
+        taste,
+        row_kind="because_you_played",
+        relation_context="trusted_popular_neighbor",
+        taste_match=_candidate_matches_taste(candidate, taste),
+        strong_personal_match=_candidate_strong_personal_match(candidate, taste),
+    )
+    try:
+        relation_strength = float(item.get("relation_strength") or 0.0)
+    except (TypeError, ValueError):
+        relation_strength = 0.0
+    if (
+        normalize_text(item.get("source_authority")) in TRUSTED_AUTHORITIES
+        and compatibility.allowed
+        and relation_strength >= 0.6
+    ):
+        item.update(compatibility.diagnostics())
+        return True, "trusted_popular_neighbor"
+
+    return False, "title_only_or_unrelated"
 
 
 def _item_genre_keys(item: Dict[str, Any]) -> Set[str]:
@@ -355,6 +542,21 @@ def _item_genre_keys(item: Dict[str, Any]) -> Set[str]:
         *{
             normalize_text(value)
             for value in item.get("genres") or []
+            if normalize_text(value)
+        },
+        *{
+            normalize_text(value)
+            for value in item.get("discovery_genres") or []
+            if normalize_text(value)
+        },
+        *{
+            normalize_text(value)
+            for value in item.get("styles") or []
+            if normalize_text(value)
+        },
+        *{
+            normalize_text(value)
+            for value in item.get("tags") or []
             if normalize_text(value)
         },
     }
@@ -402,7 +604,13 @@ def _album_taste_relation(
         return True, "history_track_album", 1.25
     if source_track_id and source_track_id in preferred_track_ids:
         return True, "lane_track_album", 1.15
-    if item.get("artist_neighborhood") is True:
+    if (
+        item.get("artist_neighborhood") is True
+        and (
+            normalize_text(candidate.source) == "artist_graph"
+            or _candidate_recommendation_path(candidate) == "artist_neighbor"
+        )
+    ):
         return True, "artist_neighborhood", 1.15
     if artist_key and artist_key in related_artist_keys:
         return True, "related_artist", 1.05
@@ -413,23 +621,38 @@ def _album_taste_relation(
     }
     if item_artist_graph & (taste_artists | related_artist_keys):
         return True, "artist_graph", 1.0
-    if genre_match and _candidate_language_compatible(candidate, taste) and _candidate_region_compatible(candidate, taste):
-        return True, "genre_match", 0.65
-    if genre_match and source_authority in {"official", "canonical", "verified_catalog"}:
-        return True, "verified_genre_match", 0.85
+    compatibility = candidate_profile_compatibility(
+        candidate,
+        taste,
+        row_kind="recommended_albums",
+        relation_context="same_genre_family",
+        taste_match=genre_match,
+        strong_personal_match=False,
+    )
+    try:
+        relation_strength = float(item.get("relation_strength") or 0.0)
+    except (TypeError, ValueError):
+        relation_strength = 0.0
     if (
         album_segment in {"known_artist_albums", "adjacent_artist_albums", "classic_neighbor_albums"}
         or pool_source in {"known_artist_albums", "adjacent_artist_albums", "classic_neighbor_albums"}
-    ) and (
-        genre_match
-        or source_authority in {"official", "canonical", "verified_catalog"}
-        or pool_source == "adjacent_artist_albums"
-    ):
+    ) and compatibility.allowed and (genre_match or relation_strength >= 0.6):
+        item.update(compatibility.diagnostics())
         return True, album_segment or pool_source, 0.5
     if (
-        pool_source == "fresh_or_recent_albums"
-        and (genre_match or source_authority in {"official", "canonical", "verified_catalog"})
+        (album_segment == "genre_album_discovery" or pool_source == "genre_album_discovery")
+        and compatibility.allowed
+        and genre_match
     ):
+        item.update(compatibility.diagnostics())
+        return True, "genre_album_discovery", 0.45
+    if (
+        pool_source == "fresh_or_recent_albums"
+        and compatibility.allowed
+        and genre_match
+        and relation_strength >= 0.55
+    ):
+        item.update(compatibility.diagnostics())
         return True, "fresh_genre_match", 0.45
     if album_source == "artist_catalog" and artist_key:
         return False, "artist_catalog_not_in_taste_graph", -1.75
@@ -442,53 +665,31 @@ def _candidate_is_admitted(
     *,
     row_kind: str,
 ) -> bool:
-    if row_kind not in DISCOVERY_ROWS:
-        return True
-    if normalize_text(candidate.item.get("source_authority")) == "search_only":
-        return False
-    sources = set(candidate.source.split("+"))
-    exploratory = bool(sources & EXPLORATORY_SOURCES)
-    if exploratory and not taste.is_cold_start:
-        source_authority = normalize_text(candidate.item.get("source_authority"))
-        if (
-            source_authority in {"", "unknown"}
-            and not _candidate_strong_personal_match(candidate, taste)
-            and not _candidate_matches_taste(candidate, taste)
-        ):
-            return False
-        if (
-            not _candidate_language_compatible(candidate, taste)
-            or not _candidate_region_compatible(candidate, taste)
-        ) and not _candidate_strong_personal_match(candidate, taste):
-            return False
-    universe_origin = normalize_text(candidate.item.get("discovery_origin"))
-    weak_only = bool(sources) and sources.issubset(
-        {"ytmusic_home", "popularity", "collaborative", "discovery_universe"}
+    _penalty, hard_suppressed = _negative_feedback_penalty(candidate.item, taste)
+    recommendation_path = _candidate_recommendation_path(candidate)
+    candidate.item["recommendation_path"] = recommendation_path
+    strong_personal_match = _candidate_strong_personal_match(candidate, taste)
+    taste_match = _candidate_matches_taste(candidate, taste)
+    compatibility = candidate_profile_compatibility(
+        candidate,
+        taste,
+        row_kind=row_kind,
+        relation_context=recommendation_path,
+        taste_match=taste_match,
+        strong_personal_match=strong_personal_match,
+        negative_suppressed=hard_suppressed,
     )
-    if "discovery_universe" in sources and universe_origin:
-        weak_only = universe_origin in {"ytmusic_home", "popularity", "collaborative"}
-    if not weak_only:
-        return True
-    if not (
-        taste.recent_tracks
-        or taste.top_tracks
-        or taste.anchor_tracks
-        or taste.artist_hints
-        or taste.top_artists
-        or taste.listened_artists
-        or taste.taste_queries
-    ):
-        return True
-    return _candidate_matches_taste(candidate, taste)
+    candidate.item.update(compatibility.diagnostics())
+    return compatibility.allowed
 
 
 def _hint_score(text: str, positive: Sequence[str], negative: Sequence[str]) -> float:
     score = 0.0
     for hint in positive or ():
-        if normalize_text(hint) in text:
+        if _contains_token_phrase(text, hint):
             score += 0.55
     for hint in negative or ():
-        if normalize_text(hint) in text:
+        if _contains_token_phrase(text, hint):
             score -= 1.15
     return score
 
@@ -510,16 +711,16 @@ def _lane_score(
     calmness = _number(mood_axes.get("calmness"))
     softness = _number(mood_axes.get("softness"))
     if lane.lane_id == "workout":
-        has_negative = any(normalize_text(hint) in text for hint in lane.negative_hints)
-        has_positive = any(normalize_text(hint) in text for hint in lane.positive_hints)
+        has_negative = any(_contains_token_phrase(text, hint) for hint in lane.negative_hints)
+        has_positive = any(_contains_token_phrase(text, hint) for hint in lane.positive_hints)
         if has_negative and not (strong_history and has_positive):
             return score - 4.0, False
         if energy and energy < 0.45 and not (strong_history and has_positive):
             return score - 3.0, False
-        if not has_positive and any(term in text for term in ("ballad", "slow", "ambient", "sleep")):
+        if not has_positive and any(_contains_token_phrase(text, term) for term in ("ballad", "slow", "ambient", "sleep")):
             return score - 2.0, False
         score += (energy + drive) * 0.8
-    if lane.lane_id == "focus" and any(term in text for term in ("party", "hardcore", "thrash")):
+    if lane.lane_id == "focus" and any(_contains_token_phrase(text, term) for term in ("party", "hardcore", "thrash")):
         return score - 2.0, False
     if lane.lane_id == "focus":
         score += calmness * 0.55
@@ -534,7 +735,7 @@ def _lane_positive_match(candidate: DiscoveryCandidate, lane_id: str) -> bool:
     if lane is None or lane_id == "all":
         return True
     text = metadata_text(candidate.item)
-    return any(normalize_text(hint) in text for hint in lane.positive_hints)
+    return any(_contains_token_phrase(text, hint) for hint in lane.positive_hints)
 
 
 def _item_lane_positive_match(item: Dict[str, Any], lane_id: str) -> bool:
@@ -542,7 +743,7 @@ def _item_lane_positive_match(item: Dict[str, Any], lane_id: str) -> bool:
     if lane is None or lane_id == "all":
         return True
     text = metadata_text(item)
-    return any(normalize_text(hint) in text for hint in lane.positive_hints)
+    return any(_contains_token_phrase(text, hint) for hint in lane.positive_hints)
 
 
 def _score_candidate(
@@ -555,7 +756,19 @@ def _score_candidate(
     sources = candidate.source.split("+")
     score = float(candidate.score)
     score += sum(SOURCE_WEIGHTS.get(source, 0.0) for source in sources)
+    if "collaborative" in sources:
+        score += {
+            "listenbrainz_first": 1.15,
+            "blended": 0.45,
+            "neatie": 0.0,
+        }.get(taste.taste_mode, 0.0)
     score -= _number(candidate.item.get("discovery_quality_penalty"))
+    feedback_penalty, hard_suppressed = _negative_feedback_penalty(candidate.item, taste)
+    if hard_suppressed:
+        return score - 8.0, False
+    score -= feedback_penalty
+    if feedback_penalty > 0:
+        candidate.item["negative_feedback_penalty"] = round(feedback_penalty, 4)
     score += _number(candidate.item.get("feature_confidence")) * 0.25
     score += _number(candidate.item.get("popularity")) * 0.12
     authority = normalize_text(candidate.item.get("source_authority"))
@@ -568,14 +781,18 @@ def _score_candidate(
     }.get(authority, -0.1)
     if row.kind in DISCOVERY_ROWS:
         score += _number(candidate.item.get("freshness")) * 0.12
-        language = normalize_text(candidate.item.get("language"))
-        supported_languages = _taste_language_keys(taste)
-        if language and language != "unknown" and supported_languages:
-            score += 0.3 if language in supported_languages else -1.8
-        region = normalize_text(candidate.item.get("region"))
-        supported_regions = _taste_region_keys(taste)
-        if region and region != "unknown" and supported_regions:
-            score += 0.18 if region in supported_regions else -0.35
+        compatibility = candidate_profile_compatibility(
+            candidate,
+            taste,
+            row_kind=row.kind,
+            relation_context=normalize_text(candidate.item.get("recommendation_relation")),
+            taste_match=_candidate_matches_taste(candidate, taste),
+            strong_personal_match=_candidate_strong_personal_match(candidate, taste),
+        )
+        candidate.item.update(compatibility.diagnostics())
+        if not compatibility.allowed:
+            return score - 5.0, False
+        score += (compatibility.score - 0.5) * 1.15
     artist_key = normalize_text(artist_name(candidate.item))
     if artist_key and artist_key in _taste_artist_keys(taste):
         score += 0.7
@@ -595,13 +812,6 @@ def _score_candidate(
         score += 1.8
     text = metadata_text(candidate.item)
     score += _hint_score(text, ROW_INTENT_HINTS.get(row.ranking_intent, ()), ())
-    if row.kind == "hidden_gems":
-        if candidate.source == "popularity":
-            score += 0.2
-        if "live" in text or "session" in text or "cover" in text:
-            score += 0.7
-        if artist_key and artist_key in _taste_artist_keys(taste):
-            score -= 0.45
     if row.kind == "quiet_picks":
         if candidate.source in {"similarity", "artist_graph"}:
             score += 1.25
@@ -627,8 +837,10 @@ def _select_diverse(
     album_counts: Dict[str, int] = defaultdict(int)
     max_same_artist = 3 if row_kind in {"last_played", "frequently_listened"} else 2
     max_same_album = 2 if row_kind in {"last_played", "frequently_listened"} else 1
-    if row_kind in {"made_for_you", "because_you_played", "hidden_gems", "trending_by_genre"}:
+    if row_kind in {"made_for_you", "because_you_played", "popular_radio"}:
         max_same_artist = 1
+    if row_kind == "because_you_played":
+        max_same_album = 2
     if row_kind == "quiet_picks":
         max_same_artist = 4
         max_same_album = 2
@@ -691,19 +903,56 @@ def rank_tracks(
         candidate_sources = lane.candidate_sources
     candidates = _collect_candidates(pools, candidate_sources, item_type="track")
     scored: List[Tuple[float, DiscoveryCandidate]] = []
+    history_ids = _history_track_ids(taste)
     for candidate in candidates:
+        if row.kind in DISCOVERY_ROWS and track_id(candidate.item) in history_ids:
+            continue
         if not _candidate_is_admitted(candidate, taste, row_kind=row.kind):
             continue
+        if row.kind == "because_you_played":
+            related, relation_reason = _because_you_played_relation(candidate, taste)
+            if not related:
+                continue
+            candidate = DiscoveryCandidate(
+                item={**candidate.item, "recommendation_relation": relation_reason},
+                source=candidate.source,
+                score=candidate.score,
+                reasons=[relation_reason, *[reason for reason in candidate.reasons if reason != relation_reason]],
+                item_type=candidate.item_type,
+            )
         if row.kind == "quiet_picks" and not _candidate_matches_taste(candidate, taste):
-            continue
+            if _candidate_recommendation_path(candidate) not in {
+                "track_radio",
+                "artist_neighbor",
+                "collaborative_neighbor",
+            }:
+                continue
         score, allowed = _score_candidate(candidate, row=row, taste=taste, lane=lane)
         if not allowed:
             continue
         scored.append((score, candidate))
     scored.sort(key=lambda item: item[0], reverse=True)
+    requested_limit = min(int(limit or row.max_items), row.max_items)
+    if taste.taste_mode in {"blended", "listenbrainz_first"}:
+        ratio = 0.3 if taste.taste_mode == "blended" else 0.6
+        collaborative_cap = max(1, int(requested_limit * ratio + 0.999))
+        bounded: List[Tuple[float, DiscoveryCandidate]] = []
+        collaborative_count = 0
+        for entry in scored:
+            evidence = normalize_text(
+                entry[1].item.get("relationship_evidence")
+                or entry[1].item.get("relation_type")
+            )
+            is_listenbrainz_personal = evidence == "personal_collaborative"
+            if is_listenbrainz_personal:
+                if collaborative_count >= collaborative_cap:
+                    continue
+                collaborative_count += 1
+            bounded.append(entry)
+        scored = bounded
     return _select_diverse(
         scored,
-        limit=min(int(limit or row.max_items), row.max_items),
+        limit=requested_limit,
         row_kind=row.kind,
         exclude_ids=exclude_ids,
     )
@@ -776,6 +1025,9 @@ def rank_albums(
         signature = normalize_text(item.get("id") or f"{title}|{artist}")
         if not title or signature in seen:
             continue
+        feedback_penalty, hard_suppressed = _negative_feedback_penalty(item, taste)
+        if hard_suppressed:
+            continue
         album_keys = {
             signature,
             normalize_text(f"{title}|{artist}"),
@@ -783,10 +1035,18 @@ def rank_albums(
         album_keys.discard("")
         if album_keys & exclude_album_keys:
             continue
-        release = str(item.get("release_date") or item.get("year") or "").strip()
+        release = str(
+            item.get("release_year")
+            or item.get("release_date")
+            or item.get("year")
+            or ""
+        ).strip()
         has_release_metadata = has_release_metadata or bool(release)
         score = candidate.score + SOURCE_WEIGHTS.get(candidate.source, 0.0)
         score -= _number(item.get("discovery_quality_penalty"))
+        score -= feedback_penalty
+        if feedback_penalty > 0:
+            item["negative_feedback_penalty"] = round(feedback_penalty, 4)
         authority = normalize_text(item.get("source_authority"))
         score += {
             "official": 0.65,
@@ -812,6 +1072,23 @@ def rank_albums(
             item["album_relation_score"] = round(relation_bonus, 4)
             if not admitted and not taste.is_cold_start:
                 continue
+            if row.kind == "featured_new_albums" and not taste.is_cold_start:
+                strong_featured_relations = {
+                    "known_artist",
+                    "history_track_album",
+                    "lane_track_album",
+                    "artist_neighborhood",
+                    "related_artist",
+                    "artist_graph",
+                    "genre_match",
+                    "verified_genre_match",
+                    "fresh_genre_match",
+                    "known_artist_albums",
+                    "adjacent_artist_albums",
+                    "classic_neighbor_albums",
+                }
+                if str(relation_reason or "").strip() not in strong_featured_relations:
+                    continue
             score += relation_bonus
             if item.get("album_source") == "artist_catalog":
                 score += 1.5
@@ -850,6 +1127,20 @@ def rank_albums(
         seen.add(signature)
         scored.append((score, DiscoveryCandidate(item=item, source=candidate.source, score=score, item_type="album")))
     scored.sort(key=lambda item: item[0], reverse=True)
+    if row.kind == "recommended_albums":
+        fresh_scored: List[Tuple[float, DiscoveryCandidate]] = []
+        listened_scored: List[Tuple[float, DiscoveryCandidate]] = []
+        for score_value, candidate in scored:
+            item = candidate.item
+            title = normalize_text(item.get("title"))
+            artist = normalize_text(item.get("artist"))
+            exact_key = f"{title}|{artist}" if title else ""
+            if exact_key in listened_album_exact or title in listened_album_titles:
+                listened_scored.append((score_value, candidate))
+            else:
+                fresh_scored.append((score_value, candidate))
+        if fresh_scored:
+            scored = [*fresh_scored, *listened_scored]
     output: List[Dict[str, Any]] = []
     artist_counts: Dict[str, int] = defaultdict(int)
     max_per_artist = 1 if row.kind == "featured_new_albums" else 2
@@ -937,39 +1228,248 @@ def build_personal_mixes(
     taste: TasteProfile,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     base = ROW_RECIPES["made_for_you"]
-    definitions = (
-        ("daily_mix_1", "Daily Mix 1", "Favorites and close neighbors.", ("similarity", "artist_graph", "discovery_universe")),
-        ("daily_mix_2", "Daily Mix 2", "Taste-shaped genre discoveries.", ("genre_mood", "similarity", "discovery_universe")),
-        ("daily_mix_3", "Daily Mix 3", "Adjacent artists and less-played picks.", ("artist_graph", "collaborative", "popularity", "discovery_universe")),
-        ("picked_again", "Picked again", "Familiar tracks with related discoveries.", ("history", "similarity", "artist_graph")),
-        ("fresh_for_you", "Fresh for you", "A wider exploration of your music orbit.", ("genre_mood", "popularity", "collaborative", "discovery_universe")),
-    )
-    mixes: List[Dict[str, Any]] = []
-    used_ids: Set[str] = set()
+    definitions = [
+        ("daily_mix_1", "Daily Mix 1", "Favorites and close neighbors.", ("profile_spine", "similarity", "artist_graph", "discovery_universe"), True),
+        ("daily_mix_2", "Daily Mix 2", "Taste-shaped genre discoveries.", ("genre_mood", "similarity", "profile_spine", "discovery_universe"), True),
+        ("daily_mix_3", "Daily Mix 3", "Adjacent artists and less-played picks.", ("artist_graph", "similarity", "profile_spine", "collaborative", "discovery_universe"), True),
+        ("picked_again", "Picked again", "Familiar tracks worth returning to.", ("history", "profile_spine", "similarity"), False),
+        ("fresh_for_you", "Fresh for you", "A wider exploration of your music orbit.", ("genre_mood", "popularity", "collaborative", "similarity", "discovery_universe"), True),
+    ]
+    min_tracks = 8
+    target_tracks = 24
+    max_deep_overlap = max(1, int(target_tracks * 0.20))
     track_counts: Dict[str, int] = {}
-    overlap_counts: Dict[str, int] = {}
-    for mix_id, title, subtitle, sources in definitions:
+    candidate_counts: Dict[str, int] = {}
+    rejection_reasons: Dict[str, str] = {}
+    overlap_counts: Dict[str, int] = defaultdict(int)
+
+    discovery_recipe = replace(
+        base,
+        kind="personal_mix_slice",
+        item_type="track",
+        candidate_sources=base.candidate_sources,
+        max_items=96,
+    )
+    replay_recipe = replace(
+        base,
+        kind="personal_replay_slice",
+        item_type="track",
+        candidate_sources=("history", "profile_spine", "similarity"),
+        max_items=96,
+    )
+    global_discovery = rank_tracks(pools, taste, discovery_recipe, limit=96)
+    global_replay = rank_tracks(pools, taste, replay_recipe, limit=96)
+    history_recipe = replace(
+        replay_recipe,
+        candidate_sources=("history",),
+    )
+    replay_history = rank_tracks(pools, taste, history_recipe, limit=48)
+
+    candidate_overrides: Dict[str, List[Dict[str, Any]]] = {}
+    discovery_visible_budget = max(len(global_discovery) - (4 * min_tracks), 0)
+    extra_mix_count = min(
+        max(base.max_items - len(definitions), 0),
+        discovery_visible_budget // min_tracks,
+    )
+    genre_candidates: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for track in global_discovery:
+        structured_genres = {
+            normalize_text(value)
+            for key in ("genres", "discovery_genres")
+            for value in (
+                track.get(key)
+                if isinstance(track.get(key), (list, tuple, set))
+                else [track.get(key)]
+            )
+            if normalize_text(value)
+        }
+        for genre in structured_genres:
+            genre_candidates[genre].append(track)
+
+    used_genre_signatures: Set[Tuple[str, ...]] = set()
+    dynamic_index = 1
+    for genre, tracks in sorted(
+        genre_candidates.items(),
+        key=lambda row: (-len(row[1]), row[0]),
+    ):
+        if dynamic_index > extra_mix_count or len(tracks) < min_tracks:
+            continue
+        candidate_signature = tuple(
+            sorted(
+                signature
+                for track in tracks
+                if (signature := normalize_text(
+                    track.get("canonical_entity_id")
+                    or track.get("canonical_track_identity")
+                    or track.get("track_key")
+                    or track_id(track)
+                ))
+            )
+        )
+        if not candidate_signature or candidate_signature in used_genre_signatures:
+            continue
+        used_genre_signatures.add(candidate_signature)
+        mix_id = f"taste_cluster_{dynamic_index}"
+        definitions.append(
+            (
+                mix_id,
+                f"{genre.title()} Mix",
+                f"More from your {genre} orbit.",
+                ("genre_mood", "similarity", "artist_graph", "discovery_universe"),
+                True,
+            )
+        )
+        candidate_overrides[mix_id] = [*tracks, *global_discovery]
+        dynamic_index += 1
+
+    while dynamic_index <= extra_mix_count:
+        mix_id = f"discovery_mix_{dynamic_index}"
+        offset = ((dynamic_index - 1) * min_tracks) % max(len(global_discovery), 1)
+        rotated = [*global_discovery[offset:], *global_discovery[:offset]]
+        definitions.append(
+            (
+                mix_id,
+                f"Discovery Mix {dynamic_index}",
+                "More unplayed tracks connected to your taste.",
+                ("similarity", "artist_graph", "genre_mood", "collaborative", "discovery_universe"),
+                True,
+            )
+        )
+        candidate_overrides[mix_id] = rotated
+        dynamic_index += 1
+
+    def signature(track: Dict[str, Any]) -> str:
+        canonical = normalize_text(
+            track.get("canonical_entity_id")
+            or track.get("canonical_track_identity")
+            or track.get("canonical_source_identity")
+            or track.get("track_key")
+        )
+        return canonical or item_signature(track)
+
+    candidate_lists: Dict[str, List[Dict[str, Any]]] = {}
+    selected: Dict[str, List[Dict[str, Any]]] = {
+        mix_id: [] for mix_id, _title, _subtitle, _sources, _discovery in definitions
+    }
+    selected_signatures: Dict[str, Set[str]] = {
+        mix_id: set() for mix_id in selected
+    }
+    for mix_id, _title, _subtitle, sources, discovery_mix in definitions:
         recipe = replace(
             base,
-            kind="personal_mix_slice",
+            kind="personal_mix_slice" if discovery_mix else "personal_replay_slice",
             item_type="track",
             candidate_sources=sources,
-            max_items=32,
+            max_items=96,
         )
-        tracks = rank_tracks(
+        candidate_counts[mix_id] = len(_collect_candidates(pools, sources, item_type="track"))
+        preferred_tracks = candidate_overrides.get(mix_id) or rank_tracks(
             pools,
             taste,
             recipe,
-            limit=32,
-            exclude_ids=used_ids,
+            limit=96,
         )
-        if len(tracks) < 8:
-            tracks = rank_tracks(pools, taste, recipe, limit=32)
-        if len(tracks) < 8:
-            continue
-        ids = {track_id(track) for track in tracks if track_id(track)}
-        prior_overlap = len(ids & used_ids)
-        if used_ids and prior_overlap / max(len(ids), 1) > 0.40:
+        fallback = (
+            global_discovery
+            if discovery_mix
+            else [*replay_history, *global_replay, *global_discovery]
+        )
+        ranked_inputs = (
+            [*preferred_tracks, *fallback]
+            if discovery_mix
+            else [*replay_history, *preferred_tracks, *fallback]
+        )
+        merged: List[Dict[str, Any]] = []
+        seen: Set[str] = set()
+        for track in ranked_inputs:
+            track_signature = signature(track)
+            if not track_signature or track_signature in seen:
+                continue
+            seen.add(track_signature)
+            merged.append(track)
+        candidate_lists[mix_id] = merged
+
+    # Reserve the visible eight tracks for every card together. This prevents
+    # the first mix from consuming the only viable tracks for later mixes.
+    visible_used: Set[str] = set()
+    for _slot in range(min_tracks):
+        for mix_id, _title, _subtitle, _sources, _discovery in definitions:
+            match = next(
+                (
+                    track
+                    for track in candidate_lists[mix_id]
+                    if (track_signature := signature(track))
+                    and track_signature not in visible_used
+                    and track_signature not in selected_signatures[mix_id]
+                ),
+                None,
+            )
+            if match is None:
+                rejection_reasons[mix_id] = (
+                    f"below_min_unique_tracks:{len(selected[mix_id])}/{min_tracks}"
+                )
+                continue
+            track_signature = signature(match)
+            selected[mix_id].append(match)
+            selected_signatures[mix_id].add(track_signature)
+            visible_used.add(track_signature)
+
+    occurrence_counts: Counter[str] = Counter(visible_used)
+    complete_mix_ids = [
+        mix_id for mix_id, tracks in selected.items() if len(tracks) >= min_tracks
+    ]
+
+    # Grow deeper catalogues with unused tracks first, shared tracks second.
+    # Shared deep tracks are bounded and no recording can occur in more than
+    # two mixes.
+    for mix_id in complete_mix_ids:
+        for track in candidate_lists[mix_id]:
+            if len(selected[mix_id]) >= target_tracks:
+                break
+            track_signature = signature(track)
+            if (
+                not track_signature
+                or track_signature in selected_signatures[mix_id]
+                or occurrence_counts[track_signature] > 0
+            ):
+                continue
+            selected[mix_id].append(track)
+            selected_signatures[mix_id].add(track_signature)
+            occurrence_counts[track_signature] += 1
+    for mix_id in complete_mix_ids:
+        for track in candidate_lists[mix_id]:
+            if (
+                len(selected[mix_id]) >= target_tracks
+                or overlap_counts[mix_id] >= max_deep_overlap
+                or (overlap_counts[mix_id] + 1)
+                / max(len(selected[mix_id]) + 1, 1)
+                > 0.20
+            ):
+                break
+            track_signature = signature(track)
+            if (
+                not track_signature
+                or track_signature in selected_signatures[mix_id]
+                or occurrence_counts[track_signature] <= 0
+                or occurrence_counts[track_signature] >= 2
+            ):
+                continue
+            selected[mix_id].append(track)
+            selected_signatures[mix_id].add(track_signature)
+            occurrence_counts[track_signature] += 1
+            overlap_counts[mix_id] += 1
+
+    mixes: List[Dict[str, Any]] = []
+    history_ids = _history_track_ids(taste)
+    discovery_track_total = 0
+    discovery_unplayed_total = 0
+    for mix_id, title, subtitle, _sources, discovery_mix in definitions:
+        tracks = selected[mix_id]
+        if len(tracks) < min_tracks:
+            rejection_reasons.setdefault(
+                mix_id,
+                f"below_min_tracks:{len(tracks)}/{min_tracks}",
+            )
             continue
         first = tracks[0]
         mixes.append(
@@ -985,18 +1485,53 @@ def build_personal_mixes(
             }
         )
         track_counts[mix_id] = len(tracks)
-        overlap_counts[mix_id] = prior_overlap
-        used_ids.update(ids)
-        if len(mixes) >= base.max_items:
-            break
+        if discovery_mix:
+            discovery_track_total += len(tracks)
+            discovery_unplayed_total += sum(
+                1 for track in tracks if track_id(track) not in history_ids
+            )
     return mixes, {
         "mix_count": len(mixes),
+        "dynamic_mix_count": sum(
+            1 for mix in mixes if str(mix.get("id") or "") in candidate_overrides
+        ),
+        "requested_mix_count": len(definitions),
+        "global_candidate_count": len(_collect_candidates(pools, base.candidate_sources, item_type="track")),
+        "global_ranked_track_count": len(global_discovery),
+        "mix_candidate_counts": candidate_counts,
         "mix_track_counts": track_counts,
-        "mix_prior_overlap_counts": overlap_counts,
-        "unique_mix_tracks": len(used_ids),
+        "mix_deep_overlap_counts": dict(overlap_counts),
+        "mix_rejection_reasons": rejection_reasons,
+        "unique_visible_tracks": len(visible_used),
+        "unique_mix_tracks": len(occurrence_counts),
+        "discovery_mix_unplayed_ratio": round(
+            discovery_unplayed_total / max(discovery_track_total, 1),
+            4,
+        ),
     }
 
 
+def build_popular_radio_cards(
+    pools: Dict[str, List[DiscoveryCandidate]],
+    taste: TasteProfile,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    del taste
+    row = ROW_RECIPES["popular_radio"]
+    cards = [
+        dict(candidate.item or {})
+        for candidate in pools.get("popular_radio_cards", []) or []
+        if candidate.item_type == "radio"
+    ][: row.max_items]
+    return cards, {
+        "source": "artist_radio_inventory",
+        "card_count": len(cards),
+        "direct_card_count": sum(
+            1 for card in cards if card.get("seed_affinity") == "direct"
+        ),
+        "similar_card_count": sum(
+            1 for card in cards if card.get("seed_affinity") == "similar"
+        ),
+    }
 def build_home_lanes(
     pools: Dict[str, List[DiscoveryCandidate]],
     taste: TasteProfile,
@@ -1094,112 +1629,41 @@ def build_home_lanes(
     return lanes, diagnostics
 
 
-def _pages(items: List[Dict[str, Any]], size: int = 3) -> List[List[Dict[str, Any]]]:
-    return [items[index : index + size] for index in range(0, len(items), size)]
-
-
-def build_trending_genre_tabs(
-    pools: Dict[str, List[DiscoveryCandidate]],
-    taste: TasteProfile,
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    genre_row = ROW_RECIPES["trending_by_genre"]
-    genre_hints = {
-        "rock": ("rock", "guitar", "classic rock", "alternative", "metal"),
-        "pop": ("pop", "dance", "synth", "hit"),
-        "soul": ("soul", "rnb", "r&b", "funk"),
-        "blues": ("blues", "muddy", "clapton", "bb king"),
-        "electronic": ("electronic", "edm", "house", "techno", "dance"),
-        "jazz": ("jazz", "swing", "bebop"),
-    }
-    all_candidates = _collect_candidates(pools, genre_row.candidate_sources, item_type="track")
-    scored_genres: List[Tuple[int, str]] = []
-    taste_text = " ".join(
-        metadata_text(track) for track in taste.recent_tracks + taste.top_tracks + taste.last_played_tracks
-    )
-    for genre, hints in genre_hints.items():
-        provenance_count = sum(
-            1
-            for candidate in all_candidates
-            if genre in {normalize_text(value) for value in candidate.item.get("discovery_genres") or []}
-        )
-        score = sum(1 for hint in hints if hint in taste_text) + provenance_count
-        scored_genres.append((score, genre))
-    scored_genres.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    ordered_genres = [genre for score, genre in scored_genres if score > 0][:5]
-
-    tabs: List[Dict[str, Any]] = []
-    used_ids: Set[str] = set()
-    for genre in ordered_genres[:5]:
-        hints = genre_hints.get(genre, ())
-        scored: List[Tuple[float, DiscoveryCandidate]] = []
-        for candidate in all_candidates:
-            text = _native_genre_text(candidate.item)
-            provenance = {
-                normalize_text(value)
-                for value in candidate.item.get("discovery_genres") or []
-                if normalize_text(value)
+def _finalize_allocated_rows(
+    rows: List[DiscoveryRow],
+    row_status: Dict[str, Dict[str, Any]],
+) -> Tuple[List[DiscoveryRow], Dict[str, Dict[str, Any]]]:
+    final_rows: List[DiscoveryRow] = []
+    for row in rows:
+        if row.item_type in {"mix", "radio"}:
+            populated = []
+            for container in row.items or []:
+                nested = container.get("tracks") or container.get("items")
+                if not isinstance(nested, list) or nested:
+                    populated.append(container)
+            row.items = populated
+        if not row.items:
+            previous = dict(row_status.get(row.kind) or {})
+            row_status[row.kind] = {
+                **previous,
+                "status": "filtered_out",
+                "reason": "empty_after_allocation",
+                "count": 0,
+                "warnings": list((row.meta or {}).get("quality_warnings") or []),
             }
-            genre_score = _hint_score_for_genre(text, hints)
-            if genre_score <= 0:
-                continue
-            if genre in provenance:
-                genre_score += 2.5
-            row_score, allowed = _score_candidate(candidate, row=genre_row, taste=taste)
-            if not allowed:
-                continue
-            scored.append((row_score + genre_score, candidate))
-        scored.sort(key=lambda item: item[0], reverse=True)
-        tracks = _select_diverse(
-            scored,
-            limit=genre_row.target_items,
-            row_kind=genre_row.kind,
-            exclude_ids=used_ids,
-        )
-        for track in tracks[:12]:
-            item_id = track_id(track)
-            if item_id:
-                used_ids.add(item_id)
-        if len(tracks) < genre_row.min_items:
             continue
-        tabs.append(
-            {
-                "id": genre,
-                "label": genre.replace("_", " ").title(),
-                "tracks": tracks,
-                "pages": _pages(tracks, 3),
-                "status": "ready",
-                "has_more": False,
-            }
-        )
-        if len(tabs) >= 4:
-            break
-    diagnostics = {
-        "accepted": len(tabs) >= 2,
-        "tab_count": len(tabs),
-        "tab_item_counts": {str(tab["id"]): len(tab.get("tracks") or []) for tab in tabs},
-        "native_evidence_counts": {
-            genre: sum(
-                1
-                for candidate in all_candidates
-                if _hint_score_for_genre(_native_genre_text(candidate.item), hints) > 0
-            )
-            for genre, hints in genre_hints.items()
-        },
-        "rejection_reasons": [] if len(tabs) >= 2 else ["below_min_tabs"],
-    }
-    return tabs, diagnostics
-
-
-def _hint_score_for_genre(text: str, hints: Sequence[str]) -> float:
-    return float(sum(0.75 for hint in hints if normalize_text(hint) in text))
-
-
-def _native_genre_text(item: Dict[str, Any]) -> str:
-    native = dict(item or {})
-    native.pop("discovery_genres", None)
-    native.pop("discovery_query", None)
-    native.pop("recommendation_reason", None)
-    return metadata_text(native)
+        warnings = list((row.meta or {}).get("quality_warnings") or [])
+        if len(row.items) < ROW_RECIPES[row.kind].min_items:
+            warnings.append("below_min_items_after_allocation")
+        previous = dict(row_status.get(row.kind) or {})
+        row_status[row.kind] = {
+            **previous,
+            "status": "emitted",
+            "count": len(row.items),
+            "warnings": list(dict.fromkeys(warnings)),
+        }
+        final_rows.append(row)
+    return final_rows, row_status
 
 
 def build_rows_from_pools(
@@ -1216,19 +1680,21 @@ def build_rows_from_pools(
     for row_kind, row in ROW_RECIPES.items():
         if row.kind == "made_for_you":
             items, mix_diagnostics = build_personal_mixes(pools, taste)
-            if len(items) < row.min_items:
+            if not items:
                 row_status[row_kind] = {
                     "status": "filtered_out",
-                    "reason": "below_min_mixes",
+                    "reason": "empty",
                     "count": len(items),
                     "diagnostics": mix_diagnostics,
                 }
                 continue
-            rows.append(_row_payload(row, items, meta={"mix_diagnostics": mix_diagnostics}))
+            warnings = ["below_target_mixes"] if len(items) < row.min_items else []
+            rows.append(_row_payload(row, items, meta={"mix_diagnostics": mix_diagnostics, "quality_warnings": warnings}))
             row_status[row_kind] = {
                 "status": "emitted",
                 "count": len(items),
                 "diagnostics": mix_diagnostics,
+                "warnings": warnings,
             }
             continue
         if row.item_type == "album":
@@ -1242,9 +1708,6 @@ def build_rows_from_pools(
                 exclude_album_keys=excluded_album_keys,
             )
             title = "Featured new albums" if row.kind == "featured_new_albums" and has_release_metadata else row.title
-            if row.kind == "recommended_albums" and not items:
-                row_status[row_kind] = {"status": "filtered_out", "reason": "empty"}
-                continue
             if len(items) < row.min_items:
                 row_status[row_kind] = {"status": "filtered_out", "reason": "below_min_items", "count": len(items)}
                 continue
@@ -1280,40 +1743,101 @@ def build_rows_from_pools(
             row_status[row_kind] = {"status": "emitted", "count": len(items)}
             continue
 
-        if row.kind == "last_played":
-            items = rank_tracks(pools, taste, row, limit=row.max_items)
-        elif row.kind == "frequently_listened":
-            items = rank_tracks(pools, taste, row, limit=row.max_items)
-        elif row.kind == "trending_by_genre":
-            tabs, tab_diagnostics = build_trending_genre_tabs(pools, taste)
-            if not tab_diagnostics.get("accepted"):
-                row_status[row_kind] = {"status": "filtered_out", "reason": "below_min_tabs", "diagnostics": tab_diagnostics}
+        if row.item_type == "radio":
+            items, radio_diagnostics = build_popular_radio_cards(pools, taste)
+            if len(items) < row.min_items:
+                row_status[row_kind] = {
+                    "status": "filtered_out",
+                    "reason": "below_min_items",
+                    "count": len(items),
+                    "diagnostics": radio_diagnostics,
+                }
                 continue
-            items = [track for tab in tabs for track in list(tab.get("tracks") or [])[: row.page_size]]
-            items = _dedupe_track_dicts(items, row.max_items)
-            meta = {
-                "tabs": tabs,
-                "active_tab_id": str((tabs[0] or {}).get("id") or ""),
-                "tab_diagnostics": tab_diagnostics,
+            warnings = ["popular_radio_below_target"] if len(items) < row.min_items else []
+            rows.append(_row_payload(row, items, meta={"radio_diagnostics": radio_diagnostics, "quality_warnings": warnings}))
+            row_status[row_kind] = {
+                "status": "emitted",
+                "count": len(items),
+                "diagnostics": radio_diagnostics,
+                "warnings": warnings,
             }
-            rows.append(_row_payload(row, items, meta=meta))
-            row_status[row_kind] = {"status": "emitted", "count": len(items), "tab_count": len(tabs)}
             continue
-        elif row.kind == "quiet_picks":
+
+        if row.kind == "last_played":
+            if len(taste.last_played_tracks) < row.min_items:
+                row_status[row_kind] = {
+                    "status": "not_applicable",
+                    "reason": "insufficient_history",
+                    "count": len(taste.last_played_tracks),
+                }
+                continue
             items = rank_tracks(pools, taste, row, limit=row.max_items)
+        elif row.kind == "because_you_played" and not (
+            taste.full_history_tracks or taste.recent_tracks or taste.anchor_tracks
+        ):
+            row_status[row_kind] = {
+                "status": "not_applicable",
+                "reason": "no_play_anchor",
+                "count": 0,
+            }
+            continue
+        elif row.kind == "frequently_listened":
+            if len(taste.frequent_tracks) < row.min_items:
+                row_status[row_kind] = {
+                    "status": "not_applicable",
+                    "reason": "insufficient_qualified_plays",
+                    "count": len(taste.frequent_tracks),
+                }
+                continue
+            frequent_seen: Set[str] = set()
+            items = []
+            for track in sorted(
+                [dict(track) for track in taste.frequent_tracks],
+                key=lambda track: (
+                    int(track.get("play_count") or 0),
+                    float(track.get("last_played_at") or 0.0),
+                ),
+                reverse=True,
+            ):
+                identity = normalize_text(
+                    track.get("canonical_entity_id")
+                    or track.get("canonical_track_identity")
+                    or item_signature(track)
+                )
+                if not identity or identity in frequent_seen:
+                    continue
+                frequent_seen.add(identity)
+                items.append(track)
+                if len(items) >= row.max_items:
+                    break
+        elif row.kind == "quiet_picks":
+            items = rank_tracks(
+                pools,
+                taste,
+                row,
+                limit=row.max_items,
+                exclude_ids=selected_recent_ids,
+            )
         else:
             items = rank_tracks(pools, taste, row, limit=row.max_items, exclude_ids=selected_recent_ids)
 
-        if len(items) < row.min_items:
+        if not items:
             row_status[row_kind] = {"status": "filtered_out", "reason": "below_min_items", "count": len(items)}
             continue
-        rows.append(_row_payload(row, items))
-        row_status[row_kind] = {"status": "emitted", "count": len(items)}
-        if row.kind in {"todays_pick", "made_for_you", "because_you_played", "hidden_gems"}:
+        warnings = ["below_target_items"] if len(items) < row.min_items else []
+        rows.append(_row_payload(row, items, meta={"quality_warnings": warnings}))
+        row_status[row_kind] = {"status": "emitted", "count": len(items), "warnings": warnings}
+        if row.kind in {"todays_pick", "made_for_you", "because_you_played"}:
             for item in items[:8]:
                 item_id = track_id(item)
                 if item_id:
                     selected_recent_ids.add(item_id)
+    rows, allocation_diagnostics = allocate_home_rows(rows, taste)
+    rows, row_status = _finalize_allocated_rows(rows, row_status)
+    home_tab_diagnostics = {
+        **dict(home_tab_diagnostics or {}),
+        "allocation": allocation_diagnostics,
+    }
     return rows, row_status, home_lanes, home_tab_diagnostics
 
 

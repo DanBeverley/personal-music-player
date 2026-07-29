@@ -417,10 +417,19 @@ def upsert_catalog_rows(
                         insert into catalog_tracks (track_id, title, artist_name, album_title, payload, updated_at)
                         values (%s, %s, %s, %s, %s::jsonb, now())
                         on conflict (track_id) do update
-                        set title = excluded.title,
-                            artist_name = excluded.artist_name,
-                            album_title = excluded.album_title,
-                            payload = excluded.payload,
+                        set title = case
+                              when excluded.title <> '' then excluded.title
+                              else catalog_tracks.title
+                            end,
+                            artist_name = case
+                              when excluded.artist_name <> '' then excluded.artist_name
+                              else catalog_tracks.artist_name
+                            end,
+                            album_title = case
+                              when excluded.album_title <> '' then excluded.album_title
+                              else catalog_tracks.album_title
+                            end,
+                            payload = catalog_tracks.payload || excluded.payload,
                             updated_at = now()
                         """,
                         [
@@ -440,8 +449,11 @@ def upsert_catalog_rows(
                         insert into catalog_artists (artist_id, name, payload, updated_at)
                         values (%s, %s, %s::jsonb, now())
                         on conflict (artist_id) do update
-                        set name = excluded.name,
-                            payload = excluded.payload,
+                        set name = case
+                              when excluded.name <> '' then excluded.name
+                              else catalog_artists.name
+                            end,
+                            payload = catalog_artists.payload || excluded.payload,
                             updated_at = now()
                         """,
                         [
@@ -459,9 +471,15 @@ def upsert_catalog_rows(
                         insert into catalog_albums (album_id, title, artist_name, payload, updated_at)
                         values (%s, %s, %s, %s::jsonb, now())
                         on conflict (album_id) do update
-                        set title = excluded.title,
-                            artist_name = excluded.artist_name,
-                            payload = excluded.payload,
+                        set title = case
+                              when excluded.title <> '' then excluded.title
+                              else catalog_albums.title
+                            end,
+                            artist_name = case
+                              when excluded.artist_name <> '' then excluded.artist_name
+                              else catalog_albums.artist_name
+                            end,
+                            payload = catalog_albums.payload || excluded.payload,
                             updated_at = now()
                         """,
                         [
@@ -476,6 +494,52 @@ def upsert_catalog_rows(
                     )
     except Exception:
         return
+
+
+def load_catalog_artist_payloads(
+    artist_ids: Iterable[str],
+) -> Dict[str, Dict[str, Any]]:
+    normalized_ids = list(
+        dict.fromkeys(
+            str(artist_id or "").strip()
+            for artist_id in artist_ids
+            if str(artist_id or "").strip()
+        )
+    )
+    if not normalized_ids or not db_available():
+        return {}
+    try:
+        with get_connection() as connection:
+            if connection is None:
+                return {}
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    select artist_id, payload
+                    from catalog_artists
+                    where artist_id = any(%s)
+                    """,
+                    [normalized_ids],
+                )
+                rows = cursor.fetchall() or []
+        output: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            artist_id = row[0] if not isinstance(row, dict) else row.get("artist_id")
+            payload = row[1] if not isinstance(row, dict) else row.get("payload")
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            if artist_id and isinstance(payload, dict):
+                output[str(artist_id)] = dict(payload)
+        return output
+    except Exception:
+        return {}
+
+
+def load_catalog_artist_payload(artist_id: str) -> Dict[str, Any] | None:
+    normalized_id = str(artist_id or "").strip()
+    if not normalized_id:
+        return None
+    return load_catalog_artist_payloads([normalized_id]).get(normalized_id)
 
 
 def load_active_model_weights(

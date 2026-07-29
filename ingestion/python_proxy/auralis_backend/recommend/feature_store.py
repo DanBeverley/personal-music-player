@@ -16,14 +16,15 @@ from ..domain.catalog import (
     canonical_title_artist_identity,
     normalize_catalog_language,
     normalize_catalog_region,
+    normalized_audience_metadata,
     normalized_audio_traits,
 )
 from ..storage.postgres import db_available, get_connection
 from .store_runtime import open_recommendation_store_connection
 
 
-CATALOG_FEATURE_VERSION = "catalog-feature-v1"
-TASTE_PROFILE_VERSION = "taste-profile-v1"
+CATALOG_FEATURE_VERSION = "catalog-feature-v2"
+TASTE_PROFILE_VERSION = "taste-profile-v2"
 SCENE_GRAPH_VERSION = "scene-graph-v1"
 _HOT_CACHE_TTL_SECONDS = max(
     30,
@@ -247,6 +248,13 @@ def _copy_cached_value(value: Any) -> Any:
     if isinstance(value, list):
         return list(value)
     return value
+
+
+def _number(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 @contextmanager
@@ -474,21 +482,121 @@ def _infer_genre_bundle(text: str) -> Tuple[str, List[str], str]:
     return primary_genre, secondary, subgenre
 
 
-def _infer_language_region(text: str, script: str) -> Tuple[str, str]:
+def _infer_language_region_evidence(text: str, script: str) -> Dict[str, Any]:
     for language, region, pattern in _LANGUAGE_HINTS:
         if pattern.search(text or ""):
-            return language, region
+            return {
+                "language": language,
+                "region": region,
+                "language_confidence": 0.82,
+                "region_confidence": 0.78,
+                "language_source": "text_hint",
+                "region_source": "text_hint",
+            }
     if script == "devanagari":
-        return "hindi", "india"
+        return {
+            "language": "hindi",
+            "region": "india",
+            "language_confidence": 0.9,
+            "region_confidence": 0.82,
+            "language_source": "script",
+            "region_source": "script",
+        }
     if script == "arabic":
-        return "arabic", "mena"
+        return {
+            "language": "arabic",
+            "region": "mena",
+            "language_confidence": 0.9,
+            "region_confidence": 0.72,
+            "language_source": "script",
+            "region_source": "script",
+        }
     if script == "cyrillic":
-        return "cyrillic", "cis"
+        return {
+            "language": "cyrillic",
+            "region": "cis",
+            "language_confidence": 0.86,
+            "region_confidence": 0.65,
+            "language_source": "script",
+            "region_source": "script",
+        }
     if script in {"han", "kana", "hangul"}:
-        return "cjk", "east_asia"
-    if script == "latin":
-        return "english", "global"
-    return "unknown", "unknown"
+        return {
+            "language": "cjk",
+            "region": "east_asia",
+            "language_confidence": 0.82,
+            "region_confidence": 0.72,
+            "language_source": "script",
+            "region_source": "script",
+        }
+    return {
+        "language": "unknown",
+        "region": "unknown",
+        "language_confidence": 0.0,
+        "region_confidence": 0.0,
+        "language_source": "unknown",
+        "region_source": "unknown",
+    }
+
+
+def _infer_language_region(text: str, script: str) -> Tuple[str, str]:
+    evidence = _infer_language_region_evidence(text, script)
+    return str(evidence.get("language") or "unknown"), str(evidence.get("region") or "unknown")
+
+
+def _metadata_language_region(
+    item: Dict[str, Any],
+    *,
+    text: str,
+    script: str,
+) -> Dict[str, Any]:
+    inferred = _infer_language_region_evidence(text, script)
+    raw_language = str(item.get("language") or "").strip()
+    raw_region = str(item.get("region") or "").strip()
+    language = normalize_catalog_language(raw_language or inferred["language"])
+    region = normalize_catalog_region(raw_region or inferred["region"])
+    language_source = str(item.get("language_source") or "").strip()
+    region_source = str(item.get("region_source") or "").strip()
+    language_confidence = _number(item.get("language_confidence"), 0.0)
+    region_confidence = _number(item.get("region_confidence"), 0.0)
+    if raw_language and language != "unknown":
+        language_source = language_source or "source_metadata"
+        language_confidence = language_confidence or 0.92
+    elif language != "unknown":
+        language_source = str(inferred.get("language_source") or "derived_metadata")
+        language_confidence = float(inferred.get("language_confidence") or 0.0)
+    else:
+        language_source = language_source or "unknown"
+        language_confidence = 0.0
+    if raw_region and region != "unknown":
+        region_source = region_source or "source_metadata"
+        region_confidence = region_confidence or 0.88
+    elif region != "unknown":
+        region_source = str(inferred.get("region_source") or "derived_metadata")
+        region_confidence = float(inferred.get("region_confidence") or 0.0)
+    else:
+        region_source = region_source or "unknown"
+        region_confidence = 0.0
+    return {
+        "language": language,
+        "region": region,
+        "language_confidence": round(max(0.0, min(language_confidence, 1.0)), 4),
+        "region_confidence": round(max(0.0, min(region_confidence, 1.0)), 4),
+        "language_source": language_source,
+        "region_source": region_source,
+    }
+
+
+def _metadata_audience(item: Dict[str, Any]) -> Dict[str, Any]:
+    audience = normalized_audience_metadata(item)
+    return {
+        "audience_profile": str(audience.get("audience_profile") or "general"),
+        "audience_confidence": round(
+            max(0.0, min(_number(audience.get("audience_confidence"), 0.0), 1.0)),
+            4,
+        ),
+        "audience_source": str(audience.get("audience_source") or "unknown"),
+    }
 
 
 def _infer_mood_axes(primary_genre: str, subgenre: str, type_tags: Sequence[str]) -> Dict[str, float]:
@@ -578,15 +686,10 @@ def derive_track_feature(server: Any, track: Dict[str, Any]) -> Dict[str, Any]:
     era = era_bucket(year)
     type_tags = _infer_type_tags(text)
     primary_genre, secondary_genres, subgenre = _infer_genre_bundle(text)
-    inferred_language, inferred_region = _infer_language_region(text, script)
-    language = str(normalized_track.get("language") or "").strip()
-    region = str(normalized_track.get("region") or "").strip()
-    if not language or language == "unknown":
-        language = inferred_language
-    if not region or region == "unknown":
-        region = inferred_region
-    language = normalize_catalog_language(language)
-    region = normalize_catalog_region(region)
+    language_region = _metadata_language_region(normalized_track, text=text, script=script)
+    audience = _metadata_audience(normalized_track)
+    language = str(language_region["language"])
+    region = str(language_region["region"])
     inferred_mood_axes = _infer_mood_axes(primary_genre, subgenre, type_tags)
     mood_axes = {**inferred_mood_axes, **normalized_audio_traits(normalized_track)}
     popularity = float(normalized_track.get("popularity") or 0.0)
@@ -613,9 +716,16 @@ def derive_track_feature(server: Any, track: Dict[str, Any]) -> Dict[str, Any]:
         "release_year": year,
         "era_bucket": era,
         "language": language,
+        "language_confidence": language_region["language_confidence"],
+        "language_source": language_region["language_source"],
         "script": script,
         "region": region,
+        "region_confidence": language_region["region_confidence"],
+        "region_source": language_region["region_source"],
         "scene_cluster_ids": _scene_clusters(primary_genre, subgenre, era, region),
+        "audience_profile": audience["audience_profile"],
+        "audience_confidence": audience["audience_confidence"],
+        "audience_source": audience["audience_source"],
         "peer_artist_ids": peer_artist_ids,
         "track_type_tags": type_tags,
         "mood_axes": mood_axes,
@@ -635,9 +745,10 @@ def derive_artist_feature(server: Any, artist: Dict[str, Any] | str) -> Dict[str
     text = _artist_text(server, payload)
     script = script_bucket(text)
     primary_genre, secondary_genres, subgenre = _infer_genre_bundle(text)
-    language, region = _infer_language_region(text, script)
-    language = normalize_catalog_language(language)
-    region = normalize_catalog_region(region)
+    language_region = _metadata_language_region(payload, text=text, script=script)
+    audience = _metadata_audience(payload)
+    language = str(language_region["language"])
+    region = str(language_region["region"])
     peer_artist_ids = _normalize_sequence(
         [
             server._recommendation_trim_text((item or {}).get("id"))
@@ -658,9 +769,16 @@ def derive_artist_feature(server: Any, artist: Dict[str, Any] | str) -> Dict[str
         "subgenre": subgenre,
         "active_era": "",
         "language": language,
+        "language_confidence": language_region["language_confidence"],
+        "language_source": language_region["language_source"],
         "script": script,
         "region": region,
+        "region_confidence": language_region["region_confidence"],
+        "region_source": language_region["region_source"],
         "scene_cluster_ids": _scene_clusters(primary_genre, subgenre, "", region),
+        "audience_profile": audience["audience_profile"],
+        "audience_confidence": audience["audience_confidence"],
+        "audience_source": audience["audience_source"],
         "peer_artist_ids": peer_artist_ids,
         "popularity": 0.5,
         "confidence": round(0.3 + (0.2 if primary_genre else 0.0) + (0.12 if peer_artist_ids else 0.0), 4),
@@ -679,15 +797,10 @@ def derive_album_feature(server: Any, album: Dict[str, Any]) -> Dict[str, Any]:
         if year is not None:
             break
     era = era_bucket(year)
-    inferred_language, inferred_region = _infer_language_region(text, script)
-    language = str(payload.get("language") or "").strip()
-    region = str(payload.get("region") or "").strip()
-    if not language or language == "unknown":
-        language = inferred_language
-    if not region or region == "unknown":
-        region = inferred_region
-    language = normalize_catalog_language(language)
-    region = normalize_catalog_region(region)
+    language_region = _metadata_language_region(payload, text=text, script=script)
+    audience = _metadata_audience(payload)
+    language = str(language_region["language"])
+    region = str(language_region["region"])
     popularity = float(payload.get("popularity") or 0.0)
     if popularity <= 0:
         popularity = 0.46
@@ -705,9 +818,16 @@ def derive_album_feature(server: Any, album: Dict[str, Any]) -> Dict[str, Any]:
         "release_year": year,
         "era_bucket": era,
         "language": language,
+        "language_confidence": language_region["language_confidence"],
+        "language_source": language_region["language_source"],
         "script": script,
         "region": region,
+        "region_confidence": language_region["region_confidence"],
+        "region_source": language_region["region_source"],
         "scene_cluster_ids": _scene_clusters(primary_genre, subgenre, era, region),
+        "audience_profile": audience["audience_profile"],
+        "audience_confidence": audience["audience_confidence"],
+        "audience_source": audience["audience_source"],
         "popularity": max(0.0, min(popularity, 1.0)),
         "freshness": _freshness_from_year(year),
         "confidence": round(0.28 + (0.2 if primary_genre else 0.0) + (0.14 if year else 0.0), 4),
@@ -997,6 +1117,7 @@ def _feature_richer(stored: Dict[str, Any], derived: Dict[str, Any]) -> bool:
         "language",
         "script",
         "region",
+        "audience_profile",
     ):
         if not stored.get(key) and derived.get(key):
             return True

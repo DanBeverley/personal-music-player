@@ -52,10 +52,6 @@ def recommendation_runtime_health(server: Any) -> Dict[str, Any]:
             or getattr(server, "RECOMMENDATION_ENABLE_SCHEDULER", False)
         ),
         "scheduler_last_error": str(runtime.get("last_scheduler_error") or "").strip(),
-        "nearline_last_cycle_status": str(
-            runtime.get("nearline_last_cycle_status") or ""
-        ).strip(),
-        "nearline_last_cycle_at": float(runtime.get("nearline_last_cycle_at") or 0.0),
     }
 
 

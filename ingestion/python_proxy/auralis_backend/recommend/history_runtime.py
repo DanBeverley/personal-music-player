@@ -28,6 +28,7 @@ def history_seed(server: Any, req: Any) -> Dict[str, Any]:
     recent_tracks = list(seed.get("recent_track_snapshots") or [])[:limit]
     top_tracks = list(seed.get("top_track_snapshots") or [])[:limit]
     last_played = list(seed.get("last_played_tracks") or [])[:limit]
+    frequent_tracks = list(seed.get("frequent_track_snapshots") or [])[:limit]
     diagnostics.update(dict(seed.get("_diagnostics") or {}))
     return {
         "status": "success",
@@ -35,6 +36,7 @@ def history_seed(server: Any, req: Any) -> Dict[str, Any]:
         "recent_track_snapshots": recent_tracks,
         "top_track_snapshots": top_tracks,
         "last_played_tracks": last_played,
+        "frequent_track_snapshots": frequent_tracks,
         "recent_track_ids": list(seed.get("recent_track_ids") or [])[:limit],
         "top_track_ids": list(seed.get("top_track_ids") or [])[:limit],
         "diagnostics": diagnostics,

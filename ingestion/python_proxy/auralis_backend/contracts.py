@@ -16,34 +16,14 @@ class TrackSnapshot(BaseModel):
     duration: Optional[int] = None
 
 
-class SearchV2Request(BaseModel):
-    query: str
-    user_scope_id: str = "guest"
-    session_id: Optional[str] = None
-    limit: int = 24
-    recent_queries: List[str] = Field(default_factory=list)
-    recent_tracks: List[Dict[str, Any]] = Field(default_factory=list)
-    context_surface: str = "search"
-    force_refresh: bool = False
-    defer_side_surfaces: bool = False
-
-
-class SuggestV2Request(BaseModel):
-    query: str
-    user_scope_id: str = "guest"
-    session_id: Optional[str] = None
-    limit: int = 6
-    recent_queries: List[str] = Field(default_factory=list)
-    recent_tracks: List[Dict[str, Any]] = Field(default_factory=list)
-
-
-class RecommendationHomeV2Request(BaseModel):
+class SearchRequest(BaseModel):
     query: str = ""
     user_scope_id: str = "guest"
     session_id: Optional[str] = None
     force_refresh: bool = False
     prepare_next_session: bool = False
     prefer_fresh_rows: bool = False
+    session_intent: bool = False
     refresh_token: str = ""
     recent_track_ids: List[str] = Field(default_factory=list)
     top_track_ids: List[str] = Field(default_factory=list)
@@ -58,69 +38,21 @@ class RecommendationHomeV2Request(BaseModel):
     library_track_ids: List[str] = Field(default_factory=list)
     offline_track_ids: List[str] = Field(default_factory=list)
     avoid_ids: List[str] = Field(default_factory=list)
-    limit: int = 18
-
-
-class RecommendationRowPageV2Request(BaseModel):
-    user_scope_id: str = "guest"
-    session_id: str
-    row_id: str
-    row_context: Optional[str] = None
-    offset: int = 0
-    limit: int = 8
-
-
-class SimilarArtistsV2Request(BaseModel):
-    user_scope_id: str = "guest"
-    session_id: Optional[str] = None
-    query: str = ""
-    surface: str = "search_results"
+    limit: int = 24
+    context_surface: str = "search"
+    surface: str = "home_feed"
     anchor_track_id: Optional[str] = None
     anchor_artist_id: Optional[str] = None
     anchor_track_snapshot: Optional[Dict[str, Any]] = None
-    recent_queries: List[str] = Field(default_factory=list)
-    recent_tracks: List[Dict[str, Any]] = Field(default_factory=list)
-    limit: int = 8
-
-
-class SearchV3Request(SearchV2Request):
-    recent_track_ids: List[str] = Field(default_factory=list)
-    top_track_ids: List[str] = Field(default_factory=list)
-    top_tracks: List[Dict[str, Any]] = Field(default_factory=list)
-    last_played_tracks: List[Dict[str, Any]] = Field(default_factory=list)
-    taste_queries: List[str] = Field(default_factory=list)
-    artist_hints: List[str] = Field(default_factory=list)
-    album_hints: List[str] = Field(default_factory=list)
-    playlist_names: List[str] = Field(default_factory=list)
-    library_track_ids: List[str] = Field(default_factory=list)
-    offline_track_ids: List[str] = Field(default_factory=list)
     search_mode: str = ""
-
-
-class RecommendationHomeV3Request(RecommendationHomeV2Request):
-    pass
-
-
-class RecommendationRowPageV3Request(RecommendationRowPageV2Request):
-    pass
-
-
-class SimilarArtistsV3Request(SimilarArtistsV2Request):
-    pass
-
-
-class SearchRequest(SearchV3Request):
-    surface: str = "home_feed"
     seed_id: Optional[str] = None
     seed_ids: List[str] = Field(default_factory=list)
     anchor_artist_hints: List[str] = Field(default_factory=list)
-    avoid_ids: List[str] = Field(default_factory=list)
     offset: int = 0
+    result_type: str = ""
+    cursor: str = ""
     row_id: Optional[str] = None
     row_context: Optional[str] = None
-    prepare_next_session: bool = False
-    prefer_fresh_rows: bool = False
-    refresh_token: str = ""
     defer_side_surfaces: bool = False
     recent_track_snapshots: List[Dict[str, Any]] = Field(default_factory=list)
     top_track_snapshots: List[Dict[str, Any]] = Field(default_factory=list)
@@ -157,16 +89,38 @@ class RecommendationModelTrainRequest(BaseModel):
     force_sync: bool = False
 
 
+class RecommendationPreferencesRequest(BaseModel):
+    user_scope_id: str = "guest"
+    taste_mode: str = "neatie"
+    listenbrainz_username: str = ""
+
+
 class DownloadRequest(BaseModel):
     video_id: str
     title: str = ""
 
 
-class WarmStreamRequest(BaseModel):
-    video_ids: List[str] = Field(default_factory=list)
-    current_video_id: Optional[str] = None
+class PrepareSessionRequest(BaseModel):
+    track_keys: List[str] = Field(default_factory=list)
+    current_track_key: Optional[str] = None
     active_queue: bool = False
     lookahead: int = 0
+    background: bool = False
+
+
+class PlaybackResolveRequest(BaseModel):
+    track_key: str
+
+
+class LyricsMeaningRequest(BaseModel):
+    video_id: str
+    title: str = ""
+    artist: str = ""
+    album: Optional[str] = None
+    year: Optional[str] = None
+    source: Optional[str] = None
+    lines: List[Dict[str, Any]] = Field(default_factory=list)
+    user_scope_id: str = "guest"
 
 
 class AssistantConversationMessage(BaseModel):

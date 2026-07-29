@@ -8,6 +8,8 @@ from typing import Any
 stream_info_cache: dict[str, Any] = {}
 stream_info_inflight: dict[str, Any] = {}
 stream_info_lock = Lock()
+stream_failure_cache: dict[str, Any] = {}
+stream_failure_lock = Lock()
 stream_chunk_cache: dict[str, Any] = {}
 stream_chunk_lock = Lock()
 stream_chunk_inflight: dict[str, Any] = {}
@@ -24,6 +26,7 @@ search_result_cache = {
     "albums": {},
     "artists_direct": {},
     "artists": {},
+    "playlists_direct": {},
     "recommended_artists": {},
     "suggestions": {},
 }

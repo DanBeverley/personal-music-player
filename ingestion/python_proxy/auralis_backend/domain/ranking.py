@@ -6,87 +6,6 @@ from ..config import get_backend_config
 from ..storage.postgres import load_active_model_weights
 
 
-SEARCH_TRACK_DEFAULT_WEIGHTS: Dict[str, float] = {
-    "source_score": 0.34,
-    "retrieval_votes": 0.58,
-    "lexical": 0.74,
-    "title_lexical": 0.48,
-    "query_similarity": 8.0,
-    "semantic_query_similarity": 6.0,
-    "context_similarity": 2.5,
-    "taste_similarity": 1.4,
-    "artist_similarity": 2.0,
-    "short_similarity": 0.9,
-    "long_similarity": 0.5,
-    "collab_latent": 5.1,
-    "collab_neighbor": 0.9,
-    "collab_artist": 0.2,
-    "anchor_artist_match": 1.4,
-    "popularity": 0.25,
-    "genre_fit": 1.25,
-    "subgenre_fit": 0.95,
-    "scene_fit": 1.7,
-    "peer_scene_bonus": 0.9,
-    "era_fit": 0.8,
-    "adjacent_era_fit": 0.35,
-    "language_fit": 0.6,
-    "script_fit": 0.3,
-    "track_type_fit": 0.28,
-    "popularity_taste_fit": 0.42,
-    "novelty_tolerance_fit": 0.3,
-    "negative_feedback_penalty": -2.4,
-    "same_title_ambiguity_penalty": -1.1,
-    "overexposed_artist_penalty": -0.85,
-}
-
-SEARCH_ARTIST_DEFAULT_WEIGHTS: Dict[str, float] = {
-    "source_score": 0.35,
-    "retrieval_votes": 0.62,
-    "lexical": 0.54,
-    "query_similarity": 5.4,
-    "semantic_query_similarity": 4.4,
-    "context_similarity": 1.8,
-    "taste_similarity": 1.1,
-    "artist_similarity": 2.6,
-    "anchor_artist_similarity": 5.8,
-    "anchor_track_similarity": 3.4,
-    "collab_artist": 0.34,
-    "genre_fit": 0.95,
-    "subgenre_fit": 0.65,
-    "scene_fit": 1.35,
-    "peer_scene_bonus": 0.95,
-    "era_fit": 0.45,
-    "adjacent_era_fit": 0.15,
-    "language_fit": 0.35,
-    "script_fit": 0.2,
-    "negative_feedback_penalty": -1.8,
-    "overexposed_artist_penalty": -0.75,
-}
-
-SEARCH_ALBUM_DEFAULT_WEIGHTS: Dict[str, float] = {
-    "source_score": 0.3,
-    "retrieval_votes": 0.55,
-    "lexical": 0.6,
-    "query_similarity": 7.6,
-    "semantic_query_similarity": 4.2,
-    "context_similarity": 1.9,
-    "taste_similarity": 1.25,
-    "artist_similarity": 1.6,
-    "collab_artist": 0.2,
-    "genre_fit": 1.0,
-    "subgenre_fit": 0.8,
-    "scene_fit": 1.4,
-    "peer_scene_bonus": 0.7,
-    "era_fit": 0.8,
-    "adjacent_era_fit": 0.3,
-    "language_fit": 0.4,
-    "script_fit": 0.2,
-    "popularity_taste_fit": 0.35,
-    "negative_feedback_penalty": -2.1,
-    "same_title_ambiguity_penalty": -2.3,
-    "overexposed_artist_penalty": -0.65,
-}
-
 HOME_GLOBAL_DEFAULT_WEIGHTS: Dict[str, float] = {
     "source_score": 0.36,
     "source_votes": 0.68,
@@ -210,18 +129,9 @@ HOME_MODEL_DEFAULTS_BY_KEY: Dict[str, Dict[str, float]] = {
     "home_discovery_ranker_v1": HOME_DISCOVERY_DEFAULT_WEIGHTS,
 }
 
-SEARCH_MODEL_DEFAULTS_BY_KEY: Dict[str, Dict[str, float]] = {
-    "search_track_reranker_v2": SEARCH_TRACK_DEFAULT_WEIGHTS,
-    "search_artist_reranker_v2": SEARCH_ARTIST_DEFAULT_WEIGHTS,
-    "search_album_reranker_v2": SEARCH_ALBUM_DEFAULT_WEIGHTS,
-}
-
-
 def defaults_for_model(model_key: str, fallback: Dict[str, float] | None = None) -> Dict[str, float]:
     if model_key in HOME_MODEL_DEFAULTS_BY_KEY:
         return dict(HOME_MODEL_DEFAULTS_BY_KEY[model_key])
-    if model_key in SEARCH_MODEL_DEFAULTS_BY_KEY:
-        return dict(SEARCH_MODEL_DEFAULTS_BY_KEY[model_key])
     return dict(fallback or {})
 
 

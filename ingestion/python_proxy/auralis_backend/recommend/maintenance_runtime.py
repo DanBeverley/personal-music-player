@@ -786,9 +786,6 @@ def _recommendation_runtime_snapshot(version_limit: int = 5):
         ),
         "active_promotion": active_promotion,
         "export_dir": RECOMMENDATION_MODEL_EXPORT_DIR,
-        "nearline_precompute": _nearline_runtime_snapshot(),
-        "nearline_last_cycle_at": _recommendation_sync_state_float("nearline_last_cycle_at", 0.0),
-        "nearline_last_cycle_status": _recommendation_sync_state_get("nearline_last_cycle_status", ""),
     }
 
 
@@ -872,9 +869,29 @@ def _recommendation_store_search_event(req: RecommendationSearchEventRequest):
             )
         except Exception:
             pass
+        try:
+            from ..discovery.inventory import append_inventory_intent_delta
+
+            intent_version = append_inventory_intent_delta(
+                resolve_server(),
+                user_scope_id=user_scope_id,
+                item=selected_item,
+                entity_type=selected_type or "track",
+                query=query,
+            )
+            if intent_version > 0:
+                payload["inventory_intent_version"] = intent_version
+        except Exception:
+            pass
     _recommendation_invalidate_collaborative_cache()
-    _nearline_invalidate_user(user_scope_id)
-    _nearline_invalidate_user_query(user_scope_id, query)
+    try:
+        from ..discovery.feed_state import load_feed_state, mark_feed_dirty
+
+        feed_state = load_feed_state(resolve_server(), user_scope_id)
+        if feed_state is not None:
+            mark_feed_dirty(resolve_server(), feed_state, "search_interaction")
+    except Exception:
+        pass
     return True
 
 
@@ -1116,6 +1133,12 @@ def _recommendation_store_interaction_event(req: RecommendationInteractionEventR
         connection.commit()
     finally:
         connection.close()
+    try:
+        from ..domain.user_state import schedule_history_seed_snapshot_refresh
+
+        schedule_history_seed_snapshot_refresh(resolve_server(), user_scope_id)
+    except Exception:
+        pass
     _recommendation_attribute_interaction_event(
         event_id,
         user_scope_id=user_scope_id,
@@ -1134,7 +1157,30 @@ def _recommendation_store_interaction_event(req: RecommendationInteractionEventR
     except Exception:
         pass
     _recommendation_invalidate_collaborative_cache()
-    _nearline_invalidate_user(user_scope_id)
+    if event_type in {"play", "complete", "save", "playlist_add"} and (
+        "search" in _recommendation_trim_text(req.source).lower()
+        or "search" in _recommendation_trim_text(payload.get("recommendation_origin")).lower()
+    ):
+        try:
+            from ..discovery.inventory import append_inventory_intent_delta
+
+            append_inventory_intent_delta(
+                resolve_server(),
+                user_scope_id=user_scope_id,
+                item={**payload, "id": track_id, "artist": artist_name},
+                entity_type="track",
+                query=_recommendation_trim_text(payload.get("search_query")),
+            )
+        except Exception:
+            pass
+    try:
+        from ..discovery.feed_state import load_feed_state, mark_feed_dirty
+
+        feed_state = load_feed_state(resolve_server(), user_scope_id)
+        if feed_state is not None:
+            mark_feed_dirty(resolve_server(), feed_state, f"interaction:{event_type}")
+    except Exception:
+        pass
     return True
 
 
@@ -2014,8 +2060,6 @@ def _recommendation_run_maintenance_cycle(
         "model_id": "",
         "source_signature": "",
         "experiment_evaluation": None,
-        "nearline_precompute": None,
-        "canonical_catalog_backfill": None,
     }
     try:
         if force_sync or bool(RECOMMENDATION_SYNC_DATABASE_DSN):
@@ -2070,55 +2114,6 @@ def _recommendation_run_maintenance_cycle(
                         "experiment_last_promoted_at",
                         str(time.time()),
                     )
-        nearline_result = _nearline_run_precompute_cycle(
-            force=bool(force_train),
-        )
-        result["nearline_precompute"] = nearline_result
-        try:
-            from ..search.catalog_pipeline import run_catalog_warmup
-
-            catalog_warmup = run_catalog_warmup(
-                resolve_server(),
-                user_scope_id="catalog",
-                max_queries=32 if force_train else 16,
-                batch_size=4,
-                time_budget_seconds=60.0 if force_train else 35.0,
-                min_interval_seconds=0.0 if force_train else 300.0,
-                force=bool(force_train),
-                source="maintenance_catalog_warmup",
-            )
-            result["catalog_warmup"] = catalog_warmup
-            result["canonical_catalog_backfill"] = catalog_warmup
-            _recommendation_sync_state_set(
-                "catalog_warmup_last_at",
-                str(time.time()),
-            )
-            _recommendation_sync_state_set(
-                "catalog_warmup_last_result",
-                json.dumps(catalog_warmup, ensure_ascii=False)[:1000],
-            )
-            _recommendation_sync_state_set(
-                "canonical_catalog_backfill_last_at",
-                str(time.time()),
-            )
-            _recommendation_sync_state_set(
-                "canonical_catalog_backfill_last_result",
-                json.dumps(catalog_warmup, ensure_ascii=False)[:1000],
-            )
-        except Exception as exc:
-            result["catalog_warmup"] = {"error": str(exc)[:240]}
-            result["canonical_catalog_backfill"] = {"error": str(exc)[:240]}
-        try:
-            _recommendation_sync_state_set(
-                "nearline_last_cycle_at",
-                str(time.time()),
-            )
-            _recommendation_sync_state_set(
-                "nearline_last_cycle_status",
-                _recommendation_trim_text((nearline_result or {}).get("error")) or "success",
-            )
-        except Exception:
-            pass
         _recommendation_sync_state_set("scheduler_last_error", "")
         _recommendation_sync_state_set(
             "scheduler_last_cycle_at",

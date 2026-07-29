@@ -5,7 +5,6 @@ from typing import Any, Dict, List
 import os
 import time
 
-from ..runtime_context import resolve_server
 from .taste_runtime import warm_profile_feature_artifacts
 
 
@@ -49,13 +48,6 @@ def _log_warmup_event(
 
 def _precompute_executor(server: Any):
     return getattr(server, "precompute_executor", None) or getattr(
-        server,
-        "recommendation_executor",
-    )
-
-
-def _search_executor(server: Any):
-    return getattr(server, "search_executor", None) or getattr(
         server,
         "recommendation_executor",
     )
@@ -139,46 +131,6 @@ def schedule_profile_feature_warmup(
 
     try:
         _precompute_executor(server).submit(_warm)
-        return True
-    except Exception:
-        _finish_warmup(warmup_key)
-        return False
-
-def schedule_search_warmup(
-    *,
-    user_scope_id: str,
-    query: str,
-    search_mode: str = "",
-    server: Any | None = None,
-) -> bool:
-    srv = resolve_server(server)
-    normalized_scope = srv._assistant_safe_scope_id(user_scope_id or "guest")
-    normalized_query = srv._recommendation_trim_text(query)
-    if not normalized_query:
-        return False
-    warmup_key = f"search:{normalized_scope}:{normalized_query.lower()}"
-    started, _stale_reset = _begin_warmup(warmup_key)
-    if not started:
-        return False
-
-    def _warm() -> None:
-        try:
-            from .precompute import build_search_snapshot
-
-            build_search_snapshot(
-                server=srv,
-                user_scope_id=normalized_scope,
-                query=normalized_query,
-                force=False,
-                search_mode=search_mode,
-            )
-        except Exception:
-            return
-        finally:
-            _finish_warmup(warmup_key)
-
-    try:
-        _search_executor(srv).submit(_warm)
         return True
     except Exception:
         _finish_warmup(warmup_key)

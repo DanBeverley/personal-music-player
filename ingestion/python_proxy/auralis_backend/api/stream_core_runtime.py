@@ -1,19 +1,214 @@
 from __future__ import annotations
 
+import json
 import time
+import urllib.parse
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, List, Optional
 
 import yt_dlp
 
+from .stream_cache import get_stream_cache
 
-def extract_stream_info(server: Any, video_id: str):
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    ydl_opts = {
+_STREAM_RESOLUTION_NAMESPACE = "playback_stream_resolution"
+_STREAM_RESOLUTION_MODEL = "youtube"
+_STREAM_RESOLUTION_EXPIRY_MARGIN_SECONDS = 90
+
+
+def _resolved_stream_expiry(server: Any, payload: dict) -> tuple[float, bool]:
+    now = time.time()
+    memory_expiry = now + max(
+        int(getattr(server, "STREAM_INFO_TTL_SECONDS", 21600) or 21600),
+        60,
+    )
+    try:
+        query = urllib.parse.parse_qs(
+            urllib.parse.urlparse(str(payload.get("url") or "")).query
+        )
+        signed_expiry = float((query.get("expire") or [0])[0] or 0)
+    except (TypeError, ValueError):
+        signed_expiry = 0.0
+    if signed_expiry <= now + _STREAM_RESOLUTION_EXPIRY_MARGIN_SECONDS:
+        return memory_expiry, False
+    return (
+        min(
+            memory_expiry,
+            signed_expiry - _STREAM_RESOLUTION_EXPIRY_MARGIN_SECONDS,
+        ),
+        True,
+    )
+
+
+def _load_persisted_stream_info(server: Any, video_id: str):
+    from ..recommend.store_runtime import (
+        open_recommendation_store_connection_without_init,
+    )
+
+    connection = None
+    try:
+        connection = open_recommendation_store_connection_without_init(server)
+        row = connection.execute(
+            """
+            SELECT model_id, payload_json
+            FROM recommendation_feature_store
+            WHERE namespace = ? AND entity_id = ?
+            LIMIT 1
+            """,
+            (_STREAM_RESOLUTION_NAMESPACE, video_id),
+        ).fetchone()
+        if row is None or str(row["model_id"] or "") != _STREAM_RESOLUTION_MODEL:
+            return None
+        stored = json.loads(str(row["payload_json"] or "{}"))
+        expires_at = float(stored.get("expires_at") or 0)
+        stream_info = stored.get("stream_info")
+        if (
+            expires_at <= time.time() + _STREAM_RESOLUTION_EXPIRY_MARGIN_SECONDS
+            or not isinstance(stream_info, dict)
+            or not str(stream_info.get("url") or "").startswith(("http://", "https://"))
+        ):
+            connection.execute(
+                """
+                DELETE FROM recommendation_feature_store
+                WHERE namespace = ? AND entity_id = ?
+                """,
+                (_STREAM_RESOLUTION_NAMESPACE, video_id),
+            )
+            connection.commit()
+            return None
+        payload = dict(stream_info)
+        payload["expires_at"] = expires_at
+        return payload, expires_at
+    except Exception:
+        return None
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _persist_stream_info(
+    server: Any,
+    video_id: str,
+    payload: dict,
+    expires_at: float,
+) -> None:
+    from ..recommend.store_runtime import (
+        open_recommendation_store_connection_without_init,
+    )
+
+    connection = None
+    try:
+        connection = open_recommendation_store_connection_without_init(server)
+        connection.execute(
+            """
+            INSERT INTO recommendation_feature_store (
+                namespace,
+                entity_id,
+                model_id,
+                payload_json,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(namespace, entity_id) DO UPDATE SET
+                model_id = excluded.model_id,
+                payload_json = excluded.payload_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                _STREAM_RESOLUTION_NAMESPACE,
+                video_id,
+                _STREAM_RESOLUTION_MODEL,
+                json.dumps(
+                    {
+                        "stream_info": payload,
+                        "expires_at": expires_at,
+                    },
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                ),
+                time.time(),
+            ),
+        )
+        connection.commit()
+    except Exception:
+        return
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _delete_persisted_stream_info(server: Any, video_id: str) -> None:
+    from ..recommend.store_runtime import (
+        open_recommendation_store_connection_without_init,
+    )
+
+    connection = None
+    try:
+        connection = open_recommendation_store_connection_without_init(server)
+        connection.execute(
+            """
+            DELETE FROM recommendation_feature_store
+            WHERE namespace = ? AND entity_id = ?
+            """,
+            (_STREAM_RESOLUTION_NAMESPACE, video_id),
+        )
+        connection.commit()
+    except Exception:
+        return
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _stream_failure_payload(exc: Exception):
+    classified = classify_stream_failure(exc)
+    return {
+        **classified,
+        "created_at": time.time(),
+    }
+
+
+def _get_stream_failure(server: Any, video_id: str):
+    now = time.time()
+    cooldown = int(getattr(server, "STREAM_FAILURE_COOLDOWN_SECONDS", 900) or 900)
+    with server.stream_failure_lock:
+        cached = server.stream_failure_cache.get(video_id)
+        if cached and (now - float(cached.get("created_at") or 0.0)) < cooldown:
+            return dict(cached)
+        if cached:
+            server.stream_failure_cache.pop(video_id, None)
+    return None
+
+
+def _store_stream_failure(server: Any, video_id: str, exc: Exception) -> dict:
+    payload = _stream_failure_payload(exc)
+    with server.stream_failure_lock:
+        server.stream_failure_cache[video_id] = payload
+    return payload
+
+
+def _clear_stream_failure(server: Any, video_id: str) -> None:
+    with server.stream_failure_lock:
+        server.stream_failure_cache.pop(video_id, None)
+
+
+def _ytdlp_opts(server: Any) -> dict:
+    opts = {
         "format": "bestaudio[ext=m4a]/bestaudio/best",
         "quiet": True,
         "no_warnings": True,
     }
+    cookies_path = str(getattr(server, "AURALIS_YTDLP_COOKIES_PATH", "") or "").strip()
+    if cookies_path:
+        opts["cookiefile"] = cookies_path
+    po_token = str(getattr(server, "AURALIS_YTDLP_PO_TOKEN", "") or "").strip()
+    if po_token:
+        opts.setdefault("extractor_args", {}).setdefault("youtube", {})["po_token"] = [po_token]
+    return opts
+
+
+def extract_stream_info(server: Any, video_id: str):
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    ydl_opts = _ytdlp_opts(server)
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
 
@@ -75,17 +270,17 @@ def store_stream_chunk(server: Any, video_id: str, payload):
 def chunk_target_bytes(server: Any, position: int, active_queue: bool):
     if active_queue:
         if position <= 0:
-            return 1572864
+            return 262144
         if position == 1:
-            return 1048576
+            return 196608
         if position == 2:
-            return 786432
-        return server.STREAM_WARM_CHUNK_BYTES
+            return 131072
+        return min(server.STREAM_WARM_CHUNK_BYTES, 131072)
     if position <= 0:
-        return 1048576
+        return 196608
     if position == 1:
-        return 786432
-    return server.STREAM_WARM_CHUNK_BYTES
+        return 131072
+    return min(server.STREAM_WARM_CHUNK_BYTES, 131072)
 
 
 def parse_byte_range(range_header: Optional[str], total_length: Optional[int]):
@@ -187,7 +382,10 @@ def summarize_prepare_metrics(server: Any):
 
 
 def warm_initial_stream_chunk(server: Any, video_id: str, stream_info: dict, target_bytes: int):
-    target_bytes = max(target_bytes, server.STREAM_WARM_CHUNK_BYTES)
+    # The caller already assigns an intent-weighted prefix size. Clamping every
+    # request back to the old global 768 KiB target erased that optimization and
+    # made a one-track tap download far more data than playback needs to start.
+    target_bytes = max(int(target_bytes or 0), 64 * 1024)
     while True:
         cached = get_cached_stream_chunk(server, video_id, min_bytes=target_bytes)
         if cached is not None:
@@ -265,8 +463,69 @@ def warm_initial_stream_chunk(server: Any, video_id: str, stream_info: dict, tar
                     server.stream_chunk_inflight.pop(video_id, None)
 
 
-def prepare_stream_track(server: Any, video_id: str, target_chunk_bytes: int, active_queue: bool):
+def _defer_initial_stream_chunk(
+    server: Any,
+    video_id: str,
+    stream_info: dict,
+    target_chunk_bytes: int,
+) -> None:
+    try:
+        server.stream_warm_executor.submit(
+            warm_initial_stream_chunk,
+            server,
+            video_id,
+            stream_info,
+            target_chunk_bytes,
+        )
+    except Exception:
+        # Playback can still stream directly from upstream if background warm
+        # scheduling fails. The prepare response should stay fast and usable.
+        return
+
+
+def prepare_stream_track(
+    server: Any,
+    video_id: str,
+    target_chunk_bytes: int,
+    active_queue: bool,
+    *,
+    defer_chunk: bool = False,
+):
     total_start = time.perf_counter()
+    cached_failure = _get_stream_failure(server, video_id)
+    if cached_failure is not None:
+        raise RuntimeError(cached_failure.get("message") or cached_failure.get("code") or "stream_failed")
+    stream_cache = get_stream_cache(server)
+    stream_cache_head_start = time.perf_counter()
+    stream_cache_meta = stream_cache.head(video_id)
+    stream_cache_head_ms = int((time.perf_counter() - stream_cache_head_start) * 1000)
+    if stream_cache_meta:
+        content_length = int(stream_cache_meta.get("content_length") or 0)
+        metrics = {
+            "prepared": True,
+            "playback_path": "",
+            "playback_url": "",
+            "source_kind": f"{stream_cache.backend_name}_proxy",
+            "headers": {},
+            "mime_type": stream_cache_meta.get("content_type") or "audio/mp4",
+            "content_length": content_length,
+            "range_supported": True,
+            "expires_at": time.time() + (60 * 60),
+            "r2_cache_hit": bool(stream_cache.backend_name == "r2"),
+            "resolve_cache_hit": False,
+            "chunk_cache_hit": True,
+            "chunk_deferred": False,
+            "resolve_ms": 0,
+            "chunk_ms": 0,
+            "stream_cache_head_ms": stream_cache_head_ms,
+            "target_chunk_bytes": target_chunk_bytes,
+            "cached_prefix_bytes": min(content_length, target_chunk_bytes) if content_length else target_chunk_bytes,
+            "duration": 0,
+            "active_queue": active_queue,
+            "server_ms": int((time.perf_counter() - total_start) * 1000),
+        }
+        record_prepare_metric(server, video_id, metrics)
+        return metrics
     resolve_start = time.perf_counter()
     resolve_cache_hit = is_stream_info_cached(server, video_id)
     stream_info = get_stream_info(server, video_id)
@@ -278,18 +537,59 @@ def prepare_stream_track(server: Any, video_id: str, target_chunk_bytes: int, ac
         min_bytes=target_chunk_bytes,
     ) is not None
     chunk_start = time.perf_counter()
-    chunk_payload = warm_initial_stream_chunk(server, video_id, stream_info, target_chunk_bytes)
-    chunk_ms = int((time.perf_counter() - chunk_start) * 1000)
+    chunk_payload = None
+    if defer_chunk and not chunk_cache_hit:
+        _defer_initial_stream_chunk(server, video_id, stream_info, target_chunk_bytes)
+        chunk_ms = 0
+    else:
+        try:
+            chunk_payload = warm_initial_stream_chunk(
+                server,
+                video_id,
+                stream_info,
+                target_chunk_bytes,
+            )
+        except Exception as exc:
+            if not should_refresh_stream_info(exc):
+                raise
+            stream_info = refresh_stream_info(server, video_id)
+            chunk_payload = warm_initial_stream_chunk(
+                server,
+                video_id,
+                stream_info,
+                target_chunk_bytes,
+            )
+        chunk_ms = int((time.perf_counter() - chunk_start) * 1000)
 
+    playback_path = ""
+    playback_url = stream_info.get("url") or ""
+    source_kind = "direct_resolved"
+    playback_headers = dict(stream_info.get("headers") or {})
+    content_length = int(stream_info.get("filesize") or stream_info.get("filesize_approx") or 0)
+    mime_type = stream_info.get("mime_type") or "audio/mp4"
+
+    stream_info_expiry = float(
+        stream_info.get("expires_at") or (time.time() + (20 * 60))
+    )
     metrics = {
         "prepared": True,
-        "playback_path": f"/proxy_stream/{video_id}",
+        "playback_path": playback_path,
+        "playback_url": playback_url,
+        "source_kind": source_kind,
+        "headers": playback_headers,
+        "mime_type": mime_type,
+        "content_length": content_length,
+        "range_supported": True,
+        "expires_at": min(stream_info_expiry, time.time() + (20 * 60)),
+        "r2_cache_hit": bool(stream_cache_meta and stream_cache.backend_name == "r2"),
         "resolve_cache_hit": resolve_cache_hit,
         "chunk_cache_hit": chunk_cache_hit,
+        "chunk_deferred": bool(defer_chunk and not chunk_cache_hit),
         "resolve_ms": resolve_ms,
         "chunk_ms": chunk_ms,
+        "stream_cache_head_ms": stream_cache_head_ms,
         "target_chunk_bytes": target_chunk_bytes,
-        "cached_prefix_bytes": len(chunk_payload.get("bytes") or b""),
+        "cached_prefix_bytes": len((chunk_payload or {}).get("bytes") or b""),
         "duration": stream_info.get("duration") or 0,
         "active_queue": active_queue,
         "server_ms": int((time.perf_counter() - total_start) * 1000),
@@ -301,7 +601,8 @@ def prepare_stream_track(server: Any, video_id: str, target_chunk_bytes: int, ac
 def prepare_stream_track_safely(server: Any, video_id: str, target_chunk_bytes: int, active_queue: bool):
     try:
         return prepare_stream_track(server, video_id, target_chunk_bytes, active_queue)
-    except Exception:
+    except Exception as exc:
+        _store_stream_failure(server, video_id, exc)
         return None
 
 
@@ -320,7 +621,7 @@ def classify_stream_failure(exc: Exception):
             "message": message or "Requested format is not available",
             "status_code": 410,
         }
-    if "sign in to confirm" in lowered or "not a bot" in lowered:
+    if "sign in to confirm" in lowered or "not a bot" in lowered or "source_blocked" in lowered:
         return {
             "code": "source_blocked",
             "message": message or "Upstream source requires verification",
@@ -339,6 +640,7 @@ def prepare_streams_with_failures(
     limit: int = 18,
     current_video_id: Optional[str] = None,
     active_queue: bool = False,
+    defer_all_chunks: bool = False,
 ):
     prepared = {}
     failed = {}
@@ -373,6 +675,7 @@ def prepare_streams_with_failures(
                 video_id,
                 targets[video_id],
                 active_queue,
+                defer_chunk=defer_all_chunks,
             ): video_id
             for video_id in deduped_ids
         }
@@ -403,6 +706,9 @@ def prepare_streams(
 
 def get_stream_info(server: Any, video_id: str):
     now = time.time()
+    cached_failure = _get_stream_failure(server, video_id)
+    if cached_failure is not None:
+        raise RuntimeError(cached_failure.get("message") or cached_failure.get("code") or "stream_failed")
     with server.stream_info_lock:
         cached = server.stream_info_cache.get(video_id)
         if cached and cached["expires_at"] > now:
@@ -420,15 +726,26 @@ def get_stream_info(server: Any, video_id: str):
         return pending.result(timeout=25)
 
     try:
-        payload = extract_stream_info(server, video_id)
+        persisted = _load_persisted_stream_info(server, video_id)
+        if persisted is not None:
+            payload, expires_at = persisted
+        else:
+            payload = extract_stream_info(server, video_id)
+            expires_at, should_persist = _resolved_stream_expiry(server, payload)
+            payload = dict(payload)
+            payload["expires_at"] = expires_at
+            if should_persist:
+                _persist_stream_info(server, video_id, payload, expires_at)
+        _clear_stream_failure(server, video_id)
         with server.stream_info_lock:
             server.stream_info_cache[video_id] = {
                 "payload": payload,
-                "expires_at": now + server.STREAM_INFO_TTL_SECONDS,
+                "expires_at": expires_at,
             }
         pending.set_result(payload)
         return payload
     except Exception as exc:
+        _store_stream_failure(server, video_id, exc)
         pending.set_exception(exc)
         raise
     finally:
@@ -440,6 +757,7 @@ def get_stream_info(server: Any, video_id: str):
 def refresh_stream_info(server: Any, video_id: str):
     with server.stream_info_lock:
         server.stream_info_cache.pop(video_id, None)
+    _delete_persisted_stream_info(server, video_id)
     return get_stream_info(server, video_id)
 
 

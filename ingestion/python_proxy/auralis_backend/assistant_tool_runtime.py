@@ -50,18 +50,18 @@ def assistant_tool_search_tracks(server: Any, query: str, limit: int):
     query = (query or "").strip()
     if not query:
         return []
-    from auralis_backend.search.runtime import search_tracks_blended
+    from auralis_backend.search.runtime import search_tracks_direct
 
-    return search_tracks_blended(query, limit, server=server)
+    return search_tracks_direct(query, limit, server=server)
 
 
 def assistant_tool_search_albums(server: Any, query: str, limit: int):
     query = (query or "").strip()
     if not query:
         return []
-    from auralis_backend.search.runtime import search_albums_blended
+    from auralis_backend.search.runtime import search_albums_direct
 
-    return search_albums_blended(query, limit, server=server)
+    return search_albums_direct(query, limit, server=server)
 
 
 def assistant_tool_search_artists_direct(server: Any, query: str, limit: int):

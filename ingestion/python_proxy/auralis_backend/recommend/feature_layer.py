@@ -94,8 +94,20 @@ def build_catalog_feature_profile(server: Any, profile: Dict[str, Any]) -> Dict[
         "affinity_titles": _as_set(taste_profile.get("affinity_titles") or []),
         "dominant_script": str(taste_profile.get("dominant_script") or "latin"),
         "supported_scripts": _as_set(taste_profile.get("supported_scripts") or ["latin"]),
-        "dominant_language": str(taste_profile.get("dominant_language") or "english"),
-        "supported_languages": _as_set(taste_profile.get("supported_languages") or ["english"]),
+        "dominant_language": str(taste_profile.get("dominant_language") or ""),
+        "supported_languages": _as_set(
+            taste_profile.get("accepted_languages")
+            or taste_profile.get("supported_languages")
+            or []
+        ),
+        "language_scores": _normalize_weight_map(taste_profile.get("language_scores") or {}),
+        "dominant_region": str(taste_profile.get("dominant_region") or ""),
+        "supported_regions": _as_set(
+            taste_profile.get("accepted_regions")
+            or taste_profile.get("supported_regions")
+            or []
+        ),
+        "region_scores": _normalize_weight_map(taste_profile.get("region_scores") or {}),
         "dominant_era": str(taste_profile.get("dominant_era") or ""),
         "supported_eras": _as_set(taste_profile.get("supported_eras") or []),
         "supported_type_tags": _as_set(taste_profile.get("supported_type_tags") or []),

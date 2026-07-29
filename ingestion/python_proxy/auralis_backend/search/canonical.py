@@ -11,6 +11,7 @@ from ..domain.catalog import (
     normalize_artist_name,
     normalize_track_title,
     normalized_popularity,
+    parse_compact_number,
 )
 from ..domain.result_quality import track_result_penalty
 from .server_adapter import SearchServerAdapter
@@ -104,6 +105,11 @@ def _learned_popularity(item: Dict[str, Any]) -> float:
 def source_quality_score(server: SearchServerAdapter, item: Dict[str, Any]) -> float:
     text = _source_text(server, item)
     score = 0.0
+    video_type = server.normalize_text(item.get("video_type")).replace(" ", "_")
+    if video_type.endswith("_atv") or video_type.endswith("_omv"):
+        score += 0.8
+    elif video_type.endswith("_ugc"):
+        score -= 0.25
     identity_authority = server.normalize_text(item.get("source_identity_authority")).replace(" ", "_")
     identity_confidence = 0.0
     try:
@@ -142,6 +148,8 @@ def source_quality_score(server: SearchServerAdapter, item: Dict[str, Any]) -> f
         score += 0.45
     elif authority == "canonical":
         score += 0.35
+    if source_is_self_labeled_official(server, item):
+        score = min(score, -0.15)
     return max(-1.0, min(score, 1.8))
 
 
@@ -169,11 +177,7 @@ def source_is_self_labeled_official(server: SearchServerAdapter, item: Dict[str,
 
 def source_popularity_score(server: SearchServerAdapter, item: Dict[str, Any]) -> float:
     for key in ("popularity", "view_count", "viewCount", "views", "play_count", "playCount"):
-        value = item.get(key)
-        try:
-            number = float(value or 0.0)
-        except (TypeError, ValueError):
-            number = 0.0
+        number = parse_compact_number(item.get(key))
         if number <= 0:
             continue
         if number <= 1.0:
@@ -393,6 +397,39 @@ def _memory_boost(
     return best
 
 
+def _authoritative_memory_entity(
+    memories: List[Dict[str, Any]] | None,
+) -> Tuple[str, str, float]:
+    """Return the strongest learned/catalog entity for a query, if one exists."""
+    best_title = ""
+    best_artist = ""
+    best_strength = 0.0
+    for memory in memories or []:
+        if memory.get("entity_type") != "track":
+            continue
+        title_key = _text(memory.get("title_key"))
+        if not title_key:
+            continue
+        artist_key = _text(memory.get("artist_key"))
+        confidence = float(memory.get("confidence") or 0.0)
+        score = float(memory.get("score") or 0.0)
+        learned = float(memory.get("learned_popularity") or 0.0)
+        event_count = float(memory.get("event_count") or 0.0)
+        strength = (
+            confidence
+            + min(score, 8.0) * 0.08
+            + min(learned, 1.0) * 0.35
+            + min(event_count, 10.0) * 0.025
+        )
+        if strength > best_strength:
+            best_title = title_key
+            best_artist = artist_key
+            best_strength = strength
+    if best_strength < 0.82:
+        return "", "", 0.0
+    return best_title, best_artist, best_strength
+
+
 def resolve_canonical_tracks(
     server: SearchServerAdapter,
     query: str,
@@ -408,11 +445,20 @@ def resolve_canonical_tracks(
     resolved_title = ""
     resolved_artist = ""
     entity_confidence = 0.0
+    memory_title, memory_artist, memory_strength = _authoritative_memory_entity(memories)
     if ranked_entities:
         (resolved_title, resolved_artist), best_score = ranked_entities[0]
         second_score = ranked_entities[1][1] if len(ranked_entities) > 1 else 0.0
         margin = best_score - second_score
         entity_confidence = min(1.0, max(0.0, (best_score / 8.0) + (margin / 10.0)))
+    if memory_title and (
+        not resolved_title
+        or memory_strength >= 1.08
+        or (resolved_title == memory_title and (not memory_artist or memory_artist == resolved_artist))
+    ):
+        resolved_title = memory_title
+        resolved_artist = memory_artist
+        entity_confidence = max(entity_confidence, min(1.0, 0.62 + memory_strength * 0.22))
 
     def score(indexed_track: Tuple[int, Dict[str, Any]]) -> Tuple[float, float, float, float, int]:
         index, track = indexed_track
@@ -440,6 +486,13 @@ def resolve_canonical_tracks(
             # Do not let VEVO/Topic-style authority outrank the resolved artist
             # cluster for exact-title searches.
             entity_mismatch_penalty += 2.35 + min(max(raw_source_quality, 0.0), 1.2)
+        if memory_title:
+            if title_key == memory_title and (not memory_artist or artist_key == memory_artist):
+                canonical_match += min(2.8, 1.25 + memory_strength * 0.55)
+            elif title_key == memory_title and memory_artist and artist_key != memory_artist:
+                entity_mismatch_penalty += min(3.25, 1.4 + memory_strength * 0.75)
+            elif query_key and title_key and query_key == title_key and memory_artist:
+                entity_mismatch_penalty += min(2.1, 0.75 + memory_strength * 0.45)
         if query_key and title_key and query_key != title_key and query_key in title_key:
             query_tokens = set(server.query_tokens(query))
             canonical_match -= 2.0 if len(query_tokens) <= 1 else 0.7

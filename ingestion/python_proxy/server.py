@@ -53,6 +53,8 @@ from auralis_backend.storage.cache_runtime import (
     stream_chunk_inflight,
     stream_chunk_inflight_lock,
     stream_chunk_lock,
+    stream_failure_cache,
+    stream_failure_lock,
     stream_info_cache,
     stream_info_inflight,
     stream_info_lock,
@@ -80,6 +82,7 @@ from auralis_backend.details.detail_runtime import (
     build_artist_details_payload as _detail_build_artist_details_payload,
     build_track_details_payload as _detail_build_track_details_payload,
 )
+from auralis_backend.domain.catalog import catalog_thumbnail_url
 import auralis_backend.assistant_core_runtime as _assistant_core_runtime
 import auralis_backend.assistant_tool_runtime as _assistant_tool_runtime
 from auralis_backend.recommend import (
@@ -96,55 +99,10 @@ try:
     from auralis_backend.domain.ranking import (
         HOME_GLOBAL_DEFAULT_WEIGHTS,
         defaults_for_model as _ranking_defaults_for_model,
-        SEARCH_ALBUM_DEFAULT_WEIGHTS,
-        SEARCH_ARTIST_DEFAULT_WEIGHTS,
-        SEARCH_TRACK_DEFAULT_WEIGHTS,
         model_version as _ranking_model_version,
         score_features as _ranking_score_features,
     )
 except Exception:
-    SEARCH_TRACK_DEFAULT_WEIGHTS = {
-        "source_score": 0.34,
-        "retrieval_votes": 0.58,
-        "lexical": 0.74,
-        "title_lexical": 0.48,
-        "query_similarity": 8.0,
-        "semantic_query_similarity": 6.0,
-        "context_similarity": 2.5,
-        "taste_similarity": 1.4,
-        "artist_similarity": 2.0,
-        "short_similarity": 0.9,
-        "long_similarity": 0.5,
-        "collab_latent": 5.1,
-        "collab_neighbor": 0.9,
-        "collab_artist": 0.2,
-        "anchor_artist_match": 1.4,
-        "popularity": 0.25,
-    }
-    SEARCH_ARTIST_DEFAULT_WEIGHTS = {
-        "source_score": 0.35,
-        "retrieval_votes": 0.62,
-        "lexical": 0.54,
-        "query_similarity": 5.4,
-        "semantic_query_similarity": 4.4,
-        "context_similarity": 1.8,
-        "taste_similarity": 1.1,
-        "artist_similarity": 2.6,
-        "anchor_artist_similarity": 5.8,
-        "anchor_track_similarity": 3.4,
-        "collab_artist": 0.34,
-    }
-    SEARCH_ALBUM_DEFAULT_WEIGHTS = {
-        "source_score": 0.3,
-        "retrieval_votes": 0.55,
-        "lexical": 0.6,
-        "query_similarity": 7.6,
-        "semantic_query_similarity": 4.2,
-        "context_similarity": 1.9,
-        "taste_similarity": 1.25,
-        "artist_similarity": 1.6,
-        "collab_artist": 0.2,
-    }
     HOME_GLOBAL_DEFAULT_WEIGHTS = {
         "source_score": 0.36,
         "source_votes": 0.68,
@@ -234,27 +192,6 @@ except Exception:
     def _pg_list_rollout_events(*, model_key: str = "", limit: int = 50):
         return []
 
-try:
-    from auralis_backend.recommend.precompute import (
-        invalidate_user as _nearline_invalidate_user,
-        invalidate_user_query as _nearline_invalidate_user_query,
-        run_precompute_cycle as _nearline_run_precompute_cycle,
-        runtime_snapshot as _nearline_runtime_snapshot,
-    )
-except Exception:
-    def _nearline_invalidate_user(user_scope_id: str) -> None:
-        return
-
-    def _nearline_invalidate_user_query(user_scope_id: str, query: str) -> None:
-        return
-
-    def _nearline_run_precompute_cycle(*, server=None, force: bool = False) -> Dict[str, Any]:
-        return {"enabled": False, "reason": "nearline_precompute_unavailable"}
-
-    def _nearline_runtime_snapshot() -> Dict[str, Any]:
-        return {"enabled": False}
-
-
 def _bind_server(fn):
     def _wrapped(*args, **kwargs):
         return fn(sys.modules[__name__], *args, **kwargs)
@@ -272,6 +209,7 @@ def extract_thumbnail(data):
     elif isinstance(thumbs, dict):
         return thumbs.get("url")
     return None
+
 
 def extract_artist(data):
     if not data: return "Unknown Artist"
@@ -416,7 +354,7 @@ def normalize_album_results(raw_results):
             "id": browse_id,
             "title": entry.get("title"),
             "artist": extract_artist(entry),
-            "thumbnail": extract_thumbnail(entry),
+            "thumbnail": catalog_thumbnail_url(entry, entity_type="album"),
             "year": entry.get("year") or "",
             "track_count": entry.get("trackCount") or entry.get("track_count") or 0,
         })
@@ -444,7 +382,8 @@ def normalize_artist_results(raw_results):
             {
                 "id": browse_id,
                 "name": name,
-                "thumbnail": extract_thumbnail(entry),
+                "thumbnail": catalog_thumbnail_url(entry, entity_type="artist"),
+                "subscribers": entry.get("subscribers") or "",
                 "description": (
                     entry.get("subscribers")
                     or entry.get("description")
@@ -721,11 +660,17 @@ def _rank_artist_detail_related_artists(
     return ranked[:12]
 
 
-def _build_artist_details_payload(artist_id: str, *, enrich_related: bool = True):
+def _build_artist_details_payload(
+    artist_id: str,
+    *,
+    enrich_related: bool = True,
+    lightweight: bool = False,
+):
     return _detail_build_artist_details_payload(
         sys.modules[__name__],
         artist_id,
         enrich_related=enrich_related,
+        lightweight=lightweight,
     )
 
 def _recommended_artist_anchor_penalty(anchor_names, candidate_name: str) -> float:
@@ -1195,7 +1140,11 @@ def normalize_recommendation_track(data):
         or "Unknown Track"
     )
     artist = extract_artist(data)
-    return {
+    # Keep provider/canonical evidence attached. Recommendation acquisition
+    # normalizes more than once; returning only display fields here previously
+    # erased the authority used by home admission and dropped every lane result.
+    normalized = dict(data)
+    normalized.update({
         "id": video_id,
         "title": title,
         "duration": parse_duration_seconds(
@@ -1209,7 +1158,8 @@ def normalize_recommendation_track(data):
         "channel": artist,
         "album": album_info.get("title"),
         "album_id": album_info.get("id"),
-    }
+    })
+    return normalized
 
 def _normalize_text(value: Optional[str]) -> str:
     return re.sub(r"\s+", " ", (value or "").strip().lower())
@@ -1581,11 +1531,35 @@ DOWNLOAD_DIR = os.path.join(os.getcwd(), "downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 ytmusic = YTMusic()
 STREAM_INFO_TTL_SECONDS = 21600
+STREAM_FAILURE_COOLDOWN_SECONDS = int(os.environ.get("STREAM_FAILURE_COOLDOWN_SECONDS", "900"))
+AURALIS_YTDLP_COOKIES_PATH = os.environ.get("AURALIS_YTDLP_COOKIES_PATH", "").strip()
+AURALIS_YTDLP_PO_TOKEN = os.environ.get("AURALIS_YTDLP_PO_TOKEN", "").strip()
+AURALIS_STREAM_CACHE_BACKEND = os.environ.get("AURALIS_STREAM_CACHE_BACKEND", "none").strip().lower()
+AURALIS_STREAM_CACHE_BUCKET = os.environ.get("AURALIS_STREAM_CACHE_BUCKET", "").strip()
+AURALIS_STREAM_CACHE_PREFIX = os.environ.get("AURALIS_STREAM_CACHE_PREFIX", "streams").strip()
+AURALIS_STREAM_CACHE_MIN_BYTES = int(os.environ.get("AURALIS_STREAM_CACHE_MIN_BYTES", "65536"))
+AURALIS_STREAM_CACHE_MAX_BYTES = int(os.environ.get("AURALIS_STREAM_CACHE_MAX_BYTES", str(80 * 1024 * 1024)))
+AURALIS_STREAM_CACHE_TMP_DIR = os.environ.get("AURALIS_STREAM_CACHE_TMP_DIR", "").strip()
+STREAM_CACHE_HEAD_HIT_TTL_SECONDS = int(
+    os.environ.get("STREAM_CACHE_HEAD_HIT_TTL_SECONDS", "45")
+)
+STREAM_CACHE_HEAD_MISS_TTL_SECONDS = int(
+    os.environ.get("STREAM_CACHE_HEAD_MISS_TTL_SECONDS", "8")
+)
+AURALIS_R2_ACCOUNT_ID = os.environ.get("AURALIS_R2_ACCOUNT_ID", "").strip()
+AURALIS_R2_ACCESS_KEY_ID = os.environ.get("AURALIS_R2_ACCESS_KEY_ID", "").strip()
+AURALIS_R2_SECRET_ACCESS_KEY = os.environ.get("AURALIS_R2_SECRET_ACCESS_KEY", "").strip()
+AURALIS_R2_ENDPOINT_URL = os.environ.get("AURALIS_R2_ENDPOINT_URL", "").strip()
 STREAM_WARM_CHUNK_BYTES = int(os.environ.get("STREAM_WARM_CHUNK_BYTES", "786432"))
 STREAM_CHUNK_TTL_SECONDS = 1800
 STREAM_WARM_WORKERS = int(os.environ.get("STREAM_WARM_WORKERS", "8"))
 PREPARE_SESSION_WORKERS = int(os.environ.get("PREPARE_SESSION_WORKERS", "4"))
+if "AURALIS_STREAM_PREWARM_CONCURRENCY" in os.environ:
+    PREPARE_SESSION_WORKERS = int(os.environ.get("AURALIS_STREAM_PREWARM_CONCURRENCY") or PREPARE_SESSION_WORKERS)
 PREPARE_SESSION_MAX_LOOKAHEAD = int(os.environ.get("PREPARE_SESSION_MAX_LOOKAHEAD", "18"))
+PREPARE_BACKGROUND_MAX_LOOKAHEAD = int(
+    os.environ.get("PREPARE_BACKGROUND_MAX_LOOKAHEAD", "3")
+)
 RECOMMENDATION_CACHE_TTL_SECONDS = int(os.environ.get("RECOMMENDATION_CACHE_TTL_SECONDS", "180"))
 RECOMMENDATION_FEED_SESSION_TTL_SECONDS = int(os.environ.get("RECOMMENDATION_FEED_SESSION_TTL_SECONDS", "900"))
 RECOMMENDATION_PROFILE_CACHE_TTL_SECONDS = int(os.environ.get("RECOMMENDATION_PROFILE_CACHE_TTL_SECONDS", "300"))
@@ -2115,46 +2089,6 @@ def recommendation_search_interaction(req: RecommendationSearchEventRequest):
     return search_interaction(sys.modules[__name__], req)
 
 
-def _fallback_home_candidates(limit: int):
-    cached = _cache_lookup_home_candidates(limit)
-    if cached:
-        return cached
-
-    results = []
-    try:
-        home_feed = ytmusic.get_home(limit=limit)
-    except Exception:
-        home_feed = []
-
-    for carousel in home_feed:
-        for item in carousel.get("contents", []):
-            track = normalize_recommendation_track(item)
-            if track is None:
-                continue
-            results.append((track, 1.0))
-            if len(results) >= limit + 10:
-                return results
-
-    if len(results) < 5:
-        try:
-            backup = ytmusic.search("trending hit songs", filter="songs", limit=limit)
-        except Exception:
-            backup = []
-        for entry in backup:
-            track = normalize_recommendation_track(entry)
-            if track is None:
-                continue
-            results.append((track, 0.7))
-            if len(results) >= limit + 10:
-                break
-
-    if results:
-        _cache_store_home_candidates(
-            results,
-            ttl_seconds=RECOMMENDATION_CACHE_TTL_SECONDS,
-            limit=limit,
-        )
-    return results
 _recommendation_trim_text = _recommendation_helper_runtime._recommendation_trim_text
 
 _recommendation_unique_strings = _recommendation_helper_runtime._recommendation_unique_strings

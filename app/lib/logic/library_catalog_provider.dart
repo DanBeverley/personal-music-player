@@ -34,9 +34,96 @@ Map<String, dynamic> _cloudTrackPayload(dynamic rawTrack) {
   };
 }
 
-Future<void> upsertCloudLibraryTrack(dynamic rawTrack) async {
+Future<File> _localLikedTracksFile(String scopeId) {
+  return getScopedDataFile('liked_tracks.json', scopeId);
+}
+
+Future<List<Map<String, dynamic>>> _loadLocalLikedTracks(String scopeId) async {
+  try {
+    final file = await _localLikedTracksFile(scopeId);
+    if (!await file.exists()) return const [];
+    final raw = jsonDecode(await file.readAsString());
+    if (raw is! List) return const [];
+    return raw
+        .whereType<Map>()
+        .map((entry) => normalizeTrack(Map<String, dynamic>.from(entry)))
+        .where((track) => extractTrackId(track)?.isNotEmpty ?? false)
+        .map((track) => {
+              ...track,
+              'is_liked_locally': true,
+              'is_cloud_saved': true,
+            })
+        .toList(growable: false);
+  } catch (error) {
+    debugPrint('Local liked tracks load failed: $error');
+    return const [];
+  }
+}
+
+Future<void> _writeLocalLikedTracks(
+  String scopeId,
+  List<Map<String, dynamic>> tracks,
+) async {
+  try {
+    final file = await _localLikedTracksFile(scopeId);
+    await file.parent.create(recursive: true);
+    await file.writeAsString(jsonEncode(tracks));
+  } catch (error) {
+    debugPrint('Local liked tracks save failed: $error');
+  }
+}
+
+Future<void> _upsertLocalLikedTrack(Map<String, dynamic> payload) async {
+  final trackId = extractTrackId(payload);
+  if (trackId == null || trackId.isEmpty) return;
+  final tracks = await _loadLocalLikedTracks(activeStorageScopeId);
+  final merged = <Map<String, dynamic>>[];
+  var inserted = false;
+  for (final track in tracks) {
+    if (extractTrackId(track) == trackId) {
+      merged.add({
+        ...track,
+        ...payload,
+        'is_liked_locally': true,
+        'is_cloud_saved': true,
+      });
+      inserted = true;
+    } else {
+      merged.add(track);
+    }
+  }
+  if (!inserted) {
+    merged.insert(0, {
+      ...payload,
+      'is_liked_locally': true,
+      'is_cloud_saved': true,
+      'liked_at': DateTime.now().toUtc().toIso8601String(),
+    });
+  }
+  await _writeLocalLikedTracks(
+    activeStorageScopeId,
+    merged.take(500).toList(),
+  );
+}
+
+Future<void> _removeLocalLikedTrack(String trackId) async {
+  if (trackId.isEmpty) return;
+  final tracks = await _loadLocalLikedTracks(activeStorageScopeId);
+  await _writeLocalLikedTracks(
+    activeStorageScopeId,
+    tracks.where((track) => extractTrackId(track) != trackId).toList(),
+  );
+}
+
+Future<void> upsertCloudLibraryTrack(
+  dynamic rawTrack, {
+  bool persistLocalLike = true,
+}) async {
   final payload = _cloudTrackPayload(rawTrack);
   final trackId = extractTrackId(payload);
+  if (persistLocalLike) {
+    await _upsertLocalLikedTrack(payload);
+  }
   if (trackId != null && trackId.isNotEmpty) {
     unawaited(
       recordProxyInteractionEvent(
@@ -66,6 +153,7 @@ Future<void> upsertCloudLibraryTrack(dynamic rawTrack) async {
 }
 
 Future<void> removeCloudLibraryTrack(String? trackId) async {
+  await _removeLocalLikedTrack(trackId ?? '');
   final client = supabaseClientOrNull;
   final userId = currentAuthenticatedUserId;
   if (client == null ||
@@ -84,6 +172,53 @@ Future<void> removeCloudLibraryTrack(String? trackId) async {
   } catch (error) {
     debugPrint('Cloud library delete failed: $error');
   }
+}
+
+List<Map<String, dynamic>> _mergeLibraryTracks({
+  required List<Map<String, dynamic>> likedTracks,
+  required List<Map<String, dynamic>> cloudTracks,
+  required List<Map<String, dynamic>> downloadedTracks,
+}) {
+  final merged = <Map<String, dynamic>>[];
+  final indexes = <String, int>{};
+
+  void add(Map<String, dynamic> track) {
+    final trackId = extractTrackId(track);
+    if (trackId == null || trackId.isEmpty) {
+      merged.add(track);
+      return;
+    }
+    final existingIndex = indexes[trackId];
+    if (existingIndex == null) {
+      indexes[trackId] = merged.length;
+      merged.add(track);
+      return;
+    }
+    merged[existingIndex] = {
+      ...merged[existingIndex],
+      ...track,
+      'is_cloud_saved':
+          merged[existingIndex]['is_cloud_saved'] == true ||
+              track['is_cloud_saved'] == true,
+      'is_liked_locally':
+          merged[existingIndex]['is_liked_locally'] == true ||
+              track['is_liked_locally'] == true,
+      'is_downloaded_locally':
+          merged[existingIndex]['is_downloaded_locally'] == true ||
+              track['is_downloaded_locally'] == true,
+    };
+  }
+
+  for (final track in likedTracks) {
+    add(track);
+  }
+  for (final track in cloudTracks) {
+    add({...track, 'is_cloud_saved': true});
+  }
+  for (final track in downloadedTracks) {
+    add(track);
+  }
+  return merged;
 }
 
 Future<List<Map<String, dynamic>>> _loadLocalLibraryTracks(
@@ -168,8 +303,13 @@ final libraryProvider = FutureProvider<List<Map<String, dynamic>>>((ref) async {
   ref.watch(storageRefreshTickProvider);
 
   final localTracks = await _loadLocalLibraryTracks(scopeId);
+  final likedTracks = await _loadLocalLikedTracks(scopeId);
   if (!authState.isAuthenticated || !isSupabaseConfigured) {
-    return localTracks;
+    return _mergeLibraryTracks(
+      likedTracks: likedTracks,
+      cloudTracks: const [],
+      downloadedTracks: localTracks,
+    );
   }
 
   final cloudTracks = await _loadCloudLibraryTracks();
@@ -181,26 +321,13 @@ final libraryProvider = FutureProvider<List<Map<String, dynamic>>>((ref) async {
     }
   }
 
-  final merged = <Map<String, dynamic>>[];
-  for (final cloudTrack in cloudTracks) {
-    final trackId = extractTrackId(cloudTrack);
-    final localTrack = trackId == null ? null : localById.remove(trackId);
-    merged.add({
-      ...cloudTrack,
-      if (localTrack != null) ...localTrack,
-      'is_cloud_saved': true,
-      'is_downloaded_locally': localTrack != null,
-    });
-  }
-
   for (final localTrack in localById.values) {
-    merged.add({
-      ...localTrack,
-      'is_cloud_saved': false,
-      'is_downloaded_locally': true,
-    });
-    unawaited(upsertCloudLibraryTrack(localTrack));
+    unawaited(upsertCloudLibraryTrack(localTrack, persistLocalLike: false));
   }
 
-  return merged;
+  return _mergeLibraryTracks(
+    likedTracks: likedTracks,
+    cloudTracks: cloudTracks,
+    downloadedTracks: localTracks,
+  );
 });

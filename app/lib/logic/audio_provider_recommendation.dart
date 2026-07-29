@@ -4,7 +4,6 @@ import 'dart:math' as math;
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import 'audio_provider.dart' show audioPlayerProvider;
 import 'audio_provider_request_builder.dart';
 import 'auth_provider.dart' show authProvider;
 import 'history_manager.dart';
@@ -31,17 +30,16 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
   bool isLoading = true;
   final Set<String> _paginatingRows = <String>{};
   int _requestVersion = 0;
-  final Set<String> _prewarmedRecommendationIds = <String>{};
   bool _startupHealthChecked = false;
   Timer? _backgroundRefreshTimer;
+  Timer? _initialFeedPollTimer;
   String _backgroundRefreshKey = '';
   String _lastCompletedBackgroundRefreshKey = '';
   DateTime? _lastCompletedBackgroundRefreshAt;
-  RecommendationFeedState? _preparedFeedState;
-  String _preparedFeedScopeId = '';
-  bool _applyNextPreparedFeedImmediately = false;
+  Future<void>? _explicitRefreshFuture;
   final List<String> _queuedSessionArtistHints = <String>[];
   final List<String> _queuedSessionQueries = <String>[];
+  String _homeReturnIntentToken = '';
   StreamSubscription<Map<String, dynamic>>? _historyTrackSubscription;
   StreamSubscription<String>? _recommendationSignalSubscription;
 
@@ -98,16 +96,7 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
   void _clearQueuedSessionIntent() {
     _queuedSessionArtistHints.clear();
     _queuedSessionQueries.clear();
-  }
-
-  Future<void> applyQueuedSessionIntent() async {
-    if (!_hasQueuedSessionIntent) return;
-    final seed = await HistoryManager.getRecommendationSeed();
-    if (!mounted) return;
-    await loadRecommendations(
-      seed,
-      requestMode: RecommendationRequestMode.launch,
-    );
+    _homeReturnIntentToken = '';
   }
 
   Future<bool> _ensureProxyHealthyAtStartup() async {
@@ -151,7 +140,6 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
         },
       );
       isLoading = false;
-      _primeRecommendationRows(state.rows);
     }
     final proxyHealthy = await _ensureProxyHealthyAtStartup();
     if (!mounted) return;
@@ -162,12 +150,14 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
           : state.copyWith(
               requestState: 'failed',
               errorMessage:
-              'Recommendation engine is unreachable. Check proxy/server connection and refresh.',
+                  'Recommendation engine is unreachable. Check proxy/server connection and refresh.',
             );
       return;
     }
     if (restoredCachedFeed) {
-      _scheduleSignalDrivenBackgroundRefresh();
+      // The local file is offline recovery only. Always reconcile it with the
+      // server-owned active version without hiding the restored rows.
+      await refreshFromSignals(forceRefresh: false);
       return;
     }
 
@@ -190,79 +180,98 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
     );
   }
 
-  String _feedSignature(RecommendationFeedState feedState) {
-    final rowSignatures = feedState.rows.map((row) {
-      final itemKeys = row.items
-          .take(24)
-          .map((item) => recommendationRowItemKey(row.itemType, item))
-          .where((key) => key.trim().isNotEmpty)
-          .join(',');
-      return '${row.kind}:${row.itemType}:$itemKeys';
-    }).join('|');
-    return rowSignatures;
-  }
-
-  String _preparedFeedDiscardReason({
-    required RecommendationFeedState prepared,
-    required bool cacheable,
-    required String artifactQuality,
-    required String refreshOutcome,
-    required bool refreshChanged,
-    required bool differsFromVisibleFeed,
-  }) {
-    if (!prepared.hasRows) return 'empty_payload';
-    if (artifactQuality == 'rejected') return 'rejected_artifact';
-    if (!cacheable) return 'not_cacheable';
-    if (!refreshChanged && !differsFromVisibleFeed) {
-      return refreshOutcome.isEmpty ? 'unchanged_visible_feed' : refreshOutcome;
+  Future<void> refreshFromSignals({bool forceRefresh = false}) {
+    if (forceRefresh) {
+      final running = _explicitRefreshFuture;
+      if (running != null) return running;
+      late final Future<void> operation;
+      operation = _refreshUntilFeedChanges().whenComplete(() {
+        if (identical(_explicitRefreshFuture, operation)) {
+          _explicitRefreshFuture = null;
+        }
+      });
+      _explicitRefreshFuture = operation;
+      return operation;
     }
-    return '';
+    return _refreshFromCurrentSignals(forceRefresh: false);
   }
 
-  Future<void> refreshFromSignals({bool forceRefresh = false}) async {
+  Future<void> _refreshFromCurrentSignals({
+    required bool forceRefresh,
+    String refreshToken = '',
+  }) async {
     final seed = await HistoryManager.getRecommendationSeed();
     if (!mounted) return;
-    if (forceRefresh) {
-      _applyNextPreparedFeedImmediately = true;
-      state = state.copyWith(
-        requestState: state.hasRows ? 'complete' : state.requestState,
-        clearError: true,
-        diagnostics: <String, dynamic>{
-          ...state.diagnostics,
-          'refresh_scheduled': true,
-          'refresh_scheduled_at': DateTime.now().toIso8601String(),
-        },
-      );
-      await _scheduleBackgroundRecommendationsRefresh(
-        seed,
-        explicitRefresh: true,
-      );
-      return;
-    }
     await loadRecommendations(
       seed,
-      requestMode: RecommendationRequestMode.launch,
+      requestMode: forceRefresh
+          ? RecommendationRequestMode.pullToRefresh
+          : RecommendationRequestMode.launch,
       allowNetworkCloudQueries: false,
+      refreshToken: refreshToken,
     );
+  }
+
+  Future<void> _refreshUntilFeedChanges() async {
+    _initialFeedPollTimer?.cancel();
+    final startingVersion = state.feedVersion;
+    final refreshToken =
+        'pull-${DateTime.now().microsecondsSinceEpoch.toString()}';
+
+    while (mounted) {
+      await _refreshFromCurrentSignals(
+        forceRefresh: true,
+        refreshToken: refreshToken,
+      );
+      if (!mounted || state.feedVersion > startingVersion) return;
+
+      final failed =
+          state.requestState == 'failed' || state.feedAction == 'build_failed';
+      final exhausted =
+          state.diagnostics['rotation_inventory_exhausted'] == true;
+      if (failed || exhausted) {
+        if (exhausted) {
+          state = state.copyWith(
+            requestState: 'complete',
+            errorMessage: 'No new recommendation rotation is available yet.',
+          );
+        }
+        return;
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 1200));
+    }
   }
 
   Future<void> applyPreparedFeedOnHomeReturn() async {
-    final prepared = _preparedFeedState;
-    if (prepared == null || isLoading) return;
-    if (_preparedFeedScopeId != _cacheScopeId()) {
-      _preparedFeedState = null;
-      _preparedFeedScopeId = '';
+    if (isLoading) return;
+    _initialFeedPollTimer?.cancel();
+    final startingVersion = state.feedVersion;
+    if (_hasQueuedSessionIntent && _homeReturnIntentToken.isEmpty) {
+      _homeReturnIntentToken =
+          'search-return-${DateTime.now().microsecondsSinceEpoch}';
+    }
+    final seed = await HistoryManager.getRecommendationSeed();
+    if (!mounted) return;
+    await loadRecommendations(
+      seed,
+      requestMode: _hasQueuedSessionIntent
+          ? RecommendationRequestMode.pullToRefresh
+          : RecommendationRequestMode.launch,
+      allowNetworkCloudQueries: false,
+      refreshToken: _homeReturnIntentToken,
+    );
+    if (!mounted ||
+        !_hasQueuedSessionIntent ||
+        state.feedVersion > startingVersion ||
+        state.requestState == 'failed' ||
+        state.feedAction == 'build_failed' ||
+        state.diagnostics['rotation_inventory_exhausted'] == true) {
       return;
     }
-    _preparedFeedState = null;
-    _preparedFeedScopeId = '';
-    _applyNextPreparedFeedImmediately = false;
-    state = prepared.copyWith(
-      requestState: 'complete',
-      clearError: true,
+    _initialFeedPollTimer = Timer(
+      const Duration(milliseconds: 1200),
+      () => unawaited(applyPreparedFeedOnHomeReturn()),
     );
-    unawaited(_storeCachedHomeFeed(state));
-    _primeRecommendationRows(state.rows);
   }
 
   void _scheduleSignalDrivenBackgroundRefresh() {
@@ -277,29 +286,12 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
     final diagnosticsRaw = payload['diagnostics'];
     if (diagnosticsRaw is! Map) return false;
     final diagnostics = Map<String, dynamic>.from(diagnosticsRaw);
-    final requestMode = diagnostics['request_mode']?.toString().trim() ?? '';
-    final artifactSource =
-        diagnostics['artifact_source']?.toString().trim() ?? '';
-    final rankingBackend =
-        diagnostics['ranking_backend']?.toString().trim() ?? '';
-    final promotionStatus =
-        diagnostics['promotion_status']?.toString().trim().toLowerCase() ?? '';
-    final cacheHit = diagnostics['cache_hit'] == true;
-    final heavyPending = diagnostics['heavy_rows_pending'] == true;
-    final heavyPartial = diagnostics['heavy_rows_partial'] == true;
-    final deferredRowsPending = diagnostics['deferred_rows_pending'] == true;
-    final launchTierOnly = diagnostics['launch_tier_only'] == true;
-    return cacheHit ||
-        requestMode == 'launch_artifact' ||
-        requestMode == 'request_build' ||
-        artifactSource == 'launch_artifact' ||
-        artifactSource == 'request_build' ||
-        rankingBackend == 'artifact_launch' ||
-        promotionStatus != 'promoted' ||
-        deferredRowsPending ||
-        launchTierOnly ||
-        heavyPending ||
-        heavyPartial;
+    final action =
+        (payload['feed_action'] ?? diagnostics['feed_action'] ?? '').toString();
+    return action == 'served_active' &&
+        diagnostics['prepared_candidate_available'] != true &&
+        diagnostics['rotation_inventory_exhausted'] != true &&
+        diagnostics['preparation_state'] != 'preparing';
   }
 
   Future<void> _scheduleBackgroundRecommendationsRefresh(
@@ -421,75 +413,14 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
         'recommend',
         'background prepare scheduled=${payload['prepared'] == true} diagnostics=${compactDiagnosticValue(payload['diagnostics'])}',
       );
-      final prepared = _feedStateFromPayload(payload);
-      final diagnostics = payload['diagnostics'] is Map
-          ? Map<String, dynamic>.from(payload['diagnostics'] as Map)
-          : const <String, dynamic>{};
-      final artifactQuality =
-          diagnostics['artifact_quality']?.toString().trim().toLowerCase() ??
-              '';
-      final refreshOutcome =
-          diagnostics['refresh_outcome']?.toString().trim().toLowerCase() ?? '';
-      final refreshChanged = diagnostics['refresh_changed'] == true;
-      final cacheable = home_feed_cache.shouldCacheHomeFeed(prepared);
-      final differsFromVisibleFeed = prepared.hasRows &&
-          _feedSignature(prepared) != _feedSignature(state);
-      final discardReason = _preparedFeedDiscardReason(
-        prepared: prepared,
-        cacheable: cacheable,
-        artifactQuality: artifactQuality,
-        refreshOutcome: refreshOutcome,
-        refreshChanged: refreshChanged,
-        differsFromVisibleFeed: differsFromVisibleFeed,
-      );
-      final shouldStagePrepared = discardReason.isEmpty;
-      if (shouldStagePrepared) {
-        final stagedFeed = prepared.copyWith(
-          requestState: 'complete',
-          clearError: true,
-          diagnostics: <String, dynamic>{
-            ...prepared.diagnostics,
-            'prepared_applied_from_background': true,
-            'prepared_refresh_changed': refreshChanged,
-            'prepared_refresh_outcome': refreshOutcome,
-            'prepared_differs_from_visible_feed': differsFromVisibleFeed,
-            'prepared_applied_at': DateTime.now().toIso8601String(),
-          },
-        );
-        _preparedFeedState = stagedFeed;
-        _preparedFeedScopeId = responseScope;
-        unawaited(_storeCachedHomeFeed(stagedFeed));
-        if (_applyNextPreparedFeedImmediately) {
-          _applyNextPreparedFeedImmediately = false;
-          _preparedFeedState = null;
-          _preparedFeedScopeId = '';
-          state = stagedFeed;
-          _primeRecommendationRows(stagedFeed.rows);
-        }
-      } else if (mounted) {
-        debugProxyLog(
-          'recommend',
-          'background prepare discarded reason=$discardReason quality=$artifactQuality outcome=$refreshOutcome changed=$refreshChanged differs=$differsFromVisibleFeed rows=${prepared.rows.length} cacheable=$cacheable',
-        );
-        state = state.copyWith(
-          requestState: 'complete',
-          clearError: true,
-          diagnostics: <String, dynamic>{
-            ...state.diagnostics,
-            'refresh_outcome': refreshOutcome.isEmpty
-                ? artifactQuality
-                : refreshOutcome,
-            'refresh_changed': false,
-            'prepared_discard_reason': discardReason,
-            'prepared_artifact_quality': artifactQuality,
-            'prepared_refresh_outcome': refreshOutcome,
-            'prepared_refresh_changed': refreshChanged,
-            'prepared_differs_from_visible_feed': differsFromVisibleFeed,
-            'prepared_row_count': prepared.rows.length,
-            'prepared_cacheable': cacheable,
-            'refresh_completed_at': DateTime.now().toIso8601String(),
-          },
-        );
+      final nextState = _feedStateFromPayload(payload);
+      if (explicitRefresh &&
+          nextState.hasRows &&
+          nextState.feedVersion > state.feedVersion &&
+          (nextState.feedAction == 'promoted_prepared' ||
+              nextState.feedAction == 'built_and_promoted')) {
+        state = nextState.copyWith(requestState: 'complete', clearError: true);
+        unawaited(_storeCachedHomeFeed(state));
       }
     } on TimeoutException catch (error) {
       debugProxyLog('recommend', 'background refresh timeout=$error');
@@ -498,7 +429,6 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
     } finally {
       if (_backgroundRefreshKey == expectedKey) {
         _backgroundRefreshKey = '';
-        _applyNextPreparedFeedImmediately = false;
         _lastCompletedBackgroundRefreshKey = refreshFingerprint;
         _lastCompletedBackgroundRefreshAt = DateTime.now();
       }
@@ -509,6 +439,7 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
   void dispose() {
     _requestVersion++;
     _backgroundRefreshTimer?.cancel();
+    _initialFeedPollTimer?.cancel();
     unawaited(_historyTrackSubscription?.cancel());
     unawaited(_recommendationSignalSubscription?.cancel());
     super.dispose();
@@ -516,44 +447,7 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
 
   RecommendationFeedState _feedStateFromPayload(Map<String, dynamic> payload) {
     final activePayload = filterActiveHomeFeedPayload(payload);
-    final rows = (activePayload['rows'] as List<dynamic>? ?? const []);
-    if (rows.isNotEmpty) {
-      final nextState = RecommendationFeedState.fromHomeJson(activePayload);
-      if (nextState.hasRows) {
-        return nextState;
-      }
-    }
-    final rawRecommendations = activePayload['recommendations'] is List
-        ? activePayload['recommendations'] as List<dynamic>
-        : payload['recommendations'] is List
-            ? payload['recommendations'] as List<dynamic>
-            : const <dynamic>[];
-    final recommendations = rawRecommendations
-            .whereType<Map>()
-            .map((entry) => normalizeTrack(Map<String, dynamic>.from(entry)))
-            .where((track) => extractTrackId(track)?.isNotEmpty ?? false)
-            .toList(growable: false);
-    if (recommendations.isNotEmpty) {
-      final rebuiltPayload = <String, dynamic>{
-        ...activePayload,
-        'rows': <Map<String, dynamic>>[
-          {
-            'id': 'made_for_you',
-            'title': 'Made for you',
-            'kind': 'made_for_you',
-            'item_type': 'track',
-            'items': recommendations,
-            'next_offset': recommendations.length,
-            'has_more': false,
-          }
-        ],
-      };
-      final nextState = RecommendationFeedState.fromHomeJson(rebuiltPayload);
-      if (nextState.hasRows) {
-        return nextState;
-      }
-    }
-    return const RecommendationFeedState(requestState: 'complete');
+    return RecommendationFeedState.fromHomeJson(activePayload);
   }
 
   void _logRecommendationDiagnostics(
@@ -578,56 +472,6 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
     debugProxyLog(
       'recommend',
       '$phase timing requestMs=${diagnostics['request_ms']} profileMs=${diagnostics['profile_build_ms']} rowMs=${diagnostics['row_assembly_ms']} stageMs=${compactDiagnosticValue(diagnostics['stage_timings_ms'])} rowStatus=${compactDiagnosticValue(rowStatusSummary)} requestId=${payload['request_id'] ?? diagnostics['request_id'] ?? ''}',
-    );
-  }
-
-  void _primeRecommendationResults(
-    Iterable<dynamic> tracks, {
-    int maxIds = 10,
-    int lookahead = 18,
-  }) {
-    final ids = <String>[];
-    for (final track in tracks) {
-      final id = extractTrackId(track);
-      if (id == null || id.isEmpty || !_prewarmedRecommendationIds.add(id)) {
-        continue;
-      }
-      ids.add(id);
-      if (ids.length >= maxIds) {
-        break;
-      }
-    }
-    if (ids.isEmpty) return;
-    if (_prewarmedRecommendationIds.length > 160) {
-      _prewarmedRecommendationIds.removeAll(
-        _prewarmedRecommendationIds
-            .take(_prewarmedRecommendationIds.length - 80),
-      );
-    }
-    unawaited(
-      ref.read(audioPlayerProvider.notifier).prewarmStreams(
-            ids,
-            lookahead: lookahead,
-            immediatePlayback: true,
-            currentVideoId: ids.first,
-          ),
-    );
-  }
-
-  void _primeRecommendationRows(List<RecommendationFeedRowState> rows) {
-    final visibleTracks = <Map<String, dynamic>>[];
-    for (final row in rows) {
-      if (row.itemType != 'track') continue;
-      visibleTracks.addAll(row.items.take(2));
-      if (visibleTracks.length >= 8) {
-        break;
-      }
-    }
-    if (visibleTracks.isEmpty) return;
-    _primeRecommendationResults(
-      visibleTracks,
-      maxIds: 3,
-      lookahead: 3,
     );
   }
 
@@ -691,7 +535,6 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
           requestState: 'complete',
           clearError: true,
         );
-        _primeRecommendationRows(nextState.rows);
       }
     } on TimeoutException catch (error) {
       debugProxyLog('recommend', 'quick request timeout=$error');
@@ -711,7 +554,7 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
       }
     } finally {
       if (_isRequestCurrent(requestVersion)) {
-        isLoading = false;
+        isLoading = !state.hasRows && state.requestState == 'loading';
         state = state.copyWith();
       }
     }
@@ -724,6 +567,7 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
     List<String> extraTasteQueries = const <String>[],
     List<String> extraSessionQueries = const <String>[],
     bool allowNetworkCloudQueries = true,
+    String refreshToken = '',
   }) async {
     final requestVersion = ++_requestVersion;
     final previousState = state;
@@ -757,6 +601,15 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
         limit: 8,
         requestMode: requestMode,
         preferFreshRows: preferFreshRows,
+        refreshToken: refreshToken,
+        avoidIds: forceRefresh
+            ? state.rows
+                .expand((row) => row.items)
+                .map(extractTrackId)
+                .whereType<String>()
+                .where((id) => id.isNotEmpty)
+                .toSet()
+            : const <String>{},
         extraArtistHints: mergedArtistHints,
         extraTasteQueries: extraTasteQueries,
         extraSessionQueries: mergedSessionQueries,
@@ -780,15 +633,34 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
           'response rows=${nextState.rows.length} hasRows=${nextState.hasRows} firstRow=${nextState.rows.isEmpty ? '' : nextState.rows.first.id} diagnostics=${compactDiagnosticValue(payload['diagnostics'])}',
         );
         if (nextState.hasRows) {
+          if (state.hasRows && nextState.feedVersion <= state.feedVersion) {
+            if (nextState.feedVersion == state.feedVersion && forceRefresh) {
+              state = state.copyWith(
+                requestState: 'complete',
+                feedAction: nextState.feedAction,
+                preparationState: nextState.preparationState,
+                diagnostics: nextState.diagnostics,
+                clearError: true,
+              );
+            }
+            return;
+          }
+          _initialFeedPollTimer?.cancel();
           state = nextState.copyWith(
             requestState: 'complete',
-            clearError: true,
+            errorMessage:
+                forceRefresh && nextState.feedAction == 'unchanged_no_rotation'
+                    ? 'Fresh recommendations are still being prepared.'
+                    : null,
+            clearError: !(forceRefresh &&
+                nextState.feedAction == 'unchanged_no_rotation'),
           );
-          if (usedQueuedSessionIntent) {
+          if (usedQueuedSessionIntent &&
+              (nextState.feedAction == 'promoted_prepared' ||
+                  nextState.feedAction == 'built_and_promoted')) {
             _clearQueuedSessionIntent();
           }
           unawaited(_storeCachedHomeFeed(state));
-          _primeRecommendationRows(state.rows);
           if (requestMode == RecommendationRequestMode.launch &&
               _shouldPrepareNextSession(payload)) {
             unawaited(
@@ -811,7 +683,29 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
           final diagnostics = payloadDiagnostics is Map
               ? Map<String, dynamic>.from(payloadDiagnostics)
               : const <String, dynamic>{};
-          if (diagnostics['fresh_account_empty_home'] == true ||
+          if (nextState.feedAction == 'preparing_initial') {
+            state = previousState.hasRows
+                ? previousState.copyWith(
+                    requestState: 'complete',
+                    preparationState: 'preparing',
+                    clearError: true,
+                    diagnostics: {
+                      ...previousState.diagnostics,
+                      ...diagnostics,
+                      'client_preserved_active_during_preparation': true,
+                    },
+                  )
+                : nextState.copyWith(
+                    requestState: 'loading',
+                    clearError: true,
+                  );
+            if (!forceRefresh) {
+              _initialFeedPollTimer?.cancel();
+              _initialFeedPollTimer = Timer(const Duration(seconds: 2), () {
+                unawaited(refreshFromSignals(forceRefresh: false));
+              });
+            }
+          } else if (diagnostics['fresh_account_empty_home'] == true ||
               diagnostics['client_signal_tier'] == 'cold_start') {
             state = RecommendationFeedState(
               requestState: 'complete',
@@ -820,7 +714,7 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
               diagnostics: diagnostics,
             );
           } else {
-            state = previousState.copyWith(
+            state = nextState.copyWith(
               requestState: 'failed',
               errorMessage:
                   'Recommendation engine returned no rows. Pull to refresh and try again.',
@@ -874,9 +768,13 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
     }
     final reserveCount =
         (targetRow?.meta['reserve_count'] as num?)?.toInt() ?? 0;
+    const quietPicksMaximum = 48;
+    final reachedQuietPicksMaximum = targetRow?.kind == 'quiet_picks' &&
+        (targetRow?.items.length ?? 0) >= quietPicksMaximum;
     final canPage = targetRow?.hasMore == true || reserveCount > 0;
     if (targetRow == null ||
         !canPage ||
+        reachedQuietPicksMaximum ||
         state.sessionId.isEmpty ||
         _paginatingRows.contains(rowId)) {
       debugProxyLog(
@@ -891,7 +789,12 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
       state = state.copyWith();
     }
     try {
-      final pageLimit = targetRow.kind == 'quiet_picks' ? 40 : 8;
+      final pageLimit = targetRow.kind == 'quiet_picks'
+          ? math.min(
+              quietPicksMaximum - currentRow.items.length,
+              40,
+            )
+          : 8;
       debugProxyLog(
         'recommend',
         'row page start row=$rowId kind=${targetRow.kind} offset=${targetRow.nextOffset} session=${state.sessionId} hasMore=${targetRow.hasMore} preparedCount=${targetRow.meta['prepared_count']} reserveCount=$reserveCount',
@@ -915,9 +818,8 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
       if (res.statusCode == 200) {
         final payload = jsonDecode(res.body) as Map<String, dynamic>;
         final rowPayload = payload['row'];
-        final newRow = rowPayload is Map
-            ? activeHomeFeedRowFromJson(rowPayload)
-            : null;
+        final newRow =
+            rowPayload is Map ? activeHomeFeedRowFromJson(rowPayload) : null;
         if (newRow != null) {
           final mergedItems = <Map<String, dynamic>>[];
           final seen = <String>{};
@@ -925,7 +827,13 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
             final key = recommendationRowItemKey(currentRow.itemType, track);
             if (key.trim().isEmpty || !seen.add(key)) continue;
             mergedItems.add(track);
+            if (currentRow.kind == 'quiet_picks' &&
+                mergedItems.length >= quietPicksMaximum) {
+              break;
+            }
           }
+          final reachedMaximum = currentRow.kind == 'quiet_picks' &&
+              mergedItems.length >= quietPicksMaximum;
           final progressed = mergedItems.length > currentRow.items.length ||
               newRow.nextOffset > currentRow.nextOffset;
           final updatedRows = state.rows
@@ -939,7 +847,9 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
                         nextOffset: progressed
                             ? newRow.nextOffset
                             : currentRow.nextOffset,
-                        hasMore: progressed ? newRow.hasMore : false,
+                        hasMore: reachedMaximum
+                            ? false
+                            : (progressed ? newRow.hasMore : false),
                       )
                     : row,
               )
@@ -947,12 +857,7 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
           state = state.copyWith(rows: updatedRows);
           debugProxyLog(
             'recommend',
-            'row page success row=$rowId appended=${mergedItems.length - currentRow.items.length} nextOffset=${progressed ? newRow.nextOffset : currentRow.nextOffset} hasMore=${progressed ? newRow.hasMore : false}',
-          );
-          _primeRecommendationResults(
-            newRow.items.take(targetRow.kind == 'quiet_picks' ? 5 : 3),
-            maxIds: targetRow.kind == 'quiet_picks' ? 5 : 2,
-            lookahead: targetRow.kind == 'quiet_picks' ? 8 : 4,
+            'row page success row=$rowId appended=${mergedItems.length - currentRow.items.length} nextOffset=${progressed ? newRow.nextOffset : currentRow.nextOffset} hasMore=${reachedMaximum ? false : (progressed ? newRow.hasMore : false)}',
           );
         }
       } else {
@@ -1023,15 +928,13 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
       if (!mounted || res.statusCode != 200) return;
       final payload = jsonDecode(res.body) as Map<String, dynamic>;
       final rowPayload = payload['row'];
-      final nextRow = rowPayload is Map
-          ? activeHomeFeedRowFromJson(rowPayload)
-          : null;
+      final nextRow =
+          rowPayload is Map ? activeHomeFeedRowFromJson(rowPayload) : null;
       if (nextRow == null) return;
       final updatedRows = state.rows
           .map((row) => row.id == rowId ? nextRow : row)
           .toList(growable: false);
       state = state.copyWith(rows: updatedRows);
-      _primeRecommendationResults(nextRow.items);
     } catch (_) {
       // Keep the existing row visible when lightweight row-context updates fail.
     } finally {

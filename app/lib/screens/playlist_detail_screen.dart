@@ -3,17 +3,18 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import '../logic/audio_provider.dart';
 import '../logic/audio_provider_queue.dart';
+import '../logic/audio_provider.dart';
+import '../logic/collection_likes_provider.dart';
 import '../logic/playlist_provider.dart';
 import '../main_dialogs.dart';
 import '../navigation/player_navigation.dart';
 import '../ui/app_theme_tokens.dart';
 import '../ui/neatie_components.dart';
 import '../widgets/app_artwork.dart';
+import '../widgets/details/details_sections.dart';
 
 const _voidBlack = neatieInk;
-const double _radiusLarge = neatieRadiusLarge;
 
 class PlaylistDetailScreen extends ConsumerStatefulWidget {
   final String playlistId;
@@ -29,26 +30,12 @@ class _PlaylistDetailScreenState extends ConsumerState<PlaylistDetailScreen> {
   final _searchCtrl = TextEditingController();
   List<dynamic> _searchResults = [];
   bool _isSearching = false;
-  final Set<String> _primedPlaylistIds = <String>{};
   int _searchRequestVersion = 0;
 
   @override
   void dispose() {
     _searchCtrl.dispose();
     super.dispose();
-  }
-
-  void _primePlaylistTracks(Iterable<dynamic> tracks, {int limit = 8}) {
-    final idsToWarm = <String>[];
-    for (final track in tracks.take(limit)) {
-      final videoId = (track['id'] ?? track['videoId'])?.toString();
-      if (videoId == null || videoId.isEmpty) continue;
-      if (_primedPlaylistIds.add(videoId)) {
-        idsToWarm.add(videoId);
-      }
-    }
-    if (idsToWarm.isEmpty) return;
-    unawaited(ref.read(audioPlayerProvider.notifier).prewarmStreams(idsToWarm));
   }
 
   Future<void> _search(String q) async {
@@ -68,7 +55,6 @@ class _PlaylistDetailScreenState extends ConsumerState<PlaylistDetailScreen> {
         final payload = fetchResult.payload!;
         final results = (payload['results'] as List<dynamic>? ?? const []);
         setState(() => _searchResults = results);
-        _primePlaylistTracks(results, limit: 8);
       } else {
         setState(() => _searchResults = []);
       }
@@ -90,6 +76,23 @@ class _PlaylistDetailScreenState extends ConsumerState<PlaylistDetailScreen> {
           playlistName: playlist.name,
           tracks: playlist.tracks,
           currentTrack: track,
+        );
+    if (!mounted) return;
+    unawaited(openFullPlayer(context));
+  }
+
+  Future<void> _playPlaylist(Playlist playlist, {bool shuffle = false}) async {
+    if (playlist.tracks.isEmpty) return;
+    final first = shuffle
+        ? playlist.tracks[
+            DateTime.now().microsecondsSinceEpoch % playlist.tracks.length]
+        : playlist.tracks.first;
+    await ref.read(playbackQueueProvider.notifier).startPlaylistSession(
+          playlistId: widget.playlistId,
+          playlistName: playlist.name,
+          tracks: playlist.tracks,
+          currentTrack: first,
+          shuffle: shuffle,
         );
     if (!mounted) return;
     unawaited(openFullPlayer(context));
@@ -117,8 +120,9 @@ class _PlaylistDetailScreenState extends ConsumerState<PlaylistDetailScreen> {
     );
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      _primePlaylistTracks(playlist.tracks);
     });
+    final likeKey = 'playlist:${widget.playlistId}';
+    final isLiked = ref.watch(collectionLikesProvider).contains(likeKey);
 
     return Scaffold(
       backgroundColor: _voidBlack,
@@ -136,7 +140,27 @@ class _PlaylistDetailScreenState extends ConsumerState<PlaylistDetailScreen> {
           children: [
             _PlaylistHeaderCard(
               playlist: playlist,
-              radiusLarge: _radiusLarge,
+              isLiked: isLiked,
+              onPrime: playlist.tracks.isEmpty
+                  ? null
+                  : () {
+                      final trackId = extractTrackId(playlist.tracks.first);
+                      if (trackId == null || trackId.isEmpty) return;
+                      unawaited(
+                        ref
+                            .read(audioPlayerProvider.notifier)
+                            .prepareImmediatePlayback(trackId),
+                      );
+                    },
+              onLike: () => unawaited(
+                ref.read(collectionLikesProvider.notifier).toggle(likeKey),
+              ),
+              onPlay: playlist.tracks.isEmpty
+                  ? null
+                  : () => unawaited(_playPlaylist(playlist)),
+              onShuffle: playlist.tracks.isEmpty
+                  ? null
+                  : () => unawaited(_playPlaylist(playlist, shuffle: true)),
             ),
             const SizedBox(height: 16),
             NeatieSurface(
@@ -179,82 +203,80 @@ class _PlaylistDetailScreenState extends ConsumerState<PlaylistDetailScreen> {
 
 class _PlaylistHeaderCard extends StatelessWidget {
   final Playlist playlist;
-  final double radiusLarge;
+  final bool isLiked;
+  final VoidCallback onLike;
+  final VoidCallback? onPlay;
+  final VoidCallback? onShuffle;
+  final VoidCallback? onPrime;
 
   const _PlaylistHeaderCard({
     required this.playlist,
-    required this.radiusLarge,
+    required this.isLiked,
+    required this.onLike,
+    required this.onPlay,
+    required this.onShuffle,
+    this.onPrime,
   });
 
   @override
   Widget build(BuildContext context) {
     final hiddenCount = playlist.tracks.where(isTrackHidden).length;
-    return NeatieSurface(
-      padding: const EdgeInsets.all(18),
-      radius: radiusLarge,
-      color: Colors.white.withValues(alpha: 0.035),
-      blur: false,
-      child: Row(
-        children: [
-          PlaylistArtworkView(
-            playlist: playlist,
-            size: 96,
-            radius: 22,
-            onTap: () => showPlaylistArtworkDialog(
-              context: context,
+    final duration = formatCollectionDuration(playlist.tracks);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Center(
+          child: CollectionVinylArtwork(
+            thumbnail: null,
+            size: 244,
+            cover: PlaylistArtworkView(
               playlist: playlist,
+              size: 181,
+              radius: 0,
+              onTap: () => showPlaylistArtworkDialog(
+                context: context,
+                playlist: playlist,
+              ),
             ),
           ),
-          const SizedBox(width: 18),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  playlist.name,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 24,
-                    fontWeight: FontWeight.w700,
-                  ),
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  hiddenCount > 0
-                      ? '${playlist.tracks.length} tracks - $hiddenCount skipped'
-                      : '${playlist.tracks.length} tracks',
-                  style: TextStyle(
-                    color: Colors.white.withValues(alpha: 0.56),
-                    fontSize: 13,
-                  ),
-                ),
-                const SizedBox(height: 14),
-                TextButton.icon(
-                  onPressed: () => showPlaylistArtworkDialog(
-                    context: context,
-                    playlist: playlist,
-                  ),
-                  icon: const Icon(Icons.photo_outlined, size: 18),
-                  label: const Text('Edit artwork'),
-                  style: TextButton.styleFrom(
-                    foregroundColor: Colors.white,
-                    backgroundColor: Colors.white.withValues(alpha: 0.05),
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 14,
-                      vertical: 12,
-                    ),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(18),
-                    ),
-                  ),
-                ),
-              ],
-            ),
+        ),
+        const SizedBox(height: 20),
+        Text(
+          playlist.name,
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(
+            color: Colors.white,
+            fontSize: 28,
+            fontWeight: FontWeight.w800,
           ),
-        ],
-      ),
+        ),
+        const SizedBox(height: 8),
+        Text(
+          [
+            if (duration.isNotEmpty) duration,
+            '${playlist.tracks.length} tracks',
+            if (hiddenCount > 0) '$hiddenCount skipped',
+          ].join('  •  '),
+          style: TextStyle(
+            color: Colors.white.withValues(alpha: 0.56),
+            fontSize: 13,
+          ),
+        ),
+        const SizedBox(height: 10),
+        CollectionIconActionsRow(
+          isLiked: isLiked,
+          onLike: onLike,
+          onPlay: onPlay,
+          onShuffle: onShuffle,
+          onPrime: onPrime,
+          secondaryIcon: Icons.photo_outlined,
+          onSecondary: () => showPlaylistArtworkDialog(
+            context: context,
+            playlist: playlist,
+          ),
+        ),
+      ],
     );
   }
 }
@@ -308,6 +330,8 @@ class _PlaylistSearchResultsSection extends StatelessWidget {
               radius: neatieRadiusMedium,
               color: Colors.white.withValues(alpha: 0.035),
               blur: false,
+              bordered: false,
+              elevated: false,
               child: Row(
                 children: [
                   AppArtwork(
@@ -402,11 +426,20 @@ class _PlaylistTracksSection extends ConsumerWidget {
               radius: neatieRadiusMedium,
               color: Colors.white.withValues(alpha: 0.035),
               blur: false,
+              bordered: false,
+              elevated: false,
               child: Material(
                 color: Colors.transparent,
                 child: InkWell(
                   borderRadius: BorderRadius.circular(neatieRadiusMedium),
                   onTap: () => onPlayTrack(track),
+                  onTapDown: videoId == null || videoId.isEmpty
+                      ? null
+                      : (_) => unawaited(
+                            ref
+                                .read(audioPlayerProvider.notifier)
+                                .prepareImmediatePlayback(videoId),
+                          ),
                   child: Row(
                     children: [
                       AppArtwork(

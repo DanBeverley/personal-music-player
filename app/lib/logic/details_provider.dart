@@ -5,7 +5,6 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'audio_provider_recommendation.dart';
 import 'auth_provider.dart';
-import 'audio_provider.dart' show audioPlayerProvider;
 import 'cloud_search_queries.dart';
 import 'history_manager.dart';
 import 'interaction_events.dart';
@@ -43,6 +42,7 @@ Future<Map<String, dynamic>?> resolveArtistReference(
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({
             'query': artistName,
+            'anchor_artist_id': directId,
             'limit': 4,
             'user_scope_id': read(authProvider).storageScopeId,
             'search_mode': 'entity',
@@ -91,7 +91,6 @@ class TrackDetailsNotifier extends StateNotifier<Map<String, dynamic>?> {
 
   Future<void> fetchDetails(String videoId) async {
     state = null;
-    unawaited(ref.read(audioPlayerProvider.notifier).prewarmStream(videoId));
     try {
       final res = await appHttpClient.post(
         buildProxyUri('/track_details'),
@@ -100,16 +99,6 @@ class TrackDetailsNotifier extends StateNotifier<Map<String, dynamic>?> {
       );
       if (res.statusCode == 200) {
         state = jsonDecode(res.body);
-        final similarTracks =
-            (state?['similar_tracks'] as List<dynamic>?) ?? const [];
-        unawaited(
-          ref.read(audioPlayerProvider.notifier).prewarmStreams([
-            videoId,
-            ...similarTracks
-                .take(8)
-                .map((track) => track['id'] ?? track['videoId']),
-          ]),
-        );
       }
     } catch (_) {
       // Track details stay best-effort.
@@ -233,12 +222,6 @@ class AlbumDetailsNotifier extends StateNotifier<AlbumDetailsState> {
       }
 
       final payload = jsonDecode(res.body) as Map<String, dynamic>;
-      final tracks = (payload['tracks'] as List<dynamic>? ?? const []);
-      unawaited(
-        ref.read(audioPlayerProvider.notifier).prewarmStreams(
-              tracks.take(8).map((track) => track['id'] ?? track['videoId']),
-            ),
-      );
       state = AlbumDetailsState(album: payload);
     } catch (_) {
       if (requestVersion != _requestVersion) return;
@@ -633,12 +616,6 @@ class ArtistDetailsNotifier extends StateNotifier<ArtistDetailsState> {
       }
 
       final payload = jsonDecode(res.body) as Map<String, dynamic>;
-      final topSongs = (payload['top_songs'] as List<dynamic>? ?? const []);
-      unawaited(
-        ref.read(audioPlayerProvider.notifier).prewarmStreams(
-              topSongs.take(8).map((track) => track['id'] ?? track['videoId']),
-            ),
-      );
       state = ArtistDetailsState(artist: payload);
     } catch (_) {
       if (requestVersion != _requestVersion) return;
@@ -732,4 +709,92 @@ class LyricsNotifier extends StateNotifier<TrackLyricsState> {
 final lyricsProvider =
     StateNotifierProvider<LyricsNotifier, TrackLyricsState>((ref) {
   return LyricsNotifier();
+});
+
+class LyricsMeaningNotifier extends StateNotifier<LyricsMeaningState> {
+  final Ref ref;
+  int _requestVersion = 0;
+
+  LyricsMeaningNotifier(this.ref) : super(const LyricsMeaningState());
+
+  Future<void> fetchMeaning({
+    required String? videoId,
+    required String title,
+    required String? artist,
+    String? album,
+    String? year,
+    String? source,
+    List<TrackLyricsLine> lines = const [],
+  }) async {
+    final resolvedVideoId = videoId?.trim() ?? '';
+    if (resolvedVideoId.isEmpty) {
+      state = const LyricsMeaningState(error: 'No track is loaded yet.');
+      return;
+    }
+    if (state.videoId == resolvedVideoId &&
+        state.hasInsight &&
+        !state.isLoading) {
+      return;
+    }
+
+    final requestVersion = ++_requestVersion;
+    state = LyricsMeaningState(isLoading: true, videoId: resolvedVideoId);
+    try {
+      final authState = ref.read(authProvider);
+      final body = {
+        'video_id': resolvedVideoId,
+        'title': title,
+        if (artist != null && artist.trim().isNotEmpty) 'artist': artist.trim(),
+        if (album != null && album.trim().isNotEmpty) 'album': album.trim(),
+        if (year != null && year.trim().isNotEmpty) 'year': year.trim(),
+        if (source != null && source.trim().isNotEmpty) 'source': source.trim(),
+        'user_scope_id': authState.storageScopeId,
+        'lines': lines
+            .map((line) => {
+                  'index': line.index,
+                  'text': line.text,
+                  if (line.startTimeMs != null)
+                    'start_time_ms': line.startTimeMs,
+                  if (line.endTimeMs != null) 'end_time_ms': line.endTimeMs,
+                })
+            .toList(growable: false),
+      };
+      final res = await appHttpClient
+          .post(
+            buildProxyUri('/lyrics/$resolvedVideoId/meaning'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode(body),
+          )
+          .timeout(const Duration(seconds: 50));
+      if (requestVersion != _requestVersion) return;
+      if (res.statusCode != 200) {
+        state = LyricsMeaningState(
+          videoId: resolvedVideoId,
+          error: 'Neatie could not interpret this song right now.',
+        );
+        return;
+      }
+      final payload = jsonDecode(res.body) as Map<String, dynamic>;
+      state = LyricsMeaningState(
+        videoId: resolvedVideoId,
+        insight: LyricsMeaningInsight.fromJson(payload),
+      );
+    } catch (_) {
+      if (requestVersion != _requestVersion) return;
+      state = LyricsMeaningState(
+        videoId: resolvedVideoId,
+        error: 'Neatie could not interpret this song right now.',
+      );
+    }
+  }
+
+  void clear() {
+    _requestVersion++;
+    state = const LyricsMeaningState();
+  }
+}
+
+final lyricsMeaningProvider =
+    StateNotifierProvider<LyricsMeaningNotifier, LyricsMeaningState>((ref) {
+  return LyricsMeaningNotifier(ref);
 });

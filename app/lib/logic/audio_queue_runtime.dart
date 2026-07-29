@@ -1,7 +1,5 @@
 // ignore_for_file: experimental_member_use
 
-import 'dart:io';
-
 import 'package:just_audio/just_audio.dart';
 
 import 'track_metadata.dart';
@@ -44,7 +42,10 @@ Future<ManagedQueueResolution> resolveManagedQueueSources({
       playableTracks.add(track);
       sources.add(source);
     } catch (error) {
-      registerUnavailableTrack(videoId, error.toString());
+      final reason = error.toString();
+      if (!reason.contains('managed_source_not_prepared')) {
+        registerUnavailableTrack(videoId, reason);
+      }
       if (i < resolvedInitialIndex) {
         resolvedInitialIndex -= 1;
       }
@@ -63,62 +64,4 @@ Future<ManagedQueueResolution> resolveManagedQueueSources({
     sources: sources,
     initialIndex: resolvedInitialIndex,
   );
-}
-
-Future<void> prefetchManagedQueueAhead({
-  required bool managedQueueActive,
-  required List<Map<String, dynamic>> managedQueueTracks,
-  required int? currentManagedQueueIndex,
-  required int lookahead,
-  required List<AudioPlayer> prefetchPlayers,
-  required List<String?> prefetchedTrackIds,
-  required Future<LockCachingAudioSource> Function(
-    String videoId, {
-    Map<String, String>? headers,
-    String? urlOverride,
-    dynamic tag,
-  }) buildCachingSourceForVideoId,
-}) async {
-  if (!managedQueueActive || managedQueueTracks.isEmpty) return;
-  final currentIndex = currentManagedQueueIndex ?? 0;
-  final targets = <Map<String, dynamic>>[];
-  for (var i = currentIndex + 1; i < managedQueueTracks.length; i++) {
-    final track = managedQueueTracks[i];
-    if (isTrackHidden(track)) continue;
-    targets.add(track);
-    if (targets.length >= lookahead) break;
-  }
-
-  for (var slot = 0; slot < prefetchPlayers.length; slot++) {
-    final track = slot < targets.length ? targets[slot] : null;
-    final trackId = track == null ? null : extractTrackId(track);
-    if (prefetchedTrackIds[slot] == trackId) {
-      continue;
-    }
-
-    if (track == null || trackId == null || trackId.isEmpty) {
-      prefetchedTrackIds[slot] = null;
-      try {
-        await prefetchPlayers[slot].stop();
-      } catch (_) {}
-      continue;
-    }
-
-    final localPath = track['local_path']?.toString();
-    if (localPath != null &&
-        localPath.isNotEmpty &&
-        File(localPath).existsSync()) {
-      prefetchedTrackIds[slot] = trackId;
-      continue;
-    }
-
-    try {
-      final source = await buildCachingSourceForVideoId(trackId, tag: track);
-      prefetchedTrackIds[slot] = trackId;
-      await prefetchPlayers[slot].stop();
-      await prefetchPlayers[slot].setAudioSource(source, preload: true);
-    } catch (_) {
-      prefetchedTrackIds[slot] = null;
-    }
-  }
 }

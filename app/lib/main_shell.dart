@@ -94,7 +94,7 @@ class _AuthGateScreenState extends ConsumerState<AuthGateScreen> {
                         mainAxisAlignment: MainAxisAlignment.center,
                         children: [
                           Image.asset(
-                            'assets/branding/neatie_intro_mark.png',
+                            'assets/branding/neatie_3rd.png',
                             width: 88,
                             height: 58,
                             fit: BoxFit.contain,

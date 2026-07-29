@@ -3,9 +3,11 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'logic/assistant_provider.dart';
 import 'logic/audio_provider.dart';
 import 'logic/audio_provider_queue.dart';
 import 'logic/details_provider.dart';
+import 'screens/assistant_screen.dart';
 import 'ui/app_theme_tokens.dart';
 import 'ui/neatie_components.dart';
 import 'widgets/player/player_lyrics_panel.dart';
@@ -40,6 +42,7 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
   List<Map<String, dynamic>> _queueSearchResults = const [];
   bool _isQueueSearchLoading = false;
   bool _isQueueSheetOpen = false;
+  bool _isLyricsMeaningOpen = false;
   int _queueSearchRequestVersion = 0;
   String? _lastLyricsVideoId;
   StateSetter? _queueSheetStateSetter;
@@ -246,10 +249,12 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
   void _ensureLyricsLoaded(String? videoId) {
     if (_lastLyricsVideoId == videoId) return;
     _lastLyricsVideoId = videoId;
+    _isLyricsMeaningOpen = false;
     _lyricsLineKeys.clear();
     _lastSyncedLyricIndex = -1;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
+      ref.read(lyricsMeaningProvider.notifier).clear();
       if (videoId == null || videoId.isEmpty) {
         ref.read(lyricsProvider.notifier).clear();
         return;
@@ -351,14 +356,49 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
     TrackLyricsState lyricsState,
   ) {
     final activeIndex = _activeLyricsIndex(lyricsState, playerState);
+    final meaningState = ref.watch(lyricsMeaningProvider);
     _syncLyricsScroll(activeIndex);
     return PlayerLyricsPanel(
       playerState: playerState,
       lyricsState: lyricsState,
+      meaningState: meaningState,
+      isMeaningPanelOpen: _isLyricsMeaningOpen,
       activeIndex: activeIndex,
       lyricKeyFor: _lyricKeyFor,
       radiusLarge: _radiusLarge,
       accentColor: _accentGrey,
+      onOpenMeaning: () => _openLyricsMeaning(playerState, lyricsState),
+      onCloseMeaning: () => setState(() => _isLyricsMeaningOpen = false),
+      onAskNeatie: _openAssistantFromLyricsMeaning,
+    );
+  }
+
+  void _openLyricsMeaning(
+    PlayerState playerState,
+    TrackLyricsState lyricsState,
+  ) {
+    setState(() => _isLyricsMeaningOpen = true);
+    unawaited(
+      ref.read(lyricsMeaningProvider.notifier).fetchMeaning(
+            videoId: playerState.videoId,
+            title: playerState.currentTrackName,
+            artist: playerState.artist,
+            source: lyricsState.source,
+            lines: lyricsState.lines,
+          ),
+    );
+  }
+
+  Future<void> _openAssistantFromLyricsMeaning() async {
+    final insight = ref.read(lyricsMeaningProvider).insight;
+    final seed = insight?.assistantSeedMessage.trim() ?? '';
+    if (seed.isEmpty) return;
+    final assistant = ref.read(assistantProvider.notifier);
+    assistant.clearConversation();
+    unawaited(assistant.sendMessage(seed));
+    if (!mounted) return;
+    await Navigator.of(context).push(
+      MaterialPageRoute(builder: (_) => const AssistantScreen()),
     );
   }
 

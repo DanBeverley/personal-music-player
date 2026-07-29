@@ -3,10 +3,13 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../logic/audio_provider.dart';
 import '../logic/audio_provider_queue.dart';
+import '../logic/collection_likes_provider.dart';
 import '../logic/details_provider.dart';
+import '../logic/track_metadata.dart';
 import '../ui/app_theme_tokens.dart';
 import '../ui/neatie_components.dart';
 import '../widgets/app_artwork.dart';
+import '../widgets/details/details_sections.dart';
 import '../widgets/home/track_menu_button.dart';
 import '../widgets/playlist/add_to_playlist_dialog.dart';
 
@@ -34,22 +37,8 @@ class PersonalMixDetailScreen extends ConsumerWidget {
     return '$minutes:${seconds.toString().padLeft(2, '0')}';
   }
 
-  Color _parseAccent(String? rawColor) {
-    final value = rawColor?.trim() ?? '';
-    final hex = value.replaceFirst('#', '');
-    if (hex.length != 6) {
-      return const Color(0xFF6C7BFF);
-    }
-    final parsed = int.tryParse('FF$hex', radix: 16);
-    if (parsed == null) {
-      return const Color(0xFF6C7BFF);
-    }
-    return Color(parsed);
-  }
-
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final accent = _parseAccent(mix['accent_color']?.toString());
     final title = mix['title']?.toString().trim().isNotEmpty ?? false
         ? mix['title'].toString().trim()
         : 'Mix for you';
@@ -60,6 +49,10 @@ class PersonalMixDetailScreen extends ConsumerWidget {
             false
         ? mix['description'].toString().trim()
         : 'A focused playlist shaped by your recent taste and repeat habits.';
+    final showDescription = description.toLowerCase() != subtitle.toLowerCase();
+    final likeKey = 'mix:${mix['id'] ?? title}';
+    final isLiked = ref.watch(collectionLikesProvider).contains(likeKey);
+    final totalDuration = formatCollectionDuration(tracks);
 
     Future<void> openPlayer() async {
       if (!context.mounted) return;
@@ -68,12 +61,16 @@ class PersonalMixDetailScreen extends ConsumerWidget {
       );
     }
 
-    Future<void> playTrack(Map<String, dynamic> track) async {
+    Future<void> playTrack(
+      Map<String, dynamic> track, {
+      bool shuffle = false,
+    }) async {
       await ref.read(playbackQueueProvider.notifier).startPlaylistSession(
             playlistId: 'mix:${mix['id'] ?? title}',
             playlistName: title,
             tracks: tracks,
             currentTrack: track,
+            shuffle: shuffle,
           );
       await openPlayer();
     }
@@ -113,117 +110,73 @@ class PersonalMixDetailScreen extends ConsumerWidget {
           physics: const BouncingScrollPhysics(),
           slivers: [
             SliverToBoxAdapter(
-              child: Container(
-                margin: const EdgeInsets.fromLTRB(16, 14, 16, 0),
-                padding: const EdgeInsets.all(18),
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    begin: Alignment.topLeft,
-                    end: Alignment.bottomRight,
-                    colors: [
-                      accent.withValues(alpha: 0.92),
-                      accent.withValues(alpha: 0.68),
-                      neatieRaised,
-                    ],
-                  ),
-                  borderRadius: BorderRadius.circular(28),
-                  border: Border.all(
-                    color: Colors.white.withValues(alpha: 0.08),
-                  ),
-                ),
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(18, 14, 18, 0),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(
-                      mix['badge']?.toString() ?? 'MIX',
-                      style: TextStyle(
-                        color: Colors.white.withValues(alpha: 0.72),
-                        fontSize: 12,
-                        fontWeight: FontWeight.w800,
-                        letterSpacing: 0.45,
+                    Center(
+                      child: CollectionVinylArtwork(
+                        thumbnail: mix['thumbnail'],
+                        videoId: tracks.isNotEmpty
+                            ? extractTrackId(tracks.first)
+                            : null,
+                        size: 244,
                       ),
                     ),
-                    const SizedBox(height: 12),
-                    Row(
-                      children: [
-                        AppArtwork(
-                          thumbnail: mix['thumbnail'],
-                          videoId: tracks.isNotEmpty
-                              ? extractTrackId(tracks.first)
-                              : null,
-                          width: 116,
-                          height: 116,
-                          radius: 22,
-                        ),
-                        const SizedBox(width: 16),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                title,
-                                style: const TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 30,
-                                  fontWeight: FontWeight.w900,
-                                  height: 1.05,
-                                ),
-                              ),
-                              const SizedBox(height: 8),
-                              Text(
-                                subtitle,
-                                style: TextStyle(
-                                  color: Colors.white.withValues(alpha: 0.78),
-                                  fontSize: 14,
-                                  height: 1.3,
-                                ),
-                              ),
-                              const SizedBox(height: 12),
-                              Text(
-                                description,
-                                style: TextStyle(
-                                  color: Colors.white.withValues(alpha: 0.7),
-                                  fontSize: 12,
-                                  height: 1.35,
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ],
+                    const SizedBox(height: 20),
+                    Text(
+                      title,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 28,
+                        fontWeight: FontWeight.w900,
+                        height: 1.08,
+                      ),
                     ),
-                    const SizedBox(height: 18),
-                    Row(
-                      children: [
-                        InkWell(
-                          onTap: tracks.isEmpty
-                              ? null
-                              : () => playTrack(tracks.first),
-                          borderRadius: BorderRadius.circular(999),
-                          child: Container(
-                            width: 56,
-                            height: 56,
-                            decoration: const BoxDecoration(
-                              color: Colors.white,
-                              shape: BoxShape.circle,
-                            ),
-                            child: Icon(
-                              Icons.play_arrow_rounded,
-                              color: accent,
-                              size: 34,
-                            ),
-                          ),
+                    const SizedBox(height: 8),
+                    Text(
+                      [
+                        subtitle,
+                        if (totalDuration.isNotEmpty) totalDuration,
+                        '${tracks.length} tracks',
+                      ].join('  •  '),
+                      style: TextStyle(
+                        color: Colors.white.withValues(alpha: 0.58),
+                        fontSize: 13,
+                      ),
+                    ),
+                    if (showDescription) ...[
+                      const SizedBox(height: 10),
+                      Text(
+                        description,
+                        style: TextStyle(
+                          color: Colors.white.withValues(alpha: 0.68),
+                          fontSize: 13,
+                          height: 1.4,
                         ),
-                        const SizedBox(width: 14),
-                        Text(
-                          '${tracks.length} tracks',
-                          style: TextStyle(
-                            color: Colors.white.withValues(alpha: 0.78),
-                            fontSize: 13,
-                            fontWeight: FontWeight.w700,
-                          ),
-                        ),
-                      ],
+                      ),
+                    ],
+                    const SizedBox(height: 10),
+                    CollectionIconActionsRow(
+                      isLiked: isLiked,
+                      onLike: () => ref
+                          .read(collectionLikesProvider.notifier)
+                          .toggle(likeKey),
+                      onPlay: tracks.isEmpty
+                          ? null
+                          : () => playTrack(tracks.first),
+                      onPrime: tracks.isEmpty
+                          ? null
+                          : () {
+                              final trackId = extractTrackId(tracks.first);
+                              if (trackId != null && trackId.isNotEmpty) {
+                                onPrimeTrack?.call(trackId);
+                              }
+                            },
+                      onShuffle: tracks.isEmpty
+                          ? null
+                          : () => playTrack(tracks.first, shuffle: true),
                     ),
                   ],
                 ),
@@ -241,15 +194,15 @@ class PersonalMixDetailScreen extends ConsumerWidget {
                       decoration: BoxDecoration(
                         color: Colors.white.withValues(alpha: 0.03),
                         borderRadius: BorderRadius.circular(22),
-                        border: Border.all(
-                          color: Colors.white.withValues(alpha: 0.06),
-                        ),
                       ),
                       child: Material(
                         color: Colors.transparent,
                         child: InkWell(
                           borderRadius: BorderRadius.circular(22),
                           onTap: () => playTrack(track),
+                          onTapDown: videoId == null || videoId.isEmpty
+                              ? null
+                              : (_) => onPrimeTrack?.call(videoId),
                           child: Padding(
                             padding: const EdgeInsets.all(12),
                             child: Row(

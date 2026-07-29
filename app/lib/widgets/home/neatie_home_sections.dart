@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../../logic/recommendation_feed_models.dart';
+import '../../logic/track_metadata.dart';
 import '../../ui/app_theme_tokens.dart';
 import '../../ui/neatie_components.dart';
 import '../app_artwork.dart';
@@ -20,6 +21,124 @@ enum NeatieHomeTab {
   final String id;
   final String label;
   final IconData icon;
+}
+
+class NeatieQuietPicksLoadingIndicator extends StatefulWidget {
+  const NeatieQuietPicksLoadingIndicator({super.key});
+
+  @override
+  State<NeatieQuietPicksLoadingIndicator> createState() =>
+      _NeatieQuietPicksLoadingIndicatorState();
+}
+
+class _NeatieQuietPicksLoadingIndicatorState
+    extends State<NeatieQuietPicksLoadingIndicator>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 1250),
+  )..repeat();
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: 42,
+      height: 26,
+      child: AnimatedBuilder(
+        animation: _controller,
+        builder: (context, child) {
+          return CustomPaint(
+            painter: _NeatieMarkLoadingPainter(_controller.value),
+          );
+        },
+      ),
+    );
+  }
+}
+
+class _NeatieMarkLoadingPainter extends CustomPainter {
+  const _NeatieMarkLoadingPainter(this.progress);
+
+  final double progress;
+
+  Path _markPath(Size size) {
+    const barHeights = <double>[10, 18, 26, 32, 26, 18, 10];
+    final scale = size.height / 34;
+    final barWidth = 4.2 * scale;
+    final gap = 2.5 * scale;
+    final totalWidth = (barWidth * barHeights.length) +
+        (gap * (barHeights.length - 1));
+    final startX = (size.width - totalWidth) / 2;
+    final centerY = size.height / 2;
+    final path = Path();
+    for (var index = 0; index < barHeights.length; index++) {
+      final left = startX + index * (barWidth + gap);
+      final height = barHeights[index] * scale;
+      path.addRRect(
+        RRect.fromRectAndRadius(
+          Rect.fromLTWH(left, centerY - height / 2, barWidth, height),
+          Radius.circular(barWidth / 2),
+        ),
+      );
+      if (index < barHeights.length - 1) {
+        path.addRRect(
+          RRect.fromRectAndRadius(
+            Rect.fromLTWH(
+              left + barWidth - 0.5,
+              centerY - 1.35 * scale,
+              gap + 1,
+              2.7 * scale,
+            ),
+            Radius.circular(1.35 * scale),
+          ),
+        );
+      }
+    }
+    return path;
+  }
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final path = _markPath(size);
+    canvas.drawPath(
+      path,
+      Paint()
+        ..color = Colors.white.withValues(alpha: 0.24)
+        ..style = PaintingStyle.fill,
+    );
+    final highlightCenter = (-0.2 + (progress * 1.4)) * size.width;
+    final highlightWidth = size.width * 0.46;
+    canvas.drawPath(
+      path,
+      Paint()
+        ..shader = const LinearGradient(
+          colors: [
+            Colors.transparent,
+            Colors.white,
+            Colors.transparent,
+          ],
+          stops: [0, 0.5, 1],
+        ).createShader(
+          Rect.fromLTWH(
+            highlightCenter - highlightWidth / 2,
+            0,
+            highlightWidth,
+            size.height,
+          ),
+        )
+        ..style = PaintingStyle.fill,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant _NeatieMarkLoadingPainter oldDelegate) =>
+      oldDelegate.progress != progress;
 }
 
 class NeatieHomeTopBar extends StatelessWidget {
@@ -593,6 +712,7 @@ class NeatieTrackStrip extends StatelessWidget {
     required this.onMenuDetails,
     required this.onAddToPlaylist,
     required this.onStartStation,
+    this.onPrime,
     this.onViewAll,
   });
 
@@ -602,6 +722,7 @@ class NeatieTrackStrip extends StatelessWidget {
   final ValueChanged<Map<String, dynamic>> onMenuDetails;
   final TrackActionCallback onAddToPlaylist;
   final TrackActionCallback onStartStation;
+  final ValueChanged<Map<String, dynamic>>? onPrime;
   final VoidCallback? onViewAll;
 
   @override
@@ -625,6 +746,7 @@ class NeatieTrackStrip extends StatelessWidget {
                 child: _SquareTrackCard(
                   track: track,
                   onPlay: () => onPlay(track),
+                  onPrime: onPrime == null ? null : () => onPrime!(track),
                   onMenuDetails: () => onMenuDetails(track),
                   onAddToPlaylist: onAddToPlaylist,
                   onStartStation: onStartStation,
@@ -638,10 +760,340 @@ class NeatieTrackStrip extends StatelessWidget {
   }
 }
 
+class NeatieAssistantEntryCard extends StatelessWidget {
+  const NeatieAssistantEntryCard({
+    super.key,
+    required this.onTap,
+  });
+
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return NeatieSurface(
+      radius: 18,
+      padding: const EdgeInsets.fromLTRB(14, 13, 14, 13),
+      color: Colors.white.withValues(alpha: 0.035),
+      blur: false,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(18),
+        child: Row(
+          children: [
+            Container(
+              width: 42,
+              height: 42,
+              decoration: BoxDecoration(
+                color: Colors.white.withValues(alpha: 0.08),
+                borderRadius: BorderRadius.circular(13),
+              ),
+              child: const Icon(
+                Icons.auto_awesome_rounded,
+                color: Colors.white,
+                size: 21,
+              ),
+            ),
+            const SizedBox(width: 12),
+            const Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Ask Neatie',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 14.5,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                  SizedBox(height: 2),
+                  Text(
+                    'Describe a mood, artist, era, or playlist idea.',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(color: neatieMutedText, fontSize: 11.5),
+                  ),
+                ],
+              ),
+            ),
+            const Icon(Icons.chevron_right_rounded, color: neatieMutedText),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class NeatieHotPickCard extends StatelessWidget {
+  const NeatieHotPickCard({
+    super.key,
+    required this.track,
+    required this.onPlay,
+    this.onPrime,
+  });
+
+  final Map<String, dynamic> track;
+  final VoidCallback onPlay;
+  final VoidCallback? onPrime;
+
+  @override
+  Widget build(BuildContext context) {
+    final title = track['title']?.toString().trim();
+    final subtitle = formatTrackSubtitle(track);
+    return NeatieSurface(
+      radius: 20,
+      color: Colors.white.withValues(alpha: 0.055),
+      blur: false,
+      padding: const EdgeInsets.all(14),
+      child: InkWell(
+        onTap: onPlay,
+        onTapDown: onPrime == null ? null : (_) => onPrime!(),
+        borderRadius: BorderRadius.circular(20),
+        child: Row(
+          children: [
+            AppArtwork(
+              thumbnail: track['thumbnail'],
+              videoId: extractPlaybackSourceId(track),
+              width: 78,
+              height: 78,
+              radius: 14,
+            ),
+            const SizedBox(width: 15),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'HOT FOR YOU',
+                    style: TextStyle(
+                      color: neatieDimText,
+                      fontSize: 10,
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: 1.2,
+                    ),
+                  ),
+                  const SizedBox(height: 7),
+                  Text(
+                    title?.isNotEmpty == true ? title! : 'Today\'s pick',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 16,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                  const SizedBox(height: 3),
+                  Text(
+                    subtitle,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(color: neatieMutedText),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 10),
+            Container(
+              width: 56,
+              height: 56,
+              decoration: const BoxDecoration(
+                color: Colors.white,
+                shape: BoxShape.circle,
+              ),
+              child: const Icon(
+                Icons.play_arrow_rounded,
+                color: Colors.black,
+                size: 32,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class NeatieYourLikesRow extends StatelessWidget {
+  const NeatieYourLikesRow({
+    super.key,
+    required this.tracks,
+    required this.onPlay,
+    this.onPrime,
+    this.onOpen,
+    this.onViewAll,
+  });
+
+  final List<Map<String, dynamic>> tracks;
+  final ValueChanged<Map<String, dynamic>> onPlay;
+  final ValueChanged<Map<String, dynamic>>? onPrime;
+  final VoidCallback? onOpen;
+  final VoidCallback? onViewAll;
+
+  @override
+  Widget build(BuildContext context) {
+    if (tracks.isEmpty) return const SizedBox.shrink();
+    final visible = tracks.take(4).toList(growable: false);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        NeatieSectionTitle(title: 'Your likes', onViewAll: onViewAll),
+        NeatieSurface(
+          radius: 18,
+          color: Colors.transparent,
+          blur: false,
+          padding: EdgeInsets.zero,
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(18),
+              gradient: const LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: [
+                  Color(0xFF37110A),
+                  Color(0xFF151515),
+                  Color(0xFF090909),
+                ],
+              ),
+            ),
+            child: Material(
+              color: Colors.transparent,
+              child: InkWell(
+                onTap: onOpen ?? onViewAll,
+                borderRadius: BorderRadius.circular(18),
+                child: Padding(
+                  padding: const EdgeInsets.all(10),
+                  child: Row(
+                    children: [
+                      Container(
+                        width: 42,
+                        height: 42,
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFFF6A3D)
+                              .withValues(alpha: 0.18),
+                          borderRadius: BorderRadius.circular(14),
+                        ),
+                        child: const Icon(
+                          Icons.favorite_rounded,
+                          color: Colors.white,
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: SizedBox(
+                          height: 58,
+                          child: ListView.separated(
+                            scrollDirection: Axis.horizontal,
+                            itemCount: visible.length,
+                            separatorBuilder: (_, __) =>
+                                const SizedBox(width: 10),
+                            itemBuilder: (context, index) => SizedBox(
+                              width: 152,
+                              child: _LikedMiniTile(
+                                track: visible[index],
+                                onTap: () => onPlay(visible[index]),
+                                onPrime: onPrime == null
+                                    ? null
+                                    : () => onPrime!(visible[index]),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                      if (onViewAll != null) ...[
+                        const SizedBox(width: 8),
+                        IconButton(
+                          onPressed: onViewAll,
+                          icon: const Icon(Icons.shuffle_rounded),
+                          color: Colors.white,
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _LikedMiniTile extends StatelessWidget {
+  const _LikedMiniTile({
+    required this.track,
+    required this.onTap,
+    this.onPrime,
+  });
+
+  final Map<String, dynamic> track;
+  final VoidCallback onTap;
+  final VoidCallback? onPrime;
+
+  @override
+  Widget build(BuildContext context) {
+    final title = track['title']?.toString().trim();
+    final subtitle = formatTrackSubtitle(track);
+    return InkWell(
+      onTap: onTap,
+      onTapDown: onPrime == null ? null : (_) => onPrime!(),
+      borderRadius: BorderRadius.circular(12),
+      child: Container(
+        padding: const EdgeInsets.all(8),
+        decoration: BoxDecoration(
+          color: Colors.white.withValues(alpha: 0.06),
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: Row(
+          children: [
+            AppArtwork(
+              thumbnail: track['thumbnail'],
+              videoId: extractPlaybackSourceId(track),
+              width: 42,
+              height: 42,
+              radius: 8,
+            ),
+            const SizedBox(width: 9),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    title?.isNotEmpty == true ? title! : 'Liked song',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    subtitle,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: neatieMutedText,
+                      fontSize: 10.5,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class _SquareTrackCard extends StatelessWidget {
   const _SquareTrackCard({
     required this.track,
     required this.onPlay,
+    this.onPrime,
     required this.onMenuDetails,
     required this.onAddToPlaylist,
     required this.onStartStation,
@@ -649,6 +1101,7 @@ class _SquareTrackCard extends StatelessWidget {
 
   final Map<String, dynamic> track;
   final VoidCallback onPlay;
+  final VoidCallback? onPrime;
   final VoidCallback onMenuDetails;
   final TrackActionCallback onAddToPlaylist;
   final TrackActionCallback onStartStation;
@@ -656,10 +1109,7 @@ class _SquareTrackCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final title = track['title']?.toString().trim();
-    final artist = (track['channel'] ?? track['artist'] ?? track['author'])
-            ?.toString()
-            .trim() ??
-        '';
+    final subtitle = formatTrackSubtitle(track);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -667,12 +1117,13 @@ class _SquareTrackCard extends StatelessWidget {
           aspectRatio: 1,
           child: InkWell(
             onTap: onPlay,
+            onTapDown: onPrime == null ? null : (_) => onPrime!(),
             borderRadius: BorderRadius.circular(11),
             child: ClipRRect(
               borderRadius: BorderRadius.circular(11),
               child: AppArtwork(
                 thumbnail: track['thumbnail'],
-                videoId: (track['id'] ?? track['videoId'])?.toString(),
+                videoId: extractPlaybackSourceId(track),
                 width: double.infinity,
                 height: double.infinity,
                 radius: 11,
@@ -683,6 +1134,7 @@ class _SquareTrackCard extends StatelessWidget {
         const SizedBox(height: 8),
         InkWell(
           onTap: onPlay,
+          onTapDown: onPrime == null ? null : (_) => onPrime!(),
           child: Text(
             title?.isNotEmpty == true ? title! : 'Unknown track',
             maxLines: 1,
@@ -699,7 +1151,7 @@ class _SquareTrackCard extends StatelessWidget {
           children: [
             Expanded(
               child: Text(
-                artist,
+                subtitle,
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
                 style: const TextStyle(
@@ -738,84 +1190,101 @@ class NeatieMadeForYouRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     if (items.isEmpty) return const SizedBox.shrink();
+    const mixColors = <Color>[
+      Color(0xFF08D8D1),
+      Color(0xFFE4F637),
+      Color(0xFFFF3A35),
+      Color(0xFF8EA7FF),
+      Color(0xFFFFB04A),
+      Color(0xFF74E08A),
+    ];
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         NeatieSectionTitle(title: 'Made for you', onViewAll: onViewAll),
         SizedBox(
-          height: 88,
+          height: 188,
           child: ListView.separated(
             scrollDirection: Axis.horizontal,
             physics: const BouncingScrollPhysics(),
             itemCount: items.length,
-            separatorBuilder: (_, __) => const SizedBox(width: 12),
+            separatorBuilder: (_, __) => const SizedBox(width: 18),
             itemBuilder: (context, index) {
               final item = items[index];
-              return NeatieSurface(
-                width: 188,
-                radius: 14,
-                color: Colors.white.withValues(alpha: 0.025),
-                blur: false,
-                padding: EdgeInsets.zero,
+              final accent = mixColors[index % mixColors.length];
+              return SizedBox(
+                width: 124,
                 child: InkWell(
                   onTap: () => onPlay(item),
-                  borderRadius: BorderRadius.circular(14),
-                  child: Row(
+                  borderRadius: BorderRadius.circular(8),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Container(
-                        width: 68,
-                        height: double.infinity,
-                        decoration: BoxDecoration(
-                          color: Colors.white.withValues(alpha: 0.04),
-                          borderRadius: const BorderRadius.horizontal(
-                            left: Radius.circular(14),
-                          ),
+                      SizedBox(
+                        height: 124,
+                        child: Stack(
+                          clipBehavior: Clip.none,
+                          fit: StackFit.expand,
+                          children: [
+                            ClipRRect(
+                              borderRadius: BorderRadius.circular(7),
+                              child: item.thumbnail != null
+                                  ? Transform.scale(
+                                      scale: 1.16,
+                                      child: AppArtwork(
+                                        thumbnail: item.thumbnail,
+                                        videoId: item.videoId,
+                                        width: 124,
+                                        height: 124,
+                                        radius: 7,
+                                        fit: BoxFit.cover,
+                                      ),
+                                    )
+                                  : ColoredBox(
+                                      color: Colors.white.withValues(alpha: 0.08),
+                                      child: const Icon(
+                                        Icons.graphic_eq_rounded,
+                                        color: Colors.white,
+                                        size: 34,
+                                      ),
+                                    ),
+                            ),
+                            Positioned(
+                              left: 6,
+                              bottom: 9,
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 4,
+                                  vertical: 2,
+                                ),
+                                color: accent,
+                                constraints: const BoxConstraints(maxWidth: 112),
+                                child: Text(
+                                  item.title,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    color: Colors.black,
+                                    fontSize: 10.5,
+                                    fontWeight: FontWeight.w900,
+                                    height: 1,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ],
                         ),
-                        child: item.thumbnail != null
-                            ? AppArtwork(
-                                thumbnail: item.thumbnail,
-                                videoId: item.videoId,
-                                width: 68,
-                                height: 88,
-                                radius: 14,
-                              )
-                            : const Icon(
-                                Icons.graphic_eq_rounded,
-                                color: Colors.white,
-                                size: 34,
-                              ),
                       ),
-                      Expanded(
-                        child: Padding(
-                          padding: const EdgeInsets.all(12),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
-                              Text(
-                                item.title,
-                                maxLines: 2,
-                                overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 13.5,
-                                  fontWeight: FontWeight.w800,
-                                  height: 1.1,
-                                ),
-                              ),
-                              const SizedBox(height: 6),
-                              Text(
-                                item.subtitle,
-                                maxLines: 2,
-                                overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(
-                                  color: neatieMutedText,
-                                  fontSize: 10.8,
-                                  height: 1.25,
-                                ),
-                              ),
-                            ],
-                          ),
+                      const SizedBox(height: 9),
+                      Text(
+                        item.subtitle.isNotEmpty ? item.subtitle : item.title,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: neatieMutedText,
+                          fontSize: 10.5,
+                          fontWeight: FontWeight.w600,
+                          height: 1.18,
                         ),
                       ),
                     ],
@@ -848,142 +1317,318 @@ class NeatieMixTileData {
   final String? videoId;
 }
 
-class NeatieTrendingCompactRow extends StatelessWidget {
-  const NeatieTrendingCompactRow({
+class NeatiePopularRadioRow extends StatelessWidget {
+  const NeatiePopularRadioRow({
     super.key,
-    this.title = 'Trending now',
-    required this.tracks,
+    this.title = 'Popular Radio',
+    required this.radios,
+    required this.onOpen,
     required this.onPlay,
-    required this.onMenuDetails,
-    required this.onAddToPlaylist,
-    required this.onStartStation,
+    required this.isLiked,
+    required this.onLike,
+    required this.colorSeed,
+    this.onViewAll,
   });
 
   final String title;
-  final List<Map<String, dynamic>> tracks;
+  final List<Map<String, dynamic>> radios;
+  final ValueChanged<Map<String, dynamic>> onOpen;
   final ValueChanged<Map<String, dynamic>> onPlay;
-  final ValueChanged<Map<String, dynamic>> onMenuDetails;
-  final TrackActionCallback onAddToPlaylist;
-  final TrackActionCallback onStartStation;
+  final bool Function(Map<String, dynamic>) isLiked;
+  final ValueChanged<Map<String, dynamic>> onLike;
+  final int colorSeed;
+  final VoidCallback? onViewAll;
 
   @override
   Widget build(BuildContext context) {
-    if (tracks.isEmpty) return const SizedBox.shrink();
-    final visible = tracks.take(10).toList(growable: false);
+    if (radios.isEmpty) return const SizedBox.shrink();
+    final visible = radios.take(16).toList(growable: false);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        NeatieSectionTitle(title: title),
-        Wrap(
-          runSpacing: 13,
-          children: [
-            for (var index = 0; index < visible.length; index++)
-              SizedBox(
-                width: MediaQuery.of(context).size.width >= 700
-                    ? (MediaQuery.of(context).size.width - 64) / 2
-                    : double.infinity,
-                child: _RankedTrackTile(
-                  rank: index + 1,
-                  track: visible[index],
-                  onPlay: () => onPlay(visible[index]),
-                  onMenuDetails: () => onMenuDetails(visible[index]),
-                  onAddToPlaylist: onAddToPlaylist,
-                  onStartStation: onStartStation,
-                ),
-              ),
-          ],
+        NeatieSectionTitle(title: title, onViewAll: onViewAll),
+        const SizedBox(height: 8),
+        SizedBox(
+          height: 238,
+          child: ListView.separated(
+            scrollDirection: Axis.horizontal,
+            physics: const BouncingScrollPhysics(),
+            itemCount: visible.length,
+            separatorBuilder: (_, __) => const SizedBox(width: 14),
+            itemBuilder: (context, index) {
+              final radio = visible[index];
+              return _PopularRadioCard(
+                radio: radio,
+                index: index,
+                colorSeed: colorSeed,
+                isLiked: isLiked(radio),
+                onOpen: () => onOpen(radio),
+                onPlay: () => onPlay(radio),
+                onLike: () => onLike(radio),
+              );
+            },
+          ),
         ),
       ],
     );
   }
 }
 
-class NeatieGenreTabsRow extends StatelessWidget {
-  const NeatieGenreTabsRow({
-    super.key,
-    required this.title,
-    required this.tabs,
-    required this.selectedTabId,
-    required this.onSelectedTab,
+class _PopularRadioCard extends StatelessWidget {
+  const _PopularRadioCard({
+    required this.radio,
+    required this.index,
+    required this.colorSeed,
+    required this.isLiked,
+    required this.onOpen,
     required this.onPlay,
-    required this.onMenuDetails,
-    required this.onAddToPlaylist,
-    required this.onStartStation,
-    this.onViewAll,
+    required this.onLike,
   });
 
-  final String title;
-  final List<Map<String, dynamic>> tabs;
-  final String selectedTabId;
-  final ValueChanged<String> onSelectedTab;
-  final ValueChanged<Map<String, dynamic>> onPlay;
-  final ValueChanged<Map<String, dynamic>> onMenuDetails;
-  final TrackActionCallback onAddToPlaylist;
-  final TrackActionCallback onStartStation;
-  final VoidCallback? onViewAll;
+  final Map<String, dynamic> radio;
+  final int index;
+  final int colorSeed;
+  final bool isLiked;
+  final VoidCallback onOpen;
+  final VoidCallback onPlay;
+  final VoidCallback onLike;
 
-  List<Map<String, dynamic>> _tabTracks(Map<String, dynamic> tab) {
-    return (tab['tracks'] as List<dynamic>? ?? const [])
-        .whereType<Map>()
-        .map((track) => Map<String, dynamic>.from(track))
-        .toList(growable: false);
+  static const _palette = <Color>[
+    Color(0xFFB98270),
+    Color(0xFF71A397),
+    Color(0xFF738CA6),
+    Color(0xFF8D7894),
+    Color(0xFFA68A5F),
+    Color(0xFFA77479),
+    Color(0xFF778D70),
+    Color(0xFF8E8175),
+  ];
+
+  Color get _accent {
+    final identity =
+        '${radio['id'] ?? radio['artist_name'] ?? radio['title'] ?? index}';
+    return _palette[(identity.hashCode ^ colorSeed).abs() % _palette.length];
+  }
+
+  List<String> get _collageImages {
+    final raw = radio['collage_images'];
+    final Iterable<String> images = raw is List
+        ? raw.map((item) => item.toString()).where((item) => item.isNotEmpty)
+        : const <String>[];
+    final thumbnail = radio['thumbnail']?.toString().trim();
+    final artistThumbnail = radio['artist_thumbnail']?.toString().trim();
+    final rawTracks = radio['tracks'] ?? radio['items'];
+    final trackArtistImages = rawTracks is List
+        ? rawTracks.whereType<Map>().map(
+              (track) => track['artist_thumbnail']?.toString().trim() ?? '',
+            )
+        : const Iterable<String>.empty();
+    return <String>{
+      if (thumbnail != null && thumbnail.isNotEmpty) thumbnail,
+      if (artistThumbnail != null && artistThumbnail.isNotEmpty)
+        artistThumbnail,
+      ...images,
+      ...trackArtistImages.where((image) => image.isNotEmpty),
+    }.take(5).toList(growable: false);
+  }
+
+  String get _title {
+    final artist = radio['artist_name']?.toString().trim();
+    if (artist != null && artist.isNotEmpty) return artist;
+    return radio['title']?.toString().trim() ?? 'Artist Radio';
+  }
+
+  String get _subtitle {
+    final subtitle = radio['subtitle']?.toString().trim();
+    if (subtitle != null && subtitle.isNotEmpty) return subtitle;
+    final count = (radio['track_count'] as num?)?.toInt() ?? 0;
+    return count > 0 ? '$count tracks from this orbit' : 'Songs from your taste';
+  }
+
+  Widget _circleArt(String? thumbnail, double size, {bool main = false}) {
+    final borderColor =
+        main ? Colors.black.withValues(alpha: 0.16) : Colors.white.withValues(alpha: 0.28);
+    return Container(
+      width: size,
+      height: size,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        border: Border.all(color: borderColor, width: main ? 4 : 2),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: main ? 0.28 : 0.18),
+            blurRadius: main ? 16 : 8,
+            offset: const Offset(0, 6),
+          ),
+        ],
+      ),
+      child: ClipOval(
+        child: thumbnail != null && thumbnail.isNotEmpty
+            ? AppArtwork(
+                thumbnail: thumbnail,
+                width: size,
+                height: size,
+                radius: size / 2,
+              )
+            : ColoredBox(
+                color: Colors.black.withValues(alpha: 0.18),
+                child: Icon(
+                  Icons.graphic_eq_rounded,
+                  color: Colors.white.withValues(alpha: 0.82),
+                  size: size * 0.42,
+                ),
+              ),
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
-    if (tabs.isEmpty) return const SizedBox.shrink();
-    final activeTab = tabs.firstWhere(
-      (tab) => tab['id']?.toString() == selectedTabId,
-      orElse: () => tabs.first,
-    );
-    final tracks = _tabTracks(activeTab).take(12).toList(growable: false);
-    if (tracks.isEmpty) return const SizedBox.shrink();
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        NeatieSectionTitle(title: title, onViewAll: onViewAll),
-        SizedBox(
-          height: 42,
-          child: ListView.separated(
-            scrollDirection: Axis.horizontal,
-            physics: const BouncingScrollPhysics(),
-            itemCount: tabs.length,
-            separatorBuilder: (_, __) => const SizedBox(width: 9),
-            itemBuilder: (context, index) {
-              final tab = tabs[index];
-              final id = tab['id']?.toString() ?? '';
-              final label = tab['label']?.toString().trim();
-              final displayLabel =
-                  label != null && label.isNotEmpty ? label : id;
-              return NeatiePill(
-                label: displayLabel,
-                selected: id == activeTab['id']?.toString(),
-                onTap: id.isEmpty ? null : () => onSelectedTab(id),
-              );
-            },
+    final images = _collageImages;
+    final primary = images.isNotEmpty ? images.first : null;
+    final artworkLayers = images.length <= 1
+        ? <Widget>[
+            Positioned(
+              left: 50,
+              top: 45,
+              child: _circleArt(primary, 90, main: true),
+            ),
+          ]
+        : images.length == 2
+            ? <Widget>[
+                Positioned(left: 27, top: 54, child: _circleArt(images[0], 70)),
+                Positioned(right: 27, top: 54, child: _circleArt(images[1], 70)),
+              ]
+            : <Widget>[
+                Positioned(left: 18, top: 76, child: _circleArt(images[1], 54)),
+                Positioned(right: 18, top: 72, child: _circleArt(images[2], 52)),
+                Positioned(
+                  left: 58,
+                  top: 48,
+                  child: _circleArt(primary, 82, main: true),
+                ),
+              ];
+    return SizedBox(
+      width: 190,
+      child: InkWell(
+        onTap: onOpen,
+        borderRadius: BorderRadius.circular(24),
+        child: Ink(
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(24),
+            gradient: LinearGradient(
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+              colors: [
+                _accent.withValues(alpha: 0.98),
+                Color.lerp(_accent, Colors.black, 0.22) ?? _accent,
+              ],
+            ),
+            border: Border.all(color: Colors.white.withValues(alpha: 0.10)),
+            boxShadow: [
+              BoxShadow(
+                color: _accent.withValues(alpha: 0.20),
+                blurRadius: 22,
+                offset: const Offset(0, 12),
+              ),
+            ],
           ),
-        ),
-        const SizedBox(height: 8),
-        Wrap(
-          runSpacing: 13,
-          children: [
-            for (var index = 0; index < tracks.length; index++)
-              SizedBox(
-                width: MediaQuery.of(context).size.width >= 700
-                    ? (MediaQuery.of(context).size.width - 64) / 2
-                    : double.infinity,
-                child: _RankedTrackTile(
-                  rank: index + 1,
-                  track: tracks[index],
-                  onPlay: () => onPlay(tracks[index]),
-                  onMenuDetails: () => onMenuDetails(tracks[index]),
-                  onAddToPlaylist: onAddToPlaylist,
-                  onStartStation: onStartStation,
+          child: Stack(
+            children: [
+              Positioned(
+                right: -36,
+                bottom: -26,
+                child: Icon(
+                  Icons.radio_rounded,
+                  size: 142,
+                  color: Colors.black.withValues(alpha: 0.08),
                 ),
               ),
-          ],
+              Positioned(
+                top: 14,
+                left: 14,
+                child: GestureDetector(
+                  onTap: onLike,
+                  child: Icon(
+                    isLiked
+                        ? Icons.favorite_rounded
+                        : Icons.favorite_border_rounded,
+                    color: Colors.black.withValues(alpha: 0.76),
+                    size: 21,
+                  ),
+                ),
+              ),
+              Positioned(
+                top: 16,
+                right: 16,
+                child: Text(
+                  'RADIO',
+                  style: TextStyle(
+                    color: Colors.black.withValues(alpha: 0.78),
+                    fontSize: 11,
+                    fontWeight: FontWeight.w900,
+                    letterSpacing: 1.8,
+                  ),
+                ),
+              ),
+              ...artworkLayers,
+              Positioned(
+                right: 14,
+                bottom: 70,
+                child: GestureDetector(
+                  onTap: onPlay,
+                  child: Container(
+                    width: 44,
+                    height: 44,
+                    decoration: const BoxDecoration(
+                      color: Colors.white,
+                      shape: BoxShape.circle,
+                    ),
+                    child: const Icon(
+                      Icons.play_arrow_rounded,
+                      color: Colors.black,
+                      size: 30,
+                    ),
+                  ),
+                ),
+              ),
+              Positioned(
+                left: 16,
+                right: 16,
+                bottom: 18,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      _title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: Colors.black,
+                        fontSize: 18,
+                        fontWeight: FontWeight.w900,
+                        letterSpacing: -0.35,
+                      ),
+                    ),
+                    const SizedBox(height: 5),
+                    Text(
+                      _subtitle,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: Colors.black.withValues(alpha: 0.66),
+                        fontSize: 10.5,
+                        fontWeight: FontWeight.w700,
+                        height: 1.2,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
         ),
-      ],
+      ),
     );
   }
 }
@@ -993,6 +1638,7 @@ class _RankedTrackTile extends StatelessWidget {
     required this.rank,
     required this.track,
     required this.onPlay,
+    this.onPrime,
     required this.onMenuDetails,
     required this.onAddToPlaylist,
     required this.onStartStation,
@@ -1001,16 +1647,14 @@ class _RankedTrackTile extends StatelessWidget {
   final int rank;
   final Map<String, dynamic> track;
   final VoidCallback onPlay;
+  final VoidCallback? onPrime;
   final VoidCallback onMenuDetails;
   final TrackActionCallback onAddToPlaylist;
   final TrackActionCallback onStartStation;
 
   @override
   Widget build(BuildContext context) {
-    final artist = (track['channel'] ?? track['artist'] ?? track['author'])
-            ?.toString()
-            .trim() ??
-        '';
+    final subtitle = formatTrackSubtitle(track);
     return Row(
       children: [
         SizedBox(
@@ -1026,10 +1670,11 @@ class _RankedTrackTile extends StatelessWidget {
         ),
         InkWell(
           onTap: onPlay,
+          onTapDown: onPrime == null ? null : (_) => onPrime!(),
           borderRadius: BorderRadius.circular(7),
           child: AppArtwork(
             thumbnail: track['thumbnail'],
-            videoId: (track['id'] ?? track['videoId'])?.toString(),
+            videoId: extractPlaybackSourceId(track),
             width: 48,
             height: 48,
             radius: 7,
@@ -1039,6 +1684,7 @@ class _RankedTrackTile extends StatelessWidget {
         Expanded(
           child: InkWell(
             onTap: onPlay,
+            onTapDown: onPrime == null ? null : (_) => onPrime!(),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
@@ -1054,7 +1700,7 @@ class _RankedTrackTile extends StatelessWidget {
                 ),
                 const SizedBox(height: 2),
                 Text(
-                  artist,
+                  subtitle,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style:
@@ -1077,7 +1723,71 @@ class _RankedTrackTile extends StatelessWidget {
   }
 }
 
-class NeatieLongTrackList extends StatelessWidget {
+class _TrackSlideIn extends StatefulWidget {
+  const _TrackSlideIn({
+    super.key,
+    required this.child,
+    required this.animate,
+    required this.delay,
+  });
+
+  final Widget child;
+  final bool animate;
+  final Duration delay;
+
+  @override
+  State<_TrackSlideIn> createState() => _TrackSlideInState();
+}
+
+class _TrackSlideInState extends State<_TrackSlideIn>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller;
+  late final Animation<double> _opacity;
+  late final Animation<Offset> _position;
+  Timer? _startTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 360),
+      value: widget.animate ? 0 : 1,
+    );
+    final curve = CurvedAnimation(
+      parent: _controller,
+      curve: Curves.easeOutQuart,
+    );
+    _opacity = Tween<double>(begin: 0, end: 1).animate(curve);
+    _position = Tween<Offset>(
+      begin: const Offset(0, 0.14),
+      end: Offset.zero,
+    ).animate(curve);
+    if (widget.animate) {
+      _startTimer = Timer(widget.delay, () => _controller.forward());
+    }
+  }
+
+  @override
+  void dispose() {
+    _startTimer?.cancel();
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FadeTransition(
+      opacity: _opacity,
+      child: SlideTransition(
+        position: _position,
+        child: widget.child,
+      ),
+    );
+  }
+}
+
+class NeatieLongTrackList extends StatefulWidget {
   const NeatieLongTrackList({
     super.key,
     required this.title,
@@ -1086,6 +1796,7 @@ class NeatieLongTrackList extends StatelessWidget {
     required this.onMenuDetails,
     required this.onAddToPlaylist,
     required this.onStartStation,
+    this.onPrime,
     this.maxItems = 48,
     this.onViewAll,
   });
@@ -1096,32 +1807,68 @@ class NeatieLongTrackList extends StatelessWidget {
   final ValueChanged<Map<String, dynamic>> onMenuDetails;
   final TrackActionCallback onAddToPlaylist;
   final TrackActionCallback onStartStation;
+  final ValueChanged<Map<String, dynamic>>? onPrime;
   final int maxItems;
   final VoidCallback? onViewAll;
 
   @override
+  State<NeatieLongTrackList> createState() => _NeatieLongTrackListState();
+}
+
+class _NeatieLongTrackListState extends State<NeatieLongTrackList> {
+  final Set<String> _knownTrackKeys = <String>{};
+  bool _initialized = false;
+
+  @override
   Widget build(BuildContext context) {
-    if (tracks.isEmpty) return const SizedBox.shrink();
-    final visible = tracks.take(maxItems).toList(growable: false);
+    if (widget.tracks.isEmpty) return const SizedBox.shrink();
+    final visible = widget.tracks.take(widget.maxItems).toList(growable: false);
+    final visibleKeys = [
+      for (final track in visible) recommendationRowItemKey('track', track),
+    ];
+    final enteringKeys = _initialized
+        ? visibleKeys.where((key) => !_knownTrackKeys.contains(key)).toList()
+        : const <String>[];
+    final enteringOrder = <String, int>{
+      for (var index = 0; index < enteringKeys.length; index++)
+        enteringKeys[index]: index,
+    };
+    _knownTrackKeys.addAll(visibleKeys);
+    _initialized = true;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        NeatieSectionTitle(title: title, onViewAll: onViewAll),
+        NeatieSectionTitle(title: widget.title, onViewAll: widget.onViewAll),
         Wrap(
           runSpacing: 13,
           children: [
             for (var index = 0; index < visible.length; index++)
-              SizedBox(
-                width: MediaQuery.of(context).size.width >= 700
-                    ? (MediaQuery.of(context).size.width - 64) / 2
-                    : double.infinity,
-                child: _RankedTrackTile(
-                  rank: index + 1,
-                  track: visible[index],
-                  onPlay: () => onPlay(visible[index]),
-                  onMenuDetails: () => onMenuDetails(visible[index]),
-                  onAddToPlaylist: onAddToPlaylist,
-                  onStartStation: onStartStation,
+              _TrackSlideIn(
+                key: ValueKey<String>(
+                  'track-slide:${visibleKeys[index]}',
+                ),
+                animate: enteringOrder.containsKey(visibleKeys[index]),
+                delay: Duration(
+                  milliseconds: (enteringOrder[visibleKeys[index]] ?? 0)
+                          .clamp(0, 8)
+                          .toInt() *
+                      28,
+                ),
+                child: SizedBox(
+                  width: MediaQuery.of(context).size.width >= 700
+                      ? (MediaQuery.of(context).size.width - 64) / 2
+                      : double.infinity,
+                  child: _RankedTrackTile(
+                    rank: index + 1,
+                    track: visible[index],
+                    onPlay: () => widget.onPlay(visible[index]),
+                    onPrime: widget.onPrime == null
+                        ? null
+                        : () => widget.onPrime!(visible[index]),
+                    onMenuDetails: () => widget.onMenuDetails(visible[index]),
+                    onAddToPlaylist: widget.onAddToPlaylist,
+                    onStartStation: widget.onStartStation,
+                  ),
                 ),
               ),
           ],
@@ -1153,157 +1900,56 @@ class NeatieAlbumStrip extends StatelessWidget {
       children: [
         NeatieSectionTitle(title: title, onViewAll: onViewAll),
         SizedBox(
-          height: 214,
+          height: 186,
           child: ListView.separated(
             scrollDirection: Axis.horizontal,
             physics: const BouncingScrollPhysics(),
             itemCount: albums.length,
-            separatorBuilder: (_, __) => const SizedBox(width: 14),
+            separatorBuilder: (_, __) => const SizedBox(width: 20),
             itemBuilder: (context, index) {
               final album = albums[index];
               final artist =
                   album['artist']?.toString().trim() ?? 'Unknown artist';
-              final metadata = _albumMetadata(album);
-              final reason = _albumRecommendationReason(album);
-              return NeatieSurface(
-                width: 244,
-                radius: 18,
-                color: Colors.transparent,
-                blur: false,
-                padding: EdgeInsets.zero,
-                child: Stack(
-                  fit: StackFit.expand,
-                  children: [
-                    Opacity(
-                      opacity: 0.24,
-                      child: AppArtwork(
+              return SizedBox(
+                width: 124,
+                child: InkWell(
+                  onTap: () => onOpen(album),
+                  borderRadius: BorderRadius.circular(6),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      AppArtwork(
                         thumbnail: album['thumbnail'],
-                        width: 244,
-                        height: 214,
-                        radius: 18,
+                        width: 124,
+                        height: 124,
+                        radius: 6,
                         fit: BoxFit.cover,
                       ),
-                    ),
-                    DecoratedBox(
-                      decoration: BoxDecoration(
-                        borderRadius: BorderRadius.circular(18),
-                        gradient: LinearGradient(
-                          begin: Alignment.topCenter,
-                          end: Alignment.bottomCenter,
-                          colors: [
-                            Colors.transparent,
-                            Colors.black.withValues(alpha: 0.90),
-                          ],
-                          stops: const [0.32, 0.76],
+                      const SizedBox(height: 9),
+                      Text(
+                        album['title']?.toString() ?? 'Unknown Album',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 12.4,
+                          fontWeight: FontWeight.w800,
+                          height: 1.1,
                         ),
                       ),
-                    ),
-                    InkWell(
-                      onTap: () => onOpen(album),
-                      borderRadius: BorderRadius.circular(18),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                      Stack(
-                        children: [
-                          AppArtwork(
-                            thumbnail: album['thumbnail'],
-                            width: 244,
-                            height: 126,
-                            radius: 18,
-                          ),
-                          Positioned.fill(
-                            child: Container(
-                              decoration: BoxDecoration(
-                                borderRadius: const BorderRadius.vertical(
-                                  top: Radius.circular(18),
-                                ),
-                                gradient: LinearGradient(
-                                  begin: Alignment.topCenter,
-                                  end: Alignment.bottomCenter,
-                                  colors: [
-                                    Colors.transparent,
-                                    Colors.black.withValues(alpha: 0.58),
-                                  ],
-                                ),
-                              ),
-                            ),
-                          ),
-                          Positioned(
-                            left: 12,
-                            bottom: 10,
-                            child: Text(
-                              metadata.isEmpty
-                                  ? 'EDITORIAL ALBUM PICK'
-                                  : metadata.toUpperCase(),
-                              style: const TextStyle(
-                                color: Colors.white70,
-                                fontSize: 9.5,
-                                fontWeight: FontWeight.w800,
-                                letterSpacing: 1.2,
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
-                      Expanded(
-                        child: Padding(
-                          padding: const EdgeInsets.fromLTRB(13, 10, 13, 11),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                album['title']?.toString() ?? 'Unknown Album',
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 14,
-                                  fontWeight: FontWeight.w800,
-                                ),
-                              ),
-                              const SizedBox(height: 3),
-                              Text(
-                                artist.isEmpty ? 'Unknown artist' : artist,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(
-                                  color: neatieMutedText,
-                                  fontSize: 11.5,
-                                ),
-                              ),
-                              if (reason.isNotEmpty) ...[
-                                const Spacer(),
-                                Row(
-                                  children: [
-                                    const Icon(
-                                      Icons.auto_awesome_rounded,
-                                      color: Colors.white54,
-                                      size: 12,
-                                    ),
-                                    const SizedBox(width: 5),
-                                    Expanded(
-                                      child: Text(
-                                        reason,
-                                        maxLines: 1,
-                                        overflow: TextOverflow.ellipsis,
-                                        style: const TextStyle(
-                                          color: Colors.white60,
-                                          fontSize: 10.5,
-                                        ),
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              ],
-                            ],
-                          ),
+                      const SizedBox(height: 4),
+                      Text(
+                        artist.isEmpty ? 'Unknown artist' : artist,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: neatieMutedText,
+                          fontSize: 10.3,
+                          fontWeight: FontWeight.w600,
                         ),
                       ),
-                        ],
-                      ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
               );
             },
@@ -1312,32 +1958,6 @@ class NeatieAlbumStrip extends StatelessWidget {
       ],
     );
   }
-}
-
-String _albumMetadata(Map<String, dynamic> album) {
-  final type = (album['album_type'] ?? album['type'] ?? album['kind'])
-          ?.toString()
-          .trim() ??
-      '';
-  final year = (album['year'] ?? album['release_date'])?.toString().trim() ?? '';
-  final cleanYear = year.length >= 4 ? year.substring(0, 4) : year;
-  return [
-    if (type.isNotEmpty && type.toLowerCase() != 'album') type,
-    if (cleanYear.isNotEmpty) cleanYear,
-  ].join('  /  ');
-}
-
-String _albumRecommendationReason(Map<String, dynamic> album) {
-  for (final key in const [
-    'recommendation_reason',
-    'reason',
-    'recommendationReason',
-    'subtitle',
-  ]) {
-    final value = album[key]?.toString().trim() ?? '';
-    if (value.isNotEmpty) return value;
-  }
-  return '';
 }
 
 class NeatieArtistStrip extends StatelessWidget {
@@ -1372,14 +1992,13 @@ class NeatieArtistStrip extends StatelessWidget {
                 width: 66,
                 child: InkWell(
                   onTap: () => onOpen(artist),
-                  borderRadius: BorderRadius.circular(999),
+                  borderRadius: BorderRadius.circular(4),
                   child: Column(
                     children: [
-                      AppArtwork(
+                      ArtistArtwork(
                         thumbnail: artist['thumbnail'],
                         width: 56,
                         height: 56,
-                        radius: 999,
                       ),
                       const SizedBox(height: 8),
                       Text(

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
@@ -10,6 +11,7 @@ import 'logic/audio_provider_history.dart';
 import 'logic/audio_provider_queue.dart';
 import 'logic/audio_provider_recommendation.dart';
 import 'logic/auth_provider.dart';
+import 'logic/collection_likes_provider.dart';
 import 'logic/details_provider.dart';
 import 'logic/playlist_provider.dart';
 import 'logic/search_provider.dart';
@@ -20,10 +22,10 @@ import 'navigation/player_navigation.dart';
 import 'screens/assistant_screen.dart';
 import 'screens/personal_mix_detail_screen.dart';
 import 'screens/playlist_detail_screen.dart';
+import 'screens/radio_detail_screen.dart';
 import 'screens/recommendation_row_detail_screen.dart';
 import 'ui/app_theme_tokens.dart';
 import 'widgets/home/neatie_home_sections.dart';
-import 'widgets/home/home_track_prewarm.dart';
 import 'widgets/home/recent_search_history_section.dart';
 import 'widgets/home/search_surface_widgets.dart';
 import 'widgets/home/song_match_widgets.dart';
@@ -56,8 +58,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   final TextEditingController _urlController = TextEditingController();
   final FocusNode _searchFocusNode = FocusNode();
   final ScrollController _homeScrollController = ScrollController();
+  final int _radioColorSeed = math.Random().nextInt(1 << 30);
   bool _isSearching = false;
-  bool _isEditingSearchQuery = false;
   bool _isProgrammaticSearchTextChange = false;
   bool _hasSubmittedSearch = false;
   String _submittedSearchQuery = '';
@@ -66,22 +68,22 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   List<String> _lastSearchRecommendationArtistHints = const <String>[];
   List<Map<String, dynamic>> _lastSearchRecommendationAnchorTracks =
       const <Map<String, dynamic>>[];
+  Future<void> _pendingSearchIntentWrite = Future<void>.value();
   bool _isClearingSearch = false;
   Timer? _suggestDebounce;
-  final Set<String> _prewarmedTrackIds = <String>{};
   final Set<String> _recordedHomeTabTaps = <String>{};
-  final Map<String, String> _selectedGenreTabs = <String, String>{};
   NeatieHomeTab _selectedHomeTab = NeatieHomeTab.all;
   String _selectedSearchTab = 'Top';
   List<String> _recentSearchHistory = const <String>[];
+  List<RecentSearchPick> _recentSearchPicks = const <RecentSearchPick>[];
   bool _isRecentSearchHistoryLoading = false;
-  String _lastPrimeSignature = '';
   int _lastSongMatchPresentationToken = 0;
   bool _isSongMatchSheetOpen = false;
   int _lastFocusSearchRequestId = 0;
   int _lastShowHomeFeedRequestId = 0;
   int _lastHandleBackRequestId = 0;
   int _lastOpenSongMatchRequestId = 0;
+  bool _isLoadingHomeQuietPicks = false;
 
   @override
   void initState() {
@@ -97,9 +99,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       final text = _urlController.text.trim();
       if (mounted) {
         setState(() {
-          if (_isSearching && text.isNotEmpty) {
-            _isEditingSearchQuery = true;
-          }
           if (_hasSubmittedSearch && text != _submittedSearchQuery) {
             _hasSubmittedSearch = false;
             _submittedSearchQuery = '';
@@ -127,9 +126,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         _suggestDebounce?.cancel();
         ref.read(suggestProvider.notifier).clear();
         ref.read(searchPageProvider.notifier).clear();
-        if (mounted) {
-          setState(() => _isEditingSearchQuery = false);
-        }
         if (widget.searchOnly) {
           _setSearchMode(true);
         } else if (_isSearching) {
@@ -139,10 +135,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     });
     _searchFocusNode.addListener(() {
       if (!mounted || !_searchFocusNode.hasFocus) return;
-      final text = _urlController.text.trim();
-      if (_isSearching && text.isNotEmpty) {
-        setState(() => _isEditingSearchQuery = true);
-      }
+      _syncControllerCanHandleBack();
     });
     if (widget.searchOnly) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -215,9 +208,45 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   }
 
   void _handleHomeScroll() {
-    if (_isSearching || !_homeScrollController.hasClients) return;
-    // Quiet Picks enrichment is intentionally user-driven. Extending it from
-    // generic page-bottom scroll made home latency feel unpredictable.
+    if (!_homeScrollController.hasClients) return;
+    if (_isSearching) {
+      if (_homeScrollController.position.extentAfter > 700 ||
+          !_hasSubmittedSearch) {
+        return;
+      }
+      final surface = switch (_selectedSearchTab.toLowerCase()) {
+        'artists' => 'artists',
+        'albums' => 'albums',
+        'playlists' => 'playlists',
+        _ => 'tracks',
+      };
+      unawaited(ref.read(searchPageProvider.notifier).loadMore(surface));
+      return;
+    }
+    if (_selectedHomeTab != NeatieHomeTab.all || _isLoadingHomeQuietPicks) {
+      return;
+    }
+    if (_homeScrollController.position.extentAfter > 900) return;
+    final feed = ref.read(recommendationProvider);
+    final quietPicks = _feedRowByKind(feed, 'quiet_picks');
+    if (quietPicks == null ||
+        !quietPicks.hasMore ||
+        quietPicks.items.length >= 48) {
+      return;
+    }
+    unawaited(_loadMoreHomeQuietPicks());
+  }
+
+  Future<void> _loadMoreHomeQuietPicks() async {
+    if (_isLoadingHomeQuietPicks) return;
+    if (mounted) setState(() => _isLoadingHomeQuietPicks = true);
+    try {
+      await ref
+          .read(recommendationProvider.notifier)
+          .loadMoreRow('quiet_picks');
+    } finally {
+      if (mounted) setState(() => _isLoadingHomeQuietPicks = false);
+    }
   }
 
   bool _handleHomeScrollNotification(ScrollNotification notification) {
@@ -307,6 +336,18 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     _refreshRecommendationsOnSearchExit =
         _lastSearchRecommendationQuery.isNotEmpty ||
             _lastSearchRecommendationArtistHints.isNotEmpty;
+    if (_refreshRecommendationsOnSearchExit) {
+      // Queue intent as soon as search succeeds. Waiting for a particular back
+      // navigation path allowed valid searches to return home as plain launch.
+      ref.read(recommendationProvider.notifier).queueSessionIntent(
+            artistHints: List<String>.from(
+              _lastSearchRecommendationArtistHints,
+            ),
+            sessionQueries: _lastSearchRecommendationQuery.isEmpty
+                ? const <String>[]
+                : <String>[_lastSearchRecommendationQuery],
+          );
+    }
   }
 
   void _clearSearchRecommendationContext() {
@@ -319,19 +360,33 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   Future<void> _loadRecentSearchHistory() async {
     if (_isRecentSearchHistoryLoading) return;
     final cached = peekRecentCloudSearchQueries(limit: 8);
-    if (cached.isNotEmpty && mounted) {
-      setState(() => _recentSearchHistory = cached);
+    final cachedPicks = peekRecentSearchPicks(limit: 8);
+    if ((cached.isNotEmpty || cachedPicks.isNotEmpty) && mounted) {
+      setState(() {
+        _recentSearchHistory = cached;
+        _recentSearchPicks = cachedPicks;
+      });
     }
     _isRecentSearchHistoryLoading = true;
     try {
-      final recentQueries = await getRecentCloudSearchQueries(limit: 8);
+      final recent = await Future.wait<Object>([
+        getRecentCloudSearchQueries(limit: 8),
+        getRecentSearchPicks(limit: 8),
+      ]);
       if (!mounted) return;
       setState(() {
-        _recentSearchHistory = recentQueries;
+        _recentSearchHistory = recent[0] as List<String>;
+        _recentSearchPicks = recent[1] as List<RecentSearchPick>;
       });
     } finally {
       _isRecentSearchHistoryLoading = false;
     }
+  }
+
+  Future<void> _removeRecentSearchPick(RecentSearchPick pick) async {
+    await removeRecentSearchPick(pick.key);
+    if (!mounted) return;
+    await _loadRecentSearchHistory();
   }
 
   Future<void> _refreshHomeFromSearchContext() async {
@@ -343,10 +398,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       artistHints: artistHints,
       sessionQueries: query.isEmpty ? const <String>[] : <String>[query],
     );
-    if (!mounted) return;
-    await notifier.applyPreparedFeedOnHomeReturn();
-    if (!mounted) return;
-    await notifier.applyQueuedSessionIntent();
+    await _pendingSearchIntentWrite;
     if (!mounted) return;
     await notifier.applyPreparedFeedOnHomeReturn();
   }
@@ -358,12 +410,12 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       _setSearchMode(widget.searchOnly);
       return;
     }
+    _suggestDebounce?.cancel();
     _isProgrammaticSearchTextChange = true;
     _urlController.text = q;
     _isProgrammaticSearchTextChange = false;
     _searchFocusNode.unfocus();
     setState(() {
-      _isEditingSearchQuery = false;
       _hasSubmittedSearch = true;
       _submittedSearchQuery = q;
       _selectedSearchTab = 'Top';
@@ -379,6 +431,49 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         trackResults: searchPage.tracks,
         artistResults: searchPage.artists,
       );
+      final topTrack = _lastSearchRecommendationAnchorTracks.isEmpty
+          ? null
+          : _lastSearchRecommendationAnchorTracks.first;
+      final queryKey = q.trim().toLowerCase();
+      final titleKey =
+          topTrack?['title']?.toString().trim().toLowerCase() ?? '';
+      if (topTrack != null &&
+          queryKey.isNotEmpty &&
+          (titleKey == queryKey || titleKey.startsWith('$queryKey '))) {
+        final topArtists = extractTrackArtists(topTrack)
+            .map((value) => value.trim().toLowerCase())
+            .where((value) => value.isNotEmpty)
+            .toSet();
+        final intentItem = Map<String, dynamic>.from(topTrack);
+        intentItem['artist_tracks'] = _lastSearchRecommendationAnchorTracks
+            .where((track) {
+              if (extractTrackId(track) == extractTrackId(topTrack)) {
+                return false;
+              }
+              final artists = extractTrackArtists(track)
+                  .map((value) => value.trim().toLowerCase())
+                  .toSet();
+              return artists.intersection(topArtists).isNotEmpty;
+            })
+            .take(8)
+            .map((track) => Map<String, dynamic>.from(track))
+            .toList(growable: false);
+        await recordProxySearchEvent(
+          q,
+          resultCount: searchPage.tracks.length +
+              searchPage.artists.length +
+              searchPage.albums.length +
+              searchPage.similarTracks.length +
+              searchPage.similarArtists.length,
+          searchScope: 'search_page',
+          metadata: <String, dynamic>{
+            'event_type': 'exact_query_intent',
+            'selected_entity_type': 'track',
+            'top_result_item': intentItem,
+            'confidence': 0.75,
+          },
+        );
+      }
     } else {
       _clearSearchRecommendationContext();
     }
@@ -393,7 +488,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     ref.read(searchPageProvider.notifier).clear();
     _hasSubmittedSearch = false;
     _submittedSearchQuery = '';
-    _isEditingSearchQuery = false;
     _selectedSearchTab = 'Top';
     _setSearchMode(widget.searchOnly);
     if (!widget.searchOnly &&
@@ -456,9 +550,19 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     }
   }
 
-  void showHomeFeed() {
+  Future<void> showHomeFeed() async {
     if (!mounted) return;
     if (widget.searchOnly) return;
+    if (_refreshRecommendationsOnSearchExit) {
+      ref.read(recommendationProvider.notifier).queueSessionIntent(
+            artistHints: List<String>.from(
+              _lastSearchRecommendationArtistHints,
+            ),
+            sessionQueries: _lastSearchRecommendationQuery.trim().isEmpty
+                ? const <String>[]
+                : <String>[_lastSearchRecommendationQuery.trim()],
+          );
+    }
     _refreshRecommendationsOnSearchExit = false;
     _clearSearch(refreshRecommendations: false);
     if (_homeScrollController.hasClients) {
@@ -468,9 +572,11 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         curve: Curves.easeOutCubic,
       );
     }
-    unawaited(
-      ref.read(recommendationProvider.notifier).applyPreparedFeedOnHomeReturn(),
-    );
+    await _pendingSearchIntentWrite;
+    if (!mounted) return;
+    unawaited(ref
+        .read(recommendationProvider.notifier)
+        .applyPreparedFeedOnHomeReturn());
     _syncControllerCanHandleBack();
   }
 
@@ -517,27 +623,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   bool get hasActiveSearch =>
       _isSearching || _urlController.text.trim().isNotEmpty;
 
-  void _primeLikelyTracks(List<dynamic> tracks) {
-    final idsToWarm = collectHomePrewarmTrackIds(
-      tracks: tracks,
-      alreadyPrewarmed: _prewarmedTrackIds,
-    );
-    if (idsToWarm.isEmpty) return;
-
-    final signature = homePrewarmSignature(idsToWarm);
-    if (signature == _lastPrimeSignature) return;
-    _lastPrimeSignature = signature;
-
-    unawaited(
-      ref.read(audioPlayerProvider.notifier).prewarmStreams(
-            idsToWarm,
-            lookahead: math.max(10, idsToWarm.length),
-            immediatePlayback: true,
-            currentVideoId: idsToWarm.first,
-          ),
-    );
-  }
-
   Future<void> _openMatchedTrackActions(Map<String, dynamic> track) async {
     if (!mounted) return;
     final normalizedTrack = normalizeTrack(track);
@@ -583,7 +668,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
 
   void _warmTrack(String? videoId) {
     if (videoId == null || videoId.isEmpty) return;
-    _prewarmedTrackIds.add(videoId);
     unawaited(
       ref.read(audioPlayerProvider.notifier).prepareImmediatePlayback(videoId),
     );
@@ -643,14 +727,32 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       ..._madeForYouTiles(feedState).expand((tile) => tile.tracks),
       ...rowTracks(feedState, const ['quiet_picks']),
       ...rowTracks(feedState, const ['because_you_played']),
-      ...rowTracks(feedState, const ['hidden_gems']),
-      ...rowTracks(feedState, const ['trending_by_genre']),
     ]);
     if (tab == NeatieHomeTab.all) return all;
     final keywordMap = <NeatieHomeTab, List<String>>{
-      NeatieHomeTab.chill: ['acoustic', 'soft', 'slow', 'quiet', 'chill', 'soul'],
-      NeatieHomeTab.workout: ['rock', 'dance', 'remix', 'live', 'power', 'beat'],
-      NeatieHomeTab.focus: ['instrumental', 'ambient', 'piano', 'study', 'focus'],
+      NeatieHomeTab.chill: [
+        'acoustic',
+        'soft',
+        'slow',
+        'quiet',
+        'chill',
+        'soul'
+      ],
+      NeatieHomeTab.workout: [
+        'rock',
+        'dance',
+        'remix',
+        'live',
+        'power',
+        'beat'
+      ],
+      NeatieHomeTab.focus: [
+        'instrumental',
+        'ambient',
+        'piano',
+        'study',
+        'focus'
+      ],
       NeatieHomeTab.mood: ['love', 'night', 'dream', 'sad', 'happy', 'mood'],
     };
     final keywords = keywordMap[tab] ?? const <String>[];
@@ -693,9 +795,9 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
             : null;
     if (rawItems is! List) return const <Map<String, dynamic>>[];
     final items = rawItems
-          .whereType<Map>()
-          .map((item) => Map<String, dynamic>.from(item))
-          .toList(growable: false);
+        .whereType<Map>()
+        .map((item) => Map<String, dynamic>.from(item))
+        .toList(growable: false);
     return collection == 'tracks' || collection == 'discoveries'
         ? _dedupeTracks(items)
         : items;
@@ -746,7 +848,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         continue;
       }
       if (row.rowStyle == 'mix_cards') {
-        for (final mix in row.items.take(4)) {
+        for (final mix in row.items) {
           final tracks = _mixTracks(mix);
           tiles.add(
             NeatieMixTileData(
@@ -761,7 +863,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
           );
         }
       } else if (row.items.isNotEmpty) {
-        final tracks = _dedupeTracks(row.items).take(12).toList(growable: false);
+        final tracks =
+            _dedupeTracks(row.items).take(12).toList(growable: false);
         tiles.add(
           NeatieMixTileData(
             title: row.title.isNotEmpty ? row.title : 'Made for you',
@@ -797,17 +900,19 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     );
   }
 
-  List<Map<String, dynamic>> _genreTabTracks(RecommendationFeedState feedState) {
-    final genreRow = _feedRowByKind(feedState, 'trending_by_genre');
-    if (genreRow == null) return const <Map<String, dynamic>>[];
-    final tracks = <Map<String, dynamic>>[];
-    for (final tab in _genreTabsFromRow(genreRow)) {
-      for (final track in _genreTracksForTab(tab)) {
-        tracks.add(track);
-      }
+  List<Map<String, dynamic>> _radioTracks(Map<String, dynamic> radio) {
+    final rawTracks =
+        radio['tracks'] ?? radio['items'] ?? radio['recommendations'];
+    if (rawTracks is! List) {
+      return const <Map<String, dynamic>>[];
     }
-    tracks.addAll(genreRow.items);
-    return _dedupeTracks(tracks);
+    return _dedupeTracks(
+      rawTracks
+          .whereType<Map>()
+          .map((track) => normalizeTrack(Map<String, dynamic>.from(track)))
+          .where((track) => extractTrackId(track)?.isNotEmpty ?? false)
+          .toList(growable: false),
+    );
   }
 
   RecommendationFeedRowState? _feedRowByKind(
@@ -837,45 +942,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       nextOffset: items.length,
       hasMore: false,
     );
-  }
-
-  List<Map<String, dynamic>> _genreTabsFromRow(
-    RecommendationFeedRowState? row,
-  ) {
-    final tabs = row?.meta['tabs'];
-    if (tabs is! List) return const <Map<String, dynamic>>[];
-    final seen = <String>{};
-    final output = <Map<String, dynamic>>[];
-    for (final tab in tabs.whereType<Map>()) {
-      final next = Map<String, dynamic>.from(tab);
-      final id = next['id']?.toString().trim();
-      final label = next['label']?.toString().trim();
-      final key = (id?.isNotEmpty == true ? id : label)?.toLowerCase() ?? '';
-      if (key.isEmpty || !seen.add(key)) continue;
-      if (_genreTracksForTab(next).isEmpty) continue;
-      output.add(next);
-    }
-    return output;
-  }
-
-  List<Map<String, dynamic>> _genreTracksForTab(Map<String, dynamic> tab) {
-    return (tab['tracks'] as List<dynamic>? ?? const [])
-        .whereType<Map>()
-        .map((track) => Map<String, dynamic>.from(track))
-        .toList(growable: false);
-  }
-
-  String _selectedGenreTabIdForRow(
-    RecommendationFeedRowState row,
-    List<Map<String, dynamic>> tabs,
-  ) {
-    final selected = _selectedGenreTabs[row.id]?.trim();
-    if (selected != null &&
-        selected.isNotEmpty &&
-        tabs.any((tab) => tab['id']?.toString() == selected)) {
-      return selected;
-    }
-    return tabs.first['id']?.toString() ?? '';
   }
 
   List<Map<String, dynamic>> _albumPreviewTracks(Map<String, dynamic> album) {
@@ -955,11 +1021,13 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         builder: (_) => RecommendationRowDetailScreen(
           initialRow: row,
           playerScreenBuilder: (_) => const FullPlayerScreen(),
-          trackDetailsScreenBuilder: (track) => TrackDetailsScreen(track: track),
+          trackDetailsScreenBuilder: (track) =>
+              TrackDetailsScreen(track: track),
           onPrimeTrack: _warmTrack,
           onOpenAlbum: (album) => unawaited(_openAlbum(album)),
           onOpenArtist: (artist) => unawaited(_openArtist(artist)),
           onOpenMix: (mix) => unawaited(_openPersonalMixItem(mix)),
+          onOpenRadio: (radio) => unawaited(_openRadioItem(radio)),
         ),
       ),
     );
@@ -973,7 +1041,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
           mix: tile.mix,
           tracks: tile.tracks,
           playerScreenBuilder: (_) => const FullPlayerScreen(),
-          trackDetailsScreenBuilder: (track) => TrackDetailsScreen(track: track),
+          trackDetailsScreenBuilder: (track) =>
+              TrackDetailsScreen(track: track),
           onPrimeTrack: _warmTrack,
         ),
       ),
@@ -990,25 +1059,47 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         tracks: tracks,
         mix: Map<String, dynamic>.from(mix),
         thumbnail: mix['thumbnail'],
-        videoId: extractTrackId(tracks.first),
+        videoId: extractPlaybackSourceId(tracks.first),
+      ),
+    );
+  }
+
+  Future<void> _openRadioItem(Map<String, dynamic> radio) async {
+    final tracks = _radioTracks(radio);
+    if (tracks.isEmpty || !mounted) return;
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => RadioDetailScreen(
+          radio: Map<String, dynamic>.from(radio),
+          tracks: tracks,
+          playerScreenBuilder: (_) => const FullPlayerScreen(),
+          trackDetailsScreenBuilder: (track) =>
+              TrackDetailsScreen(track: track),
+          onPrimeTrack: _warmTrack,
+        ),
       ),
     );
   }
 
   Future<void> _playSearchDiscoveryTrack(Map<String, dynamic> track) async {
-    unawaited(_recordSearchSelection(
+    _queueSearchSelectionWrite(
       eventType: 'play_start',
       entityType: 'track',
       item: track,
       confidence: 0.94,
-    ));
+    );
+    final trackId = extractTrackId(track);
+    if (trackId != null && trackId.isNotEmpty) {
+      _warmTrack(trackId);
+    }
+    if (mounted) {
+      unawaited(openFullPlayer(context));
+    }
     await ref.read(playbackQueueProvider.notifier).startDiscoverySession(
           track,
           sessionName:
               'Inspired by ${track['title']?.toString() ?? 'this track'}',
         );
-    if (!mounted) return;
-    await openFullPlayer(context);
   }
 
   Future<void> _playSearchSuggestion(SearchSuggestion suggestion) async {
@@ -1017,12 +1108,12 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       await _performSearch(ref, suggestion.text);
       return;
     }
-    unawaited(_recordSearchSelection(
+    _queueSearchSelectionWrite(
       eventType: 'suggestion_play_start',
       entityType: 'track',
       item: track,
       confidence: 0.9,
-    ));
+    );
     final trackId = extractTrackId(track) ?? suggestion.text;
     await _playTrackFromCollection(
       tracks: [track],
@@ -1042,6 +1133,21 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         ? _submittedSearchQuery.trim()
         : _urlController.text.trim();
     if (query.isEmpty || item.isEmpty) return;
+    rememberSearchSelectionOverride(
+      ref.read,
+      query,
+      entityType: entityType,
+      item: item,
+    );
+    if (entityType == 'track') {
+      await recordRecentSearchPick(query, item);
+      if (mounted) {
+        setState(() {
+          _recentSearchPicks = peekRecentSearchPicks(limit: 8);
+        });
+        unawaited(_loadRecentSearchHistory());
+      }
+    }
     final searchPage = ref.read(searchPageProvider);
     final resultCount = searchPage.tracks.length +
         searchPage.artists.length +
@@ -1060,45 +1166,95 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         'selected_tab': _selectedSearchTab,
       },
     );
+    invalidateRecentCloudSearchQueryCache();
+  }
+
+  void _queueSearchSelectionWrite({
+    required String eventType,
+    required String entityType,
+    required Map<String, dynamic> item,
+    double confidence = 0.85,
+  }) {
+    _pendingSearchIntentWrite = _recordSearchSelection(
+      eventType: eventType,
+      entityType: entityType,
+      item: item,
+      confidence: confidence,
+    ).catchError((Object _) {});
+    unawaited(_pendingSearchIntentWrite);
   }
 
   Future<void> _openSearchTrackDetails(Map<String, dynamic> track) async {
-    unawaited(_recordSearchSelection(
+    _queueSearchSelectionWrite(
       eventType: 'detail_open',
       entityType: 'track',
       item: track,
       confidence: 0.82,
-    ));
+    );
     await _openTrackDetails(track, extractTrackId(track));
   }
 
   Future<void> _openSearchArtist(Map<String, dynamic> artist) async {
-    unawaited(_recordSearchSelection(
+    _queueSearchSelectionWrite(
       eventType: 'artist_open',
       entityType: 'artist',
       item: artist,
       confidence: 0.86,
-    ));
+    );
     await _openArtist(artist);
+    invalidateSearchPayloadCache();
+    if (mounted) {
+      await ref
+          .read(searchPageProvider.notifier)
+          .refreshVisibleArtistMetadata();
+    }
   }
 
   Future<void> _openSearchAlbum(Map<String, dynamic> album) async {
-    unawaited(_recordSearchSelection(
+    _queueSearchSelectionWrite(
       eventType: 'album_open',
       entityType: 'album',
       item: album,
       confidence: 0.84,
-    ));
+    );
     await _openAlbum(album);
   }
 
   Future<void> _openSearchPlaylist(Map<String, dynamic> playlist) async {
-    unawaited(_recordSearchSelection(
+    _queueSearchSelectionWrite(
       eventType: 'playlist_open',
       entityType: 'playlist',
       item: playlist,
       confidence: 0.72,
-    ));
+    );
+    if (playlist['provider']?.toString() == 'ytmusic') {
+      final playlistId = playlist['id']?.toString().trim() ?? '';
+      if (playlistId.isEmpty) return;
+      try {
+        final response = await proxyControlHttpClient
+            .get(buildProxyUri('/search_playlist/$playlistId'))
+            .timeout(const Duration(seconds: 10));
+        if (response.statusCode == 200) {
+          final payload = jsonDecode(response.body);
+          final resolved = payload is Map && payload['playlist'] is Map
+              ? Map<String, dynamic>.from(payload['playlist'] as Map)
+              : <String, dynamic>{};
+          if (_mixTracks(resolved).isNotEmpty) {
+            await _openPersonalMixItem(resolved);
+            return;
+          }
+        }
+      } catch (_) {
+        // The result remains visible; a temporary provider failure should not
+        // turn the whole search page into an error.
+      }
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Playlist is temporarily unavailable.')),
+        );
+      }
+      return;
+    }
     await _openPlaylist(playlist);
   }
 
@@ -1106,6 +1262,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     required RecommendationFeedState recState,
     required List<Map<String, dynamic>> lastPlayedTracks,
     required List<Map<String, dynamic>> frequentTracks,
+    required List<Map<String, dynamic>> likedTracks,
     required String displayName,
     required String? avatarUrl,
     required bool isLoading,
@@ -1126,39 +1283,22 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     final becauseYouPlayedTracks =
         rowTracks(recState, const ['because_you_played']);
     final quietPickTracks = rowTracks(recState, const ['quiet_picks']);
-    final hiddenGemTracks = rowTracks(recState, const ['hidden_gems']);
-    final trendingTracks = selectedTab == NeatieHomeTab.all
-        ? _genreTabTracks(recState)
-        : tabTracks;
-    const trendingTitle = 'Trending by genre';
-    final genreRow = _feedRowByKind(recState, 'trending_by_genre');
-    final todaysPickRow = _feedRowByKind(recState, 'todays_pick');
     final lastPlayedRow = _feedRowByKind(recState, 'last_played');
     final madeForYouRow = _feedRowByKind(recState, 'made_for_you');
     final becauseYouPlayedRow = _feedRowByKind(recState, 'because_you_played');
-    final hiddenGemsRow = _feedRowByKind(recState, 'hidden_gems');
+    final popularRadioRow = _feedRowByKind(recState, 'popular_radio');
     final frequentRow = _feedRowByKind(recState, 'frequently_listened');
     final quietPicksRow = _feedRowByKind(recState, 'quiet_picks');
     final recommendedAlbumsRow = _feedRowByKind(recState, 'recommended_albums');
     final recommendedArtistsRow =
         _feedRowByKind(recState, 'recommended_artists');
-    final genreTabs = _genreTabsFromRow(genreRow);
-    final selectedGenreTabId = genreRow == null || genreTabs.isEmpty
-        ? ''
-        : _selectedGenreTabIdForRow(genreRow, genreTabs);
-    final selectedGenreTracks = genreTabs.isEmpty
-        ? const <Map<String, dynamic>>[]
-        : _genreTracksForTab(
-            genreTabs.firstWhere(
-              (tab) => tab['id']?.toString() == selectedGenreTabId,
-              orElse: () => genreTabs.first,
-            ),
-          );
+    final popularRadioCards =
+        popularRadioRow?.items ?? const <Map<String, dynamic>>[];
+    final collectionLikes = ref.watch(collectionLikesProvider);
     final laneAlbums = _backendHomeTabItems(recState, selectedTab, 'albums');
     final laneArtists = _backendHomeTabItems(recState, selectedTab, 'artists');
-    final visibleAlbums = selectedTab == NeatieHomeTab.all
-        ? recommendedAlbums
-        : laneAlbums;
+    final visibleAlbums =
+        selectedTab == NeatieHomeTab.all ? recommendedAlbums : laneAlbums;
     final visibleArtists =
         selectedTab == NeatieHomeTab.all ? globalArtists : laneArtists;
     final laneDiscoveryRow = _syntheticRow(
@@ -1179,10 +1319,25 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       itemType: 'artist',
       items: visibleArtists,
     );
+    final likedTracksRow = _syntheticRow(
+      id: 'library:your_likes',
+      title: 'Your likes',
+      itemType: 'track',
+      items: likedTracks,
+    );
     final madeForYou = _madeForYouTiles(recState);
+    final backendLastPlayedTracks =
+        lastPlayedRow?.items ?? const <Map<String, dynamic>>[];
+    final backendFrequentTracks =
+        frequentRow?.items ?? const <Map<String, dynamic>>[];
     final recentTracks = selectedTab == NeatieHomeTab.all
-        ? lastPlayedTracks
+        ? (backendLastPlayedTracks.isNotEmpty
+            ? backendLastPlayedTracks
+            : lastPlayedTracks)
         : tabTracks.take(10).toList(growable: false);
+    final visibleFrequentTracks = backendFrequentTracks.isNotEmpty
+        ? backendFrequentTracks
+        : frequentTracks;
 
     void playTrack(
       Map<String, dynamic> track,
@@ -1209,7 +1364,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
           children: [
             NeatieHomeTopBar(
               displayName: displayName,
-              logoAsset: 'assets/branding/neatie_intro_mark.png',
+              logoAsset: 'assets/branding/neatie_3rd.png',
               avatarUrl: avatarUrl,
               onSearch: widget.onOpenSearchTab ?? focusSearch,
               onProfile: widget.onOpenProfileTab ?? _openAssistant,
@@ -1232,179 +1387,192 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         children: [
           NeatieHomeTopBar(
             displayName: displayName,
-            logoAsset: 'assets/branding/neatie_intro_mark.png',
+            logoAsset: 'assets/branding/neatie_3rd.png',
             avatarUrl: avatarUrl,
             onSearch: widget.onOpenSearchTab ?? focusSearch,
             onProfile: widget.onOpenProfileTab ?? _openAssistant,
           ),
-        NeatieFeaturedAlbumHero(
-          albums: heroAlbums,
-          onOpen: (album) => unawaited(_openAlbum(album)),
-          onPlay: (album) => unawaited(_playAlbumPreview(album)),
-        ),
+          NeatieFeaturedAlbumHero(
+            albums: heroAlbums,
+            onOpen: (album) => unawaited(_openAlbum(album)),
+            onPlay: (album) => unawaited(_playAlbumPreview(album)),
+          ),
+          if (selectedTab == NeatieHomeTab.all) ...[
+            const SizedBox(height: 12),
+            NeatieAssistantEntryCard(onTap: _openAssistant),
+          ],
           const SizedBox(height: 12),
           NeatieHomeTabBar(
             selected: selectedTab,
             availableTabs: availableTabs,
             onSelected: (tab) => _selectHomeTab(recState, tab),
           ),
-        if (selectedTab == NeatieHomeTab.all && todaysPickTracks.isNotEmpty) ...[
+          if (selectedTab == NeatieHomeTab.all &&
+              todaysPickTracks.isNotEmpty) ...[
+            const SizedBox(height: 14),
+            NeatieHotPickCard(
+              track: todaysPickTracks.first,
+              onPrime: () => _warmTrack(extractTrackId(todaysPickTracks.first)),
+              onPlay: () => playTrack(
+                todaysPickTracks.first,
+                todaysPickTracks,
+                "Today's pick",
+              ),
+            ),
+          ],
+          if (selectedTab == NeatieHomeTab.all && likedTracks.isNotEmpty) ...[
+            const SizedBox(height: 14),
+            NeatieYourLikesRow(
+              tracks: likedTracks,
+              onPrime: (track) => _warmTrack(extractTrackId(track)),
+              onPlay: (track) => playTrack(track, likedTracks, 'Your likes'),
+              onViewAll: () =>
+                  unawaited(_openRecommendationRow(likedTracksRow)),
+              onOpen: () => unawaited(_openRecommendationRow(likedTracksRow)),
+            ),
+          ],
           const SizedBox(height: 14),
-          NeatieTrackStrip(
-            title: "Today's pick",
-            tracks: todaysPickTracks,
-            onPlay: (track) =>
-                playTrack(track, todaysPickTracks, "Today's pick"),
-            onMenuDetails: (track) =>
-                unawaited(_openTrackDetails(track, extractTrackId(track))),
-            onAddToPlaylist: _addTrackToPlaylistFromMenu,
-            onStartStation: _startTrackStationFromMenu,
-            onViewAll: () => unawaited(_openRecommendationRow(todaysPickRow)),
-          ),
-        ],
-        const SizedBox(height: 14),
-        if (selectedTab == NeatieHomeTab.all)
-          NeatieTrackStrip(
-            title: 'Recently played',
-            tracks: recentTracks,
-            onPlay: (track) => playTrack(track, recentTracks, 'Recently played'),
-            onMenuDetails: (track) =>
-                unawaited(_openTrackDetails(track, extractTrackId(track))),
-            onAddToPlaylist: _addTrackToPlaylistFromMenu,
-            onStartStation: _startTrackStationFromMenu,
-            onViewAll: () => unawaited(_openRecommendationRow(lastPlayedRow)),
-          )
-        else
-          NeatieLongTrackList(
-            title: 'Discoveries',
-            tracks: tabTracks,
-            onPlay: (track) =>
-                playTrack(track, tabTracks, 'Discoveries'),
-            onMenuDetails: (track) =>
-                unawaited(_openTrackDetails(track, extractTrackId(track))),
-            onAddToPlaylist: _addTrackToPlaylistFromMenu,
-            onStartStation: _startTrackStationFromMenu,
-            onViewAll: () => unawaited(_openRecommendationRow(laneDiscoveryRow)),
-          ),
-        if (selectedTab == NeatieHomeTab.all && madeForYou.isNotEmpty) ...[
-          const SizedBox(height: 18),
-          NeatieMadeForYouRow(
-            items: madeForYou,
-            onPlay: (tile) => unawaited(_openPersonalMix(tile)),
-            onViewAll: () => unawaited(_openRecommendationRow(madeForYouRow)),
-          ),
-        ],
-        if (selectedTab == NeatieHomeTab.all &&
-            becauseYouPlayedTracks.isNotEmpty) ...[
-          const SizedBox(height: 18),
-          NeatieTrackStrip(
-            title: 'Because you played',
-            tracks: becauseYouPlayedTracks,
-            onPlay: (track) =>
-                playTrack(track, becauseYouPlayedTracks, 'Because you played'),
-            onMenuDetails: (track) =>
-                unawaited(_openTrackDetails(track, extractTrackId(track))),
-            onAddToPlaylist: _addTrackToPlaylistFromMenu,
-            onStartStation: _startTrackStationFromMenu,
-            onViewAll: () =>
-                unawaited(_openRecommendationRow(becauseYouPlayedRow)),
-          ),
-        ],
-        if (selectedTab == NeatieHomeTab.all && hiddenGemTracks.isNotEmpty) ...[
-          const SizedBox(height: 18),
-          NeatieTrackStrip(
-            title: 'Hidden gems',
-            tracks: hiddenGemTracks,
-            onPlay: (track) => playTrack(track, hiddenGemTracks, 'Hidden gems'),
-            onMenuDetails: (track) =>
-                unawaited(_openTrackDetails(track, extractTrackId(track))),
-            onAddToPlaylist: _addTrackToPlaylistFromMenu,
-            onStartStation: _startTrackStationFromMenu,
-            onViewAll: () => unawaited(_openRecommendationRow(hiddenGemsRow)),
-          ),
-        ],
-        if (selectedTab == NeatieHomeTab.all && genreTabs.isNotEmpty) ...[
-          const SizedBox(height: 18),
-          NeatieGenreTabsRow(
-            title: 'Trending by genre',
-            tabs: genreTabs,
-            selectedTabId: selectedGenreTabId,
-            onSelectedTab: (tabId) {
-              if (genreRow == null) return;
-              setState(() => _selectedGenreTabs[genreRow.id] = tabId);
-            },
-            onPlay: (track) =>
-                playTrack(track, selectedGenreTracks, 'Trending by genre'),
-            onMenuDetails: (track) =>
-                unawaited(_openTrackDetails(track, extractTrackId(track))),
-            onAddToPlaylist: _addTrackToPlaylistFromMenu,
-            onStartStation: _startTrackStationFromMenu,
-            onViewAll: () => unawaited(_openRecommendationRow(genreRow)),
-          ),
-        ] else if (selectedTab == NeatieHomeTab.all &&
-            trendingTracks.isNotEmpty) ...[
-          const SizedBox(height: 18),
-          NeatieTrendingCompactRow(
-            title: trendingTitle,
-            tracks: trendingTracks,
-            onPlay: (track) =>
-                playTrack(track, trendingTracks, trendingTitle),
-            onMenuDetails: (track) =>
-                unawaited(_openTrackDetails(track, extractTrackId(track))),
-            onAddToPlaylist: _addTrackToPlaylistFromMenu,
-            onStartStation: _startTrackStationFromMenu,
-          ),
-        ],
-        if (visibleAlbums.isNotEmpty) ...[
-          const SizedBox(height: 18),
-          NeatieAlbumStrip(
-            title: selectedTab == NeatieHomeTab.all
-                ? 'Albums for you'
-                : 'Albums',
-            albums: visibleAlbums,
-            onOpen: (album) => unawaited(_openAlbum(album)),
-            onViewAll: selectedTab == NeatieHomeTab.all
-                ? () => unawaited(_openRecommendationRow(recommendedAlbumsRow))
-                : () => unawaited(_openRecommendationRow(laneAlbumRow)),
-          ),
-        ],
-        if (visibleArtists.isNotEmpty) ...[
-          const SizedBox(height: 18),
-          NeatieArtistStrip(
-            artists: visibleArtists,
-            onOpen: (artist) => unawaited(_openArtist(artist)),
-            onViewAll: selectedTab == NeatieHomeTab.all
-                ? () => unawaited(_openRecommendationRow(recommendedArtistsRow))
-                : () => unawaited(_openRecommendationRow(laneArtistRow)),
-          ),
-        ],
-        if (selectedTab == NeatieHomeTab.all && frequentTracks.isNotEmpty) ...[
-          const SizedBox(height: 18),
-          NeatieTrackStrip(
-            title: 'Frequently listened',
-            tracks: frequentTracks,
-            onPlay: (track) =>
-                playTrack(track, frequentTracks, 'Frequently listened'),
-            onMenuDetails: (track) =>
-                unawaited(_openTrackDetails(track, extractTrackId(track))),
-            onAddToPlaylist: _addTrackToPlaylistFromMenu,
-            onStartStation: _startTrackStationFromMenu,
-            onViewAll: () => unawaited(_openRecommendationRow(frequentRow)),
-          ),
-        ],
-        if (selectedTab == NeatieHomeTab.all && quietPickTracks.isNotEmpty) ...[
-          const SizedBox(height: 22),
-          NeatieLongTrackList(
-            title: 'Quiet Picks',
-            tracks: quietPickTracks,
-            onPlay: (track) => playTrack(track, quietPickTracks, 'Quiet Picks'),
-            onMenuDetails: (track) =>
-                unawaited(_openTrackDetails(track, extractTrackId(track))),
-            onAddToPlaylist: _addTrackToPlaylistFromMenu,
-            onStartStation: _startTrackStationFromMenu,
-            onViewAll: () => unawaited(_openRecommendationRow(quietPicksRow)),
-          ),
-        ],
+          if (selectedTab == NeatieHomeTab.all)
+            NeatieTrackStrip(
+              title: 'Recently played',
+              tracks: recentTracks,
+              onPrime: (track) => _warmTrack(extractTrackId(track)),
+              onPlay: (track) =>
+                  playTrack(track, recentTracks, 'Recently played'),
+              onMenuDetails: (track) =>
+                  unawaited(_openTrackDetails(track, extractTrackId(track))),
+              onAddToPlaylist: _addTrackToPlaylistFromMenu,
+              onStartStation: _startTrackStationFromMenu,
+              onViewAll: () => unawaited(_openRecommendationRow(lastPlayedRow)),
+            )
+          else
+            NeatieLongTrackList(
+              title: 'Discoveries',
+              tracks: tabTracks,
+              onPrime: (track) => _warmTrack(extractTrackId(track)),
+              onPlay: (track) => playTrack(track, tabTracks, 'Discoveries'),
+              onMenuDetails: (track) =>
+                  unawaited(_openTrackDetails(track, extractTrackId(track))),
+              onAddToPlaylist: _addTrackToPlaylistFromMenu,
+              onStartStation: _startTrackStationFromMenu,
+              onViewAll: () =>
+                  unawaited(_openRecommendationRow(laneDiscoveryRow)),
+            ),
+          if (selectedTab == NeatieHomeTab.all && madeForYou.isNotEmpty) ...[
+            const SizedBox(height: 18),
+            NeatieMadeForYouRow(
+              items: madeForYou,
+              onPlay: (tile) => unawaited(_openPersonalMix(tile)),
+              onViewAll: () => unawaited(_openRecommendationRow(madeForYouRow)),
+            ),
+          ],
+          if (selectedTab == NeatieHomeTab.all &&
+              becauseYouPlayedTracks.isNotEmpty) ...[
+            const SizedBox(height: 18),
+            NeatieTrackStrip(
+              title: 'Because you played',
+              tracks: becauseYouPlayedTracks,
+              onPrime: (track) => _warmTrack(extractTrackId(track)),
+              onPlay: (track) => playTrack(
+                  track, becauseYouPlayedTracks, 'Because you played'),
+              onMenuDetails: (track) =>
+                  unawaited(_openTrackDetails(track, extractTrackId(track))),
+              onAddToPlaylist: _addTrackToPlaylistFromMenu,
+              onStartStation: _startTrackStationFromMenu,
+              onViewAll: () =>
+                  unawaited(_openRecommendationRow(becauseYouPlayedRow)),
+            ),
+          ],
+          if (selectedTab == NeatieHomeTab.all &&
+              popularRadioCards.isNotEmpty) ...[
+            const SizedBox(height: 18),
+            NeatiePopularRadioRow(
+              radios: popularRadioCards,
+              colorSeed: _radioColorSeed,
+              isLiked: (radio) => collectionLikes.contains(
+                'radio:${radio['id'] ?? radio['artist_name'] ?? radio['title']}',
+              ),
+              onLike: (radio) {
+                final key =
+                    'radio:${radio['id'] ?? radio['artist_name'] ?? radio['title']}';
+                unawaited(
+                  ref.read(collectionLikesProvider.notifier).toggle(key),
+                );
+              },
+              onOpen: (radio) => unawaited(_openRadioItem(radio)),
+              onPlay: (radio) {
+                final tracks = _radioTracks(radio);
+                if (tracks.isEmpty) return;
+                final title = radio['radio_title']?.toString() ??
+                    '${radio['title'] ?? 'Popular'} Radio';
+                playTrack(tracks.first, tracks, title);
+              },
+              onViewAll: () =>
+                  unawaited(_openRecommendationRow(popularRadioRow)),
+            ),
+          ],
+          if (visibleAlbums.isNotEmpty) ...[
+            const SizedBox(height: 18),
+            NeatieAlbumStrip(
+              title: selectedTab == NeatieHomeTab.all
+                  ? 'Albums for you'
+                  : 'Albums',
+              albums: visibleAlbums,
+              onOpen: (album) => unawaited(_openAlbum(album)),
+              onViewAll: selectedTab == NeatieHomeTab.all
+                  ? () =>
+                      unawaited(_openRecommendationRow(recommendedAlbumsRow))
+                  : () => unawaited(_openRecommendationRow(laneAlbumRow)),
+            ),
+          ],
+          if (visibleArtists.isNotEmpty) ...[
+            const SizedBox(height: 18),
+            NeatieArtistStrip(
+              artists: visibleArtists,
+              onOpen: (artist) => unawaited(_openArtist(artist)),
+              onViewAll: selectedTab == NeatieHomeTab.all
+                  ? () =>
+                      unawaited(_openRecommendationRow(recommendedArtistsRow))
+                  : () => unawaited(_openRecommendationRow(laneArtistRow)),
+            ),
+          ],
+          if (selectedTab == NeatieHomeTab.all &&
+              visibleFrequentTracks.isNotEmpty) ...[
+            const SizedBox(height: 18),
+            NeatieTrackStrip(
+              title: 'Frequently listened',
+              tracks: visibleFrequentTracks,
+              onPrime: (track) => _warmTrack(extractTrackId(track)),
+              onPlay: (track) => playTrack(
+                  track, visibleFrequentTracks, 'Frequently listened'),
+              onMenuDetails: (track) =>
+                  unawaited(_openTrackDetails(track, extractTrackId(track))),
+              onAddToPlaylist: _addTrackToPlaylistFromMenu,
+              onStartStation: _startTrackStationFromMenu,
+              onViewAll: () => unawaited(_openRecommendationRow(frequentRow)),
+            ),
+          ],
+          if (selectedTab == NeatieHomeTab.all &&
+              quietPickTracks.isNotEmpty) ...[
+            const SizedBox(height: 22),
+            NeatieLongTrackList(
+              title: 'Quiet Picks',
+              tracks: quietPickTracks,
+              onPrime: (track) => _warmTrack(extractTrackId(track)),
+              onPlay: (track) =>
+                  playTrack(track, quietPickTracks, 'Quiet Picks'),
+              onMenuDetails: (track) =>
+                  unawaited(_openTrackDetails(track, extractTrackId(track))),
+              onAddToPlaylist: _addTrackToPlaylistFromMenu,
+              onStartStation: _startTrackStationFromMenu,
+              onViewAll: () => unawaited(_openRecommendationRow(quietPicksRow)),
+            ),
+            if (_isLoadingHomeQuietPicks && quietPickTracks.length < 48)
+              const Padding(
+                padding: EdgeInsets.only(top: 14, bottom: 6),
+                child: Center(child: NeatieQuietPicksLoadingIndicator()),
+              ),
+          ],
         ],
       ),
     );
@@ -1442,14 +1610,19 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     required String playlistName,
   }) async {
     if (tracks.isEmpty) return;
+    final trackId = extractTrackId(track);
+    if (trackId != null && trackId.isNotEmpty) {
+      _warmTrack(trackId);
+    }
+    if (mounted) {
+      unawaited(openFullPlayer(context));
+    }
     await ref.read(playbackQueueProvider.notifier).startPlaylistSession(
           playlistId: playlistId,
           playlistName: playlistName,
           tracks: tracks,
           currentTrack: track,
         );
-    if (!mounted) return;
-    unawaited(openFullPlayer(context));
   }
 
   Future<void> _openAlbum(Map<String, dynamic> album) async {
@@ -1515,12 +1688,11 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       return playlist.tracks.any((rawTrack) {
         if (rawTrack is! Map) return false;
         final title = rawTrack['title']?.toString().toLowerCase() ?? '';
-        final artist = (rawTrack['artist'] ??
-                rawTrack['channel'] ??
-                rawTrack['author'])
-            ?.toString()
-            .toLowerCase() ??
-            '';
+        final artist =
+            (rawTrack['artist'] ?? rawTrack['channel'] ?? rawTrack['author'])
+                    ?.toString()
+                    .toLowerCase() ??
+                '';
         return title.contains(normalizedQuery) ||
             artist.contains(normalizedQuery);
       });
@@ -1536,68 +1708,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         'thumbnail': firstTrack?['thumbnail'],
       };
     }).toList(growable: false);
-  }
-
-  List<Map<String, dynamic>> _searchDiscoveryPlaylists(
-    SearchPageState searchPage,
-    String query,
-  ) {
-    final cleanedQuery = query.trim();
-    if (cleanedQuery.isEmpty) return const <Map<String, dynamic>>[];
-    final primary = _dedupeTracks([
-      ...searchPage.tracks,
-      ...searchPage.similarTracks,
-    ]);
-    final artistOrbit = _dedupeTracks([
-      ...searchPage.artistTracks,
-      ...searchPage.similarTracks,
-      ...searchPage.tracks,
-    ]);
-    final output = <Map<String, dynamic>>[];
-
-    void addMix(String id, String name, String subtitle,
-        List<Map<String, dynamic>> tracks) {
-      final unique = _dedupeTracks(tracks).take(32).toList(growable: false);
-      if (unique.length < 4) return;
-      output.add({
-        'id': 'search_mix:$id',
-        'name': name,
-        'title': name,
-        'subtitle': subtitle,
-        'generated': true,
-        'track_count': unique.length,
-        'tracks': unique,
-        'thumbnail': unique.first['thumbnail'],
-      });
-    }
-
-    addMix(
-      'query:${cleanedQuery.toLowerCase()}',
-      '$cleanedQuery mix',
-      'Tracks and close neighbors from this search.',
-      primary,
-    );
-    if (searchPage.artists.isNotEmpty) {
-      final artistName =
-          searchPage.artists.first['name']?.toString().trim() ?? '';
-      if (artistName.isNotEmpty) {
-        addMix(
-          'artist:${artistName.toLowerCase()}',
-          '$artistName and related',
-          'Works and adjacent artists connected to $artistName.',
-          artistOrbit,
-        );
-      }
-    }
-    if (searchPage.similarTracks.length >= 4) {
-      addMix(
-        'neighbors:${cleanedQuery.toLowerCase()}',
-        'Beyond $cleanedQuery',
-        'A wider discovery path around this result.',
-        searchPage.similarTracks,
-      );
-    }
-    return output;
   }
 
   void _openBrowseSurface(WidgetRef ref, String surface) {
@@ -1624,7 +1734,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       ),
     );
   }
-
 
   List<Map<String, dynamic>> _deriveAlbumsFromTracks(List<dynamic> tracks) {
     final seen = <String>{};
@@ -1658,17 +1767,44 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     return albums;
   }
 
+  List<Map<String, dynamic>> _dedupeSearchAlbums(
+    Iterable<Map<String, dynamic>> albums,
+  ) {
+    final output = <Map<String, dynamic>>[];
+    final seen = <String>{};
+    for (final album in albums) {
+      final key = (album['canonical_album_identity'] ??
+              album['id'] ??
+              '${album['title'] ?? album['name'] ?? ''}|'
+                  '${album['artist'] ?? album['artist_name'] ?? ''}')
+          .toString()
+          .trim()
+          .toLowerCase();
+      if (key.isEmpty || !seen.add(key)) continue;
+      output.add(album);
+    }
+    return output;
+  }
+
   @override
   Widget build(BuildContext context) {
     final searchPage = ref.watch(searchPageProvider);
     final playlists = ref.watch(playlistProvider);
     final isSearchLoading = ref.watch(searchPageProvider.notifier).isLoading;
+    final displaySearchTracks = _dedupeTracks([
+      ...searchPage.tracks,
+      ...searchPage.artistTracks,
+    ]);
     final fallbackAlbums = _isSearching
-        ? _deriveAlbumsFromTracks(searchPage.tracks)
+        ? _deriveAlbumsFromTracks(displaySearchTracks)
         : const <Map<String, dynamic>>[];
+    final enrichedAlbums = _dedupeSearchAlbums([
+      ...searchPage.albums,
+      ...searchPage.relatedAlbums,
+    ]);
     final displayAlbums =
-        searchPage.albums.isNotEmpty ? searchPage.albums : fallbackAlbums;
-    final searchTrackIds = searchPage.tracks
+        enrichedAlbums.isNotEmpty ? enrichedAlbums : fallbackAlbums;
+    final searchTrackIds = displaySearchTracks
         .map((track) => extractTrackId(track) ?? '')
         .where((id) => id.trim().isNotEmpty)
         .toSet();
@@ -1686,18 +1822,24 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
             authState.user?.userMetadata?['name']?.toString() ??
             authState.user?.email?.split('@').first ??
             'Listener';
-    final avatarUrl =
-        authState.user?.userMetadata?['avatar_url']?.toString() ??
-            authState.user?.userMetadata?['picture']?.toString();
+    final avatarUrl = authState.user?.userMetadata?['avatar_url']?.toString() ??
+        authState.user?.userMetadata?['picture']?.toString();
     final isRecLoading = widget.searchOnly
         ? false
-        : ref.watch(recommendationProvider.notifier).isLoading;
-    final lastPlayedTracks = widget.searchOnly
-        ? const <Map<String, dynamic>>[]
-        : ref.watch(lastPlayedProvider);
+        : ref.watch(recommendationProvider.notifier).isLoading ||
+            (!recState.hasRows && recState.preparationState == 'preparing');
+    final lastPlayedTracks = ref.watch(lastPlayedProvider);
     final frequentTracks = widget.searchOnly
         ? const <Map<String, dynamic>>[]
         : ref.watch(frequentlyPlayedProvider);
+    final likedTracks = widget.searchOnly
+        ? const <Map<String, dynamic>>[]
+        : ref.watch(libraryProvider).maybeWhen(
+              data: (tracks) => tracks
+                  .where((track) => track['is_liked_locally'] == true)
+                  .toList(growable: false),
+              orElse: () => const <Map<String, dynamic>>[],
+            );
     final suggestState = ref.watch(suggestProvider);
     final searchInput = _urlController.text.trim();
     final submittedQuery = _submittedSearchQuery.trim();
@@ -1712,30 +1854,47 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         searchPage.requestState != 'complete' &&
         !searchPage.hasResults &&
         !isSearchLoading;
-    final visibleTracks =
-        _isSearching ? searchPage.tracks : recState.visibleTracks;
     final songMatchState = ref.watch(songMatchProvider);
     final showRecentSearchHistory = _isSearching &&
         searchInput.isEmpty &&
         !isSearchLoading &&
         !searchPage.hasResults &&
-        _recentSearchHistory.isNotEmpty;
+        (_recentSearchHistory.isNotEmpty || _recentSearchPicks.isNotEmpty);
     final songMatchLauncher = _buildSongMatchLauncher(songMatchState);
     final recentSearchHistorySection = RecentSearchHistorySection(
       queries: _recentSearchHistory,
+      picks: _recentSearchPicks,
       isLoading: _isRecentSearchHistoryLoading,
       onSelectQuery: (query) => _performSearch(ref, query),
+      onPlayPick: (pick) => unawaited(
+        () async {
+          await recordRecentSearchPick(pick.query, pick.track);
+          if (mounted) {
+            setState(() {
+              _recentSearchPicks = peekRecentSearchPicks(limit: 8);
+            });
+          }
+          await _playTrackFromCollection(
+            tracks: [pick.track],
+            track: pick.track,
+            playlistId: 'neatie:recent_search:${pick.key}',
+            playlistName: pick.query,
+          );
+        }(),
+      ),
+      onRemovePick: (pick) => unawaited(_removeRecentSearchPick(pick)),
     );
     final matchingPlaylists = _isSearching
         ? [
+            ...searchPage.playlists,
             ..._searchLocalPlaylists(playlists, submittedQuery),
-            ..._searchDiscoveryPlaylists(searchPage, submittedQuery),
           ]
         : const <Map<String, dynamic>>[];
     final neatieHomeExperience = _buildNeatieHomeExperience(
       recState: recState,
       lastPlayedTracks: lastPlayedTracks,
       frequentTracks: frequentTracks,
+      likedTracks: likedTracks,
       displayName: displayName,
       avatarUrl: avatarUrl,
       isLoading: isRecLoading,
@@ -1776,12 +1935,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       });
     }
 
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
-      _primeLikelyTracks(visibleTracks);
-    });
-    if (!widget.searchOnly) {
-    }
+    if (!widget.searchOnly) {}
     return SafeArea(
       child: RefreshIndicator(
         color: _accentGrey,
@@ -1820,6 +1974,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                   SearchSuggestionPanel(
                     suggestions: suggestState,
                     onSelectSuggestion: (query) => _performSearch(ref, query),
+                    onPrimeSuggestion: (suggestion) =>
+                        _warmTrack(extractTrackId(suggestion.track)),
                     onPlaySuggestion: (suggestion) =>
                         unawaited(_playSearchSuggestion(suggestion)),
                   ),
@@ -1843,36 +1999,74 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                   else ...[
                     NeatieSearchTabBar(
                       selected: _selectedSearchTab,
-                      onSelected: (tab) =>
-                          setState(() => _selectedSearchTab = tab),
+                      onSelected: (tab) {
+                        setState(() => _selectedSearchTab = tab);
+                        final surface = switch (tab.toLowerCase()) {
+                          'artists' => 'artists',
+                          'albums' => 'albums',
+                          'playlists' => 'playlists',
+                          _ => 'tracks',
+                        };
+                        unawaited(
+                          ref
+                              .read(searchPageProvider.notifier)
+                              .loadMore(surface),
+                        );
+                      },
                     ),
                     const SizedBox(height: 12),
-                    NeatieSearchResultsSection(
-                      query: submittedQuery,
-                      queryIntent: searchPage.queryIntent,
-                      selectedTab: _selectedSearchTab,
-                      isLoading: isSearchLoading,
-                      tracks: searchPage.tracks,
-                      artists: searchPage.artists,
-                      albums: displayAlbums,
-                      similarArtists: searchPage.similarArtists,
-                      artistWorks: [
-                        ...searchPage.artistTracks,
-                        ...searchPage.relatedAlbums,
-                      ],
-                      similarTracks: similarTracks,
-                      playlists: matchingPlaylists,
-                      errorMessage: searchPage.errorMessage,
-                      onPlayTrack: (track) =>
-                          unawaited(_playSearchDiscoveryTrack(track)),
-                      onOpenTrack: (track) =>
-                          unawaited(_openSearchTrackDetails(track)),
-                      onOpenArtist: (artist) =>
-                          unawaited(_openSearchArtist(artist)),
-                      onOpenAlbum: (album) =>
-                          unawaited(_openSearchAlbum(album)),
-                      onOpenPlaylist: (playlist) =>
-                          unawaited(_openSearchPlaylist(playlist)),
+                    AnimatedSwitcher(
+                      duration: const Duration(milliseconds: 220),
+                      switchInCurve: Curves.easeOutCubic,
+                      switchOutCurve: Curves.easeInCubic,
+                      transitionBuilder: (child, animation) {
+                        final slide = Tween<Offset>(
+                          begin: const Offset(0.035, 0),
+                          end: Offset.zero,
+                        ).animate(animation);
+                        return FadeTransition(
+                          opacity: animation,
+                          child: SlideTransition(position: slide, child: child),
+                        );
+                      },
+                      child: NeatieSearchResultsSection(
+                        key: ValueKey<String>(
+                          'search-results:$_selectedSearchTab',
+                        ),
+                        query: submittedQuery,
+                        queryIntent: searchPage.queryIntent,
+                        topResult: searchPage.topResult,
+                        leadArtist: searchPage.leadArtist,
+                        containingAlbum: searchPage.containingAlbum,
+                        selectedTab: _selectedSearchTab,
+                        isLoading: isSearchLoading,
+                        loadingSurfaces: searchPage.loadingSurfaces,
+                        appendedItemKeys: searchPage.appendedItemKeys,
+                        tracks: displaySearchTracks,
+                        artists: searchPage.artists,
+                        albums: displayAlbums,
+                        recentlyPlayedTracks: lastPlayedTracks,
+                        similarArtists: searchPage.similarArtists,
+                        artistWorks: <Map<String, dynamic>>[
+                          ...searchPage.artistTracks,
+                          ...searchPage.artistAlbums,
+                        ],
+                        similarTracks: similarTracks,
+                        playlists: matchingPlaylists,
+                        errorMessage: searchPage.errorMessage,
+                        onPrimeTrack: (track) =>
+                            _warmTrack(extractTrackId(track)),
+                        onPlayTrack: (track) =>
+                            unawaited(_playSearchDiscoveryTrack(track)),
+                        onOpenTrack: (track) =>
+                            unawaited(_openSearchTrackDetails(track)),
+                        onOpenArtist: (artist) =>
+                            unawaited(_openSearchArtist(artist)),
+                        onOpenAlbum: (album) =>
+                            unawaited(_openSearchAlbum(album)),
+                        onOpenPlaylist: (playlist) =>
+                            unawaited(_openSearchPlaylist(playlist)),
+                      ),
                     ),
                   ],
                 ] else ...[

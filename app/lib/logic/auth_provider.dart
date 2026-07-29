@@ -42,7 +42,7 @@ String? get currentAuthenticatedUserId =>
 String? get rememberedStorageScopeId => _rememberedStorageScopeId;
 
 String get activeStorageScopeId => _sanitizeScopeSegment(
-      currentAuthenticatedUserId ?? 'guest',
+      currentAuthenticatedUserId ?? _rememberedStorageScopeId ?? 'guest',
     );
 
 Future<void> initSupabase() async {
@@ -337,7 +337,7 @@ class AppAuthState {
       rememberedScopeId?.trim().isNotEmpty == true;
   bool get canUseApp => user != null || !isConfigured;
   bool get requiresAuthGate => isConfigured && isInitialized && !canUseApp;
-  String get storageScopeId => user?.id ?? 'guest';
+  String get storageScopeId => user?.id ?? rememberedScopeId ?? 'guest';
 
   AppAuthState copyWith({
     bool? isConfigured,

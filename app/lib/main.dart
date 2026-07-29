@@ -161,9 +161,9 @@ class _AuralisAppState extends ConsumerState<AuralisApp>
                       color: Colors.black,
                       child: Center(
                         child: Image.asset(
-                          'assets/branding/neatie_intro_mark.png',
-                          width: 140,
-                          height: 140,
+                          'assets/branding/neatie_3rd.png',
+                          width: 46,
+                          height: 46,
                           fit: BoxFit.contain,
                         ),
                       ),

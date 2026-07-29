@@ -91,7 +91,7 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
 
   void _primeTracks(
     Iterable<dynamic> tracks, {
-    int limit = 8,
+    int limit = 2,
   }) {
     final ids = <String>[];
     for (final track in tracks) {
@@ -105,7 +105,7 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
     unawaited(ref.read(audioPlayerProvider.notifier).prewarmStreams(ids));
   }
 
-  void _primeUpcomingQueue({int lookahead = 10}) {
+  void _primeUpcomingQueue({int lookahead = 2}) {
     final upcoming = <Map<String, dynamic>>[];
     final resolvedCurrentIndex = _resolvedCurrentIndex();
     for (var i = resolvedCurrentIndex + 1; i < state.queue.length; i++) {
@@ -120,18 +120,6 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
     }
     if (upcoming.isNotEmpty) {
       _primeTracks(upcoming, limit: lookahead);
-    }
-    if (state.recommendations.isNotEmpty) {
-      _primeTracks(state.recommendations, limit: 6);
-    }
-    if (state.mode == PlaybackQueueMode.playlist) {
-      unawaited(
-        ref.read(audioPlayerProvider.notifier).prefetchFixedQueueTracks(
-              state.queue,
-              currentIndex: resolvedCurrentIndex,
-              count: 2,
-            ),
-      );
     }
   }
 

@@ -3,6 +3,7 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
+import '../../logic/track_metadata.dart';
 import '../../ui/app_theme_tokens.dart';
 import '../../ui/neatie_components.dart';
 import '../app_artwork.dart';
@@ -203,11 +204,10 @@ class HomeArtistRow extends StatelessWidget {
                           onTap: () => onOpenArtist(artist),
                           child: Column(
                             children: [
-                              AppArtwork(
+                              ArtistArtwork(
                                 thumbnail: artist['thumbnail'],
                                 width: 68,
                                 height: 68,
-                                radius: 999,
                               ),
                               const SizedBox(height: 10),
                               Text(
@@ -322,6 +322,8 @@ class HomeTrackList extends StatelessWidget {
           radius: neatieRadiusLarge,
           color: Colors.white.withValues(alpha: 0.035),
           blur: false,
+          bordered: false,
+          elevated: false,
           child: Material(
             color: Colors.transparent,
             child: InkWell(
@@ -375,7 +377,7 @@ class HomeTrackList extends StatelessWidget {
                           ),
                           const SizedBox(height: 4),
                           Text(
-                            rawTrack['channel'] ?? '',
+                            formatTrackSubtitle(rawTrack),
                             maxLines: 1,
                             style: const TextStyle(
                               color: neatieDimText,

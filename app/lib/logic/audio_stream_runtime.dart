@@ -5,7 +5,6 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
-import 'package:http/http.dart' as http;
 import 'package:just_audio/just_audio.dart';
 
 import 'auth_provider.dart';
@@ -21,8 +20,6 @@ class AudioStreamRuntime {
   final Map<String, DateTime> _recentPrepareBatches = <String, DateTime>{};
   final Map<String, Future<void>> _pendingPrepareBatches =
       <String, Future<void>>{};
-  final Map<String, Future<void>> _fullPrefetchTasks = {};
-  String? _activePlaybackVideoId;
   int _latencySummaryProbeCounter = 0;
 
   Uri _proxyUri(String path) => buildProxyUri(path);
@@ -40,19 +37,90 @@ class AudioStreamRuntime {
     DateTime? fetchedAt,
   }) {
     return ResolvedStreamSource(
-      url: _proxyUri('/proxy_stream/$videoId').toString(),
+      url: _proxyUri(
+        '/playback/stream/${Uri.encodeComponent(videoId)}',
+      ).toString(),
       headers: const {},
       fetchedAt: fetchedAt ?? DateTime.now(),
+      sourceKind: 'proxy',
     );
+  }
+
+  String _preparedPlaybackUrl(String videoId, Map<dynamic, dynamic> payload) {
+    final raw = (payload['playback_url'] ?? payload['playback_path'])?.toString();
+    if (raw == null || raw.trim().isEmpty) {
+      return _proxyUri(
+        '/playback/stream/${Uri.encodeComponent(videoId)}',
+      ).toString();
+    }
+    final trimmed = raw.trim();
+    if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+      return trimmed;
+    }
+    return _proxyUri(trimmed.startsWith('/') ? trimmed : '/$trimmed').toString();
+  }
+
+  DateTime? _preparedExpiresAt(Map<dynamic, dynamic> payload) {
+    final raw = payload['expires_at'];
+    if (raw is num && raw > 0) {
+      return DateTime.fromMillisecondsSinceEpoch(
+        (raw * 1000).round(),
+        isUtc: true,
+      );
+    }
+    if (raw is String && raw.trim().isNotEmpty) {
+      final parsedNumber = num.tryParse(raw);
+      if (parsedNumber != null && parsedNumber > 0) {
+        return DateTime.fromMillisecondsSinceEpoch(
+          (parsedNumber * 1000).round(),
+          isUtc: true,
+        );
+      }
+      return DateTime.tryParse(raw);
+    }
+    return null;
+  }
+
+  ResolvedStreamSource buildPreparedStreamSource(
+    String videoId,
+    dynamic payload, {
+    DateTime? fetchedAt,
+  }) {
+    if (payload is! Map) {
+      return buildProxyStreamSource(videoId, fetchedAt: fetchedAt);
+    }
+    final headers = _parseHeaders(payload['headers']);
+    final source = ResolvedStreamSource(
+      url: _preparedPlaybackUrl(videoId, payload),
+      headers: headers,
+      fetchedAt: fetchedAt ?? DateTime.now(),
+      sourceKind: payload['source_kind']?.toString() ?? 'prepared',
+      expiresAt: _preparedExpiresAt(payload),
+    );
+    _streamCache[videoId] = source;
+    return source;
   }
 
   ResolvedStreamSource markPreparedStream(
     String videoId, {
+    dynamic payload,
     DateTime? fetchedAt,
   }) {
-    final source = buildProxyStreamSource(videoId, fetchedAt: fetchedAt);
+    final source = buildPreparedStreamSource(
+      videoId,
+      payload,
+      fetchedAt: fetchedAt,
+    );
     _streamCache[videoId] = source;
+    _unavailableStreamTrackIds.remove(videoId);
+    _unavailableStreamReasons.remove(videoId);
     return source;
+  }
+
+  void invalidateStreamSource(String? videoId) {
+    final normalizedId = videoId?.trim();
+    if (normalizedId == null || normalizedId.isEmpty) return;
+    _streamCache.remove(normalizedId);
   }
 
   bool isUnavailableTrackId(String? videoId) {
@@ -111,35 +179,12 @@ class AudioStreamRuntime {
     return File('${cacheFile.path}.done');
   }
 
-  void markActivePlaybackVideoId(String? videoId) {
-    final normalized = videoId?.trim();
-    _activePlaybackVideoId =
-        normalized == null || normalized.isEmpty ? null : normalized;
-  }
-
-  bool _isActivePlaybackVideoId(String videoId) =>
-      _activePlaybackVideoId == videoId.trim();
-
-  Future<LockCachingAudioSource> buildCachingSourceForVideoId(
-    String videoId, {
-    Map<String, String>? headers,
-    String? urlOverride,
-    dynamic tag,
-  }) async {
-    final cacheFile = await cacheFileForVideoId(videoId);
-    return LockCachingAudioSource(
-      Uri.parse(urlOverride ?? _proxyUri('/proxy_stream/$videoId').toString()),
-      headers: headers == null || headers.isEmpty ? null : headers,
-      cacheFile: cacheFile,
-      tag: tag,
-    );
-  }
-
   Future<AudioSource> buildPlaybackSourceForVideoId(
     String videoId, {
     Map<String, String>? headers,
     String? urlOverride,
     dynamic tag,
+    bool requirePrepared = false,
   }) async {
     final cacheFile = await cacheFileForVideoId(videoId);
     final markerFile = await cacheMarkerForVideoId(videoId);
@@ -148,9 +193,21 @@ class AudioStreamRuntime {
         cacheFile.lengthSync() > 100000) {
       return AudioSource.file(cacheFile.path, tag: tag);
     }
+    final preparedSource =
+        urlOverride == null ? freshStreamSource(videoId) : null;
+    if (requirePrepared && urlOverride == null && preparedSource == null) {
+      throw StateError('managed_source_not_prepared');
+    }
+    final resolvedUrl = urlOverride ??
+        preparedSource?.url ??
+        _proxyUri(
+          '/playback/stream/${Uri.encodeComponent(videoId)}',
+        ).toString();
+    final resolvedHeaders =
+        headers ?? preparedSource?.headers ?? const <String, String>{};
     return AudioSource.uri(
-      Uri.parse(urlOverride ?? _proxyUri('/proxy_stream/$videoId').toString()),
-      headers: headers == null || headers.isEmpty ? null : headers,
+      Uri.parse(resolvedUrl),
+      headers: resolvedHeaders.isEmpty ? null : resolvedHeaders,
       tag: tag,
     );
   }
@@ -185,10 +242,12 @@ class AudioStreamRuntime {
     Iterable<String> ids, {
     String? currentVideoId,
     required bool activeQueue,
+    required bool background,
     required int lookahead,
   }) {
     return [
       activeQueue ? '1' : '0',
+      background ? '1' : '0',
       currentVideoId ?? '',
       '$lookahead',
       ids.join(','),
@@ -213,6 +272,7 @@ class AudioStreamRuntime {
     Iterable<String?> videoIds, {
     String? currentVideoId,
     bool activeQueue = false,
+    bool background = true,
     int lookahead = 8,
     Future<void> Function(String videoId)? onFallbackPrewarm,
   }) async {
@@ -239,6 +299,7 @@ class AudioStreamRuntime {
       idsNeedingWarm,
       currentVideoId: currentVideoId,
       activeQueue: activeQueue,
+      background: background,
       lookahead: lookahead,
     );
 
@@ -262,10 +323,11 @@ class AudioStreamRuntime {
             _proxyUri('/prepare_session'),
             headers: {'Content-Type': 'application/json'},
             body: jsonEncode({
-              'video_ids': idsNeedingWarm,
-              'current_video_id': currentVideoId,
+              'track_keys': idsNeedingWarm,
+              'current_track_key': currentVideoId,
               'active_queue': activeQueue,
               'lookahead': lookahead,
+              'background': background,
             }),
           )
           .timeout(const Duration(seconds: 18));
@@ -287,10 +349,11 @@ class AudioStreamRuntime {
       }
       if (prepared is Map) {
         prepared.forEach((key, dynamic value) {
-          markPreparedStream(key.toString());
+          markPreparedStream(key.toString(), payload: value);
           if (value is Map) {
             debugPrint(
               '[EBB] prepared ${key.toString()} '
+              'source=${value['source_kind']} '
               'resolveMs=${value['resolve_ms']} '
               'chunkMs=${value['chunk_ms']} '
               'targetBytes=${value['target_chunk_bytes']} '
@@ -325,147 +388,6 @@ class AudioStreamRuntime {
     }
   }
 
-  Future<void> cleanupFullPrefetchCache(Set<String> keepIds) async {
-    final cacheDir = await streamCacheDirectory();
-    if (!cacheDir.existsSync()) return;
-    final keepNames = keepIds.map(_sanitizeCacheKey).toSet();
-    final activePlaybackName = _activePlaybackVideoId == null
-        ? null
-        : _sanitizeCacheKey(_activePlaybackVideoId!);
-    for (final entity in cacheDir.listSync(followLinks: false)) {
-      if (entity is! File) continue;
-      final name =
-          entity.uri.pathSegments.isEmpty ? '' : entity.uri.pathSegments.last;
-      if (name.isEmpty) continue;
-      // `.audio.part` is exclusively owned by LockCachingAudioSource. Deleting
-      // it from general cleanup races the writer and breaks playback/prefetch.
-      if (name.endsWith('.audio.part')) continue;
-      var baseName = '';
-      for (final suffix in const [
-        '.audio.full.part',
-        '.audio.done',
-        '.audio',
-      ]) {
-        if (!name.endsWith(suffix)) continue;
-        baseName = name.substring(0, name.length - suffix.length);
-        break;
-      }
-      if (baseName.isEmpty) continue;
-      if (activePlaybackName != null && baseName == activePlaybackName) {
-        continue;
-      }
-      if (keepNames.contains(baseName)) continue;
-      try {
-        entity.deleteSync();
-      } catch (_) {}
-    }
-  }
-
-  Future<void> prefetchTrackToTempStorage(String videoId) async {
-    if (_isActivePlaybackVideoId(videoId)) {
-      return;
-    }
-    final existing = _fullPrefetchTasks[videoId];
-    if (existing != null) {
-      return existing;
-    }
-
-    final task = () async {
-      final cacheFile = await cacheFileForVideoId(videoId);
-      final markerFile = await cacheMarkerForVideoId(videoId);
-      if (_isActivePlaybackVideoId(videoId)) {
-        return;
-      }
-      if (cacheFile.existsSync() &&
-          cacheFile.lengthSync() > 100000 &&
-          markerFile.existsSync()) {
-        return;
-      }
-
-      // Keep this distinct from just_audio's LockCachingAudioSource `.part`
-      // file, otherwise background full-prefetch can delete/rename the file
-      // the active player is using.
-      final tempFile = File('${cacheFile.path}.full.part');
-      if (tempFile.existsSync()) {
-        try {
-          tempFile.deleteSync();
-        } catch (_) {}
-      }
-
-      try {
-        final request =
-            http.Request('GET', _proxyUri('/proxy_stream/$videoId'));
-        final response = await appHttpClient.send(request);
-        if (response.statusCode != 200) {
-          throw Exception('Prefetch failed: ${response.statusCode}');
-        }
-        final sink = tempFile.openWrite();
-        await for (final chunk in response.stream) {
-          sink.add(chunk);
-        }
-        await sink.close();
-        if (_isActivePlaybackVideoId(videoId)) {
-          if (tempFile.existsSync()) {
-            tempFile.deleteSync();
-          }
-          return;
-        }
-        if (cacheFile.existsSync()) {
-          try {
-            cacheFile.deleteSync();
-          } catch (_) {}
-        }
-        await tempFile.rename(cacheFile.path);
-        await markerFile.writeAsString(DateTime.now().toIso8601String());
-        debugPrint(
-          '[EBB] full-prefetched $videoId bytes=${cacheFile.lengthSync()}',
-        );
-      } catch (error) {
-        debugPrint('[EBB] full-prefetch failed for $videoId: $error');
-        if (tempFile.existsSync()) {
-          try {
-            tempFile.deleteSync();
-          } catch (_) {}
-        }
-      }
-    }();
-
-    _fullPrefetchTasks[videoId] = task;
-    await task.whenComplete(() => _fullPrefetchTasks.remove(videoId));
-  }
-
-  Future<void> prefetchFixedQueueTracks(
-    List<Map<String, dynamic>> tracks, {
-    required int currentIndex,
-    int count = 2,
-  }) async {
-    if (tracks.isEmpty || currentIndex < 0 || currentIndex >= tracks.length) {
-      return;
-    }
-
-    final keepIds = <String>{};
-    final currentTrackId = extractTrackId(tracks[currentIndex]);
-    if (currentTrackId != null && currentTrackId.isNotEmpty) {
-      keepIds.add(currentTrackId);
-    }
-
-    final targetIds = <String>[];
-    for (var i = currentIndex + 1; i < tracks.length; i++) {
-      final track = tracks[i];
-      if (isTrackHidden(track)) continue;
-      final id = extractTrackId(track);
-      if (id == null || id.isEmpty) continue;
-      targetIds.add(id);
-      keepIds.add(id);
-      if (targetIds.length >= count) break;
-    }
-
-    await cleanupFullPrefetchCache(keepIds);
-    for (final id in targetIds) {
-      unawaited(prefetchTrackToTempStorage(id));
-    }
-  }
-
   Future<ResolvedStreamSource> fetchStreamSource(String videoId) async {
     final cached = freshStreamSource(videoId);
     if (cached != null) {
@@ -478,7 +400,7 @@ class AudioStreamRuntime {
           _proxyUri('/prepare_session'),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({
-            'video_ids': [videoId],
+            'track_keys': [videoId],
           }),
         )
         .timeout(const Duration(seconds: 18));
@@ -506,6 +428,7 @@ class AudioStreamRuntime {
     if (metrics is Map) {
       debugPrint(
         '[EBB] prepared $videoId '
+        'source=${metrics['source_kind']} '
         'resolveMs=${metrics['resolve_ms']} '
         'chunkMs=${metrics['chunk_ms']} '
         'chunkBytes=${metrics['cached_prefix_bytes']} '
@@ -515,12 +438,16 @@ class AudioStreamRuntime {
     debugPrint(
       '[EBB] prepare_session[$videoId] totalMs=${stopwatch.elapsedMilliseconds}',
     );
-    return markPreparedStream(videoId);
+    return markPreparedStream(videoId, payload: metrics);
   }
 
   Future<ResolvedStreamSource> fetchDirectStreamSource(String videoId) async {
     final res = await appHttpClient
-        .get(_proxyUri('/direct_url/$videoId'))
+        .post(
+          _proxyUri('/playback/resolve'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({'track_key': videoId}),
+        )
         .timeout(const Duration(seconds: 15));
 
     if (res.statusCode != 200) {
@@ -533,11 +460,20 @@ class AudioStreamRuntime {
       throw Exception('Proxy returned an empty direct stream URL');
     }
 
-    return ResolvedStreamSource(
-      url: directUrl,
+    final playbackUrl = directUrl.startsWith('http://') ||
+            directUrl.startsWith('https://')
+        ? directUrl
+        : _proxyUri(directUrl.startsWith('/') ? directUrl : '/$directUrl')
+            .toString();
+    final source = ResolvedStreamSource(
+      url: playbackUrl,
       headers: _parseHeaders(data['headers']),
       fetchedAt: DateTime.now(),
+      sourceKind: 'direct_url',
+      expiresAt: _preparedExpiresAt(data),
     );
+    _streamCache[videoId] = source;
+    return source;
   }
 
   Future<ResolvedStreamSource> resolveStreamSource(String videoId) {
@@ -572,11 +508,18 @@ class AudioStreamRuntime {
           [videoId],
           currentVideoId: videoId,
           activeQueue: true,
+          background: false,
           lookahead: 1,
         );
         return;
       }
-      await resolveStreamSource(videoId);
+      await prepareQueueSession(
+        [videoId],
+        currentVideoId: videoId,
+        activeQueue: false,
+        background: true,
+        lookahead: 1,
+      );
     } catch (_) {
       // Prewarm should stay silent. Playback will surface real errors later.
     }
@@ -584,7 +527,7 @@ class AudioStreamRuntime {
 
   Future<void> prewarmStreams(
     Iterable<String?> videoIds, {
-    int lookahead = 18,
+    int lookahead = 3,
     bool immediatePlayback = false,
     String? currentVideoId,
   }) async {
@@ -602,6 +545,7 @@ class AudioStreamRuntime {
       videoIds,
       lookahead: lookahead,
       activeQueue: immediatePlayback,
+      background: !immediatePlayback,
       currentVideoId: prioritizedId,
     );
   }

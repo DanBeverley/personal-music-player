@@ -10,6 +10,77 @@ String _cleanTrackString(dynamic value) {
   return value?.toString().trim() ?? '';
 }
 
+String _formatDurationSeconds(int seconds) {
+  final safeSeconds = seconds.clamp(0, 24 * 60 * 60).toInt();
+  final minutes = safeSeconds ~/ 60;
+  final remainingSeconds = safeSeconds % 60;
+  return '$minutes:${remainingSeconds.toString().padLeft(2, '0')}';
+}
+
+int trackDurationSeconds(dynamic rawTrack) {
+  if (rawTrack is! Map) return 0;
+  final raw = rawTrack['duration'] ??
+      rawTrack['duration_seconds'] ??
+      rawTrack['length_seconds'];
+  var seconds = _parseTrackInt(raw);
+  if (seconds > 24 * 60 * 60) {
+    seconds = (seconds / 1000).round();
+  }
+  return seconds.clamp(0, 24 * 60 * 60).toInt();
+}
+
+String formatCollectionDuration(Iterable<dynamic> tracks) {
+  final totalSeconds = tracks.fold<int>(
+    0,
+    (total, track) => total + trackDurationSeconds(track),
+  );
+  if (totalSeconds <= 0) return '';
+  final hours = totalSeconds ~/ 3600;
+  final minutes = (totalSeconds % 3600) ~/ 60;
+  final seconds = totalSeconds % 60;
+  if (hours > 0) {
+    return '$hours:${minutes.toString().padLeft(2, '0')}:${seconds.toString().padLeft(2, '0')}';
+  }
+  return '$minutes:${seconds.toString().padLeft(2, '0')}';
+}
+
+String? _extractReleaseYear(dynamic rawTrack) {
+  if (rawTrack is! Map) return null;
+  final rawYear = (rawTrack['release_year'] ??
+          rawTrack['year'] ??
+          rawTrack['releaseDate'] ??
+          rawTrack['release_date'])
+      ?.toString()
+      .trim();
+  if (rawYear == null || rawYear.isEmpty) return null;
+  return RegExp(r'\b(?:19|20)\d{2}\b').firstMatch(rawYear)?.group(0);
+}
+
+String formatTrackSubtitle(
+  Map<String, dynamic> track, {
+  bool includeYear = true,
+  bool includeDuration = false,
+}) {
+  final parts = <String>[];
+  final artist = (track['channel'] ?? track['artist'] ?? track['author'])
+          ?.toString()
+          .trim() ??
+      '';
+  if (artist.isNotEmpty) parts.add(artist);
+
+  if (includeYear) {
+    final year = _extractReleaseYear(track);
+    if (year != null && year.isNotEmpty) parts.add(year);
+  }
+
+  if (includeDuration) {
+    final duration = _parseTrackInt(track['duration']);
+    if (duration > 0) parts.add(_formatDurationSeconds(duration));
+  }
+
+  return parts.join(' | ');
+}
+
 String _extractPrimaryArtist(dynamic rawTrack) {
   if (rawTrack is! Map) return '';
   final artists = rawTrack['artists'];
@@ -30,10 +101,43 @@ String _extractPrimaryArtist(dynamic rawTrack) {
 
 String? extractTrackId(dynamic track) {
   if (track is! Map) return null;
-  final value = track['id'] ?? track['videoId'] ?? track['video_id'];
+  final recordingId = track['musicbrainz_recording_id']?.toString().trim();
+  final value = track['track_key'] ??
+      (recordingId != null && recordingId.isNotEmpty
+          ? 'recording:$recordingId'
+          : null) ??
+      track['id'] ??
+      track['videoId'] ??
+      track['video_id'];
   final id = value?.toString();
   if (id == null || id.isEmpty) return null;
   return id;
+}
+
+String extractPlaybackProvider(dynamic track) {
+  if (track is! Map) return 'youtube';
+  final playback = track['playback'];
+  final value = playback is Map
+      ? playback['provider']
+      : track['source_provider'] ?? track['provider'];
+  final provider = value?.toString().trim().toLowerCase() ?? '';
+  if (provider == 'audius') return 'audius';
+  return 'youtube';
+}
+
+String? extractPlaybackSourceId(dynamic track) {
+  if (track is! Map) return null;
+  final playback = track['playback'];
+  final value = playback is Map
+      ? playback['source_id']
+      : track['playback_source_id'] ?? track['videoId'] ?? track['video_id'];
+  final sourceId = value?.toString().trim();
+  if (sourceId != null && sourceId.isNotEmpty) return sourceId;
+  final trackId = track['id']?.toString().trim() ?? '';
+  if (trackId.startsWith('audius:') && trackId.length > 'audius:'.length) {
+    return trackId.substring('audius:'.length);
+  }
+  return null;
 }
 
 List<String> extractTrackArtists(dynamic rawTrack) {
@@ -79,6 +183,8 @@ List<String> extractTrackArtists(dynamic rawTrack) {
 Map<String, dynamic> normalizeTrack(dynamic rawTrack) {
   final track = Map<String, dynamic>.from(rawTrack as Map);
   final id = extractTrackId(track);
+  final playbackSourceId = extractPlaybackSourceId(track);
+  final playbackProvider = extractPlaybackProvider(track);
   final title = _cleanTrackString(
     track['title'] ??
         track['name'] ??
@@ -98,7 +204,17 @@ Map<String, dynamic> normalizeTrack(dynamic rawTrack) {
   return {
     ...track,
     if (id != null) 'id': id,
-    if (id != null && track['videoId'] == null) 'videoId': id,
+    if (id != null) 'track_key': id,
+    if (playbackProvider == 'youtube' && playbackSourceId != null)
+      'videoId': playbackSourceId,
+    if (playbackSourceId != null)
+      'playback': {
+        ...?(track['playback'] is Map
+            ? Map<String, dynamic>.from(track['playback'] as Map)
+            : null),
+        'provider': playbackProvider,
+        'source_id': playbackSourceId,
+      },
     'title': title.isNotEmpty ? title : 'Unknown Track',
     'channel': channel,
     'author': channel,

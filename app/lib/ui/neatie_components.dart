@@ -73,6 +73,8 @@ class NeatieSurface extends StatelessWidget {
   final double radius;
   final Color color;
   final bool blur;
+  final bool bordered;
+  final bool elevated;
 
   const NeatieSurface({
     super.key,
@@ -85,6 +87,8 @@ class NeatieSurface extends StatelessWidget {
     this.radius = neatieRadiusLarge,
     this.color = neatieGlass,
     this.blur = true,
+    this.bordered = true,
+    this.elevated = true,
   });
 
   @override
@@ -97,14 +101,16 @@ class NeatieSurface extends StatelessWidget {
       decoration: BoxDecoration(
         color: color,
         borderRadius: BorderRadius.circular(radius),
-        border: Border.all(color: neatieStroke),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withValues(alpha: 0.34),
-            blurRadius: 34,
-            offset: const Offset(0, 18),
-          ),
-        ],
+        border: bordered ? Border.all(color: neatieStroke) : null,
+        boxShadow: elevated
+            ? [
+                BoxShadow(
+                  color: Colors.black.withValues(alpha: 0.34),
+                  blurRadius: 34,
+                  offset: const Offset(0, 18),
+                ),
+              ]
+            : const [],
       ),
       child: Material(
         color: Colors.transparent,

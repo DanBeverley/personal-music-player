@@ -514,6 +514,8 @@ class LibraryHistoryLane extends ConsumerWidget {
                 radius: 18,
                 color: Colors.white.withValues(alpha: 0.035),
                 blur: false,
+                bordered: false,
+                elevated: false,
                 padding: EdgeInsets.zero,
                 width: 132,
                 child: InkWell(
@@ -955,6 +957,8 @@ class SavedTracksSection extends ConsumerWidget {
                   radius: neatieRadiusMedium,
                   color: Colors.white.withValues(alpha: 0.035),
                   blur: false,
+                  bordered: false,
+                  elevated: false,
                   child: InkWell(
                       borderRadius: BorderRadius.circular(neatieRadiusMedium),
                       onTap: () async {

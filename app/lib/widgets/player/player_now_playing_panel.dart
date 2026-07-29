@@ -75,6 +75,8 @@ class PlayerNowPlayingPanel extends ConsumerWidget {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
+              const _PlayerHeaderLogo(),
+              const SizedBox(height: 14),
               _ArtworkStage(
                 playerState: playerState,
                 artworkSize: layout.artworkSize,
@@ -114,6 +116,27 @@ class PlayerNowPlayingPanel extends ConsumerWidget {
   }
 }
 
+class _PlayerHeaderLogo extends StatelessWidget {
+  const _PlayerHeaderLogo();
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Image.asset(
+        'assets/branding/neatie_3rd.png',
+        width: 34,
+        height: 26,
+        fit: BoxFit.contain,
+        errorBuilder: (_, __, ___) => const Icon(
+          Icons.graphic_eq_rounded,
+          color: Colors.white70,
+          size: 22,
+        ),
+      ),
+    );
+  }
+}
+
 class _ArtworkStage extends StatelessWidget {
   const _ArtworkStage({
     required this.playerState,
@@ -131,10 +154,8 @@ class _ArtworkStage extends StatelessWidget {
       child: Hero(
         tag: 'album_art_${playerState.currentTrackName}',
         child: Container(
-          padding: const EdgeInsets.all(6),
           decoration: BoxDecoration(
             borderRadius: BorderRadius.circular(radius),
-            border: Border.all(color: neatieHairline),
             boxShadow: [
               BoxShadow(
                 color: Colors.white.withValues(alpha: 0.08),
@@ -153,7 +174,7 @@ class _ArtworkStage extends StatelessWidget {
             videoId: playerState.videoId,
             width: artworkSize,
             height: artworkSize,
-            radius: radius - 7,
+            radius: radius,
           ),
         ),
       ),
@@ -161,13 +182,36 @@ class _ArtworkStage extends StatelessWidget {
   }
 }
 
-class _TrackIdentity extends ConsumerWidget {
+class _TrackIdentity extends ConsumerStatefulWidget {
   const _TrackIdentity({required this.playerState});
 
   final PlayerState playerState;
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<_TrackIdentity> createState() => _TrackIdentityState();
+}
+
+class _TrackIdentityState extends ConsumerState<_TrackIdentity> {
+  String? _optimisticTrackId;
+  bool? _optimisticSaved;
+
+  @override
+  Widget build(BuildContext context) {
+    final playerState = widget.playerState;
+    final trackId = playerState.videoId?.trim();
+    final libraryState = ref.watch(libraryProvider);
+    final librarySaved = libraryState.maybeWhen(
+      data: (tracks) => tracks.any(
+        (track) =>
+            extractTrackId(track) == trackId &&
+            track['is_liked_locally'] == true,
+      ),
+      orElse: () => false,
+    );
+    final isSaved =
+        _optimisticTrackId == trackId && _optimisticSaved != null
+            ? _optimisticSaved!
+            : librarySaved;
     return Row(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -202,25 +246,46 @@ class _TrackIdentity extends ConsumerWidget {
           ),
         ),
         IconButton(
-          onPressed: playerState.videoId == null
+          onPressed: trackId == null || trackId.isEmpty
               ? null
               : () {
+                  final nextSaved = !isSaved;
+                  setState(() {
+                    _optimisticTrackId = trackId;
+                    _optimisticSaved = nextSaved;
+                  });
+                  final updateFuture = nextSaved
+                      ? upsertCloudLibraryTrack({
+                          'id': trackId,
+                          'videoId': trackId,
+                          'title': playerState.currentTrackName,
+                          'artist': playerState.artist,
+                          'channel': playerState.artist,
+                          'thumbnail': playerState.thumbnail,
+                          'duration': playerState.duration,
+                        })
+                      : removeCloudLibraryTrack(trackId);
                   unawaited(
-                    upsertCloudLibraryTrack({
-                      'id': playerState.videoId,
-                      'videoId': playerState.videoId,
-                      'title': playerState.currentTrackName,
-                      'artist': playerState.artist,
-                      'channel': playerState.artist,
-                      'thumbnail': playerState.thumbnail,
-                      'duration': playerState.duration,
-                    }).then((_) => ref.invalidate(libraryProvider)),
+                    updateFuture.then((_) {
+                      ref.invalidate(libraryProvider);
+                      if (!mounted) return;
+                      setState(() {
+                        _optimisticSaved = null;
+                      });
+                    }).catchError((_) {
+                      if (!mounted) return;
+                      setState(() {
+                        _optimisticSaved = null;
+                      });
+                    }),
                   );
                 },
-          icon: const Icon(Icons.favorite_border_rounded),
+          icon: Icon(
+            isSaved ? Icons.favorite_rounded : Icons.favorite_border_rounded,
+          ),
           color: Colors.white,
           iconSize: 27,
-          tooltip: 'Save',
+          tooltip: isSaved ? 'Remove from liked songs' : 'Like',
         ),
       ],
     );

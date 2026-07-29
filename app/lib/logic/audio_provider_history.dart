@@ -3,7 +3,6 @@ import 'dart:async';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'auth_provider.dart' show authProvider, storageRefreshTickProvider;
-import 'audio_provider.dart' show audioPlayerProvider;
 import 'history_manager.dart';
 import 'track_hydration.dart';
 import 'track_metadata.dart';
@@ -44,12 +43,11 @@ class FrequentlyPlayedNotifier
       mounted && requestVersion == _requestVersion;
 
   Future<void> bootstrap() async {
-    await loadTracks(allowPrewarm: false);
+    await loadTracks();
   }
 
   Future<void> loadTracks({
     bool forceRefresh = false,
-    bool allowPrewarm = true,
   }) async {
     final requestVersion = ++_requestVersion;
     isLoading = true;
@@ -134,15 +132,6 @@ class FrequentlyPlayedNotifier
 
       if (!_isRequestCurrent(requestVersion)) return;
       state = resolved.take(8).toList(growable: false);
-      if (_isRequestCurrent(requestVersion) &&
-          allowPrewarm &&
-          state.isNotEmpty) {
-        unawaited(
-          ref.read(audioPlayerProvider.notifier).prewarmStreams(
-                state.take(6).map(extractTrackId),
-              ),
-        );
-      }
     } finally {
       if (_isRequestCurrent(requestVersion)) {
         isLoading = false;

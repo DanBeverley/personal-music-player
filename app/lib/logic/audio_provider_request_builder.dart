@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'auth_provider.dart' show authProvider;
@@ -117,6 +119,7 @@ Future<Map<String, dynamic>> buildRecommendationRequestBody(
   Set<String> avoidIds = const <String>{},
   RecommendationRequestMode requestMode = RecommendationRequestMode.launch,
   bool preferFreshRows = false,
+  String refreshToken = '',
   List<String> extraArtistHints = const <String>[],
   List<String> extraTasteQueries = const <String>[],
   List<String> extraSessionQueries = const <String>[],
@@ -240,7 +243,12 @@ Future<Map<String, dynamic>> buildRecommendationRequestBody(
     'force_refresh': behavior.forceRefresh,
     'prepare_next_session': behavior.prepareNextSession,
     'prefer_fresh_rows': behavior.preferFreshRows,
-    if (behavior.preferFreshRows)
+    'session_intent': extraArtistHints.isNotEmpty ||
+        extraTasteQueries.isNotEmpty ||
+        extraSessionQueries.isNotEmpty,
+    if (refreshToken.trim().isNotEmpty)
+      'refresh_token': refreshToken.trim()
+    else if (behavior.preferFreshRows)
       'refresh_token': DateTime.now().millisecondsSinceEpoch.toString(),
     if (seedIds.isNotEmpty) 'seed_id': seedIds.first,
     'seed_ids': seedIds.take(5).toList(growable: false),

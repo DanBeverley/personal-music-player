@@ -13,6 +13,7 @@ enum _TrackMenuAction {
   addToPlaylist,
   startStation,
   download,
+  removeFromFeed,
   details,
 }
 
@@ -188,6 +189,27 @@ Future<void> showTrackActionSheet({
                                 : 'Download started',
                           ),
                 ),
+                _TrackActionTile(
+                  icon: Icons.block_rounded,
+                  label: 'Remove from feed',
+                  enabled: videoId != null && videoId.isNotEmpty,
+                  onTap: videoId == null || videoId.isEmpty
+                      ? null
+                      : () => closeAndRun(
+                            () async {
+                              await recordProxyInteractionEvent(
+                                'remove_from_feed',
+                                trackId: videoId,
+                                rawTrack: normalizedTrack,
+                                metadata: const <String, dynamic>{
+                                  'reason': 'remove_from_feed',
+                                },
+                              );
+                              notifyRecommendationSignal('remove_from_feed');
+                            },
+                            message: 'Removed from future recommendations',
+                          ),
+                ),
                 Divider(
                   height: 1,
                   color: Colors.white.withValues(alpha: 0.08),
@@ -261,6 +283,24 @@ class _TrackMenuButtonState extends ConsumerState<TrackMenuButton> {
             );
           }
           return;
+        case _TrackMenuAction.removeFromFeed:
+          if (videoId == null || videoId.isEmpty) return;
+          await recordProxyInteractionEvent(
+            'remove_from_feed',
+            trackId: videoId,
+            rawTrack: normalizedTrack,
+            metadata: const <String, dynamic>{
+              'reason': 'remove_from_feed',
+            },
+          );
+          notifyRecommendationSignal('remove_from_feed');
+          if (context.mounted) {
+            _showTrackActionFeedback(
+              context,
+              'Removed from future recommendations',
+            );
+          }
+          return;
         case _TrackMenuAction.details:
           widget.onOpenDetails();
           return;
@@ -315,6 +355,15 @@ class _TrackMenuButtonState extends ConsumerState<TrackMenuButton> {
                     ? 'Downloaded'
                     : 'Download',
             muted: videoId == null || isDownloadActive,
+          ),
+        ),
+        PopupMenuItem<_TrackMenuAction>(
+          value: _TrackMenuAction.removeFromFeed,
+          enabled: videoId != null && videoId.isNotEmpty,
+          child: _TrackMenuPopupItem(
+            icon: Icons.block_rounded,
+            label: 'Remove from feed',
+            muted: videoId == null || videoId.isEmpty,
           ),
         ),
         PopupMenuItem<_TrackMenuAction>(

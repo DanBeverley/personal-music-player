@@ -16,6 +16,7 @@ dependencies:
   audio_service: ^0.18.18
   google_fonts: ^8.0.2
   cached_network_image: ^3.4.1
+  flutter_cache_manager: ^3.4.1
   just_audio: ^0.10.5
   image_picker: ^1.1.2
   file_picker: ^8.1.2
@@ -34,11 +35,12 @@ dev_dependencies:
 flutter:
   uses-material-design: true
   assets:
-    - assets/branding/neatie_app_icon.png
+    - assets/branding/neatie_3rd.png
     - assets/branding/neatie_login_wave_bg.png
-    - assets/branding/neatie_intro_mark.png
-    - assets/branding/neatie_intro_icon.png
 
 flutter_launcher_icons:
   android: true
-  image_path: assets/branding/neatie_app_icon.png
+  image_path: assets/branding/neatie_3rd.png
+  adaptive_icon_background: "#000000"
+  adaptive_icon_foreground: assets/branding/neatie_3rd.png
+  adaptive_icon_foreground_inset: 25

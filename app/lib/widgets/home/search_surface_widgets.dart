@@ -19,6 +19,7 @@ String _searchArtistIdentityKey(Map<String, dynamic> artist) {
       (artist['canonical_artist_id'] ?? artist['canonical_artist_key'] ?? '')
           .toString()
           .trim()
+          .toLowerCase();
   final musicBrainz = (artist['musicbrainz_artist_id'] ??
           artist['artist_mbid'] ??
           artist['mb_artist_id'] ??

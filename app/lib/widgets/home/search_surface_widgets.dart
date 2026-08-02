@@ -15,11 +15,14 @@ import 'neatie_home_sections.dart';
 import 'track_menu_button.dart';
 
 String _searchArtistIdentityKey(Map<String, dynamic> artist) {
-  final canonical = (artist['canonical_artist_id'] ?? '')
-      .toString()
-      .trim()
-      .toLowerCase();
-  final musicBrainz = (artist['musicbrainz_artist_id'] ?? '')
+  final canonical =
+      (artist['canonical_artist_id'] ?? artist['canonical_artist_key'] ?? '')
+          .toString()
+          .trim()
+  final musicBrainz = (artist['musicbrainz_artist_id'] ??
+          artist['artist_mbid'] ??
+          artist['mb_artist_id'] ??
+          '')
       .toString()
       .trim()
       .toLowerCase();
@@ -46,6 +49,16 @@ String _searchArtistIdentityKey(Map<String, dynamic> artist) {
       .trim()
       .toLowerCase();
   return 'name:$name';
+}
+
+String _searchAlbumIdentityKey(Map<String, dynamic> album) {
+  return (album['canonical_album_identity'] ??
+          album['id'] ??
+          '${album['title'] ?? album['name'] ?? ''}|'
+              '${album['artist'] ?? album['artist_name'] ?? ''}')
+      .toString()
+      .trim()
+      .toLowerCase();
 }
 
 class NeatieSearchMasthead extends StatelessWidget {
@@ -490,7 +503,8 @@ class NeatieSearchResultsSection extends StatelessWidget {
     required this.albums,
     required this.recentlyPlayedTracks,
     required this.similarArtists,
-    required this.artistWorks,
+    required this.artistTracks,
+    required this.artistAlbums,
     required this.similarTracks,
     required this.playlists,
     required this.errorMessage,
@@ -516,7 +530,8 @@ class NeatieSearchResultsSection extends StatelessWidget {
   final List<Map<String, dynamic>> albums;
   final List<Map<String, dynamic>> recentlyPlayedTracks;
   final List<Map<String, dynamic>> similarArtists;
-  final List<Map<String, dynamic>> artistWorks;
+  final List<Map<String, dynamic>> artistTracks;
+  final List<Map<String, dynamic>> artistAlbums;
   final List<Map<String, dynamic>> similarTracks;
   final List<Map<String, dynamic>> playlists;
   final String? errorMessage;
@@ -530,9 +545,23 @@ class NeatieSearchResultsSection extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final normalizedTab = selectedTab.toLowerCase();
-    final normalizedIntent = queryIntent.trim().toLowerCase();
-    final preferTrackTop = normalizedIntent == 'track' ||
-        (normalizedIntent == 'exact' && tracks.isNotEmpty);
+    final leadArtistName =
+        (leadArtist?['name'] ?? leadArtist?['artist'] ?? '').toString().trim();
+    final artistAlbumTitle = leadArtistName.isEmpty
+        ? 'Albums by this artist'
+        : 'Albums by $leadArtistName';
+    // Query albums and artist-discography albums have different contracts.
+    // Do not erase the query row merely because the same release also appears
+    // in the richer artist catalog.
+    final regularAlbums = albums;
+    final primaryTrackIds = tracks
+        .map(extractTrackId)
+        .whereType<String>()
+        .where((id) => id.isNotEmpty)
+        .toSet();
+    final additionalArtistTracks = artistTracks
+        .where((track) => !primaryTrackIds.contains(extractTrackId(track)))
+        .toList(growable: false);
     final sections = <Widget>[];
     if (normalizedTab == 'top') {
       final backendTopType =
@@ -541,31 +570,26 @@ class NeatieSearchResultsSection extends StatelessWidget {
       final backendTop = backendTopItem is Map
           ? Map<String, dynamic>.from(backendTopItem)
           : null;
-      final top = backendTopType == 'artist' && backendTop != null
-          ? _TopArtistResult(
-              artist: backendTop,
-              onTap: () => onOpenArtist(backendTop),
-            )
-          : backendTopType == 'track' && backendTop != null
-              ? _TopTrackResult(
-                  track: backendTop,
-                  onPlay: () => onPlayTrack(backendTop),
-                  onPrime: () => onPrimeTrack(backendTop),
-                  onOpen: () => onOpenTrack(backendTop),
-                )
-              : preferTrackTop && tracks.isNotEmpty
-                  ? _TopTrackResult(
-                      track: tracks.first,
-                      onPlay: () => onPlayTrack(tracks.first),
-                      onPrime: () => onPrimeTrack(tracks.first),
-                      onOpen: () => onOpenTrack(tracks.first),
-                    )
-                  : artists.isNotEmpty
-                      ? _TopArtistResult(
-                          artist: artists.first,
-                          onTap: () => onOpenArtist(artists.first),
-                        )
-                      : null;
+      Widget? top;
+      if (backendTopType == 'artist' && backendTop != null) {
+        top = _TopArtistResult(
+          artist: backendTop,
+          onTap: () => onOpenArtist(backendTop),
+        );
+      } else if (backendTopType == 'track' && backendTop != null) {
+        top = _TopTrackResult(
+          track: backendTop,
+          onPlay: () => onPlayTrack(backendTop),
+          onPrime: () => onPrimeTrack(backendTop),
+          onOpen: () => onOpenTrack(backendTop),
+        );
+      } else if (backendTopType == 'album' && backendTop != null) {
+        top = _TaggedEntityResult(
+          item: backendTop,
+          tag: 'Album',
+          onTap: () => onOpenAlbum(backendTop),
+        );
+      }
       if (top != null) sections.add(top);
       if (leadArtist != null &&
           !(backendTopType == 'artist' &&
@@ -579,7 +603,11 @@ class NeatieSearchResultsSection extends StatelessWidget {
           ),
         );
       }
-      if (containingAlbum != null) {
+      if (containingAlbum != null &&
+          !(backendTopType == 'album' &&
+              backendTop != null &&
+              _searchAlbumIdentityKey(backendTop) ==
+                  _searchAlbumIdentityKey(containingAlbum!))) {
         sections.add(
           _TaggedEntityResult(
             item: containingAlbum!,
@@ -625,26 +653,29 @@ class NeatieSearchResultsSection extends StatelessWidget {
             appendedItemKeys: appendedItemKeys,
             onOpen: onOpenArtist));
       }
-      if (similarArtists.isNotEmpty) {
-        sections.add(_SearchArtistSection(
-            title: 'Related artists',
-            artists: similarArtists,
-            appendedItemKeys: appendedItemKeys,
-            onOpen: onOpenArtist));
-      }
-      if (albums.isNotEmpty) {
+      if (artistAlbums.isNotEmpty) {
         sections.add(_SearchAlbumSection(
-            albums: albums,
+            title: artistAlbumTitle,
+            albums: artistAlbums,
             appendedItemKeys: appendedItemKeys,
             onOpen: onOpenAlbum));
       }
-      if (artistWorks.isNotEmpty) {
-        sections.add(_ArtistWorksSection(
-            works: artistWorks,
-            onPlayTrack: onPlayTrack,
-            onPrimeTrack: onPrimeTrack,
-            onOpenTrack: onOpenTrack,
-            onOpenAlbum: onOpenAlbum));
+      if (regularAlbums.isNotEmpty) {
+        sections.add(_SearchAlbumSection(
+            albums: regularAlbums,
+            appendedItemKeys: appendedItemKeys,
+            onOpen: onOpenAlbum));
+      }
+      if (additionalArtistTracks.isNotEmpty) {
+        sections.add(_SearchTrackSection(
+          title: leadArtistName.isEmpty
+              ? 'More from this artist'
+              : 'More from $leadArtistName',
+          tracks: additionalArtistTracks,
+          onPlay: onPlayTrack,
+          onPrime: onPrimeTrack,
+          onOpen: onOpenTrack,
+        ));
       }
       if (similarTracks.isNotEmpty) {
         sections.add(_SearchTrackSection(
@@ -659,6 +690,14 @@ class NeatieSearchResultsSection extends StatelessWidget {
             playlists: playlists,
             appendedItemKeys: appendedItemKeys,
             onOpen: onOpenPlaylist));
+      }
+      if (similarArtists.isNotEmpty) {
+        sections.add(_SearchArtistSection(
+            title: 'Related artists',
+            artists: similarArtists,
+            appendedItemKeys: appendedItemKeys,
+            animateSection: true,
+            onOpen: onOpenArtist));
       }
     } else if (normalizedTab == 'songs') {
       if (tracks.isNotEmpty) {
@@ -679,9 +718,16 @@ class NeatieSearchResultsSection extends StatelessWidget {
             onOpen: onOpenTrack));
       }
     } else if (normalizedTab == 'albums') {
-      if (albums.isNotEmpty) {
+      if (artistAlbums.isNotEmpty) {
         sections.add(_SearchAlbumSection(
-            albums: albums,
+            title: artistAlbumTitle,
+            albums: artistAlbums,
+            appendedItemKeys: appendedItemKeys,
+            onOpen: onOpenAlbum));
+      }
+      if (regularAlbums.isNotEmpty) {
+        sections.add(_SearchAlbumSection(
+            albums: regularAlbums,
             appendedItemKeys: appendedItemKeys,
             onOpen: onOpenAlbum));
       }
@@ -693,20 +739,31 @@ class NeatieSearchResultsSection extends StatelessWidget {
             appendedItemKeys: appendedItemKeys,
             onOpen: onOpenArtist));
       }
+      if (artistAlbums.isNotEmpty) {
+        sections.add(_SearchAlbumSection(
+            title: artistAlbumTitle,
+            albums: artistAlbums,
+            appendedItemKeys: appendedItemKeys,
+            onOpen: onOpenAlbum));
+      }
+      if (artistTracks.isNotEmpty) {
+        sections.add(_SearchTrackSection(
+          title: leadArtistName.isEmpty
+              ? 'Artist works'
+              : 'Works by $leadArtistName',
+          tracks: artistTracks,
+          onPlay: onPlayTrack,
+          onPrime: onPrimeTrack,
+          onOpen: onOpenTrack,
+        ));
+      }
       if (similarArtists.isNotEmpty) {
         sections.add(_SearchArtistSection(
             title: 'Related artists',
             artists: similarArtists,
             appendedItemKeys: appendedItemKeys,
+            animateSection: true,
             onOpen: onOpenArtist));
-      }
-      if (artistWorks.isNotEmpty) {
-        sections.add(_ArtistWorksSection(
-            works: artistWorks,
-            onPlayTrack: onPlayTrack,
-            onPrimeTrack: onPrimeTrack,
-            onOpenTrack: onOpenTrack,
-            onOpenAlbum: onOpenAlbum));
       }
     } else {
       if (playlists.isNotEmpty) {
@@ -769,7 +826,10 @@ class _SearchAppendAnimation extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    if (!animate) return child;
+    final mediaQuery = MediaQuery.maybeOf(context);
+    final reduceMotion = mediaQuery?.disableAnimations == true ||
+        mediaQuery?.accessibleNavigation == true;
+    if (!animate || reduceMotion) return child;
     final delayMs = (order % 6) * 28;
     final totalMs = 260 + delayMs;
     return TweenAnimationBuilder<double>(
@@ -805,7 +865,12 @@ class _SearchPlaylistSection extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    if (playlists.isEmpty) return const SizedBox.shrink();
+    final visiblePlaylists = playlists
+        .where((playlist) => preferredArtworkUrl(
+              playlist['thumbnail']?.toString(),
+            ).isNotEmpty)
+        .toList(growable: false);
+    if (visiblePlaylists.isEmpty) return const SizedBox.shrink();
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -819,9 +884,9 @@ class _SearchPlaylistSection extends StatelessWidget {
               crossAxisSpacing: 14,
               childAspectRatio: 0.78,
             ),
-            itemCount: playlists.length,
+            itemCount: visiblePlaylists.length,
             itemBuilder: (context, index) {
-              final playlist = playlists[index];
+              final playlist = visiblePlaylists[index];
               final count = (playlist['track_count'] as num?)?.toInt() ?? 0;
               final key = (playlist['id'] ?? playlist['name'] ?? '').toString();
               return _SearchAppendAnimation(
@@ -1207,17 +1272,24 @@ class _SearchArtistSection extends StatelessWidget {
     required this.artists,
     required this.onOpen,
     this.appendedItemKeys = const {},
+    this.animateSection = false,
   });
 
   final String title;
   final List<Map<String, dynamic>> artists;
   final ValueChanged<Map<String, dynamic>> onOpen;
   final Set<String> appendedItemKeys;
+  final bool animateSection;
 
   @override
   Widget build(BuildContext context) {
     if (artists.isEmpty) return const SizedBox.shrink();
-    return Column(
+    final allItemsWereAppended = artists.every(
+      (artist) => appendedItemKeys.contains(
+        'artists:${_searchArtistIdentityKey(artist)}',
+      ),
+    );
+    final section = Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         _SearchSectionTitle(title),
@@ -1267,63 +1339,11 @@ class _SearchArtistSection extends StatelessWidget {
         ),
       ],
     );
-  }
-}
-
-class _ArtistWorksSection extends StatelessWidget {
-  const _ArtistWorksSection({
-    required this.works,
-    required this.onPlayTrack,
-    required this.onPrimeTrack,
-    required this.onOpenTrack,
-    required this.onOpenAlbum,
-  });
-
-  final List<Map<String, dynamic>> works;
-  final ValueChanged<Map<String, dynamic>> onPlayTrack;
-  final ValueChanged<Map<String, dynamic>> onPrimeTrack;
-  final ValueChanged<Map<String, dynamic>> onOpenTrack;
-  final ValueChanged<Map<String, dynamic>> onOpenAlbum;
-
-  bool _isAlbum(Map<String, dynamic> work) {
-    final type = (work['entity_type'] ?? work['type'] ?? work['kind'])
-        ?.toString()
-        .toLowerCase();
-    final hasTrackShape = work['videoId'] != null ||
-        work['video_id'] != null ||
-        work['channel'] != null ||
-        work['author'] != null ||
-        work['duration'] != null;
-    return type == 'album' ||
-        work['browseId'] != null ||
-        work['album_id'] != null ||
-        (!hasTrackShape && work['artist'] != null && work['title'] != null);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    if (works.isEmpty) return const SizedBox.shrink();
-    final albums = works.where(_isAlbum).toList(growable: false);
-    final tracks =
-        works.where((work) => !_isAlbum(work)).toList(growable: false);
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        if (tracks.isNotEmpty)
-          _SearchTrackSection(
-            title: 'Artist works',
-            tracks: tracks,
-            onPlay: onPlayTrack,
-            onPrime: onPrimeTrack,
-            onOpen: onOpenTrack,
-          ),
-        if (albums.isNotEmpty)
-          _SearchAlbumSection(
-            title: tracks.isEmpty ? 'Artist works' : 'Albums by these artists',
-            albums: albums,
-            onOpen: onOpenAlbum,
-          ),
-      ],
+    return _SearchAppendAnimation(
+      key: ValueKey('artist-section:$title'),
+      animate: animateSection && allItemsWereAppended,
+      order: 0,
+      child: section,
     );
   }
 }
@@ -1343,7 +1363,12 @@ class _SearchAlbumSection extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    if (albums.isEmpty) return const SizedBox.shrink();
+    final visibleAlbums = albums
+        .where((album) => preferredArtworkUrl(
+              album['thumbnail']?.toString(),
+            ).isNotEmpty)
+        .toList(growable: false);
+    if (visibleAlbums.isEmpty) return const SizedBox.shrink();
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -1357,12 +1382,10 @@ class _SearchAlbumSection extends StatelessWidget {
               crossAxisSpacing: 14,
               childAspectRatio: 0.72,
             ),
-            itemCount: albums.length,
+            itemCount: visibleAlbums.length,
             itemBuilder: (context, index) {
-              final album = albums[index];
-              final key =
-                  (album['id'] ?? '${album['title']}|${album['artist']}')
-                      .toString();
+              final album = visibleAlbums[index];
+              final key = _searchAlbumIdentityKey(album);
               return _SearchAppendAnimation(
                 key: ValueKey('album:$key'),
                 animate: appendedItemKeys.contains('albums:$key'),

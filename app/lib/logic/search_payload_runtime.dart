@@ -211,16 +211,6 @@ Future<Map<String, dynamic>> buildSemanticSearchRequestBody(
   };
 }
 
-class _CachedSearchPayload {
-  final Map<String, dynamic> payload;
-  final DateTime storedAt;
-
-  const _CachedSearchPayload({
-    required this.payload,
-    required this.storedAt,
-  });
-}
-
 class SearchFetchResult {
   final Map<String, dynamic>? payload;
   final String status;
@@ -235,26 +225,14 @@ class SearchFetchResult {
   bool get hasPayload => payload != null;
 }
 
-final Map<String, _CachedSearchPayload> _searchPayloadCache =
-    <String, _CachedSearchPayload>{};
-final Map<String, Map<String, dynamic>> _searchSelectionOverrides =
-    <String, Map<String, dynamic>>{};
-final Map<String, Future<SearchFetchResult>> _searchPayloadForegroundInflight =
+final Map<String, Future<SearchFetchResult>> _searchPayloadInflight =
     <String, Future<SearchFetchResult>>{};
-final Map<String, Future<SearchFetchResult>> _searchPayloadBackgroundInflight =
-    <String, Future<SearchFetchResult>>{};
-const Duration _searchCacheFreshTtl = Duration(minutes: 4);
-const Duration _searchCacheMaxTtl = Duration(minutes: 12);
-
-void invalidateSearchPayloadCache() {
-  _searchPayloadCache.clear();
-}
 
 Future<T> _runSearchRequest<T>(Future<T> future, Duration timeout) {
   return runSearchRequest(future, timeout);
 }
 
-String _searchPayloadCacheKey(
+String _searchRequestKey(
   ProviderReader read,
   String query, {
   required int limit,
@@ -270,156 +248,11 @@ String _searchPayloadCacheKey(
   return '$storageScopeId|$limit|$normalizedQuery|${deferSideSurfaces ? 'tracks_first' : 'full'}|$normalizedSearchMode|$resultType|$offset';
 }
 
-String _searchSelectionKey(ProviderReader read, String query) {
-  final normalizedQuery = query.trim().toLowerCase();
-  final storageScopeId = read(authProvider).storageScopeId;
-  return '$storageScopeId|$normalizedQuery';
-}
-
-void rememberSearchSelectionOverride(
-  ProviderReader read,
-  String query, {
-  required String entityType,
-  required Map<String, dynamic> item,
-}) {
-  final normalizedQuery = query.trim();
-  if (normalizedQuery.isEmpty || item.isEmpty) return;
-  final key = _searchSelectionKey(read, normalizedQuery);
-  _searchSelectionOverrides[key] = <String, dynamic>{
-    'entity_type': entityType,
-    'item': entityType == 'track'
-        ? normalizeTrack(Map<String, dynamic>.from(item))
-        : Map<String, dynamic>.from(item),
-    'selected_at': DateTime.now().millisecondsSinceEpoch,
-  };
-  if (_searchSelectionOverrides.length > 48) {
-    final entries = _searchSelectionOverrides.entries.toList()
-      ..sort((a, b) {
-        final aAt = (a.value['selected_at'] as num?)?.toInt() ?? 0;
-        final bAt = (b.value['selected_at'] as num?)?.toInt() ?? 0;
-        return aAt.compareTo(bAt);
-      });
-    for (final entry in entries.take(_searchSelectionOverrides.length - 36)) {
-      _searchSelectionOverrides.remove(entry.key);
-    }
-  }
-}
-
-List<Map<String, dynamic>> _promoteSelectedTrack(
-  List<dynamic>? values,
-  Map<String, dynamic> selected,
-) {
-  final selectedId = extractTrackId(selected);
-  final selectedTitle = selected['title']?.toString().trim().toLowerCase();
-  final selectedArtist =
-      (selected['artist'] ?? selected['channel'] ?? selected['author'])
-          ?.toString()
-          .trim()
-          .toLowerCase();
-  final promoted = <Map<String, dynamic>>[
-    normalizeTrack(Map<String, dynamic>.from(selected)),
-  ];
-  for (final value in values ?? const []) {
-    if (value is! Map) continue;
-    final track = normalizeTrack(Map<String, dynamic>.from(value));
-    final trackId = extractTrackId(track);
-    final title = track['title']?.toString().trim().toLowerCase();
-    final artist = (track['artist'] ?? track['channel'] ?? track['author'])
-        ?.toString()
-        .trim()
-        .toLowerCase();
-    final sameId =
-        selectedId != null && selectedId.isNotEmpty && selectedId == trackId;
-    final sameEntity = selectedTitle != null &&
-        selectedTitle.isNotEmpty &&
-        selectedTitle == title &&
-        selectedArtist != null &&
-        selectedArtist.isNotEmpty &&
-        selectedArtist == artist;
-    if (!sameId && !sameEntity) promoted.add(track);
-  }
-  return promoted;
-}
-
-Map<String, dynamic> _applySearchSelectionOverride(
-  ProviderReader read,
-  String query,
-  Map<String, dynamic> payload,
-) {
-  final override = _searchSelectionOverrides[_searchSelectionKey(read, query)];
-  if (override == null) return Map<String, dynamic>.from(payload);
-  final entityType = override['entity_type']?.toString();
-  final item = override['item'];
-  if (item is! Map) return Map<String, dynamic>.from(payload);
-  final result = Map<String, dynamic>.from(payload);
-  final selected = Map<String, dynamic>.from(item);
-  if (entityType == 'track') {
-    final promotedTracks =
-        _promoteSelectedTrack(result['tracks'] as List?, selected);
-    result['tracks'] = promotedTracks;
-    result['results'] =
-        _promoteSelectedTrack(result['results'] as List?, selected);
-    result['top_result'] = <String, dynamic>{
-      'entity_type': 'track',
-      'item': promotedTracks.first,
-      'source': 'local_selection_override',
-    };
-  } else {
-    result['top_result'] = <String, dynamic>{
-      'entity_type': entityType ?? 'unknown',
-      'item': selected,
-      'source': 'local_selection_override',
-    };
-  }
-  final diagnostics = Map<String, dynamic>.from(
-    (result['diagnostics'] as Map?) ?? const <String, dynamic>{},
-  );
-  diagnostics['local_selection_override'] = true;
-  result['diagnostics'] = diagnostics;
-  return result;
-}
-
-void _storeSearchPayloadCache(
-  String cacheKey,
-  Map<String, dynamic> payload,
-) {
-  _searchPayloadCache[cacheKey] = _CachedSearchPayload(
-    payload: Map<String, dynamic>.from(payload),
-    storedAt: DateTime.now(),
-  );
-  if (_searchPayloadCache.length > 36) {
-    final oldestEntries = _searchPayloadCache.entries.toList()
-      ..sort((a, b) => a.value.storedAt.compareTo(b.value.storedAt));
-    for (final entry in oldestEntries.take(_searchPayloadCache.length - 24)) {
-      _searchPayloadCache.remove(entry.key);
-    }
-  }
-}
-
-_CachedSearchPayload? _lookupSearchPayloadCache(
-  String cacheKey, {
-  bool allowStale = false,
-}) {
-  final cached = _searchPayloadCache[cacheKey];
-  if (cached == null) return null;
-  final age = DateTime.now().difference(cached.storedAt);
-  final ttl = allowStale ? _searchCacheMaxTtl : _searchCacheFreshTtl;
-  if (age > ttl) {
-    if (allowStale) {
-      _searchPayloadCache.remove(cacheKey);
-    }
-    return null;
-  }
-  return cached;
-}
-
 Future<SearchFetchResult> fetchSearchPayload(
   ProviderReader read,
   String query, {
   required int limit,
   required Duration timeout,
-  bool preferCache = true,
-  bool backgroundRefresh = false,
   bool deferSideSurfaces = false,
   String searchMode = '',
   String resultType = '',
@@ -432,7 +265,7 @@ Future<SearchFetchResult> fetchSearchPayload(
   final normalizedSearchMode = searchMode.isNotEmpty
       ? searchMode
       : classifySearchQueryMode(normalizedQuery);
-  final cacheKey = _searchPayloadCacheKey(
+  final requestKey = _searchRequestKey(
     read,
     normalizedQuery,
     limit: limit,
@@ -441,48 +274,7 @@ Future<SearchFetchResult> fetchSearchPayload(
     resultType: resultType,
     offset: offset,
   );
-  final freshCached = _lookupSearchPayloadCache(cacheKey);
-  if (preferCache && freshCached != null && !backgroundRefresh) {
-    return SearchFetchResult(
-      status: 'cache_hit',
-      payload: _applySearchSelectionOverride(
-        read,
-        normalizedQuery,
-        freshCached.payload,
-      ),
-    );
-  }
-  if (!backgroundRefresh) {
-    final staleCached = _lookupSearchPayloadCache(cacheKey, allowStale: true);
-    if (staleCached != null) {
-      unawaited(
-        fetchSearchPayload(
-          read,
-          normalizedQuery,
-          limit: limit,
-          timeout: timeout,
-          preferCache: false,
-          backgroundRefresh: true,
-          deferSideSurfaces: deferSideSurfaces,
-          searchMode: normalizedSearchMode,
-          resultType: resultType,
-          offset: offset,
-        ),
-      );
-      return SearchFetchResult(
-        status: 'stale_cache',
-        payload: _applySearchSelectionOverride(
-          read,
-          normalizedQuery,
-          staleCached.payload,
-        ),
-      );
-    }
-  }
-  final inflightMap = backgroundRefresh
-      ? _searchPayloadBackgroundInflight
-      : _searchPayloadForegroundInflight;
-  final inflight = inflightMap[cacheKey];
+  final inflight = _searchPayloadInflight[requestKey];
   if (inflight != null) {
     return inflight;
   }
@@ -507,68 +299,24 @@ Future<SearchFetchResult> fetchSearchPayload(
         timeout,
       );
       if (timedResponse.statusCode != 200) {
-        if (!backgroundRefresh) {
-          final staleCached =
-              _lookupSearchPayloadCache(cacheKey, allowStale: true);
-          if (staleCached != null) {
-            return SearchFetchResult(
-              status: 'stale_cache',
-              payload: _applySearchSelectionOverride(
-                read,
-                normalizedQuery,
-                staleCached.payload,
-              ),
-              statusCode: timedResponse.statusCode,
-            );
-          }
-        }
         return SearchFetchResult(
           status: 'http_error',
           statusCode: timedResponse.statusCode,
         );
       }
       final payload = jsonDecode(timedResponse.body) as Map<String, dynamic>;
-      _storeSearchPayloadCache(cacheKey, payload);
       return SearchFetchResult(
         status: 'network_success',
-        payload: _applySearchSelectionOverride(read, normalizedQuery, payload),
+        payload: payload,
       );
     } on TimeoutException {
-      if (!backgroundRefresh) {
-        final staleCached =
-            _lookupSearchPayloadCache(cacheKey, allowStale: true);
-        if (staleCached != null) {
-          return SearchFetchResult(
-            status: 'stale_cache',
-            payload: _applySearchSelectionOverride(
-              read,
-              normalizedQuery,
-              staleCached.payload,
-            ),
-          );
-        }
-      }
       return const SearchFetchResult(status: 'timeout');
     } catch (_) {
-      if (!backgroundRefresh) {
-        final staleCached =
-            _lookupSearchPayloadCache(cacheKey, allowStale: true);
-        if (staleCached != null) {
-          return SearchFetchResult(
-            status: 'stale_cache',
-            payload: _applySearchSelectionOverride(
-              read,
-              normalizedQuery,
-              staleCached.payload,
-            ),
-          );
-        }
-      }
       return const SearchFetchResult(status: 'exception');
     } finally {
-      inflightMap.remove(cacheKey);
+      _searchPayloadInflight.remove(requestKey);
     }
   }();
-  inflightMap[cacheKey] = requestFuture;
+  _searchPayloadInflight[requestKey] = requestFuture;
   return requestFuture;
 }

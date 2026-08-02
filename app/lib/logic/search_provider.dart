@@ -423,6 +423,13 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
   String _currentQuery = '';
   static const Duration _searchDebounce = Duration.zero;
   static const Duration _searchTimeout = Duration(seconds: 15);
+  static const List<Duration> _progressiveRefreshDelays = <Duration>[
+    Duration(milliseconds: 700),
+    Duration(milliseconds: 1100),
+    Duration(milliseconds: 1700),
+    Duration(milliseconds: 2500),
+    Duration(milliseconds: 3500),
+  ];
 
   SearchPageNotifier(this.ref) : super(const SearchPageState());
 
@@ -456,10 +463,7 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
         state = nextState.copyWith(
           requestState: 'complete',
           clearError: true,
-          diagnostics: <String, dynamic>{
-            ...nextState.diagnostics,
-            'single_search_response': true,
-          },
+          diagnostics: nextState.diagnostics,
         );
         debugProxyLog(
           'search',
@@ -478,6 +482,14 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
             searchScope: 'search_page',
           ),
         );
+        if (_artistSurfaceNeedsRefresh()) {
+          unawaited(
+            _refreshPendingArtistSurface(
+              query: normalizedQuery,
+              requestVersion: requestVersion,
+            ),
+          );
+        }
       } else {
         final errorMessage = fetchResult.status == 'timeout'
             ? searchTimeoutMessage
@@ -515,6 +527,40 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
         isLoading = false;
         state = state.copyWith();
       }
+    }
+  }
+
+  bool _artistSurfaceNeedsRefresh() {
+    final pendingSurfaces = state.diagnostics['search_pending_surfaces'];
+    if (pendingSurfaces is List &&
+        pendingSurfaces.any((surface) => surface.toString() == 'artists')) {
+      return true;
+    }
+    final artworkPending =
+        (state.diagnostics['artist_artwork_pending'] as num?)?.toInt() ?? 0;
+    if (artworkPending > 0) return true;
+    final artistsPage = state.pagination['artists'];
+    return artistsPage is Map && artistsPage['deferred_expansion'] == true;
+  }
+
+  Future<void> _refreshPendingArtistSurface({
+    required String query,
+    required int requestVersion,
+  }) async {
+    for (final delay in _progressiveRefreshDelays) {
+      if (requestVersion != _requestVersion ||
+          query != _currentQuery ||
+          !_artistSurfaceNeedsRefresh()) {
+        return;
+      }
+      await Future<void>.delayed(delay);
+      if (requestVersion != _requestVersion || query != _currentQuery) return;
+      await loadMore(
+        'artists',
+        expectedQuery: query,
+        expectedRequestVersion: requestVersion,
+        refreshVisiblePage: true,
+      );
     }
   }
 
@@ -563,7 +609,6 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
         submittedQuery,
         limit: 16,
         timeout: _searchTimeout,
-        preferCache: false,
         deferSideSurfaces: false,
         resultType: normalizedSurface,
         offset: offset,
@@ -645,8 +690,12 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
           ? appendArtists(state.artists, next.artists)
           : state.artists;
       Map<String, dynamic>? refreshedTopResult = state.topResult;
+      final incomingTopResult = next.topResult;
       final currentTopItem = state.topResult?['item'];
       if (normalizedSurface == 'artists' &&
+          incomingTopResult?['entity_type']?.toString() == 'artist') {
+        refreshedTopResult = incomingTopResult;
+      } else if (normalizedSurface == 'artists' &&
           state.topResult?['entity_type']?.toString() == 'artist' &&
           currentTopItem is Map) {
         final currentTop = Map<String, dynamic>.from(currentTopItem);
@@ -681,6 +730,9 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
         if (next.pagination[normalizedSurface] != null)
           normalizedSurface: next.pagination[normalizedSurface],
       };
+      final previousSnapshotRevision =
+          (state.diagnostics['search_snapshot_revision'] as num?)?.toInt() ??
+              0;
       state = state.copyWith(
         tracks: normalizedSurface == 'tracks'
             ? appendUnique(
@@ -736,7 +788,33 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
         containingAlbum: state.containingAlbum ?? next.containingAlbum,
         pagination: nextPagination,
         appendedItemKeys: appendedKeys,
+        diagnostics: <String, dynamic>{
+          ...state.diagnostics,
+          ...next.diagnostics,
+        },
       );
+      if (normalizedSurface == 'artists') {
+        final snapshotRevision =
+            (state.diagnostics['search_snapshot_revision'] as num?)?.toInt() ??
+                0;
+        if (snapshotRevision > previousSnapshotRevision) {
+          final primaryTrackIds = state.tracks
+              .map(extractTrackId)
+              .whereType<String>()
+              .where((id) => id.isNotEmpty)
+              .toSet();
+          final visibleMoreCount = state.artistTracks
+              .where(
+                (track) =>
+                    !primaryTrackIds.contains(extractTrackId(track)),
+              )
+              .length;
+          debugProxyLog(
+            'search',
+            'progressive refresh query="$submittedQuery" snapshot_revision=$snapshotRevision visible_related=${state.similarArtists.length} artist_tracks=${state.artistTracks.length} visible_more=$visibleMoreCount artist_albums=${state.artistAlbums.length} query_albums=${state.albums.length} playlists=${state.playlists.length}',
+          );
+        }
+      }
     } finally {
       state = state.copyWith(
         loadingSurfaces: state.loadingSurfaces.difference({normalizedSurface}),

@@ -59,7 +59,7 @@ class ArtistArtwork extends StatelessWidget {
       width: width,
       height: height,
       radius: 0,
-      fit: BoxFit.contain,
+      fit: BoxFit.cover,
       heroTag: heroTag,
       expandForeground: false,
       showBorder: false,

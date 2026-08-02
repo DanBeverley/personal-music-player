@@ -1133,12 +1133,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         ? _submittedSearchQuery.trim()
         : _urlController.text.trim();
     if (query.isEmpty || item.isEmpty) return;
-    rememberSearchSelectionOverride(
-      ref.read,
-      query,
-      entityType: entityType,
-      item: item,
-    );
     if (entityType == 'track') {
       await recordRecentSearchPick(query, item);
       if (mounted) {
@@ -1202,7 +1196,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       confidence: 0.86,
     );
     await _openArtist(artist);
-    invalidateSearchPayloadCache();
     if (mounted) {
       await ref
           .read(searchPageProvider.notifier)
@@ -1791,10 +1784,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     final searchPage = ref.watch(searchPageProvider);
     final playlists = ref.watch(playlistProvider);
     final isSearchLoading = ref.watch(searchPageProvider.notifier).isLoading;
-    final displaySearchTracks = _dedupeTracks([
-      ...searchPage.tracks,
-      ...searchPage.artistTracks,
-    ]);
+    final displaySearchTracks = _dedupeTracks(searchPage.tracks);
     final fallbackAlbums = _isSearching
         ? _deriveAlbumsFromTracks(displaySearchTracks)
         : const <Map<String, dynamic>>[];
@@ -2047,10 +2037,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                         albums: displayAlbums,
                         recentlyPlayedTracks: lastPlayedTracks,
                         similarArtists: searchPage.similarArtists,
-                        artistWorks: <Map<String, dynamic>>[
-                          ...searchPage.artistTracks,
-                          ...searchPage.artistAlbums,
-                        ],
+                        artistTracks: searchPage.artistTracks,
+                        artistAlbums: searchPage.artistAlbums,
                         similarTracks: similarTracks,
                         playlists: matchingPlaylists,
                         errorMessage: searchPage.errorMessage,

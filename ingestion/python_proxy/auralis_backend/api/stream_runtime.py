@@ -18,6 +18,7 @@ from .stream_cache import (
     should_cache_full_response,
 )
 from .stream_core_runtime import (
+    _ytdlp_opts,
     classify_stream_failure,
     get_cached_stream_chunk,
     get_stream_info,
@@ -292,7 +293,7 @@ def download_audio(server: Any, req: Any):
             pass
 
     if os.path.exists(out_path):
-        ydl_opts = {"quiet": True, "no_warnings": True}
+        ydl_opts = _ytdlp_opts(server)
         url = f"https://www.youtube.com/watch?v={req.video_id}"
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             try:
@@ -316,15 +317,13 @@ def download_audio(server: Any, req: Any):
                 raise HTTPException(status_code=500, detail=str(exc))
 
     ydl_opts = {
-        "format": "bestaudio/best",
+        **_ytdlp_opts(server),
         "outtmpl": os.path.join(server.DOWNLOAD_DIR, f"{req.video_id}.%(ext)s"),
         "postprocessors": [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",
             "preferredquality": "192",
         }],
-        "quiet": False,
-        "no_warnings": True,
     }
 
     url = f"https://www.youtube.com/watch?v={req.video_id}"

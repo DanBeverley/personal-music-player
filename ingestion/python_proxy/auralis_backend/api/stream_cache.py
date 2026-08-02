@@ -225,6 +225,7 @@ class R2StreamCache(StreamCacheBackend):
 
 
 def get_stream_cache(server: Any) -> StreamCacheBackend:
+    server = getattr(server, "raw", server)
     key = id(server)
     cached = _STREAM_CACHE_CLIENTS.get(key)
     if cached is not None:

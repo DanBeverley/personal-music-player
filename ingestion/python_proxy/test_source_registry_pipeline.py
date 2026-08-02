@@ -336,7 +336,7 @@ def test_only_the_bounded_shortlist_is_verified() -> None:
     assert len(resolved.pools["similarity"]) == 3
 
 
-def test_adaptive_scheduler_verifies_more_than_sixteen_across_pools() -> None:
+def test_adaptive_scheduler_caps_each_background_cycle_at_sixteen() -> None:
     supply = MaterializedCandidateSupply(
         pools={
             "similarity": [_track(index) for index in range(0, 20)],
@@ -377,15 +377,15 @@ def test_adaptive_scheduler_verifies_more_than_sixteen_across_pools() -> None:
             _taste(),
         )
 
-    assert resolved.diagnostics["source_verification_limit"] == 32
-    assert resolved.diagnostics["source_verification_attempted"] == 32
+    assert resolved.diagnostics["source_verification_limit"] == 16
+    assert resolved.diagnostics["source_verification_attempted"] == 16
     assert resolved.diagnostics["source_verification_attempted_by_pool"] == {
-        "similarity": 8,
-        "artist_graph": 8,
-        "profile_spine": 8,
-        "genre_mood": 8,
+        "similarity": 4,
+        "artist_graph": 4,
+        "profile_spine": 4,
+        "genre_mood": 4,
     }
-    assert verifier.call_count == 32
+    assert verifier.call_count == 16
 
 
 def test_source_lookup_misses_are_replaced_in_the_same_cycle() -> None:
@@ -558,6 +558,43 @@ def test_two_bot_challenges_open_the_circuit_and_stop_remaining_work() -> None:
     assert verifier.call_count == 2
     assert resolved.diagnostics["source_verification_blocked"] == 2
     set_health.assert_called_once_with(server, blocked=True, failures=2)
+
+
+def test_three_systemic_format_failures_stop_the_background_cycle() -> None:
+    server = _Server()
+    supply = MaterializedCandidateSupply(
+        pools={"similarity": [_track(index) for index in range(12)]}
+    )
+
+    def enumerate_source(_server, item):
+        index = int(str(item["musicbrainz_recording_id"]).split("-")[-1])
+        return [_source(index, state="pending")]
+
+    with (
+        patch("auralis_backend.discovery.source_registry._load_sources", return_value={}),
+        patch("auralis_backend.discovery.source_registry._provider_is_blocked", return_value=False),
+        patch("auralis_backend.discovery.source_registry._enumerate_youtube_sources", side_effect=enumerate_source),
+        patch("auralis_backend.discovery.source_registry._verify_source", return_value=(None, "format_unavailable")) as verifier,
+        patch("auralis_backend.discovery.source_registry._store_sources"),
+        patch("auralis_backend.discovery.source_registry._set_provider_health") as set_health,
+    ):
+        resolved = verify_materialized_supply(
+            server,
+            supply,
+            _taste(),
+            max_new_verifications=12,
+            max_workers=1,
+        )
+
+    assert verifier.call_count == 3
+    assert resolved.diagnostics["source_verification_attempted"] == 3
+    assert resolved.diagnostics["source_verification_format_unavailable"] == 3
+    set_health.assert_called_once_with(
+        server,
+        blocked=True,
+        failures=3,
+        reason="format_unavailable",
+    )
 
 
 def test_album_qualifies_only_from_its_verified_canonical_tracklist() -> None:

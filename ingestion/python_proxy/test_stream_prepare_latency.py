@@ -50,6 +50,56 @@ def _fake_server() -> SimpleNamespace:
 
 
 class StreamPrepareLatencyTests(unittest.TestCase):
+    def test_format_selection_falls_back_to_a_real_audio_format(self) -> None:
+        server = _fake_server()
+        server.AURALIS_YTDLP_COOKIES_PATH = "C:/test/cookies.txt"
+        first = MagicMock()
+        first.__enter__.return_value.extract_info.side_effect = RuntimeError(
+            "Requested format is not available"
+        )
+        second = MagicMock()
+        second.__enter__.return_value.extract_info.return_value = {
+            "duration": 123,
+            "http_headers": {"User-Agent": "test"},
+            "formats": [
+                {
+                    "url": "https://example.test/video",
+                    "acodec": "aac",
+                    "vcodec": "h264",
+                    "ext": "mp4",
+                    "abr": 96,
+                },
+                {
+                    "url": "https://example.test/audio",
+                    "acodec": "mp4a",
+                    "vcodec": "none",
+                    "ext": "m4a",
+                    "abr": 128,
+                },
+            ],
+        }
+
+        with patch.object(
+            stream_core_runtime.yt_dlp,
+            "YoutubeDL",
+            side_effect=[first, second],
+        ) as youtube_dl:
+            result = stream_core_runtime.extract_stream_info(
+                server,
+                "00000000001",
+            )
+
+        self.assertEqual(result.get("url"), "https://example.test/audio")
+        self.assertEqual(result.get("duration"), 123)
+        first_options = youtube_dl.call_args_list[0].args[0]
+        fallback_options = youtube_dl.call_args_list[1].args[0]
+        self.assertEqual(
+            first_options.get("format"),
+            "bestaudio[acodec!=none]/best[acodec!=none]/best",
+        )
+        self.assertEqual(first_options.get("cookiefile"), "C:/test/cookies.txt")
+        self.assertNotIn("format", fallback_options)
+
     def test_background_prepare_limits_speculative_resolution_to_three_tracks(self) -> None:
         server = _fake_server()
         server.PREPARE_SESSION_MAX_LOOKAHEAD = 18

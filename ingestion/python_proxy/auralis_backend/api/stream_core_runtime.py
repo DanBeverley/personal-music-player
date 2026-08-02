@@ -191,11 +191,25 @@ def _clear_stream_failure(server: Any, video_id: str) -> None:
         server.stream_failure_cache.pop(video_id, None)
 
 
+class _QuietYtDlpLogger:
+    """yt-dlp failures are summarized by the caller, not printed per video."""
+
+    def debug(self, _message: str) -> None:
+        return None
+
+    def warning(self, _message: str) -> None:
+        return None
+
+    def error(self, _message: str) -> None:
+        return None
+
+
 def _ytdlp_opts(server: Any) -> dict:
     opts = {
-        "format": "bestaudio[ext=m4a]/bestaudio/best",
+        "format": "bestaudio[acodec!=none]/best[acodec!=none]/best",
         "quiet": True,
         "no_warnings": True,
+        "logger": _QuietYtDlpLogger(),
     }
     cookies_path = str(getattr(server, "AURALIS_YTDLP_COOKIES_PATH", "") or "").strip()
     if cookies_path:
@@ -209,19 +223,66 @@ def _ytdlp_opts(server: Any) -> dict:
 def extract_stream_info(server: Any, video_id: str):
     url = f"https://www.youtube.com/watch?v={video_id}"
     ydl_opts = _ytdlp_opts(server)
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as exc:
+        if "requested format is not available" not in str(exc).casefold():
+            raise
+        # Some extractor clients expose usable formats but fail the selector.
+        # Inspect the unprocessed result once and choose a real audio-bearing
+        # URL instead of repeating the same failing format request.
+        raw_opts = dict(ydl_opts)
+        raw_opts.pop("format", None)
+        with yt_dlp.YoutubeDL(raw_opts) as ydl:
+            raw_info = ydl.extract_info(url, download=False, process=False)
+        formats = [
+            dict(entry)
+            for entry in list((raw_info or {}).get("formats") or [])
+            if isinstance(entry, dict)
+            and entry.get("url")
+            and str(entry.get("acodec") or "none").lower() != "none"
+        ]
+        if not formats:
+            raise exc
+        formats.sort(
+            key=lambda entry: (
+                1 if str(entry.get("vcodec") or "none").lower() == "none" else 0,
+                1 if str(entry.get("ext") or "").lower() in {"m4a", "mp4"} else 0,
+                float(entry.get("abr") or entry.get("tbr") or 0.0),
+            ),
+            reverse=True,
+        )
+        info = {**dict(raw_info or {}), **formats[0]}
+
+    selected = next(
+        (
+            dict(entry)
+            for entry in [
+                *list((info or {}).get("requested_downloads") or []),
+                *list((info or {}).get("requested_formats") or []),
+                info,
+            ]
+            if isinstance(entry, dict) and entry.get("url")
+        ),
+        {},
+    )
+    if not selected:
+        raise RuntimeError("stream_url_missing")
 
     headers = {}
-    for key, value in (info.get("http_headers") or {}).items():
+    for key, value in {
+        **dict((info or {}).get("http_headers") or {}),
+        **dict(selected.get("http_headers") or {}),
+    }.items():
         if key and value:
             headers[str(key)] = str(value)
 
     return {
-        "url": info["url"],
+        "url": selected["url"],
         "headers": headers,
-        "mime_type": info.get("ext") or info.get("acodec") or "audio/mp4",
-        "duration": info.get("duration") or 0,
+        "mime_type": selected.get("ext") or selected.get("acodec") or "audio/mp4",
+        "duration": selected.get("duration") or (info or {}).get("duration") or 0,
     }
 
 

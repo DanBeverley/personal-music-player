@@ -24,14 +24,16 @@ from .structured_providers import CanonicalRecording, configured_provider_value
 _YOUTUBE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 _PROVIDER_HEALTH_KEY = "youtube_stream_verification"
 _BLOCKED_TTL_SECONDS = 30 * 60
+_FORMAT_UNAVAILABLE_TTL_SECONDS = 5 * 60
 _VERIFIED_TTL_SECONDS = 14 * 24 * 60 * 60
 _LOOKUP_RETRY_SECONDS = 24 * 60 * 60
 _EMPTY_LOOKUP_RETRY_SECONDS = 30 * 60
 _LOOKUP_PROVIDER = "youtube_lookup"
 _LOOKUP_SOURCE_ID = "exact_recording"
-_MIN_ADAPTIVE_VERIFICATIONS = 32
-_MAX_ADAPTIVE_VERIFICATIONS = 48
+_MIN_ADAPTIVE_VERIFICATIONS = 8
+_MAX_ADAPTIVE_VERIFICATIONS = 16
 _MAX_VERIFICATION_WORKERS = 4
+_FORMAT_FAILURE_CIRCUIT_THRESHOLD = 3
 _POOL_PRIORITY = {
     "similarity": 0,
     "artist_graph": 1,
@@ -309,7 +311,8 @@ def _provider_is_blocked(server: Any) -> bool:
         entity_key=_PROVIDER_HEALTH_KEY,
     ) or {}
     return (
-        payload.get("state") == "temporarily_blocked"
+        payload.get("state")
+        in {"temporarily_blocked", "temporarily_unavailable"}
         and float(payload.get("retry_at") or 0.0) > time.time()
     )
 
@@ -320,7 +323,13 @@ def youtube_background_resolution_blocked(server: Any) -> bool:
     return _provider_is_blocked(server)
 
 
-def _set_provider_health(server: Any, *, blocked: bool, failures: int = 0) -> None:
+def _set_provider_health(
+    server: Any,
+    *,
+    blocked: bool,
+    failures: int = 0,
+    reason: str = "source_blocked",
+) -> None:
     now = time.time()
     existing = load_catalog_feature(
         server,
@@ -333,9 +342,25 @@ def _set_provider_health(server: Any, *, blocked: bool, failures: int = 0) -> No
         entity_key=_PROVIDER_HEALTH_KEY,
         payload={
             **existing,
-            "state": "temporarily_blocked" if blocked else "available",
+            "state": (
+                "temporarily_unavailable"
+                if blocked and reason == "format_unavailable"
+                else "temporarily_blocked"
+                if blocked
+                else "available"
+            ),
             "consecutive_blocked_failures": int(failures if blocked else 0),
-            "retry_at": now + _BLOCKED_TTL_SECONDS if blocked else 0.0,
+            "failure_reason": reason if blocked else "",
+            "retry_at": (
+                now
+                + (
+                    _FORMAT_UNAVAILABLE_TTL_SECONDS
+                    if reason == "format_unavailable"
+                    else _BLOCKED_TTL_SECONDS
+                )
+                if blocked
+                else 0.0
+            ),
             "updated_at": now,
         },
         source_kind="playback_verification",
@@ -602,7 +627,11 @@ def _verify_source(server: Any, entity_key: str, source: Dict[str, Any]) -> Tupl
             "failure_reason": failure.get("code") or "stream_failed",
             "retry_at": now + _BLOCKED_TTL_SECONDS if blocked else 0.0,
         }
-        return failed, "source_blocked" if blocked else "unavailable"
+        return failed, (
+            "source_blocked"
+            if blocked
+            else str(failure.get("code") or "unavailable")
+        )
 
 
 def _apply_source(item: Dict[str, Any], source: Dict[str, Any]) -> Dict[str, Any]:
@@ -911,6 +940,7 @@ def verify_materialized_supply(
     verified_new = 0
     unavailable = 0
     blocked_failures = 0
+    format_failures = 0
     attempted = 0
 
     unresolved_count = len(set(entity_keys) - set(verified_by_key) - {""})
@@ -1085,6 +1115,9 @@ def verify_materialized_supply(
                         verified_by_pool[pool] = verified_by_pool.get(pool, 0) + 1
                     elif outcome == "source_blocked":
                         blocked_failures += 1
+                    elif outcome == "format_unavailable":
+                        format_failures += 1
+                        unavailable += 1
                     else:
                         unavailable += 1
                 _store_sources(
@@ -1092,10 +1125,20 @@ def verify_materialized_supply(
                     completed_sources,
                     store_initialized=True,
                 )
-                if blocked_failures >= 2:
+                if (
+                    blocked_failures >= 2
+                    or format_failures >= _FORMAT_FAILURE_CIRCUIT_THRESHOLD
+                ):
                     break
         if blocked_failures >= 2:
             _set_provider_health(server, blocked=True, failures=blocked_failures)
+        elif format_failures >= _FORMAT_FAILURE_CIRCUIT_THRESHOLD:
+            _set_provider_health(
+                server,
+                blocked=True,
+                failures=format_failures,
+                reason="format_unavailable",
+            )
         elif attempted and not blocked_failures:
             _set_provider_health(server, blocked=False)
 
@@ -1263,6 +1306,7 @@ def verify_materialized_supply(
         "source_verification_attempted_by_authority": attempted_by_authority,
         "source_verification_verified_by_pool": verified_by_pool,
         "source_verification_unavailable": unavailable,
+        "source_verification_format_unavailable": format_failures,
         "source_verification_blocked": blocked_failures,
         "source_verification_circuit_open": _provider_is_blocked(server),
         "source_verification_elapsed_ms": int((time.perf_counter() - started) * 1000),
@@ -1275,7 +1319,7 @@ def verify_materialized_supply(
         f"lookup_deferred={source_lookup_deferred} "
         f"prefiltered={sum(preverification_rejections.values())} "
         f"attempted={attempted} verified={verified_new} "
-        f"unavailable={unavailable} blocked={blocked_failures} "
+        f"unavailable={unavailable} format_unavailable={format_failures} blocked={blocked_failures} "
         f"pools={','.join(f'{pool}:{count}' for pool, count in attempted_by_pool.items()) or '-'} "
         f"authority={','.join(f'{authority}:{count}' for authority, count in attempted_by_authority.items()) or '-'} "
         f"circuit_open={int(bool(diagnostics['source_verification_circuit_open']))} "

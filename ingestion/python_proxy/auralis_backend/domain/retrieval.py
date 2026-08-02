@@ -220,6 +220,475 @@ def _collect_album_candidates(
         )
 
 
+def _provider_identity(value: Any, *, entity_type: str) -> str:
+    identity = trim_text(value)
+    if not identity:
+        return ""
+    lowered = identity.casefold()
+    rejected_prefixes = {
+        "track": ("musicbrainz:recording:", "track-name:", "derived:"),
+        "artist": ("musicbrainz:artist:", "artist-name:", "derived:"),
+        "album": (
+            "musicbrainz:release:",
+            "musicbrainz:release-group:",
+            "album-name:",
+            "derived:",
+        ),
+    }
+    return "" if lowered.startswith(rejected_prefixes.get(entity_type, ())) else identity
+
+
+def _track_provider_identity(track: Dict[str, Any]) -> str:
+    playback = track.get("playback") if isinstance(track.get("playback"), dict) else {}
+    return _provider_identity(
+        playback.get("source_id")
+        or playback.get("video_id")
+        or track.get("playback_source_id")
+        or track.get("videoId")
+        or track.get("video_id")
+        or track.get("id"),
+        entity_type="track",
+    )
+
+
+def _artist_provider_identity(artist: Dict[str, Any]) -> str:
+    return _provider_identity(
+        artist.get("provider_artist_id")
+        or artist.get("browseId")
+        or artist.get("artist_id")
+        or artist.get("id"),
+        entity_type="artist",
+    )
+
+
+def _album_provider_identity(album: Dict[str, Any]) -> str:
+    return _provider_identity(
+        album.get("provider_album_id")
+        or album.get("browseId")
+        or album.get("album_id")
+        or album.get("albumId")
+        or album.get("id"),
+        entity_type="album",
+    )
+
+
+def _artist_relationship_support(
+    artist: Dict[str, Any],
+    tracks: Iterable[Dict[str, Any]],
+) -> float:
+    provider_id = _artist_provider_identity(artist).casefold()
+    name_key = normalize_artist_name(artist.get("name") or artist.get("artist"))
+    support = 0.0
+    for track in tracks or []:
+        if not isinstance(track, dict):
+            continue
+        credited_id = trim_text(
+            track.get("artist_id")
+            or track.get("artistId")
+            or track.get("artist_browse_id")
+        ).casefold()
+        credited_name = normalize_artist_name(
+            track.get("channel") or track.get("artist") or track.get("artist_name")
+        )
+        if provider_id and credited_id and provider_id == credited_id:
+            support += 1.25
+        elif name_key and credited_name and name_key == credited_name:
+            support += 1.0
+    return support
+
+
+def _matching_provider_artist(
+    credited_artist: Dict[str, Any],
+    artists: Iterable[Dict[str, Any]],
+) -> Dict[str, Any]:
+    credited_id = _artist_provider_identity(credited_artist).casefold()
+    if not credited_id:
+        return dict(credited_artist or {})
+    match = next(
+        (
+            dict(artist)
+            for artist in artists or []
+            if isinstance(artist, dict)
+            and _artist_provider_identity(artist).casefold() == credited_id
+        ),
+        {},
+    )
+    return {**match, **dict(credited_artist or {})} if match else dict(credited_artist)
+
+
+def _artist_from_album(
+    album: Dict[str, Any],
+    artists: Iterable[Dict[str, Any]],
+) -> Dict[str, Any]:
+    name = trim_text(
+        album.get("artist") or album.get("artist_name") or album.get("channel")
+    )
+    artist_id = trim_text(
+        album.get("artist_id")
+        or album.get("artistId")
+        or album.get("artist_browse_id")
+    )
+    if artist_id:
+        matched = _matching_provider_artist(
+            {"id": artist_id, "name": name},
+            artists,
+        )
+        if matched:
+            return matched
+    return {"name": name} if name else {}
+
+
+def resolve_search_target(
+    *,
+    query: str,
+    tracks: List[Dict[str, Any]],
+    artists: List[Dict[str, Any]],
+    albums: List[Dict[str, Any]],
+    canonical_resolution: Dict[str, Any] | None = None,
+    search_mode: str = "",
+    entity_type_hint: str = "",
+    server=None,
+) -> Dict[str, Any]:
+    """Resolve one evidence-backed entity before any artist expansion.
+
+    Text similarity discovers candidates; it never owns identity.  The
+    returned bundle is the only authority for target-dependent search
+    surfaces.  When competing evidence is too close, the safe result is a
+    mixed page without an inferred lead artist.
+    """
+    server = adapt_domain_server(server)
+    normalized_query = trim_text(query).casefold()
+    empty = {
+        "entity_type": "mixed",
+        "item": {},
+        "lead_artist": {},
+        "containing_album": {},
+        "target_identity": "",
+        "confidence": 0.0,
+        "confidence_tier": "ambiguous",
+        "decision_margin": 0.0,
+        "evidence": [],
+        "resolver": "classify_then_resolve_v2",
+    }
+    if not normalized_query:
+        return empty
+    canonical = dict(canonical_resolution or {})
+    canonical_title = trim_text(canonical.get("title"))
+    canonical_artist = trim_text(canonical.get("artist"))
+    primary_track = _best_track_match(
+        server,
+        query,
+        tracks,
+        preferred_title=canonical_title,
+        preferred_artist=canonical_artist,
+    )
+    primary_artist = _best_artist_match(query, artists, tracks)
+    primary_album = _best_album_match(query, albums)
+    candidates: List[Dict[str, Any]] = []
+
+    explicit_track = bool(re.search(r"\b(song|track|lyrics)\b", normalized_query))
+    explicit_artist = bool(re.search(r"\b(artist|band|singer)\b", normalized_query))
+    explicit_album = bool(re.search(r"\b(album|ep|soundtrack|ost)\b", normalized_query))
+
+    if primary_track:
+        title = trim_text(primary_track.get("title") or primary_track.get("name"))
+        credited_name = trim_text(
+            primary_track.get("channel") or primary_track.get("artist")
+        )
+        title_match = search_text_similarity(query, title)
+        canonical_title_match = (
+            search_text_similarity(canonical_title, title) if canonical_title else 0.0
+        )
+        canonical_artist_match = (
+            search_text_similarity(canonical_artist, credited_name)
+            if canonical_artist
+            else 0.0
+        )
+        canonical_pair_match = (
+            canonical_title_match * 0.56 + canonical_artist_match * 0.44
+            if canonical_title and canonical_artist
+            else 0.0
+        )
+        stable_id = _track_provider_identity(primary_track)
+        credited_artist = _matching_provider_artist(
+            _credited_artist_from_track(primary_track),
+            artists,
+        )
+        mismatch_penalty = (
+            5.0
+            if canonical_title_match >= 0.90 and canonical_artist_match < 0.62
+            else 0.0
+        )
+        score = (
+            title_match * 4.0
+            + (2.0 if title_match >= 0.98 else 0.0)
+            + (1.0 if stable_id else 0.0)
+            + (0.6 if credited_name else 0.0)
+            + canonical_pair_match * 5.0
+            + normalized_popularity(primary_track) * 1.5
+            + (2.5 if explicit_track else 0.0)
+            - mismatch_penalty
+        )
+        evidence = ["exact_title"] if title_match >= 0.98 else ["title_match"]
+        if stable_id:
+            evidence.append("provider_track_identity")
+        independent_canonical = bool(
+            canonical.get("independent_provider_corroboration")
+        )
+        if canonical_pair_match >= 0.80 and independent_canonical:
+            evidence.append("canonical_recording_credit")
+        if credited_name:
+            evidence.append("credited_artist")
+        if title_match >= 0.78 and stable_id and credited_name:
+            candidates.append(
+                {
+                    "entity_type": "track",
+                    "item": dict(primary_track),
+                    "lead_artist": credited_artist,
+                    "containing_album": _album_from_track(primary_track),
+                    "target_identity": (
+                        f"musicbrainz:recording:{canonical.get('musicbrainz_recording_id')}"
+                        if canonical_pair_match >= 0.80
+                        and independent_canonical
+                        and canonical.get("musicbrainz_recording_id")
+                        else f"provider:track:{stable_id.casefold()}"
+                    ),
+                    "score": score,
+                    "popularity": normalized_popularity(primary_track),
+                    "confidence_tier": (
+                        "authoritative"
+                        if canonical_pair_match >= 0.80
+                        and independent_canonical
+                        else "corroborated"
+                    ),
+                    "evidence": evidence,
+                }
+            )
+
+    if primary_artist:
+        name = trim_text(primary_artist.get("name") or primary_artist.get("artist"))
+        name_match = search_text_similarity(query, name)
+        stable_id = _artist_provider_identity(primary_artist)
+        relationship_support = _artist_relationship_support(primary_artist, tracks)
+        authority = trim_text(primary_artist.get("source_authority")).casefold()
+        catalog_items = len(list(primary_artist.get("top_songs") or [])) + len(
+            list(primary_artist.get("albums") or [])
+        )
+        authority_supported = authority in {
+            "official",
+            "official_artist_channel",
+            "verified_catalog",
+            "ytmusic_artist_detail",
+        }
+        artist_supported = (
+            relationship_support >= 1.75
+            or normalized_popularity(primary_artist) >= 0.25
+            or authority_supported
+            or catalog_items >= 2
+        )
+        score = (
+            name_match * 4.0
+            + (2.0 if _raw_artist_name(query) == _raw_artist_name(name) else 0.0)
+            + (1.0 if stable_id else 0.0)
+            + min(relationship_support * 1.4, 5.6)
+            + normalized_popularity(primary_artist) * 2.0
+            + (1.5 if authority_supported else 0.0)
+            + min(catalog_items, 8) * 0.15
+            + (2.5 if explicit_artist else 0.0)
+        )
+        evidence = ["exact_name"] if name_match >= 0.98 else ["name_match"]
+        if stable_id:
+            evidence.append("provider_artist_identity")
+        if relationship_support:
+            evidence.append("provider_catalog_credit")
+        if authority_supported:
+            evidence.append("source_authority")
+        if name_match >= 0.72 and stable_id and artist_supported:
+            candidates.append(
+                {
+                    "entity_type": "artist",
+                    "item": dict(primary_artist),
+                    "lead_artist": dict(primary_artist),
+                    "containing_album": {},
+                    "target_identity": f"provider:artist:{stable_id.casefold()}",
+                    "score": score,
+                    "popularity": normalized_popularity(primary_artist),
+                    "exact_name": name_match >= 0.98,
+                    "confidence_tier": "corroborated",
+                    "evidence": evidence,
+                    "relationship_support": relationship_support,
+                }
+            )
+
+    if primary_album:
+        title = trim_text(primary_album.get("title") or primary_album.get("name"))
+        artist_name = trim_text(
+            primary_album.get("artist")
+            or primary_album.get("artist_name")
+            or primary_album.get("channel")
+        )
+        title_match = search_text_similarity(query, title)
+        stable_id = _album_provider_identity(primary_album)
+        album_key = canonical_album_identity(primary_album)
+        relationship_support = sum(
+            1
+            for track in tracks or []
+            if isinstance(track, dict)
+            and (
+                (
+                    stable_id
+                    and stable_id
+                    == trim_text(
+                        track.get("album_id")
+                        or track.get("albumId")
+                        or track.get("browseId")
+                    )
+                )
+                or (
+                    album_key
+                    and album_key
+                    == canonical_album_identity(
+                        {
+                            "title": track.get("album") or track.get("album_title"),
+                            "artist": track.get("channel") or track.get("artist"),
+                        }
+                    )
+                )
+            )
+        )
+        score = (
+            title_match * 4.0
+            + (2.0 if title_match >= 0.98 else 0.0)
+            + (1.0 if stable_id else 0.0)
+            + (0.5 if artist_name else 0.0)
+            + min(relationship_support * 1.4, 4.2)
+            + normalized_popularity(primary_album)
+            + (2.5 if explicit_album else 0.0)
+        )
+        evidence = ["exact_title"] if title_match >= 0.98 else ["title_match"]
+        if stable_id:
+            evidence.append("provider_album_identity")
+        if relationship_support:
+            evidence.append("album_track_relationship")
+        if title_match >= 0.78 and stable_id and artist_name:
+            candidates.append(
+                {
+                    "entity_type": "album",
+                    "item": dict(primary_album),
+                    "lead_artist": _artist_from_album(primary_album, artists),
+                    "containing_album": dict(primary_album),
+                    "target_identity": f"provider:album:{stable_id.casefold()}",
+                    "score": score,
+                    "confidence_tier": (
+                        "corroborated" if relationship_support else "supported"
+                    ),
+                    "evidence": evidence,
+                    "relationship_support": float(relationship_support),
+                }
+            )
+
+    normalized_type_hint = trim_text(entity_type_hint).casefold()
+    if normalized_type_hint in {"track", "artist", "album"}:
+        candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.get("entity_type") == normalized_type_hint
+        ]
+    if not candidates or search_mode == "taste":
+        return empty
+    # An exact, established artist should beat an obscure homonymous recording
+    # when multiple provider catalog credits support that artist.  This is a
+    # generic evidence comparison, not an artist/title exception.
+    track_candidate = next(
+        (
+            candidate
+            for candidate in candidates
+            if candidate.get("entity_type") == "track"
+        ),
+        None,
+    )
+    artist_candidate = next(
+        (
+            candidate
+            for candidate in candidates
+            if candidate.get("entity_type") == "artist"
+            and candidate.get("exact_name")
+            and float(candidate.get("relationship_support") or 0.0) >= 1.75
+        ),
+        None,
+    )
+    if track_candidate is not None and artist_candidate is not None:
+        popularity_delta = float(artist_candidate.get("popularity") or 0.0) - float(
+            track_candidate.get("popularity") or 0.0
+        )
+        if popularity_delta >= 0.12 and not explicit_track:
+            artist_candidate["score"] = float(
+                artist_candidate.get("score") or 0.0
+            ) + min(popularity_delta * 8.0, 2.5)
+            artist_candidate["evidence"] = [
+                *list(artist_candidate.get("evidence") or []),
+                "catalog_popularity_advantage",
+            ]
+    candidates.sort(
+        key=lambda candidate: (
+            float(candidate.get("score") or 0.0),
+            candidate.get("entity_type") or "",
+            candidate.get("target_identity") or "",
+        ),
+        reverse=True,
+    )
+    winner = dict(candidates[0])
+    runner_score = float(candidates[1].get("score") or 0.0) if len(candidates) > 1 else 0.0
+    margin = float(winner.get("score") or 0.0) - runner_score
+    tier = str(winner.get("confidence_tier") or "supported")
+    clear_winner = (
+        len(candidates) == 1
+        or (tier == "authoritative" and margin >= 0.15)
+        or margin >= 0.65
+        or (
+            winner.get("entity_type") == "artist"
+            and float(winner.get("relationship_support") or 0.0) >= 1.75
+            and margin >= 0.25
+        )
+        or (
+            winner.get("entity_type") == "album"
+            and explicit_album
+            and margin >= 0.25
+        )
+    )
+    if not clear_winner:
+        ambiguous = dict(empty)
+        ambiguous["decision_margin"] = round(margin, 4)
+        ambiguous["evidence"] = ["competing_authoritative_entities"]
+        ambiguous["candidate_scores"] = [
+            {
+                "entity_type": candidate.get("entity_type"),
+                "target_identity": candidate.get("target_identity"),
+                "score": round(float(candidate.get("score") or 0.0), 4),
+            }
+            for candidate in candidates[:3]
+        ]
+        return ambiguous
+
+    score = float(winner.pop("score") or 0.0)
+    tier_bonus = 0.10 if tier == "authoritative" else 0.05
+    winner["confidence"] = round(
+        min(0.99, 0.55 + min(score / 40.0, 0.25) + min(margin / 10.0, 0.14) + tier_bonus),
+        4,
+    )
+    winner["decision_margin"] = round(margin, 4)
+    winner["resolver"] = "classify_then_resolve_v2"
+    winner["candidate_scores"] = [
+        {
+            "entity_type": candidate.get("entity_type"),
+            "target_identity": candidate.get("target_identity"),
+            "score": round(float(candidate.get("score") or 0.0), 4),
+        }
+        for candidate in candidates[:3]
+    ]
+    return winner
+
+
 def classify_query_intent(
     *,
     query: str,
@@ -228,173 +697,17 @@ def classify_query_intent(
     albums: List[Dict[str, Any]],
     server=None,
 ) -> str:
-    server = adapt_domain_server(server)
-    normalized_query = trim_text(query).lower()
-    if not normalized_query:
-        return "mixed"
-    if "lyrics" in normalized_query:
-        return "lyric"
-    if any(
-        token in normalized_query
-        for token in ["mood", "chill", "focus", "sleep", "ambient", "playlist"]
-    ):
-        return "mood"
-    if normalized_query.startswith("songs like ") or normalized_query.startswith("similar to "):
-        return "mixed"
-
-    def best_track_score() -> float:
-        scores = []
-        for item in (tracks or [])[:10]:
-            title = trim_text(item.get("title") or item.get("name"))
-            artist = trim_text(item.get("channel") or item.get("artist"))
-            scores.append(
-                max(
-                    search_text_similarity(query, title),
-                    search_text_similarity(query, f"{title} {artist}") * 0.92,
-                )
-            )
-        return max(scores, default=0.0)
-
-    def best_artist_score() -> float:
-        return max(
-            (
-                search_text_similarity(
-                    query,
-                    trim_text(item.get("name") or item.get("artist")),
-                )
-                for item in (artists or [])[:10]
-            ),
-            default=0.0,
-        )
-
-    def best_album_score() -> float:
-        scores = []
-        for item in (albums or [])[:10]:
-            title = trim_text(item.get("title") or item.get("name"))
-            artist = trim_text(item.get("artist") or item.get("channel"))
-            scores.append(
-                max(
-                    search_text_similarity(query, title),
-                    search_text_similarity(query, f"{title} {artist}") * 0.92,
-                )
-            )
-        return max(scores, default=0.0)
-
-    top_track_score = best_track_score()
-    top_artist_score = best_artist_score()
-    top_album_score = best_album_score()
-
-    best_artist_name = ""
-    best_artist_popularity = 0.0
-    best_artist_has_provider_identity = False
-    if artists:
-        best_artist = max(
-            artists[:10],
-            key=lambda item: search_text_similarity(
-                query,
-                trim_text(item.get("name") or item.get("artist")),
-            ),
-        )
-        best_artist_name = trim_text(
-            best_artist.get("name") or best_artist.get("artist")
-        )
-        best_artist_popularity = normalized_popularity(best_artist)
-        best_artist_has_provider_identity = bool(
-            trim_text(
-                best_artist.get("provider_artist_id")
-                or best_artist.get("id")
-            )
-        )
-    artist_catalog_support = sum(
-        1
-        for item in (tracks or [])[:16]
-        if best_artist_name
-        and search_text_similarity(
-            best_artist_name,
-            trim_text(item.get("channel") or item.get("artist")),
-        )
-        >= 0.88
+    """Compatibility facade; production consumes the full target bundle."""
+    return str(
+        resolve_search_target(
+            server=server,
+            query=query,
+            tracks=tracks,
+            artists=artists,
+            albums=albums,
+        ).get("entity_type")
+        or "mixed"
     )
-    exact_track_support = sum(
-        1
-        for item in (tracks or [])[:16]
-        if search_text_similarity(
-            query,
-            trim_text(item.get("title") or item.get("name")),
-        )
-        >= 0.94
-    )
-
-    # A high-authority exact artist result is stronger evidence than an
-    # unrelated recording that merely shares the query as its title. This
-    # resolves ambiguous names such as "Dio" without turning obscure
-    # same-name artist uploads into artist searches.
-    if (
-        top_artist_score >= 0.96
-        and best_artist_has_provider_identity
-        and best_artist_popularity >= 0.35
-    ):
-        return "artist"
-    if (
-        top_artist_score >= 0.88
-        and best_artist_has_provider_identity
-        and best_artist_popularity >= 0.48
-        and artist_catalog_support >= 1
-    ):
-        return "artist"
-
-    # Track-credit support distinguishes a real artist query from an album or
-    # recording that happens to have the same title. This must run before the
-    # album rule so "Nirvana" cannot become an obscure same-name album search.
-    if (
-        top_artist_score >= 0.82
-        and artist_catalog_support >= 2
-        and (
-            top_artist_score >= 0.90
-            or top_artist_score >= top_track_score - 0.04
-        )
-    ):
-        return "artist"
-
-    # An exact same-name artist without catalog support is not enough evidence
-    # on its own. For example, "The Trooper" should remain a recording query.
-    strong_exact_track = any(
-        search_text_similarity(
-            query,
-            trim_text(item.get("title") or item.get("name")),
-        )
-        >= 0.98
-        and bool(trim_text(item.get("channel") or item.get("artist")))
-        and bool(
-            trim_text(
-                item.get("track_key")
-                or item.get("canonical_recording_id")
-                or item.get("videoId")
-                or item.get("id")
-            )
-        )
-        for item in (tracks or [])[:16]
-    )
-    if strong_exact_track and top_track_score >= 0.94 and artist_catalog_support < 2:
-        return "track"
-    if (
-        top_album_score >= 0.90
-        and top_album_score >= top_track_score + 0.04
-        and top_album_score >= top_artist_score - 0.01
-        and artist_catalog_support < 2
-    ):
-        return "album"
-    if exact_track_support and top_track_score >= 0.90 and artist_catalog_support < 2:
-        return "track"
-    if top_artist_score >= 0.82 and artist_catalog_support >= 2:
-        return "artist"
-    if top_track_score >= 0.78 and top_track_score >= max(top_artist_score, top_album_score) + 0.06:
-        return "track"
-    if top_artist_score >= 0.78 and top_artist_score >= max(top_track_score, top_album_score) + 0.06:
-        return "artist"
-    if top_album_score >= 0.78 and top_album_score >= max(top_track_score, top_artist_score) + 0.06:
-        return "album"
-    return "mixed"
 
 
 def _best_track_match(
@@ -454,27 +767,40 @@ def _canonical_track_resolution(
     server: Any,
     *,
     query: str,
+    provider_tracks: Iterable[Dict[str, Any]],
     fuzzy_tracks: Iterable[Dict[str, Any]],
     musicbrainz_tracks: Iterable[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    candidates = [
+    providers = [
         dict(item)
-        for item in [*list(fuzzy_tracks or []), *list(musicbrainz_tracks or [])]
+        for item in list(provider_tracks or [])
         if isinstance(item, dict)
+        and trim_text(item.get("title") or item.get("name"))
+        and trim_text(item.get("channel") or item.get("artist"))
     ]
-    ranked: List[tuple[float, Dict[str, Any]]] = []
+    candidates_by_credit: Dict[str, Dict[str, Any]] = {}
+    for raw_item in [*list(fuzzy_tracks or []), *list(musicbrainz_tracks or [])]:
+        if not isinstance(raw_item, dict):
+            continue
+        item = dict(raw_item)
+        credit_key = canonical_title_artist_identity(item)
+        if not credit_key:
+            continue
+        existing = candidates_by_credit.get(credit_key)
+        if existing is None or (
+            item.get("musicbrainz_recording_id")
+            and not existing.get("musicbrainz_recording_id")
+        ):
+            candidates_by_credit[credit_key] = item
+    candidates = list(candidates_by_credit.values())
+    ranked: List[tuple[float, float, Dict[str, Any], Dict[str, Any]]] = []
     for item in candidates:
         title = trim_text(item.get("title") or item.get("name"))
         artist = trim_text(item.get("channel") or item.get("artist"))
         if not title or not artist:
             continue
         title_similarity = search_text_similarity(query, title)
-        combined_similarity = search_text_similarity(
-            query,
-            f"{title} {artist}".strip(),
-        )
-        relevance = max(title_similarity, combined_similarity * 0.94)
-        if relevance < 0.72:
+        if title_similarity < 0.78:
             continue
         try:
             provider_confidence = float(
@@ -485,43 +811,102 @@ def _canonical_track_resolution(
             )
         except (TypeError, ValueError):
             provider_confidence = 0.0
-        try:
-            learned_popularity = float(item.get("learned_popularity") or 0.0)
-        except (TypeError, ValueError):
-            learned_popularity = 0.0
-        release_year_text = trim_text(
-            item.get("release_year") or item.get("year")
-        )
-        release_year = (
-            int(release_year_text[:4])
-            if release_year_text[:4].isdigit()
-            else 9999
-        )
-        chronology_bonus = (
-            max(0.0, min((2005 - release_year) / 100.0, 0.35))
-            if release_year < 9999
-            else 0.0
-        )
+        best_provider: Dict[str, Any] = {}
+        best_pair = 0.0
+        best_provider_support = 0.0
+        for index, provider_track in enumerate(providers):
+            provider_title = trim_text(
+                provider_track.get("title") or provider_track.get("name")
+            )
+            provider_artist = trim_text(
+                provider_track.get("channel") or provider_track.get("artist")
+            )
+            provider_title_match = search_text_similarity(title, provider_title)
+            if provider_title_match < 0.90:
+                continue
+            provider_artist_match = search_text_similarity(
+                artist,
+                provider_artist,
+            )
+            pair_match = (
+                provider_title_match * 0.56
+                + provider_artist_match * 0.44
+            )
+            authority = trim_text(
+                provider_track.get("source_authority")
+                or provider_track.get("authority")
+            ).casefold()
+            authority_score = (
+                1.0
+                if authority
+                in {
+                    "official",
+                    "official_artist_channel",
+                    "topic",
+                    "vevo",
+                    "verified_catalog",
+                    "ytmusic_artist_detail",
+                }
+                else 0.35
+                if trim_text(
+                    provider_track.get("artist_id")
+                    or provider_track.get("artistId")
+                    or provider_track.get("channel_id")
+                )
+                else 0.0
+            )
+            rank_score = max(0.0, 1.0 - (index / max(len(providers), 1)))
+            support = (
+                pair_match * 5.0
+                + normalized_popularity(provider_track) * 2.0
+                + authority_score * 1.4
+                + rank_score * 0.4
+            )
+            if support > best_provider_support:
+                best_provider = provider_track
+                best_pair = pair_match
+                best_provider_support = support
+        independently_corroborated = bool(best_provider) and best_pair >= 0.90
         score = (
-            relevance * 5.0
-            + max(0.0, min(provider_confidence, 1.0)) * 2.0
-            + max(0.0, min(learned_popularity, 1.0)) * 1.5
-            + chronology_bonus
+            title_similarity * 4.0
+            + max(0.0, min(provider_confidence, 1.0))
+            + best_provider_support
+            - (0.0 if independently_corroborated else 3.0)
         )
-        ranked.append((score, item))
+        ranked.append((score, best_pair, item, best_provider))
     if not ranked:
         return {}
-    ranked.sort(key=lambda entry: entry[0], reverse=True)
-    score, item = ranked[0]
-    confidence = max(
-        search_text_similarity(
-            query,
-            trim_text(item.get("title") or item.get("name")),
-        ),
-        min(score / 8.5, 1.0),
-    )
-    if confidence < 0.76:
+    corroborated = [entry for entry in ranked if entry[1] >= 0.90]
+    if not corroborated:
         return {}
+    corroborated.sort(key=lambda entry: entry[0], reverse=True)
+    score, pair_match, item, provider_track = corroborated[0]
+    runner_score = corroborated[1][0] if len(corroborated) > 1 else 0.0
+    margin = score - runner_score
+    if len(corroborated) > 1 and margin < 0.30:
+        return {
+            "ambiguous": True,
+            "reason": "competing_recording_credits",
+            "decision_margin": round(margin, 4),
+            "candidate_credits": [
+                {
+                    "title": trim_text(entry[2].get("title") or entry[2].get("name")),
+                    "artist": trim_text(
+                        entry[2].get("channel") or entry[2].get("artist")
+                    ),
+                    "provider_source_id": trim_text(
+                        entry[3].get("videoId")
+                        or entry[3].get("video_id")
+                        or entry[3].get("id")
+                    ),
+                }
+                for entry in corroborated[:3]
+            ],
+        }
+    confidence = min(
+        0.97,
+        0.72 + min(pair_match * 0.18, 0.18) + min(margin / 20.0, 0.07),
+    )
     return {
         "title": trim_text(item.get("title") or item.get("name")),
         "artist": trim_text(item.get("channel") or item.get("artist")),
@@ -535,6 +920,13 @@ def _canonical_track_resolution(
         "musicbrainz_recording_id": trim_text(
             item.get("musicbrainz_recording_id")
         ),
+        "independent_provider_corroboration": True,
+        "provider_source_id": trim_text(
+            provider_track.get("videoId")
+            or provider_track.get("video_id")
+            or provider_track.get("id")
+        ),
+        "decision_margin": round(margin, 4),
     }
 
 
@@ -842,7 +1234,7 @@ def load_artist_entity_expansion(
     )
     album_tracklists_loaded = 0
     album_tracklists_attempted = 0
-    album_ids = [
+    all_album_ids = [
         trim_text(
             album.get("id")
             or album.get("album_id")
@@ -850,7 +1242,11 @@ def load_artist_entity_expansion(
         )
         for album in albums
     ]
-    album_ids = [album_id for album_id in album_ids if album_id]
+    all_album_ids = [
+        album_id
+        for index, album_id in enumerate(all_album_ids)
+        if album_id and album_id not in all_album_ids[:index]
+    ]
     albums_by_id = {
         trim_text(
             album.get("id")
@@ -865,6 +1261,27 @@ def load_artist_entity_expansion(
             or album.get("browseId")
         )
     }
+    missing_artwork_ids = [
+        album_id
+        for album_id in all_album_ids
+        if not catalog_thumbnail_url(
+            albums_by_id.get(album_id) or {},
+            entity_type="album",
+        )
+    ]
+    # Complete at most the visible album page, prioritizing records whose
+    # existing artist payload has no cover. This reuses the album-detail calls
+    # already needed for playable tracklists instead of adding another lookup
+    # path.
+    album_ids = [
+        *missing_artwork_ids,
+        *[
+            album_id
+            for album_id in all_album_ids
+            if album_id not in missing_artwork_ids
+        ],
+    ][:16]
+    pending_artwork_ids = set(missing_artwork_ids) & set(album_ids)
     executor = _search_executor(server)
 
     def load_album_tracklist(album_id: str) -> Dict[str, Any]:
@@ -879,7 +1296,10 @@ def load_artist_entity_expansion(
     # parallel instead of paying one provider round-trip per album in series.
     # Stop submitting more batches as soon as the catalog target is met.
     for batch_start in range(0, len(album_ids), 4):
-        if len(unique_tracks) >= target_track_count:
+        if (
+            len(unique_tracks) >= target_track_count
+            and not pending_artwork_ids
+        ):
             break
         batch_ids = album_ids[batch_start : batch_start + 4]
         future_pairs = [
@@ -888,12 +1308,10 @@ def load_artist_entity_expansion(
         ]
         album_tracklists_attempted += len(future_pairs)
         for _album_id, future in future_pairs:
+            pending_artwork_ids.discard(_album_id)
             try:
                 album_payload = dict(future.result() or {})
             except Exception:
-                continue
-            album_tracks = list(album_payload.get("tracks") or [])
-            if not album_tracks:
                 continue
             album_record = {
                 **dict(albums_by_id.get(_album_id) or {}),
@@ -903,6 +1321,10 @@ def load_artist_entity_expansion(
                     if value not in (None, "", [], {})
                 },
             }
+            albums_by_id[_album_id] = album_record
+            album_tracks = list(album_payload.get("tracks") or [])
+            if not album_tracks:
+                continue
             album_thumbnail = catalog_thumbnail_url(
                 album_record,
                 entity_type="album",
@@ -929,7 +1351,21 @@ def load_artist_entity_expansion(
             album_tracklists_loaded += 1
             add_tracks(hydrated_album_tracks)
 
-    catalog_complete = bool(details) and (
+    albums = [
+        dict(
+            albums_by_id.get(
+                trim_text(
+                    album.get("id")
+                    or album.get("album_id")
+                    or album.get("browseId")
+                ),
+                album,
+            )
+        )
+        for album in albums
+        if isinstance(album, dict)
+    ]
+    track_catalog_complete = (
         len(unique_tracks) >= target_track_count
         or (
             bool(album_ids)
@@ -937,6 +1373,23 @@ def load_artist_entity_expansion(
             and album_tracklists_loaded >= len(album_ids)
         )
         or (not album_ids and len(unique_tracks) >= 8)
+    )
+    artwork_target = min(4, len(albums))
+    artwork_count = sum(
+        1
+        for album in albums
+        if catalog_thumbnail_url(album, entity_type="album")
+    )
+    artwork_completion_exhausted = (
+        not album_ids or album_tracklists_attempted >= len(album_ids)
+    )
+    album_artwork_complete = (
+        artwork_count >= artwork_target or artwork_completion_exhausted
+    )
+    catalog_complete = (
+        bool(details)
+        and track_catalog_complete
+        and album_artwork_complete
     )
 
     return {
@@ -979,6 +1432,7 @@ def _retrieval_cache_key(
     )
     return "||".join(
         [
+            "classify-resolve-v2",
             trim_text(legacy_req.query).lower(),
             trim_text(getattr(legacy_req, "surface", "") or "search"),
             trim_text(getattr(legacy_req, "result_type", "") or ""),
@@ -1180,31 +1634,9 @@ def retrieve_search_candidates_fast(
             max(limit, 8),
             server=server,
         )
+    # Recording lookup is type-specific. Starting it before classification
+    # made artist queries pay for (and become contaminated by) a track branch.
     canonical_evidence_future = None
-    if not (strong_fuzzy_artist and not strong_fuzzy_track):
-        canonical_evidence_future = executor.submit(
-            search_musicbrainz_recording_items,
-            query,
-            limit=8,
-        )
-
-    canonical_track_query = ""
-    for memory in fuzzy_memories:
-        if memory.get("entity_type") != "track":
-            continue
-        payload = memory.get("payload")
-        if not isinstance(payload, dict):
-            continue
-        title = trim_text(payload.get("title") or payload.get("name"))
-        artist = trim_text(payload.get("artist") or payload.get("channel"))
-        if (
-            not title
-            or not artist
-            or search_text_similarity(query, title) < 0.78
-        ):
-            continue
-        canonical_track_query = f"{title} {artist}".strip()
-        break
 
     future_sources = {
         fast_track_future: "tracks.fast",
@@ -1266,62 +1698,87 @@ def retrieve_search_candidates_fast(
     fast_playlists: List[Dict[str, Any]] = []
     musicbrainz_tracks: List[Dict[str, Any]] = []
 
-    # A known canonical track should not force a second provider request when
-    # the direct result already agrees with its title and artist. Only resolve
-    # the longer exact query when the first provider result conflicts.
-    local_resolution = _canonical_track_resolution(
-        server,
+    preclassified_target = resolve_search_target(
+        server=server,
         query=query,
-        fuzzy_tracks=fuzzy_tracks,
-        musicbrainz_tracks=[],
+        tracks=fast_tracks[:24],
+        artists=[*fast_artists, *fuzzy_artists][:16],
+        albums=[*fast_albums, *fuzzy_albums][:16],
+        search_mode=search_mode,
     )
-    direct_match = _best_track_match(
-        server,
-        query,
-        fast_tracks,
-        preferred_title=trim_text(local_resolution.get("title")),
-        preferred_artist=trim_text(local_resolution.get("artist")),
-    )
-    expected_title = trim_text(local_resolution.get("title"))
-    expected_artist = trim_text(local_resolution.get("artist"))
-    direct_agrees = bool(direct_match) and (
-        not expected_title
-        or search_text_similarity(
-            expected_title,
-            trim_text(direct_match.get("title") or direct_match.get("name")),
-        )
-        >= 0.88
-    ) and (
-        not expected_artist
-        or search_text_similarity(
-            expected_artist,
-            trim_text(direct_match.get("channel") or direct_match.get("artist")),
-        )
-        >= 0.82
-    )
+    preclassified_intent = str(
+        preclassified_target.get("entity_type") or "mixed"
+    ).strip().lower()
     if (
-        canonical_track_query
-        and server.normalize_text(canonical_track_query)
-        != server.normalize_text(query)
-        and float(local_resolution.get("confidence") or 0.0) >= 0.88
-        and not direct_agrees
+        preclassified_intent == "track"
+        and search_mode != "taste"
     ):
-        canonical_started_at = time.perf_counter()
-        try:
-            canonical_tracks = list(
-                search_tracks_direct(
-                    canonical_track_query,
-                    max(limit, 12),
-                    server=server,
-                )
-                or []
-            )
-            completed_sources.append("tracks.canonical")
-        except Exception:
-            timed_out_sources.append("tracks.canonical")
-        provider_timings_ms["tracks.canonical"] = int(
-            (time.perf_counter() - canonical_started_at) * 1000
+        canonical_evidence_future = executor.submit(
+            search_musicbrainz_recording_items,
+            query,
+            limit=12,
         )
+
+    if canonical_evidence_future is not None:
+        elapsed_seconds = time.perf_counter() - retrieval_started_at
+        remaining_seconds = max(
+            _SEARCH_RETRIEVAL_TOTAL_BUDGET_SECONDS - elapsed_seconds,
+            0.0,
+        )
+        if canonical_evidence_future.done():
+            canonical_done = {canonical_evidence_future}
+        elif _SEARCH_DISABLE_TIMEOUTS:
+            wait({canonical_evidence_future})
+            canonical_done = {canonical_evidence_future}
+        elif remaining_seconds > 0.0:
+            canonical_done, _ = wait(
+                {canonical_evidence_future},
+                timeout=min(remaining_seconds, 1.5),
+            )
+        else:
+            canonical_done = set()
+        if canonical_evidence_future in canonical_done:
+            try:
+                musicbrainz_tracks = list(
+                    canonical_evidence_future.result() or []
+                )
+                completed_sources.append("canonical.musicbrainz")
+            except Exception:
+                timed_out_sources.append("canonical.musicbrainz")
+        else:
+            timed_out_sources.append("canonical.musicbrainz")
+            canonical_evidence_future.cancel()
+
+    canonical_resolution = (
+        _canonical_track_resolution(
+            server,
+            query=query,
+            provider_tracks=fast_tracks,
+            fuzzy_tracks=fuzzy_tracks,
+            musicbrainz_tracks=musicbrainz_tracks,
+        )
+        if preclassified_intent == "track"
+        else {}
+    )
+    same_title_provider_credits = {
+        normalize_artist_name(track.get("channel") or track.get("artist"))
+        for track in fast_tracks
+        if isinstance(track, dict)
+        and search_text_similarity(
+            query,
+            trim_text(track.get("title") or track.get("name")),
+        )
+        >= 0.94
+        and normalize_artist_name(track.get("channel") or track.get("artist"))
+    }
+    unresolved_provider_ambiguity = bool(
+        preclassified_intent == "track"
+        and len(same_title_provider_credits) > 1
+        and not canonical_resolution.get("title")
+    )
+    # A title+artist lookup may hydrate an accepted target later, but it must
+    # never manufacture the evidence used to accept that target.
+    canonical_track_query = ""
 
     _collect_track_candidates(
         track_candidates,
@@ -1366,117 +1823,100 @@ def retrieve_search_candidates_fast(
         base_score=4.7,
     )
 
-    query_intent = classify_query_intent(
-        server=server,
-        query=query,
-        # Live exact-query candidates must be evaluated before fuzzy catalog
-        # memories. A stale local alias must never push an exact provider track
-        # outside the classifier's first-page evidence window.
-        tracks=[*canonical_tracks, *fast_tracks, *fuzzy_tracks][:24],
-        artists=[*fast_artists, *fuzzy_artists][:16],
-        albums=[*fast_albums, *fuzzy_albums][:16],
-    )
-    canonical_resolution: Dict[str, Any] = {}
-    if query_intent in {"track", "mixed"} and not defer_expansion:
-        canonical_resolution = _canonical_track_resolution(
-            server,
+    if canonical_resolution.get("ambiguous") or unresolved_provider_ambiguity:
+        resolved_target = resolve_search_target(
+            server=server,
             query=query,
-            fuzzy_tracks=fuzzy_tracks,
-            musicbrainz_tracks=[],
+            tracks=[],
+            artists=[],
+            albums=[],
+            search_mode=search_mode,
         )
-        if float(canonical_resolution.get("confidence") or 0.0) < 0.88:
-            canonical_evidence_future = canonical_evidence_future or executor.submit(
-                search_musicbrainz_recording_items,
-                query,
-                limit=8,
+        resolved_target["evidence"] = [
+            str(
+                canonical_resolution.get("reason")
+                or "uncorroborated_competing_recording_credits"
             )
-            elapsed_seconds = time.perf_counter() - retrieval_started_at
-            remaining_seconds = max(
-                _SEARCH_RETRIEVAL_TOTAL_BUDGET_SECONDS - elapsed_seconds,
-                0.0,
-            )
-            if _SEARCH_DISABLE_TIMEOUTS:
-                canonical_done = {canonical_evidence_future}
-                wait(canonical_done)
-            elif remaining_seconds > 0.0:
-                canonical_done, _ = wait(
-                    {canonical_evidence_future},
-                    timeout=min(remaining_seconds, 1.5),
+        ]
+        resolved_target["decision_margin"] = float(
+            canonical_resolution.get("decision_margin") or 0.0
+        )
+        resolved_target["candidate_credits"] = list(
+            canonical_resolution.get("candidate_credits") or []
+        )
+        if unresolved_provider_ambiguity and not resolved_target["candidate_credits"]:
+            resolved_target["candidate_credits"] = [
+                {
+                    "title": trim_text(track.get("title") or track.get("name")),
+                    "artist": trim_text(track.get("channel") or track.get("artist")),
+                    "provider_source_id": trim_text(
+                        track.get("videoId")
+                        or track.get("video_id")
+                        or track.get("id")
+                    ),
+                }
+                for track in fast_tracks
+                if normalize_artist_name(
+                    track.get("channel") or track.get("artist")
                 )
-            else:
-                canonical_done = set()
-            if canonical_evidence_future in canonical_done:
-                try:
-                    musicbrainz_tracks = list(
-                        canonical_evidence_future.result() or []
-                    )
-                    completed_sources.append("canonical.musicbrainz")
-                except Exception:
-                    timed_out_sources.append("canonical.musicbrainz")
-            else:
-                timed_out_sources.append("canonical.musicbrainz")
-                canonical_evidence_future.cancel()
-            canonical_resolution = _canonical_track_resolution(
-                server,
-                query=query,
-                fuzzy_tracks=fuzzy_tracks,
-                musicbrainz_tracks=musicbrainz_tracks,
-            )
-        else:
-            if canonical_evidence_future is not None:
-                canonical_evidence_future.cancel()
+                in same_title_provider_credits
+            ][:3]
     else:
-        if canonical_evidence_future is not None:
-            canonical_evidence_future.cancel()
-    primary_track = _best_track_match(
-        server,
-        query,
-        [*canonical_tracks, *fast_tracks],
-        preferred_title=trim_text(canonical_resolution.get("title")),
-        preferred_artist=trim_text(canonical_resolution.get("artist")),
-    )
-    primary_artist = _best_artist_match(
-        query,
-        [*fuzzy_artists, *fast_artists],
-        [*canonical_tracks, *fast_tracks],
-    )
-    primary_album = _best_album_match(
-        query,
-        [*fuzzy_albums, *fast_albums],
-    )
-    credited_artist = _credited_artist_from_track(primary_track)
-    track_album = _album_from_track(primary_track)
-    track_expansion_artist = credited_artist
-    if (
-        primary_artist
-        and credited_artist
-        and normalize_artist_name(
-            primary_artist.get("name") or primary_artist.get("artist")
+        resolved_target = resolve_search_target(
+            server=server,
+            query=query,
+            tracks=[*canonical_tracks, *fast_tracks][:24],
+            artists=[*fast_artists, *fuzzy_artists][:16],
+            albums=[*fast_albums, *fuzzy_albums][:16],
+            canonical_resolution=canonical_resolution,
+            search_mode=search_mode,
+            entity_type_hint=preclassified_intent,
         )
-        == normalize_artist_name(credited_artist.get("name"))
-    ):
-        track_expansion_artist = primary_artist
+    query_intent = str(resolved_target.get("entity_type") or "mixed")
+    resolved_artist = dict(resolved_target.get("lead_artist") or {})
+    primary_track = (
+        dict(resolved_target.get("item") or {})
+        if query_intent == "track"
+        else {}
+    )
+    primary_artist = (
+        dict(resolved_target.get("item") or {})
+        if query_intent == "artist"
+        else {}
+    )
+    primary_album = (
+        dict(resolved_target.get("item") or {})
+        if query_intent == "album"
+        else {}
+    )
+    track_album = dict(resolved_target.get("containing_album") or {})
+    track_expansion_artist = resolved_artist
 
-    if credited_artist:
-        _collect_artist_candidates(
-            artist_candidates,
-            artists=[credited_artist],
-            source_name="credited_artist",
-            base_score=5.6,
+    if query_intent == "track" and primary_track:
+        _collect_track_candidates(
+            track_candidates,
+            server=server,
+            tracks=[primary_track],
+            source_name="resolved_target",
+            base_score=6.6,
         )
-    if query_intent == "artist" and primary_artist:
+    if resolved_artist and _artist_provider_identity(resolved_artist):
         _collect_artist_candidates(
             artist_candidates,
-            artists=[primary_artist],
-            source_name="resolved_artist",
-            base_score=6.2,
+            artists=[resolved_artist],
+            source_name=(
+                "resolved_artist" if query_intent == "artist" else "credited_artist"
+            ),
+            base_score=6.4,
         )
     if track_album:
         _collect_album_candidates(
             album_candidates,
             albums=[track_album],
-            source_name="track_album",
-            base_score=5.3,
+            source_name=(
+                "resolved_target" if query_intent == "album" else "track_album"
+            ),
+            base_score=6.2 if query_intent == "album" else 5.3,
         )
 
     expansion_future = None
@@ -1644,13 +2084,8 @@ def retrieve_search_candidates_fast(
         "album_candidates": album_candidates,
         "playlists": fast_playlists,
         "related_artists": related_artists,
-        "resolved_artist": (
-            primary_artist
-            if query_intent == "artist"
-            else credited_artist
-            if query_intent in {"track", "mixed"}
-            else {}
-        ),
+        "resolved_artist": resolved_artist,
+        "resolved_target": resolved_target,
         "canonical_resolution": canonical_resolution,
         "anchor_tracks": anchor_tracks,
         "anchor_artist_names": anchor_artist_names,
@@ -1682,7 +2117,17 @@ def retrieve_search_candidates_fast(
             "local_index_ms": local_index_ms,
             "removed_untrusted_aliases": removed_untrusted_aliases,
             "canonical_track_query": canonical_track_query,
+            "classified_entity_type": preclassified_intent,
             "canonical_resolution": canonical_resolution,
+            "target_resolver": resolved_target.get("resolver"),
+            "target_identity": resolved_target.get("target_identity"),
+            "target_confidence": resolved_target.get("confidence"),
+            "target_confidence_tier": resolved_target.get("confidence_tier"),
+            "target_decision_margin": resolved_target.get("decision_margin"),
+            "target_evidence": list(resolved_target.get("evidence") or []),
+            "target_candidate_scores": list(
+                resolved_target.get("candidate_scores") or []
+            ),
             "structured_expansion": expansion_kind,
             "provider_plan": (
                 "direct_plus_local_catalog"

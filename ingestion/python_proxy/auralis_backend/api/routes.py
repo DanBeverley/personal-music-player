@@ -19,7 +19,7 @@ from ..search.catalog_pipeline import (
     load_catalog_acceptance_fixtures,
 )
 from ..search.service import SearchService
-from ..storage.artist_artwork import read_artist_artwork
+from ..storage.artist_artwork import read_artist_artwork, read_entity_artwork
 from ..contracts import (
     AssistantChatRequest,
     AssistantSessionCreateRequest,
@@ -318,6 +318,19 @@ def get_artist_details(artist_id: str):
 @router.get("/artist_artwork/{token}")
 def get_artist_artwork(token: str):
     cached = read_artist_artwork(_require_server(), token)
+    if cached is None:
+        return Response(status_code=404)
+    data, content_type = cached
+    return Response(
+        content=data,
+        media_type=content_type,
+        headers={"Cache-Control": "public, max-age=2592000, immutable"},
+    )
+
+
+@router.get("/entity_artwork/{token}")
+def get_entity_artwork(token: str):
+    cached = read_entity_artwork(_require_server(), token)
     if cached is None:
         return Response(status_code=404)
     data, content_type = cached

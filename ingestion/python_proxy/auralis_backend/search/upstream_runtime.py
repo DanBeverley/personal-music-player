@@ -4,6 +4,17 @@ from typing import Any, Dict, List, Optional
 
 from .server_adapter import adapt_search_server
 
+
+class _QuietSearchLogger:
+    def debug(self, _message: str) -> None:
+        return None
+
+    def warning(self, _message: str) -> None:
+        return None
+
+    def error(self, _message: str) -> None:
+        return None
+
 def _search_cache_key(server: Any, query: str, limit: int) -> str:
     server = adapt_search_server(server)
     normalized_query = server.normalize_text(query)
@@ -132,6 +143,7 @@ def ytdlp_song_search(server: Any, query: str, limit: int):
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
+        "logger": _QuietSearchLogger(),
         "extract_flat": True,
         "skip_download": True,
     }

@@ -430,7 +430,7 @@ def catalog_thumbnail_url(
         if isinstance(value, str) and value.strip():
             url = value.strip()
             youtube_match = _YOUTUBE_THUMBNAIL_ID_RE.search(url)
-            if youtube_match:
+            if youtube_match and str(entity_type or "").strip().lower() == "track":
                 source = verified_playback_source(item)
                 if (
                     not _YOUTUBE_VIDEO_ID_RE.fullmatch(youtube_match.group(1))
@@ -746,12 +746,32 @@ def normalized_track_payload(track: Dict[str, Any]) -> Dict[str, Any]:
 def normalized_artist_payload(artist: Dict[str, Any]) -> Dict[str, Any]:
     name = _display_text(artist.get("name"), artist.get("artist"), artist.get("channel"))
     normalized_name = normalize_artist_name(name)
+    provider_artist_id = _text(
+        artist.get("provider_artist_id")
+        or artist.get("browseId")
+        or artist.get("artist_id")
+    )
+    if provider_artist_id.startswith(
+        ("musicbrainz:artist:", "artist-name:", "derived:")
+    ):
+        provider_artist_id = ""
+    if not provider_artist_id:
+        candidate_id = _text(artist.get("id"))
+        if candidate_id and not candidate_id.startswith(
+            ("musicbrainz:artist:", "artist-name:", "derived:")
+        ):
+            provider_artist_id = candidate_id
     aliases: List[str] = []
     for value in (
         name,
         artist.get("artist"),
         artist.get("artist_name"),
         artist.get("channel"),
+        *(
+            artist.get("artist_aliases") or []
+            if isinstance(artist.get("artist_aliases"), list)
+            else []
+        ),
         *(artist.get("aliases") or [] if isinstance(artist.get("aliases"), list) else []),
     ):
         alias = normalize_artist_name(value)
@@ -760,11 +780,12 @@ def normalized_artist_payload(artist: Dict[str, Any]) -> Dict[str, Any]:
     payload = dict(artist)
     payload.update(
         {
+            "id": provider_artist_id or _text(artist.get("id")),
             "name": name,
             "normalized_name": normalized_name,
             "canonical_artist_identity": canonical_artist_identity(artist),
             "canonical_artist_id": canonical_artist_record_key(artist),
-            "provider_artist_id": _text(artist.get("id")),
+            "provider_artist_id": provider_artist_id,
             "artist_aliases": aliases,
             **_shared_catalog_metadata(artist, entity_type="artist"),
         }

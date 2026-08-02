@@ -144,7 +144,7 @@ def catalog_entity_key(entity_type: str, item: Dict[str, Any], *, query: str = "
     if normalized_type == "artist":
         mbid = _text(item.get("musicbrainz_artist_id") or item.get("mb_artist_id"))
         if mbid:
-            return f"musicbrainz:artist:{mbid}"
+            return f"musicbrainz:artist:{mbid.casefold()}"
         provider_id = _text(
             item.get("provider_artist_id")
             or item.get("browseId")
@@ -748,7 +748,7 @@ def load_catalog_artist_records(
     *,
     artist_names: Iterable[str],
 ) -> Dict[str, Dict[str, Any]]:
-    """Load canonical artist records by normalized identity in one SQLite query."""
+    """Load artist records by intrinsic aliases and stable identity keys."""
     artist_keys = list(
         dict.fromkeys(
             normalize_artist_name(name)
@@ -768,7 +768,9 @@ def load_catalog_artist_records(
             f"""
             SELECT e.entity_key, e.confidence, e.learned_popularity,
                    e.popularity, e.payload_json, e.updated_at,
-                   coalesce(a.alias_key, e.entity_key) AS matched_key
+                   coalesce(a.alias_key, e.entity_key) AS matched_key,
+                   coalesce(a.source, '') AS alias_source,
+                   coalesce(a.confidence, 0) AS alias_confidence
             FROM catalog_entities e
             LEFT JOIN catalog_entity_aliases a
               ON a.entity_type = e.entity_type
@@ -789,30 +791,76 @@ def load_catalog_artist_records(
     finally:
         connection.close()
     records: Dict[str, Dict[str, Any]] = {}
-    for row in rows:
-        key = normalize_artist_name(row["matched_key"])
-        payload = _json_loads(row["payload_json"])
-        if not key or not isinstance(payload, dict):
-            continue
-        payload["_catalog_confidence"] = float(row["confidence"] or 0.0)
-        payload["_catalog_updated_at"] = float(row["updated_at"] or 0.0)
-        previous = records.get(key)
-        payload_has_cached_artwork = str(
-            payload.get("thumbnail") or ""
-        ).startswith("/artist_artwork/")
-        previous_has_cached_artwork = str(
-            (previous or {}).get("thumbnail") or ""
-        ).startswith("/artist_artwork/")
-        if previous is None or (
-            payload_has_cached_artwork,
-            float(payload.get("_catalog_confidence") or 0.0),
-            float(payload.get("_catalog_updated_at") or 0.0),
-        ) > (
-            previous_has_cached_artwork,
-            float(previous.get("_catalog_confidence") or 0.0),
-            float(previous.get("_catalog_updated_at") or 0.0),
+
+    def record_keys(payload: Dict[str, Any], matched_key: Any) -> set[str]:
+        keys = {normalize_artist_name(matched_key)}
+        musicbrainz_id = _text(
+            payload.get("musicbrainz_artist_id")
+            or payload.get("artist_mbid")
+            or payload.get("mb_artist_id")
+        ).casefold()
+        canonical_id = _text(
+            payload.get("canonical_artist_id")
+            or payload.get("canonical_artist_key")
+        ).casefold()
+        if not musicbrainz_id and canonical_id.startswith(
+            "musicbrainz:artist:"
         ):
-            records[key] = payload
+            musicbrainz_id = canonical_id.removeprefix(
+                "musicbrainz:artist:"
+            )
+        provider_id = _text(
+            payload.get("provider_artist_id")
+            or payload.get("browseId")
+            or payload.get("artist_id")
+            or payload.get("id")
+        )
+        if provider_id.startswith(
+            ("musicbrainz:artist:", "artist-name:", "derived:")
+        ):
+            provider_id = ""
+        if musicbrainz_id:
+            keys.add(f"mbid:{musicbrainz_id}")
+        if provider_id:
+            keys.add(f"provider:{provider_id.casefold()}")
+        keys.discard("")
+        return keys
+
+    def record_priority(payload: Dict[str, Any]) -> tuple[Any, ...]:
+        has_musicbrainz_id = any(
+            key.startswith("mbid:") for key in record_keys(payload, "")
+        )
+        has_provider_id = any(
+            key.startswith("provider:") for key in record_keys(payload, "")
+        )
+        return (
+            has_musicbrainz_id and has_provider_id,
+            has_provider_id,
+            str(payload.get("thumbnail") or "").startswith(
+                "/artist_artwork/"
+            ),
+            float(payload.get("_catalog_confidence") or 0.0),
+            float(payload.get("_catalog_alias_confidence") or 0.0),
+            float(payload.get("_catalog_updated_at") or 0.0),
+        )
+
+    for row in rows:
+        payload = _json_loads(row["payload_json"])
+        if not isinstance(payload, dict):
+            continue
+        payload["_catalog_entity_key"] = _text(row["entity_key"])
+        payload["_catalog_confidence"] = float(row["confidence"] or 0.0)
+        payload["_catalog_alias_confidence"] = float(
+            row["alias_confidence"] or 0.0
+        )
+        payload["_catalog_alias_source"] = _text(row["alias_source"])
+        payload["_catalog_updated_at"] = float(row["updated_at"] or 0.0)
+        for key in record_keys(payload, row["matched_key"]):
+            previous = records.get(key)
+            if previous is None or record_priority(payload) > record_priority(
+                previous
+            ):
+                records[key] = payload
     return records
 
 
@@ -1531,6 +1579,8 @@ def _catalog_alias_keys(
             add(query_key)
         add(artist_key)
         add(_text(item.get("name") or item.get("artist") or item.get("channel")))
+        for alias in item.get("artist_aliases") or []:
+            add(_text(alias))
     elif normalized_type == "album":
         if include_query_alias:
             add(query_key)
@@ -1668,15 +1718,6 @@ def _merge_entity_metadata_payload(
     if entity_type != "artist":
         return merged
 
-    existing_thumbnail = _text(existing.get("thumbnail"))
-    incoming_thumbnail = _text(incoming.get("thumbnail"))
-    if existing_thumbnail.startswith("/artist_artwork/") and not (
-        incoming_thumbnail.startswith("/artist_artwork/")
-    ):
-        merged["thumbnail"] = existing_thumbnail
-        if incoming_thumbnail.startswith(("http://", "https://")):
-            merged["artwork_source_url"] = incoming_thumbnail
-
     aliases: List[str] = []
     for payload in (existing, incoming):
         for value in (
@@ -1704,6 +1745,27 @@ def _merge_entity_metadata_payload(
     ):
         merged["canonical_artist_id"] = existing_canonical_id
     return merged
+
+
+def _artist_catalog_duplicate_keys(
+    item: Dict[str, Any],
+    *,
+    canonical_key: str,
+) -> List[str]:
+    if not canonical_key.startswith("musicbrainz:artist:"):
+        return []
+    provider_id = _text(
+        item.get("provider_artist_id")
+        or item.get("browseId")
+        or item.get("artist_id")
+        or item.get("id")
+    )
+    if not provider_id or provider_id.startswith(
+        ("musicbrainz:artist:", "artist-name:", "derived:")
+    ):
+        return []
+    provider_key = f"provider:artist:{provider_id.casefold()}"
+    return [provider_key] if provider_key != canonical_key else []
 
 
 def remember_catalog_entity(
@@ -1734,17 +1796,6 @@ def remember_catalog_entity(
     safe_confidence = max(0.0, min(float(confidence or 0.0), 1.0))
     weight = max(float(event_weight or 0.0), 0.0)
     popularity_delta = _event_popularity_delta(event_type or source, weight)
-    display = _entity_display_fields(item)
-    identity = infer_source_identity(item)
-    alias_keys = _catalog_alias_keys(
-        query_key,
-        entity_type=normalized_type,
-        item=item,
-        title_key=title_key,
-        artist_key=artist_key,
-        album_key=album_key,
-        include_query_alias=learn_query_alias,
-    )
     now = time.time()
     try:
         connection = open_recommendation_store_connection(server)
@@ -1752,9 +1803,48 @@ def remember_catalog_entity(
         return False
     try:
         stored_item = dict(item)
+        duplicate_popularity = 0.0
+        duplicate_keys = (
+            _artist_catalog_duplicate_keys(
+                stored_item,
+                canonical_key=entity_key,
+            )
+            if normalized_type == "artist"
+            else []
+        )
+        if duplicate_keys:
+            placeholders = ",".join("?" for _ in duplicate_keys)
+            duplicate_rows = connection.execute(
+                f"""
+                SELECT entity_key, confidence, popularity,
+                       learned_popularity, payload_json
+                FROM catalog_entities
+                WHERE entity_type = 'artist'
+                  AND entity_key IN ({placeholders})
+                """,
+                duplicate_keys,
+            ).fetchall()
+            for row in duplicate_rows:
+                stored_item = _merge_entity_metadata_payload(
+                    _json_loads(row["payload_json"]),
+                    stored_item,
+                    entity_type=normalized_type,
+                )
+                safe_confidence = max(
+                    safe_confidence,
+                    float(row["confidence"] or 0.0),
+                )
+                popularity_delta = max(
+                    popularity_delta,
+                    float(row["learned_popularity"] or 0.0),
+                )
+                duplicate_popularity = max(
+                    duplicate_popularity,
+                    float(row["popularity"] or 0.0),
+                )
         existing_row = connection.execute(
             """
-            SELECT payload_json
+            SELECT confidence, payload_json
             FROM catalog_entities
             WHERE entity_type = ? AND entity_key = ?
             """,
@@ -1767,6 +1857,21 @@ def remember_catalog_entity(
                 stored_item,
                 entity_type=normalized_type,
             )
+            safe_confidence = max(
+                safe_confidence,
+                float(existing_row["confidence"] or 0.0),
+            )
+        display = _entity_display_fields(stored_item)
+        identity = infer_source_identity(stored_item)
+        alias_keys = _catalog_alias_keys(
+            query_key,
+            entity_type=normalized_type,
+            item=stored_item,
+            title_key=title_key,
+            artist_key=artist_key,
+            album_key=album_key,
+            include_query_alias=learn_query_alias,
+        )
         connection.execute(
             """
             INSERT INTO catalog_entities(
@@ -1807,12 +1912,40 @@ def remember_catalog_entity(
                 display["display_artist"],
                 display["display_album"],
                 safe_confidence,
-                normalized_popularity(item),
+                max(normalized_popularity(stored_item), duplicate_popularity),
                 popularity_delta,
                 _json_dumps(stored_item),
                 now,
             ],
         )
+        for duplicate_key in duplicate_keys:
+            for table in (
+                "catalog_entity_aliases",
+                "catalog_entity_sources",
+                "catalog_entity_metrics",
+            ):
+                connection.execute(
+                    f"""
+                    UPDATE OR IGNORE {table}
+                    SET entity_key = ?
+                    WHERE entity_type = 'artist' AND entity_key = ?
+                    """,
+                    [entity_key, duplicate_key],
+                )
+                connection.execute(
+                    f"""
+                    DELETE FROM {table}
+                    WHERE entity_type = 'artist' AND entity_key = ?
+                    """,
+                    [duplicate_key],
+                )
+            connection.execute(
+                """
+                DELETE FROM catalog_entities
+                WHERE entity_type = 'artist' AND entity_key = ?
+                """,
+                [duplicate_key],
+            )
         for alias_key in alias_keys:
             connection.execute(
                 """

@@ -16,6 +16,9 @@ except Exception:  # pragma: no cover - optional production dependency
 
 
 _CLIENTS: Dict[int, "ArtistArtworkCache | None"] = {}
+_ENTITY_CLIENTS: Dict[int, "ArtistArtworkCache | None"] = {}
+_ENTITY_SOURCES: Dict[str, tuple[Any, list[str], str]] = {}
+_ENTITY_SOURCES_LOCK = threading.Lock()
 _EXECUTOR = ThreadPoolExecutor(
     max_workers=2,
     thread_name_prefix="auralis-artist-artwork",
@@ -41,6 +44,50 @@ def artist_artwork_path(canonical_artist_id: str) -> str:
     return f"/artist_artwork/{token}" if token else ""
 
 
+def _artwork_token_from_path(value: Any) -> str:
+    path = _clean(value)
+    token = path.removeprefix("/artist_artwork/") if path.startswith(
+        "/artist_artwork/"
+    ) else ""
+    return token if _TOKEN_RE.match(token) else ""
+
+
+def _http_artwork_url(value: Any) -> str:
+    url = _clean(value)
+    return url if url.startswith(("http://", "https://")) else ""
+
+
+def _download_artwork(
+    server: Any,
+    source_url: str,
+) -> tuple[bytes, str] | None:
+    if not _http_artwork_url(source_url):
+        return None
+    try:
+        response = server.upstream_http.get(
+            source_url,
+            timeout=(3.0, 8.0),
+            stream=True,
+        )
+        response.raise_for_status()
+        content_type = _clean(response.headers.get("Content-Type")).split(";", 1)[0]
+        if not content_type.startswith("image/"):
+            return None
+        chunks = []
+        total = 0
+        for chunk in response.iter_content(chunk_size=64 * 1024):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > 2 * 1024 * 1024:
+                return None
+            chunks.append(chunk)
+        data = b"".join(chunks)
+        return (data, content_type) if data else None
+    except Exception:
+        return None
+
+
 def _artist_cache_identities(artist: Dict[str, Any]) -> list[str]:
     identities: list[str] = []
 
@@ -51,9 +98,6 @@ def _artist_cache_identities(artist: Dict[str, Any]) -> list[str]:
         }:
             identities.append(identity)
 
-    add(artist.get("artwork_cache_identity"))
-    add(artist.get("canonical_artist_id"))
-    add(artist.get("canonical_artist_key"))
     provider_artist_id = _clean(
         artist.get("provider_artist_id")
         or artist.get("browseId")
@@ -64,12 +108,23 @@ def _artist_cache_identities(artist: Dict[str, Any]) -> list[str]:
         ("musicbrainz:artist:", "artist-name:", "derived:")
     ):
         add(f"provider:artist:{provider_artist_id.casefold()}")
+    for value in (
+        artist.get("artwork_cache_identity"),
+        artist.get("canonical_artist_id"),
+        artist.get("canonical_artist_key"),
+    ):
+        identity = _clean(value)
+        if identity.startswith(("provider:artist:", "musicbrainz:artist:")):
+            add(identity)
     normalized_name = re.sub(
         r"[^a-z0-9]+",
         " ",
         _clean(artist.get("normalized_name") or artist.get("name")).casefold(),
     ).strip()
-    if normalized_name:
+    # A name is discovery evidence, not artwork ownership. Legacy name keys
+    # remain readable only for records that have no provider/canonical
+    # identity; a provider-backed homonym must never inherit those bytes.
+    if normalized_name and not identities:
         add(f"artist-name:{normalized_name}")
         # Older cache entries used the bare normalized name.
         add(normalized_name)
@@ -83,27 +138,58 @@ def attach_cached_artist_artwork(
     """Attach an existing R2 object before attempting a live artwork lookup."""
     updated = dict(artist or {})
     thumbnail = _clean(updated.get("thumbnail"))
-    if thumbnail.startswith("/artist_artwork/"):
-        return updated
+    source_url = _http_artwork_url(updated.get("artwork_source_url"))
+    identities = _artist_cache_identities(updated)
+    allowed_tokens = {
+        artist_artwork_token(identity)
+        for identity in identities
+        if artist_artwork_token(identity)
+    }
+    current_token = _artwork_token_from_path(thumbnail)
+    if current_token:
+        cache = get_artist_artwork_cache(server)
+        if (
+            current_token in allowed_tokens
+            and cache is not None
+            and cache.head(current_token) is not None
+        ):
+            updated["artwork_cache_token"] = current_token
+            return updated
+        updated.pop("artwork_cache_token", None)
+        if source_url:
+            updated["thumbnail"] = source_url
+        else:
+            updated.pop("thumbnail", None)
+    elif _http_artwork_url(thumbnail):
+        source_url = thumbnail
+        updated["artwork_source_url"] = source_url
+    elif thumbnail:
+        updated.pop("thumbnail", None)
     cache = get_artist_artwork_cache(server)
     if cache is None:
+        if source_url:
+            updated["thumbnail"] = source_url
         return updated
     persisted_token = _clean(updated.get("artwork_cache_token"))
-    if _TOKEN_RE.match(persisted_token):
+    if (
+        _TOKEN_RE.match(persisted_token)
+        and persisted_token in allowed_tokens
+        and cache.head(persisted_token) is not None
+    ):
         updated["thumbnail"] = f"/artist_artwork/{persisted_token}"
         return updated
-    for identity in _artist_cache_identities(updated):
+    if persisted_token:
+        updated.pop("artwork_cache_token", None)
+    for identity in identities:
         token = artist_artwork_token(identity)
         if not token or cache.head(token) is None:
             continue
         updated["artwork_cache_identity"] = identity
         updated["artwork_cache_token"] = token
         updated["thumbnail"] = f"/artist_artwork/{token}"
-        print(
-            "[EBB:artist-artwork] "
-            f"status=r2_hit identity={identity} token={token}"
-        )
         return updated
+    if source_url:
+        updated["thumbnail"] = source_url
     return updated
 
 
@@ -126,7 +212,13 @@ def notify_artist_metadata_updated(artist: Dict[str, Any]) -> None:
 
 
 class ArtistArtworkCache:
-    def __init__(self, server: Any) -> None:
+    def __init__(
+        self,
+        server: Any,
+        *,
+        prefix_setting: str = "AURALIS_ARTIST_ARTWORK_CACHE_PREFIX",
+        default_prefix: str = "artist-artwork",
+    ) -> None:
         if boto3 is None or Config is None:
             raise RuntimeError("boto3 dependency unavailable")
         bucket = _clean(getattr(server, "AURALIS_STREAM_CACHE_BUCKET", ""))
@@ -141,8 +233,8 @@ class ArtistArtworkCache:
         self.server = server
         self.bucket = bucket
         self.prefix = (
-            _clean(getattr(server, "AURALIS_ARTIST_ARTWORK_CACHE_PREFIX", "artist-artwork"))
-            or "artist-artwork"
+            _clean(getattr(server, prefix_setting, default_prefix))
+            or default_prefix
         )
         self.client = boto3.client(
             "s3",
@@ -152,11 +244,18 @@ class ArtistArtworkCache:
             region_name="auto",
             config=Config(signature_version="s3v4", retries={"max_attempts": 2}),
         )
+        self._verified_tokens: set[str] = set()
+        self._verified_tokens_lock = threading.Lock()
 
     def _key(self, token: str) -> str:
         return f"{self.prefix.rstrip('/')}/{token}.img"
 
     def head(self, token: str) -> Dict[str, Any] | None:
+        if not _TOKEN_RE.match(token):
+            return None
+        with self._verified_tokens_lock:
+            if token in self._verified_tokens:
+                return {"content_type": "image/jpeg", "content_length": 1}
         try:
             response = self.client.head_object(
                 Bucket=self.bucket,
@@ -164,9 +263,14 @@ class ArtistArtworkCache:
             )
         except Exception:
             return None
+        content_length = int(response.get("ContentLength") or 0)
+        if content_length <= 0:
+            return None
+        with self._verified_tokens_lock:
+            self._verified_tokens.add(token)
         return {
             "content_type": _clean(response.get("ContentType")) or "image/jpeg",
-            "content_length": int(response.get("ContentLength") or 0),
+            "content_length": content_length,
         }
 
     def read(self, token: str) -> tuple[bytes, str] | None:
@@ -186,6 +290,8 @@ class ArtistArtworkCache:
             return None
         if not data:
             return None
+        with self._verified_tokens_lock:
+            self._verified_tokens.add(token)
         return data, _clean(response.get("ContentType")) or "image/jpeg"
 
     def store(
@@ -193,34 +299,18 @@ class ArtistArtworkCache:
         *,
         token: str,
         source_url: str,
-        canonical_artist_id: str,
+        canonical_artist_id: str = "",
+        cache_identity: str = "",
     ) -> bool:
         if not _TOKEN_RE.match(token) or not source_url.startswith(("http://", "https://")):
             return False
         if self.head(token) is not None:
             return True
         try:
-            response = self.server.upstream_http.get(
-                source_url,
-                timeout=(3.0, 8.0),
-                stream=True,
-            )
-            response.raise_for_status()
-            content_type = _clean(response.headers.get("Content-Type")).split(";", 1)[0]
-            if not content_type.startswith("image/"):
+            downloaded = _download_artwork(self.server, source_url)
+            if downloaded is None:
                 return False
-            chunks = []
-            total = 0
-            for chunk in response.iter_content(chunk_size=64 * 1024):
-                if not chunk:
-                    continue
-                total += len(chunk)
-                if total > 2 * 1024 * 1024:
-                    return False
-                chunks.append(chunk)
-            data = b"".join(chunks)
-            if not data:
-                return False
+            data, content_type = downloaded
             self.client.put_object(
                 Bucket=self.bucket,
                 Key=self._key(token),
@@ -228,10 +318,14 @@ class ArtistArtworkCache:
                 ContentType=content_type,
                 CacheControl="public, max-age=2592000, immutable",
                 Metadata={
-                    "canonical-artist": canonical_artist_id[:512],
+                    "cache-identity": (
+                        cache_identity or canonical_artist_id
+                    )[:512],
                     "cached-at": str(int(time.time())),
                 },
             )
+            with self._verified_tokens_lock:
+                self._verified_tokens.add(token)
             return True
         except Exception:
             return False
@@ -251,6 +345,139 @@ def get_artist_artwork_cache(server: Any) -> ArtistArtworkCache | None:
     return cache
 
 
+def _entity_artwork_identity(
+    item: Dict[str, Any],
+    *,
+    entity_type: str,
+) -> str:
+    normalized_type = _clean(entity_type).casefold()
+    if normalized_type == "album":
+        stable_id = _clean(
+            item.get("canonical_album_identity")
+            or item.get("musicbrainz_release_group_id")
+            or item.get("provider_album_id")
+            or item.get("browseId")
+            or item.get("album_id")
+            or item.get("id")
+        )
+        if not stable_id:
+            stable_id = "|".join(
+                value
+                for value in (
+                    _clean(item.get("title") or item.get("name")).casefold(),
+                    _clean(item.get("artist") or item.get("artist_name")).casefold(),
+                )
+                if value
+            )
+    elif normalized_type == "playlist":
+        stable_id = _clean(item.get("id") or item.get("browseId"))
+    else:
+        stable_id = ""
+    return f"{normalized_type}:{stable_id}" if stable_id else ""
+
+
+def get_entity_artwork_cache(server: Any) -> ArtistArtworkCache | None:
+    server = getattr(server, "raw", server)
+    key = id(server)
+    if key in _ENTITY_CLIENTS:
+        return _ENTITY_CLIENTS[key]
+    try:
+        cache = ArtistArtworkCache(
+            server,
+            prefix_setting="AURALIS_ENTITY_ARTWORK_CACHE_PREFIX",
+            default_prefix="entity-artwork",
+        )
+    except Exception:
+        _ENTITY_CLIENTS[key] = None
+        return None
+    _ENTITY_CLIENTS[key] = cache
+    return cache
+
+
+def attach_entity_artwork_proxy(
+    server: Any,
+    item: Dict[str, Any],
+    *,
+    entity_type: str,
+) -> Dict[str, Any]:
+    """Make album/playlist artwork backend-owned without blocking search."""
+    server = getattr(server, "raw", server)
+    updated = dict(item or {})
+    existing_path = _clean(updated.get("thumbnail"))
+    if existing_path.startswith("/entity_artwork/"):
+        return updated
+    source_urls: list[str] = []
+
+    def add_source(value: Any) -> None:
+        url = _http_artwork_url(value)
+        if url and url not in source_urls:
+            source_urls.append(url)
+
+    for value in (
+        updated.get("artwork_source_url"),
+        existing_path,
+        updated.get("artwork_url"),
+        updated.get("cover_url"),
+        updated.get("image_url"),
+        updated.get("artwork"),
+        updated.get("cover"),
+        updated.get("image"),
+    ):
+        if isinstance(value, dict):
+            add_source(value.get("url") or value.get("src"))
+        else:
+            add_source(value)
+    for value in reversed(list(updated.get("thumbnails") or updated.get("images") or [])):
+        if isinstance(value, dict):
+            add_source(value.get("url") or value.get("src"))
+        else:
+            add_source(value)
+    identity = _entity_artwork_identity(updated, entity_type=entity_type)
+    if not source_urls or not identity:
+        return updated
+    token = artist_artwork_token(identity)
+    if not token:
+        return updated
+    with _ENTITY_SOURCES_LOCK:
+        _ENTITY_SOURCES[token] = (server, source_urls, identity)
+    updated["artwork_source_url"] = source_urls[0]
+    updated["artwork_cache_identity"] = identity
+    updated["artwork_cache_token"] = token
+    updated["thumbnail"] = f"/entity_artwork/{token}"
+    return updated
+
+
+def read_entity_artwork(
+    server: Any,
+    token: str,
+) -> tuple[bytes, str] | None:
+    server = getattr(server, "raw", server)
+    cache = get_entity_artwork_cache(server)
+    if not _TOKEN_RE.match(_clean(token)):
+        return None
+    cached = cache.read(token) if cache is not None else None
+    if cached is not None:
+        return cached
+    with _ENTITY_SOURCES_LOCK:
+        source = _ENTITY_SOURCES.get(token)
+    if source is None:
+        return None
+    _source_server, source_urls, identity = source
+    for source_url in source_urls:
+        if cache is not None and cache.store(
+            token=token,
+            source_url=source_url,
+            cache_identity=identity,
+        ):
+            cached = cache.read(token)
+            if cached is not None:
+                return cached
+        downloaded = _download_artwork(server, source_url)
+        if downloaded is not None:
+            return downloaded
+    return None
+
+
 def schedule_artist_artwork_cache(
     server: Any,
     artist: Dict[str, Any],
@@ -266,18 +493,18 @@ def schedule_artist_artwork_cache(
         return True
 
     source_url = _clean(
-        artist.get("artwork_source_url")
-        or artist.get("thumbnail")
+        cached_artist.get("artwork_source_url")
+        or cached_artist.get("thumbnail")
     )
     canonical_artist_id = _clean(
-        artist.get("canonical_artist_id")
-        or artist.get("canonical_artist_key")
+        cached_artist.get("canonical_artist_id")
+        or cached_artist.get("canonical_artist_key")
     )
     provider_artist_id = _clean(
-        artist.get("provider_artist_id")
-        or artist.get("browseId")
-        or artist.get("artist_id")
-        or artist.get("id")
+        cached_artist.get("provider_artist_id")
+        or cached_artist.get("browseId")
+        or cached_artist.get("artist_id")
+        or cached_artist.get("id")
     )
     if (
         provider_artist_id
@@ -292,7 +519,7 @@ def schedule_artist_artwork_cache(
         canonical_artist_id = f"provider:artist:{provider_artist_id.casefold()}"
     if not canonical_artist_id:
         canonical_artist_id = _clean(
-            artist.get("normalized_name") or artist.get("name")
+            cached_artist.get("normalized_name") or cached_artist.get("name")
         )
     if (
         not source_url.startswith(("http://", "https://"))
@@ -319,16 +546,12 @@ def schedule_artist_artwork_cache(
                 canonical_artist_id=canonical_artist_id,
             ):
                 return
-            updated = dict(artist)
+            updated = dict(cached_artist)
             updated["artwork_source_url"] = source_url
             updated["artwork_cached_at"] = int(time.time())
             updated["artwork_cache_identity"] = canonical_artist_id
             updated["artwork_cache_token"] = token
             updated["thumbnail"] = f"/artist_artwork/{token}"
-            print(
-                "[EBB:artist-artwork] "
-                f"status=stored identity={canonical_artist_id} token={token}"
-            )
             notify_artist_metadata_updated(updated)
             if on_cached is not None:
                 on_cached(updated)

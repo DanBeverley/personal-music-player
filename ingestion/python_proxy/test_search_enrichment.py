@@ -63,6 +63,7 @@ from auralis_backend.search.musicbrainz import (
 )
 from auralis_backend.recommend.store_runtime import open_recommendation_store_connection
 from auralis_backend.search.server_adapter import SearchServerAdapter
+from auralis_backend.domain.catalog import normalized_artist_payload
 from auralis_backend.domain.result_quality import album_result_penalty
 
 
@@ -154,7 +155,9 @@ class SearchEnrichmentTests(unittest.TestCase):
             remembered = {
                 "id": "UC-canonical-arctic-monkeys",
                 "name": "Arctic Monkeys",
-                "thumbnail": "/artist_artwork/0123456789abcdef0123456789abcdef",
+                "thumbnail": artist_artwork_path(
+                    "provider:artist:uc-canonical-arctic-monkeys"
+                ),
                 "canonical_artist_id": "artist-name:arctic monkeys",
                 "source_authority": "ytmusic_artist_detail",
             }
@@ -189,6 +192,12 @@ class SearchEnrichmentTests(unittest.TestCase):
                 patch(
                     "auralis_backend.search.service._SEARCH_CATALOG_WRITER.submit"
                 ),
+                patch(
+                    "auralis_backend.storage.artist_artwork.get_artist_artwork_cache",
+                    return_value=SimpleNamespace(
+                        head=Mock(return_value={"content_length": 100})
+                    ),
+                ),
             ):
                 hydrated = service._hydrate_artist_artwork(
                     [
@@ -206,8 +215,231 @@ class SearchEnrichmentTests(unittest.TestCase):
             )
             self.assertEqual(
                 hydrated[0].get("thumbnail"),
-                "/artist_artwork/0123456789abcdef0123456789abcdef",
+                artist_artwork_path(
+                    "provider:artist:uc-canonical-arctic-monkeys"
+                ),
             )
+
+    def test_artist_normalization_preserves_explicit_provider_identity(self) -> None:
+        artist = normalized_artist_payload(
+            {
+                "id": "musicbrainz:artist:mbid-queensryche",
+                "provider_artist_id": "UC-Queensryche",
+                "musicbrainz_artist_id": "mbid-queensryche",
+                "name": "Queensrÿche",
+                "artist_aliases": ["Queensryche"],
+            }
+        )
+
+        self.assertEqual(artist.get("id"), "UC-Queensryche")
+        self.assertEqual(
+            artist.get("provider_artist_id"),
+            "UC-Queensryche",
+        )
+        self.assertEqual(
+            artist.get("canonical_artist_id"),
+            "musicbrainz:artist:mbid-queensryche",
+        )
+        self.assertIn("queensryche", artist.get("artist_aliases") or [])
+
+    def test_accepted_artist_bridge_coalesces_provider_catalog_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            memory_server = _MemoryTestServer(
+                str(pathlib.Path(tmp_dir) / "artist-bridge.sqlite")
+            )
+            cached_path = artist_artwork_path(
+                "provider:artist:uc-queensryche"
+            )
+            provider_record = {
+                "id": "UC-Queensryche",
+                "provider_artist_id": "UC-Queensryche",
+                "name": "Queensrÿche",
+                "thumbnail": cached_path,
+                "source_authority": "ytmusic_artist_detail",
+            }
+            self.assertTrue(
+                remember_catalog_entity(
+                    memory_server,
+                    user_scope_id="global",
+                    query="Queensrÿche",
+                    entity_type="artist",
+                    item=provider_record,
+                    confidence=0.88,
+                    event_weight=0.0,
+                    event_type="artist_metadata",
+                    source="canonical_search_artist",
+                )
+            )
+            self.assertTrue(
+                remember_catalog_entity(
+                    memory_server,
+                    user_scope_id="global",
+                    query="Queensrÿche",
+                    entity_type="artist",
+                    item={
+                        "id": "musicbrainz:artist:mbid-queensryche",
+                        "musicbrainz_artist_id": "mbid-queensryche",
+                        "name": "Queensrÿche",
+                    },
+                    confidence=0.98,
+                    event_weight=0.0,
+                    event_type="musicbrainz_artist",
+                    source="musicbrainz_catalog",
+                )
+            )
+            with (
+                patch(
+                    "auralis_backend.search.service.load_catalog_artist_payloads",
+                    return_value={},
+                ),
+                patch(
+                    "auralis_backend.storage.artist_artwork.get_artist_artwork_cache",
+                    return_value=SimpleNamespace(
+                        head=Mock(return_value={"content_length": 100})
+                    ),
+                ),
+            ):
+                reused = SearchService(
+                    memory_server
+                )._hydrate_artist_artwork(
+                    [
+                        {
+                            "id": "musicbrainz:artist:mbid-queensryche",
+                            "musicbrainz_artist_id": "mbid-queensryche",
+                            "name": "Queensrÿche",
+                            "artist_aliases": ["Queensryche"],
+                        }
+                    ],
+                    allow_live_lead_lookup=False,
+                    schedule_background=False,
+                )
+            self.assertEqual(
+                reused[0].get("provider_artist_id"),
+                "UC-Queensryche",
+            )
+            bridged_record = normalized_artist_payload(reused[0])
+            self.assertTrue(
+                remember_catalog_entity(
+                    memory_server,
+                    user_scope_id="global",
+                    query="Queensrÿche",
+                    entity_type="artist",
+                    item=bridged_record,
+                    confidence=0.88,
+                    event_weight=0.0,
+                    event_type="artist_metadata",
+                    source="canonical_search_artist",
+                )
+            )
+
+            connection = open_recommendation_store_connection(memory_server)
+            try:
+                entity_rows = connection.execute(
+                    """
+                    SELECT entity_key, payload_json
+                    FROM catalog_entities
+                    WHERE entity_type = 'artist'
+                    """
+                ).fetchall()
+                alias_entity_keys = {
+                    row["entity_key"]
+                    for row in connection.execute(
+                        """
+                        SELECT entity_key
+                        FROM catalog_entity_aliases
+                        WHERE entity_type = 'artist'
+                        """
+                    ).fetchall()
+                }
+            finally:
+                connection.close()
+
+            self.assertEqual(len(entity_rows), 1)
+            self.assertEqual(
+                entity_rows[0]["entity_key"],
+                "musicbrainz:artist:mbid-queensryche",
+            )
+            persisted = json.loads(entity_rows[0]["payload_json"])
+            self.assertEqual(
+                persisted.get("provider_artist_id"),
+                "UC-Queensryche",
+            )
+            self.assertEqual(
+                alias_entity_keys,
+                {"musicbrainz:artist:mbid-queensryche"},
+            )
+
+            service = SearchService(memory_server)
+            with (
+                patch(
+                    "auralis_backend.search.service.load_catalog_artist_payloads",
+                    return_value={},
+                ),
+                patch(
+                    "auralis_backend.search.service._SEARCH_CATALOG_WRITER.submit",
+                ),
+                patch(
+                    "auralis_backend.search.service._schedule_artist_metadata_resolution",
+                ) as mock_schedule,
+                patch(
+                    "auralis_backend.storage.artist_artwork.get_artist_artwork_cache",
+                    return_value=SimpleNamespace(
+                        head=Mock(return_value={"content_length": 100})
+                    ),
+                ),
+            ):
+                related = service._resolve_first_page_related_artists(
+                    [
+                        {
+                            "id": "musicbrainz:artist:mbid-queensryche",
+                            "musicbrainz_artist_id": "mbid-queensryche",
+                            "name": "Queensrÿche",
+                        }
+                    ],
+                    query="Dio",
+                )
+
+            self.assertEqual(
+                related[0].get("provider_artist_id"),
+                "UC-Queensryche",
+            )
+            self.assertEqual(related[0].get("thumbnail"), cached_path)
+            mock_schedule.assert_not_called()
+
+    def test_related_artist_provider_resolution_is_bounded_per_pass(self) -> None:
+        service = SearchService(_MemoryTestServer(":memory:"))
+        candidates = [
+            {
+                "id": f"musicbrainz:artist:mbid-{index}",
+                "musicbrainz_artist_id": f"mbid-{index}",
+                "name": f"Related Artist {index}",
+            }
+            for index in range(10)
+        ]
+        with (
+            patch.object(
+                service,
+                "_hydrate_artist_artwork",
+                side_effect=lambda artists, **_kwargs: artists,
+            ),
+            patch(
+                "auralis_backend.search.service._SEARCH_CATALOG_WRITER.submit",
+            ),
+            patch(
+                "auralis_backend.search.service._schedule_artist_metadata_resolution",
+                return_value=True,
+            ) as mock_schedule,
+        ):
+            service._resolve_first_page_related_artists(
+                candidates,
+                query="Dio",
+                limit=6,
+            )
+
+        self.assertEqual(
+            mock_schedule.call_count,
+            search_service_module._SEARCH_RELATED_ARTIST_RESOLUTION_BATCH,
+        )
 
     def test_thin_artist_update_cannot_erase_cached_r2_artwork(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -259,6 +491,45 @@ class SearchEnrichmentTests(unittest.TestCase):
             self.assertEqual(
                 loaded["iron maiden"].get("thumbnail"),
                 cached_path,
+            )
+
+    def test_live_artist_artwork_replaces_stale_internal_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            memory_server = _MemoryTestServer(
+                str(pathlib.Path(tmp_dir) / "artist-artwork-repair.sqlite")
+            )
+            for thumbnail, source in (
+                (
+                    "/artist_artwork/0123456789abcdef0123456789abcdef",
+                    "test_stale_artwork",
+                ),
+                ("https://example.test/dio.jpg", "test_live_artwork"),
+            ):
+                self.assertTrue(
+                    remember_catalog_entity(
+                        memory_server,
+                        user_scope_id="global",
+                        query="Dio",
+                        entity_type="artist",
+                        item={
+                            "id": "UC-Dio",
+                            "name": "Dio",
+                            "thumbnail": thumbnail,
+                        },
+                        confidence=0.88,
+                        event_weight=0.0,
+                        event_type="artist_metadata",
+                        source=source,
+                    )
+                )
+
+            loaded = load_catalog_artist_records(
+                memory_server,
+                artist_names=["Dio"],
+            )
+            self.assertEqual(
+                loaded["dio"].get("thumbnail"),
+                "https://example.test/dio.jpg",
             )
 
     def test_thin_track_and_album_updates_cannot_erase_artwork(self) -> None:
@@ -344,6 +615,9 @@ class SearchEnrichmentTests(unittest.TestCase):
 
     def test_snapshot_rehydrates_artwork_cached_after_initial_search(self) -> None:
         service = SearchService(_MemoryTestServer(":memory:"))
+        cached_path = artist_artwork_path(
+            "provider:artist:uc-arcticmonkeys"
+        )
         with (
             patch(
                 "auralis_backend.search.service.load_catalog_artist_payloads",
@@ -356,9 +630,15 @@ class SearchEnrichmentTests(unittest.TestCase):
                         "id": "UC-ArcticMonkeys",
                         "name": "Arctic Monkeys",
                         "canonical_artist_id": "artist-name:arctic monkeys",
-                        "thumbnail": "/artist_artwork/arctic",
+                        "thumbnail": cached_path,
                     }
                 },
+            ),
+            patch(
+                "auralis_backend.storage.artist_artwork.get_artist_artwork_cache",
+                return_value=SimpleNamespace(
+                    head=Mock(return_value={"content_length": 100})
+                ),
             ),
         ):
             refreshed = service._rehydrate_search_snapshot(
@@ -386,11 +666,11 @@ class SearchEnrichmentTests(unittest.TestCase):
         self.assertEqual(len(refreshed.get("artists") or []), 1)
         self.assertEqual(
             (refreshed.get("artists") or [])[0].get("thumbnail"),
-            "/artist_artwork/arctic",
+            cached_path,
         )
         self.assertEqual(
             (refreshed.get("lead_artist") or {}).get("thumbnail"),
-            "/artist_artwork/arctic",
+            cached_path,
         )
 
     def test_artist_hydration_rejects_same_name_cache_for_another_provider(self) -> None:
@@ -608,6 +888,184 @@ class SearchEnrichmentTests(unittest.TestCase):
         self.assertEqual(
             artist.get("artwork_cache_identity"),
             "provider:artist:uc-ironmaiden",
+        )
+
+    def test_provider_artist_rejects_legacy_same_name_artwork_object(self) -> None:
+        legacy_name_token = artist_artwork_token("artist-name:in bloom")
+        cache = SimpleNamespace(
+            head=Mock(
+                side_effect=lambda token: (
+                    {"content_length": 100}
+                    if token == legacy_name_token
+                    else None
+                )
+            )
+        )
+        with patch(
+            "auralis_backend.storage.artist_artwork.get_artist_artwork_cache",
+            return_value=cache,
+        ):
+            artist = attach_cached_artist_artwork(
+                object(),
+                {
+                    "id": "UC-InBloom",
+                    "name": "In Bloom",
+                    "thumbnail": f"/artist_artwork/{legacy_name_token}",
+                    "artwork_cache_token": legacy_name_token,
+                },
+            )
+
+        self.assertFalse(artist.get("thumbnail"))
+        self.assertNotEqual(artist.get("artwork_cache_token"), legacy_name_token)
+
+    def test_stale_artist_artwork_path_falls_back_to_source_url(self) -> None:
+        with patch(
+            "auralis_backend.storage.artist_artwork.get_artist_artwork_cache",
+            return_value=SimpleNamespace(head=Mock(return_value=None)),
+        ):
+            artist = attach_cached_artist_artwork(
+                object(),
+                {
+                    "id": "UC-Dio",
+                    "name": "Dio",
+                    "thumbnail": (
+                        "/artist_artwork/"
+                        "0123456789abcdef0123456789abcdef"
+                    ),
+                    "artwork_source_url": "https://example.test/dio.jpg",
+                },
+            )
+
+        self.assertEqual(
+            artist.get("thumbnail"),
+            "https://example.test/dio.jpg",
+        )
+
+    def test_stale_artist_artwork_path_without_source_is_removed(self) -> None:
+        with patch(
+            "auralis_backend.storage.artist_artwork.get_artist_artwork_cache",
+            return_value=SimpleNamespace(head=Mock(return_value=None)),
+        ):
+            artist = attach_cached_artist_artwork(
+                object(),
+                {
+                    "id": "UC-Dio",
+                    "name": "Dio",
+                    "thumbnail": (
+                        "/artist_artwork/"
+                        "0123456789abcdef0123456789abcdef"
+                    ),
+                },
+            )
+
+        self.assertFalse(artist.get("thumbnail"))
+
+    def test_related_artist_visibility_requires_usable_artwork(self) -> None:
+        service = SearchService(_MemoryTestServer(":memory:"))
+        valid_token = artist_artwork_token("provider:artist:uc-valid")
+        with patch(
+            "auralis_backend.storage.artist_artwork.get_artist_artwork_cache",
+            return_value=SimpleNamespace(
+                head=Mock(
+                    side_effect=lambda token: (
+                        {"content_length": 100}
+                        if token == valid_token
+                        else None
+                    )
+                )
+            ),
+        ):
+            visible = service._visible_artists(
+                [
+                    {
+                        "id": "UC-dead",
+                        "name": "Dead Artwork",
+                        "thumbnail": (
+                            "/artist_artwork/"
+                            "0123456789abcdef0123456789abcdef"
+                        ),
+                    },
+                    {
+                        "id": "UC-valid",
+                        "name": "Valid Artwork",
+                        "thumbnail": "https://example.test/valid.jpg",
+                    },
+                    {
+                        "id": "UC-missing",
+                        "name": "Missing Artwork",
+                    },
+                    {
+                        "id": "musicbrainz:artist:unresolved",
+                        "name": "Unresolved Artist",
+                        "thumbnail": "https://example.test/unresolved.jpg",
+                    },
+                ],
+                {"id": "UC-Dio", "name": "Dio"},
+            )
+
+        self.assertEqual(
+            [artist.get("name") for artist in visible],
+            ["Valid Artwork"],
+        )
+        self.assertEqual(
+            visible[0].get("thumbnail"),
+            f"/artist_artwork/{valid_token}",
+        )
+
+    def test_background_artist_completion_advances_snapshot_revision(self) -> None:
+        service = SearchService(_MemoryTestServer(":memory:"))
+        snapshot_key = "progressive-test||dio"
+        search_service_module._store_search_snapshot(
+            snapshot_key,
+            {
+                "revision": 1,
+                "lead_artist": {"id": "UC-Dio", "name": "Dio"},
+                "artists": [{"id": "UC-Dio", "name": "Dio"}],
+                "related_artists": [],
+                "expansion_state": {"artists": "retryable"},
+            },
+        )
+
+        def complete(*, snapshot, **_kwargs):
+            snapshot["related_artists"] = [
+                {
+                    "id": "UC-Elf",
+                    "name": "Elf",
+                    "thumbnail": "https://example.test/elf.jpg",
+                }
+            ]
+            snapshot["expansion_state"] = {"artists": "complete"}
+            return snapshot
+
+        with (
+            patch.object(
+                service,
+                "_expand_search_snapshot_surface",
+                side_effect=complete,
+            ),
+            patch.object(
+                search_service_module._SEARCH_ARTIST_METADATA_WRITER,
+                "submit",
+                side_effect=lambda function, *args, **kwargs: function(
+                    *args,
+                    **kwargs,
+                ),
+            ),
+        ):
+            self.assertTrue(
+                service._schedule_search_snapshot_completion(
+                    snapshot_key=snapshot_key,
+                    query="Dio",
+                    search_mode="exact",
+                    user_scope_id="progressive-test",
+                )
+            )
+
+        refreshed = search_service_module._load_search_snapshot(snapshot_key)
+        self.assertEqual(refreshed.get("revision"), 2)
+        self.assertEqual(
+            [artist.get("name") for artist in refreshed["related_artists"]],
+            ["Elf"],
         )
 
     @patch(

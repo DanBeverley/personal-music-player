@@ -12,9 +12,11 @@ if str(CURRENT_DIR) not in sys.path:
 import server
 from auralis_backend.domain.retrieval import (
     _best_track_match,
+    _canonical_track_resolution,
     _collect_track_candidates,
     classify_query_intent,
     load_artist_entity_expansion,
+    resolve_search_target,
     retrieve_search_candidates_fast,
 )
 from auralis_backend.domain.server_adapter import adapt_domain_server
@@ -25,8 +27,66 @@ from auralis_backend.search.pipeline import (
 )
 from auralis_backend.search.intelligence import search_text_similarity
 from auralis_backend.search.query_mode import resolve_search_mode
-from auralis_backend.search.service import SearchService, _repair_search_artwork
+from auralis_backend.search.service import (
+    SearchService,
+    _repair_search_artwork,
+    _search_album_is_publishable,
+    _search_playlist_is_publishable,
+)
 from auralis_backend.search.upstream_runtime import normalize_song_result
+
+
+def _visible_declared_artwork(
+    artists,
+    excluded_artist=None,
+):
+    excluded_id = str((excluded_artist or {}).get("id") or "").strip()
+    excluded_name = str((excluded_artist or {}).get("name") or "").strip().casefold()
+    return [
+        dict(artist)
+        for artist in artists
+        if str((artist or {}).get("thumbnail") or "").startswith(
+            ("http://", "https://", "/artist_artwork/")
+        )
+        and not (
+            excluded_id
+            and str((artist or {}).get("id") or "").strip() == excluded_id
+        )
+        and not (
+            excluded_name
+            and str((artist or {}).get("name") or "").strip().casefold()
+            == excluded_name
+        )
+    ]
+
+
+def _test_resolved_target(
+    entity_type,
+    item,
+    *,
+    lead_artist=None,
+    containing_album=None,
+):
+    entity_id = str(
+        item.get("videoId")
+        or item.get("id")
+        or item.get("browseId")
+        or ""
+    ).strip().casefold()
+    return {
+        "entity_type": entity_type,
+        "item": dict(item),
+        "lead_artist": dict(lead_artist or (item if entity_type == "artist" else {})),
+        "containing_album": dict(
+            containing_album or (item if entity_type == "album" else {})
+        ),
+        "target_identity": f"provider:{entity_type}:{entity_id}",
+        "confidence": 0.9,
+        "confidence_tier": "corroborated",
+        "decision_margin": 1.0,
+        "evidence": ["test_provider_identity"],
+        "resolver": "evidence_first_v1",
+    }
 
 
 class SearchLatencyTests(unittest.TestCase):
@@ -79,6 +139,62 @@ class SearchLatencyTests(unittest.TestCase):
         self.assertEqual(tracks[0].get("thumbnail"), expected)
         self.assertEqual(albums[0].get("thumbnail"), expected)
 
+    def test_search_cards_require_artwork_before_publication(self) -> None:
+        self.assertFalse(
+            _search_album_is_publishable(
+                {
+                    "id": "MPRE-missing-cover",
+                    "title": "Missing Cover",
+                    "artist": "Dio",
+                }
+            )
+        )
+        self.assertTrue(
+            _search_album_is_publishable(
+                {
+                    "id": "MPRE-with-cover",
+                    "title": "With Cover",
+                    "artist": "Dio",
+                    "thumbnail": "https://example.test/cover.jpg",
+                }
+            )
+        )
+        self.assertFalse(
+            _search_playlist_is_publishable(
+                {"id": "playlist-without-cover", "name": "No Cover"}
+            )
+        )
+        self.assertTrue(
+            _search_playlist_is_publishable(
+                {
+                    "id": "generated-playlist",
+                    "name": "Artist Essentials",
+                    "generated": True,
+                    "thumbnail": "https://i.ytimg.com/vi/abcdefghijk/hqdefault.jpg",
+                }
+            )
+        )
+
+    def test_album_artwork_is_owned_by_backend_when_server_is_available(self) -> None:
+        _tracks, albums = _repair_search_artwork(
+            [],
+            [
+                {
+                    "id": "MPRE-backend-owned-cover",
+                    "title": "Backend Owned Cover",
+                    "artist": "Test Artist",
+                    "thumbnail": "https://example.test/cover.jpg",
+                }
+            ],
+            server=SimpleNamespace(),
+        )
+
+        self.assertTrue(albums[0]["thumbnail"].startswith("/entity_artwork/"))
+        self.assertEqual(
+            albums[0]["artwork_source_url"],
+            "https://example.test/cover.jpg",
+        )
+
     def test_artist_details_adapter_preserves_lightweight_contract(self) -> None:
         expected = {
             "id": "UC-Dio",
@@ -125,7 +241,9 @@ class SearchLatencyTests(unittest.TestCase):
                     "id": f"album-{index}",
                     "title": f"Album {index}",
                     "artist": "Dio",
-                    "thumbnail": f"album-{index}.jpg",
+                    "thumbnail": (
+                        "" if index == 0 else f"album-{index}.jpg"
+                    ),
                 }
                 for index in range(4)
             ],
@@ -134,6 +252,7 @@ class SearchLatencyTests(unittest.TestCase):
 
         def album_payload(album_id: str):
             return {
+                "thumbnail": f"detail-{album_id}.jpg",
                 "tracks": [
                     {
                         "id": f"{album_id}-track-{index}",
@@ -179,7 +298,16 @@ class SearchLatencyTests(unittest.TestCase):
             for track in catalog.get("tracks") or []
             if str(track.get("id") or "").startswith("album-0-track-")
         )
-        self.assertEqual(album_track.get("thumbnail"), "album-0.jpg")
+        self.assertEqual(album_track.get("thumbnail"), "detail-album-0.jpg")
+        hydrated_album = next(
+            album
+            for album in catalog.get("albums") or []
+            if album.get("id") == "album-0"
+        )
+        self.assertEqual(
+            hydrated_album.get("thumbnail"),
+            "detail-album-0.jpg",
+        )
 
     def test_artist_catalog_replaces_unusable_track_channel_id(self) -> None:
         artist_payload = {
@@ -386,6 +514,10 @@ class SearchLatencyTests(unittest.TestCase):
         mock_retrieve.return_value = {
             "query_intent": "artist",
             "resolved_artist": {"id": "UC-Dio", "name": "Dio"},
+            "resolved_target": _test_resolved_target(
+                "artist",
+                {"id": "UC-Dio", "name": "Dio", "subscribers": "1M"},
+            ),
             "normalized_anchor_artists": {"dio"},
             "track_candidates": {
                 "holy-diver": {
@@ -423,6 +555,7 @@ class SearchLatencyTests(unittest.TestCase):
                         "id": "MPRE-holy-diver-album",
                         "title": "Holy Diver",
                         "artist": "Ronnie James Dio",
+                        "thumbnail": "https://example.test/holy-diver.jpg",
                     },
                     "source_scores": {"artist_discography": 4.6},
                 }
@@ -438,12 +571,17 @@ class SearchLatencyTests(unittest.TestCase):
             for artist in artists:
                 item = dict(artist)
                 if item.get("id") == "UC-Dio":
-                    item["thumbnail"] = "dio.jpg"
+                    item["thumbnail"] = "https://example.test/dio.jpg"
                 output.append(item)
             return output
 
         with (
             patch.object(service, "_hydrate_artist_artwork", side_effect=hydrate),
+            patch.object(
+                service,
+                "_visible_artists",
+                side_effect=_visible_declared_artwork,
+            ),
             patch.object(service, "_lastfm_related_artists", return_value=[]),
             patch(
                 "auralis_backend.search.service.catalog_playable_tracks_for_artist",
@@ -497,7 +635,7 @@ class SearchLatencyTests(unittest.TestCase):
         self.assertEqual((response.get("artists") or [])[0].get("id"), "UC-Dio")
         self.assertEqual(
             (response.get("artists") or [])[0].get("thumbnail"),
-            "dio.jpg",
+            "https://example.test/dio.jpg",
         )
         self.assertEqual(
             [item.get("id") for item in response.get("artist_albums") or []],
@@ -516,8 +654,16 @@ class SearchLatencyTests(unittest.TestCase):
             "resolved_artist": {
                 "id": "UC-Dio",
                 "name": "Dio",
-                "thumbnail": "dio.jpg",
+                "thumbnail": "https://example.test/dio.jpg",
             },
+            "resolved_target": _test_resolved_target(
+                "artist",
+                {
+                    "id": "UC-Dio",
+                    "name": "Dio",
+                    "thumbnail": "https://example.test/dio.jpg",
+                },
+            ),
             "normalized_anchor_artists": {"dio"},
             "track_candidates": {
                 "holy-diver": {
@@ -544,7 +690,7 @@ class SearchLatencyTests(unittest.TestCase):
                     "payload": {
                         "id": "UC-Dio",
                         "name": "Dio",
-                        "thumbnail": "dio.jpg",
+                        "thumbnail": "https://example.test/dio.jpg",
                     },
                     "source_scores": {"resolved_artist": 6.2},
                 },
@@ -601,7 +747,7 @@ class SearchLatencyTests(unittest.TestCase):
             "artist": {
                 "id": "UC-Dio",
                 "name": "Dio",
-                "thumbnail": "dio.jpg",
+                "thumbnail": "https://example.test/dio.jpg",
             },
             "tracks": catalog_tracks,
             "albums": catalog_albums,
@@ -613,7 +759,7 @@ class SearchLatencyTests(unittest.TestCase):
             {
                 "id": f"related-{index}",
                 "name": f"Related Artist {index}",
-                "thumbnail": f"related-{index}.jpg",
+                "thumbnail": f"https://example.test/related-{index}.jpg",
             }
             for index in range(8)
         ]
@@ -623,6 +769,11 @@ class SearchLatencyTests(unittest.TestCase):
                 service,
                 "_lastfm_related_artists",
                 return_value=related,
+            ),
+            patch.object(
+                service,
+                "_visible_artists",
+                side_effect=_visible_declared_artwork,
             ),
             patch.object(
                 service,
@@ -706,13 +857,36 @@ class SearchLatencyTests(unittest.TestCase):
             "resolved_artist": {
                 "id": "UC-IronMaiden",
                 "name": "Iron Maiden",
-                "thumbnail": "iron-maiden.jpg",
+                "thumbnail": "https://example.test/iron-maiden.jpg",
             },
             "canonical_resolution": {
                 "title": "The Trooper",
                 "artist": "Iron Maiden",
                 "confidence": 1.0,
             },
+            "resolved_target": _test_resolved_target(
+                "track",
+                {
+                    "id": "the-trooper",
+                    "playback": {
+                        "provider": "youtube",
+                        "source_id": "00000000001",
+                    },
+                    "title": "The Trooper",
+                    "channel": "Iron Maiden",
+                    "artist_id": "UC-IronMaiden",
+                },
+                lead_artist={
+                    "id": "UC-IronMaiden",
+                    "name": "Iron Maiden",
+                    "thumbnail": "https://example.test/iron-maiden.jpg",
+                },
+                containing_album={
+                    "id": "MPRE-piece-of-mind",
+                    "title": "Piece of Mind",
+                    "artist": "Iron Maiden",
+                },
+            ),
             "normalized_anchor_artists": {"iron maiden"},
             "track_candidates": {
                 "the-trooper": {
@@ -739,7 +913,7 @@ class SearchLatencyTests(unittest.TestCase):
                     "payload": {
                         "id": "UC-IronMaiden",
                         "name": "Iron Maiden",
-                        "thumbnail": "iron-maiden.jpg",
+                        "thumbnail": "https://example.test/iron-maiden.jpg",
                     },
                     "source_scores": {"credited_artist": 5.8},
                 },
@@ -776,6 +950,9 @@ class SearchLatencyTests(unittest.TestCase):
                 "id": f"MPRE-iron-maiden-album-{index}",
                 "title": f"Iron Maiden Album {index}",
                 "artist": "Iron Maiden",
+                "thumbnail": (
+                    f"https://example.test/iron-maiden-album-{index}.jpg"
+                ),
             }
             for index in range(6)
         ]
@@ -783,7 +960,7 @@ class SearchLatencyTests(unittest.TestCase):
             "artist": {
                 "id": "UC-IronMaiden",
                 "name": "Iron Maiden",
-                "thumbnail": "iron-maiden.jpg",
+                "thumbnail": "https://example.test/iron-maiden.jpg",
             },
             "tracks": catalog_tracks,
             "albums": catalog_albums,
@@ -795,7 +972,7 @@ class SearchLatencyTests(unittest.TestCase):
             {
                 "id": f"related-{index}",
                 "name": f"Related Metal Artist {index}",
-                "thumbnail": f"related-{index}.jpg",
+                "thumbnail": f"https://example.test/related-{index}.jpg",
             }
             for index in range(8)
         ]
@@ -805,6 +982,11 @@ class SearchLatencyTests(unittest.TestCase):
                 service,
                 "_lastfm_related_artists",
                 return_value=related,
+            ),
+            patch.object(
+                service,
+                "_visible_artists",
+                side_effect=_visible_declared_artwork,
             ),
             patch.object(
                 service,
@@ -1153,46 +1335,182 @@ class SearchLatencyTests(unittest.TestCase):
         self.assertEqual(artists[0].get("name"), "Iron Maiden")
         self.assertEqual(albums[0].get("title"), "Piece of Mind")
 
-    def test_track_query_lead_cannot_drift_from_resolved_artist(self) -> None:
-        lead_artist, containing_album = SearchService(server)._lead_entities(
-            query="The Trooper",
-            query_intent="track",
+    def test_in_bloom_target_is_bound_to_nirvana_recording_evidence(self) -> None:
+        target = resolve_search_target(
+            server=server,
+            query="In Bloom",
             tracks=[
                 {
-                    "id": "stale-queen-result",
-                    "title": "Another One Bites the Dust",
-                    "channel": "Queen",
-                    "artist_id": "UC-Queen",
-                    "album": "The Game",
+                    "id": "nirvana-in-bloom",
+                    "title": "In Bloom",
+                    "channel": "Nirvana",
+                    "artist_id": "UC-Nirvana",
+                    "album_id": "MPRE-Nevermind",
+                    "album": "Nevermind",
                 },
                 {
-                    "id": "trooper",
-                    "title": "The Trooper",
-                    "channel": "Iron Maiden",
-                    "artist_id": "UC-IronMaiden",
-                    "album": "Piece of Mind",
+                    "id": "bittersweet-in-bloom",
+                    "title": "In Bloom",
+                    "channel": "Bittersweet",
+                    "artist_id": "UC-Bittersweet",
+                    "album": "Bittersweet",
                 },
             ],
             artists=[
-                {"id": "UC-Queen", "name": "Queen"},
-                {"id": "UC-IronMaiden", "name": "Iron Maiden"},
+                {"id": "UC-Bittersweet", "name": "Bittersweet"},
+                {"id": "UC-Nirvana", "name": "Nirvana"},
             ],
             albums=[
-                {"id": "the-game", "title": "The Game", "artist": "Queen"},
                 {
-                    "id": "piece-of-mind",
-                    "title": "Piece of Mind",
-                    "artist": "Iron Maiden",
+                    "id": "MPRE-Nevermind",
+                    "title": "Nevermind",
+                    "artist": "Nirvana",
+                },
+                {
+                    "id": "MPRE-Bittersweet",
+                    "title": "Bittersweet",
+                    "artist": "Bittersweet",
                 },
             ],
-            resolved_artist={
-                "id": "UC-IronMaiden",
-                "name": "Iron Maiden",
+            canonical_resolution={
+                "title": "In Bloom",
+                "artist": "Nirvana",
+                "confidence": 0.98,
+                "musicbrainz_recording_id": "mb-in-bloom",
             },
         )
 
-        self.assertEqual(lead_artist.get("name"), "Iron Maiden")
-        self.assertEqual(containing_album.get("title"), "Piece of Mind")
+        self.assertEqual(target.get("entity_type"), "track")
+        self.assertEqual((target.get("item") or {}).get("id"), "nirvana-in-bloom")
+        self.assertEqual((target.get("lead_artist") or {}).get("name"), "Nirvana")
+        self.assertEqual(
+            (target.get("containing_album") or {}).get("title"),
+            "Nevermind",
+        )
+
+    def test_competing_recording_credits_fail_closed(self) -> None:
+        resolution = _canonical_track_resolution(
+            server,
+            query="Shared Title",
+            provider_tracks=[
+                {
+                    "id": "provider-one",
+                    "title": "Shared Title",
+                    "channel": "Artist One",
+                    "views": "10M",
+                },
+                {
+                    "id": "provider-two",
+                    "title": "Shared Title",
+                    "channel": "Artist Two",
+                    "views": "10M",
+                },
+            ],
+            fuzzy_tracks=[],
+            musicbrainz_tracks=[
+                {
+                    "musicbrainz_recording_id": "mb-one",
+                    "title": "Shared Title",
+                    "artist": "Artist One",
+                    "musicbrainz_score": 1.0,
+                },
+                {
+                    "musicbrainz_recording_id": "mb-two",
+                    "title": "Shared Title",
+                    "artist": "Artist Two",
+                    "musicbrainz_score": 1.0,
+                },
+            ],
+        )
+
+        self.assertTrue(resolution.get("ambiguous"))
+        self.assertEqual(resolution.get("reason"), "competing_recording_credits")
+        self.assertEqual(len(resolution.get("candidate_credits") or []), 2)
+
+    def test_resolver_is_invariant_to_candidate_order(self) -> None:
+        tracks = [
+            {
+                "id": "nirvana-in-bloom",
+                "title": "In Bloom",
+                "channel": "Nirvana",
+                "artist_id": "UC-Nirvana",
+                "views": "300M",
+            },
+            {
+                "id": "other-in-bloom",
+                "title": "In Bloom",
+                "channel": "Other Artist",
+                "views": "2K",
+            },
+        ]
+        artists = [
+            {"id": "UC-InBloom", "name": "In Bloom"},
+            {"id": "UC-Nirvana", "name": "Nirvana"},
+        ]
+        canonical = {
+            "title": "In Bloom",
+            "artist": "Nirvana",
+            "confidence": 0.98,
+            "musicbrainz_recording_id": "mb-in-bloom",
+        }
+
+        first = resolve_search_target(
+            server=server,
+            query="In Bloom",
+            tracks=tracks,
+            artists=artists,
+            albums=[],
+            canonical_resolution=canonical,
+        )
+        reversed_result = resolve_search_target(
+            server=server,
+            query="In Bloom",
+            tracks=list(reversed(tracks)),
+            artists=list(reversed(artists)),
+            albums=[],
+            canonical_resolution=canonical,
+        )
+
+        self.assertEqual(first.get("target_identity"), reversed_result.get("target_identity"))
+
+    def test_famous_artist_beats_obscure_same_name_recording(self) -> None:
+        target = resolve_search_target(
+            server=server,
+            query="Dio",
+            tracks=[
+                {
+                    "id": "same-title",
+                    "title": "Dio",
+                    "channel": "Tameer Hassan",
+                    "views": "10K",
+                },
+                {
+                    "id": "holy-diver",
+                    "title": "Holy Diver",
+                    "channel": "Dio",
+                    "artist_id": "UC-Dio",
+                    "views": "100M",
+                },
+                {
+                    "id": "rainbow-dark",
+                    "title": "Rainbow in the Dark",
+                    "channel": "Dio",
+                    "artist_id": "UC-Dio",
+                    "views": "100M",
+                },
+            ],
+            artists=[{"id": "UC-Dio", "name": "Dio", "subscribers": "1.2M"}],
+            albums=[],
+            canonical_resolution={
+                "title": "Dio",
+                "artist": "Tameer Hassan",
+                "confidence": 0.98,
+                "musicbrainz_recording_id": "mb-dio",
+            },
+        )
+
+        self.assertEqual(target.get("entity_type"), "artist")
+        self.assertEqual(target.get("target_identity"), "provider:artist:uc-dio")
 
     def test_track_query_admits_same_artist_catalog_below_exact_match(self) -> None:
         candidates = {
@@ -1523,10 +1841,12 @@ class SearchLatencyTests(unittest.TestCase):
         "auralis_backend.domain.retrieval.catalog_playable_tracks_for_artist",
         return_value=[],
     )
+    @patch("auralis_backend.domain.retrieval.search_musicbrainz_recording_items")
     @patch("auralis_backend.domain.retrieval.search_tracks_direct")
-    def test_canonical_identity_launches_exact_playable_resolution(
+    def test_track_resolution_uses_only_unconditioned_provider_evidence(
         self,
         mock_track_search,
+        mock_musicbrainz,
         _mock_artist_catalog,
         _mock_artist_search,
         _mock_album_search,
@@ -1534,47 +1854,49 @@ class SearchLatencyTests(unittest.TestCase):
         _mock_cache_get,
         _mock_cache_set,
     ) -> None:
-        mock_fuzzy.return_value = [
+        canonical_rows = [
             {
-                "entity_type": "track",
-                "confidence": 0.96,
-                "payload": {
-                    "id": "musicbrainz:recording:trooper",
-                    "title": "The Trooper",
-                    "artist": "Iron Maiden",
-                    "source_provider": "musicbrainz",
-                    "playable": False,
-                },
-            }
+                "musicbrainz_recording_id": "mb-butchers",
+                "title": "In Bloom",
+                "artist": "The Butchers",
+                "source_provider": "musicbrainz",
+                "musicbrainz_score": 1.0,
+            },
+            {
+                "musicbrainz_recording_id": "mb-nirvana",
+                "title": "In Bloom",
+                "artist": "Nirvana",
+                "source_provider": "musicbrainz",
+                "musicbrainz_score": 1.0,
+            },
         ]
-
-        def track_results(query, *_args, **_kwargs):
-            if query == "The Trooper Iron Maiden":
-                return [
-                    {
-                        "id": "youtube-trooper",
-                        "playback": {"provider": "youtube", "source_id": "00000000001"},
-                        "title": "The Trooper",
-                        "channel": "Iron Maiden",
-                        "source_provider": "ytmusic",
-                    }
-                ]
-            return [
-                {
-                    "id": "wrong",
-                    "playback": {"provider": "youtube", "source_id": "00000000002"},
-                    "title": "The Trooper",
-                    "channel": "The HU",
-                }
-            ]
-
-        mock_track_search.side_effect = track_results
+        mock_fuzzy.return_value = []
+        mock_musicbrainz.return_value = canonical_rows
+        mock_track_search.return_value = [
+            {
+                "id": "butchers-in-bloom",
+                "playback": {"provider": "youtube", "source_id": "00000000001"},
+                "title": "In Bloom",
+                "channel": "The Butchers",
+                "views": "10K",
+                "source_provider": "ytmusic",
+            },
+            {
+                "id": "nirvana-in-bloom",
+                "playback": {"provider": "youtube", "source_id": "00000000002"},
+                "title": "In Bloom",
+                "channel": "Nirvana",
+                "views": "300M",
+                "source_provider": "ytmusic",
+            },
+        ]
         payload = retrieve_search_candidates_fast(
             SimpleNamespace(
-                query="The Trooper",
+                query="In Bloom",
                 surface="search",
                 force_refresh=False,
                 search_mode="exact",
+                defer_side_surfaces=True,
                 anchor_track_snapshots=[],
             ),
             {
@@ -1586,16 +1908,82 @@ class SearchLatencyTests(unittest.TestCase):
         )
         results = rank_track_candidates_fast_path(
             server,
-            SimpleNamespace(query="The Trooper"),
+            SimpleNamespace(query="In Bloom"),
             payload,
             limit=8,
         )
-        self.assertEqual(results[0].get("id"), "youtube-trooper")
+        self.assertEqual(results[0].get("id"), "nirvana-in-bloom")
+        self.assertEqual(
+            (payload.get("resolved_target") or {}).get("target_identity"),
+            "musicbrainz:recording:mb-nirvana",
+        )
         self.assertEqual(
             (payload.get("retrieval_diagnostics") or {}).get(
                 "canonical_track_query"
             ),
-            "The Trooper Iron Maiden",
+            "",
+        )
+        self.assertEqual(
+            [call.args[0] for call in mock_track_search.call_args_list],
+            ["In Bloom"],
+        )
+
+    @patch("auralis_backend.domain.retrieval._retrieval_cache_set")
+    @patch("auralis_backend.domain.retrieval._retrieval_cache_get", return_value=None)
+    @patch("auralis_backend.domain.retrieval.load_fuzzy_catalog_entity_memories")
+    @patch("auralis_backend.domain.retrieval.search_albums_direct", return_value=[])
+    @patch("auralis_backend.domain.retrieval.search_artists_direct_cached")
+    @patch("auralis_backend.domain.retrieval.search_tracks_direct")
+    def test_artist_query_never_runs_recording_lookup_or_conditioned_search(
+        self,
+        mock_track_search,
+        mock_artist_search,
+        _mock_album_search,
+        mock_fuzzy,
+        _mock_cache_get,
+        _mock_cache_set,
+    ) -> None:
+        mock_track_search.return_value = [
+            {
+                "id": "same-title-track",
+                "title": "Eric Clapton",
+                "channel": "Fritt Mig",
+                "views": "500",
+            }
+        ]
+        mock_artist_search.return_value = [
+            {
+                "id": "UC-EricClapton",
+                "name": "Eric Clapton",
+                "subscribers": "3M",
+                "top_songs": [{"id": "song-1"}, {"id": "song-2"}],
+            }
+        ]
+        mock_fuzzy.return_value = []
+        with patch(
+            "auralis_backend.domain.retrieval.search_musicbrainz_recording_items"
+        ) as recording_lookup:
+            payload = retrieve_search_candidates_fast(
+                SimpleNamespace(
+                    query="Eric Clapton",
+                    surface="search",
+                    force_refresh=False,
+                    search_mode="exact",
+                    anchor_track_snapshots=[],
+                ),
+                {
+                    "user_scope_id": "guest",
+                    "recent_queries": [],
+                    "last_played_tracks": [],
+                },
+                limit=8,
+            )
+
+        self.assertEqual(payload.get("query_intent"), "artist")
+        recording_lookup.assert_not_called()
+        self.assertEqual(
+            [call.args[0] for call in mock_track_search.call_args_list],
+            ["Eric Clapton"],
         )
 
     @patch("auralis_backend.domain.retrieval._retrieval_cache_set")
@@ -1798,6 +2186,14 @@ class SearchLatencyTests(unittest.TestCase):
     ) -> None:
         mock_retrieve.return_value = {
             "query_intent": "artist",
+            "resolved_target": _test_resolved_target(
+                "artist",
+                {
+                    "id": "UC-Queen",
+                    "name": "Queen",
+                    "thumbnail": "https://example.test/queen.jpg",
+                },
+            ),
             "normalized_anchor_artists": {"queen"},
             "track_candidates": {
                 f"queen-track-{index}": {
@@ -1806,6 +2202,9 @@ class SearchLatencyTests(unittest.TestCase):
                         "playback": {"provider": "youtube", "source_id": f"{index:011d}"},
                         "title": f"Queen Song {index}",
                         "channel": "Queen",
+                        "thumbnail": (
+                            f"https://example.test/queen-track-{index}.jpg"
+                        ),
                     },
                     "source_scores": {"artist_catalog": 4.8},
                 }
@@ -1816,7 +2215,7 @@ class SearchLatencyTests(unittest.TestCase):
                     "payload": {
                         "id": "UC-Queen",
                         "name": "Queen",
-                        "thumbnail": "queen.jpg",
+                        "thumbnail": "https://example.test/queen.jpg",
                     },
                     "source_scores": {"resolved_artist": 6.2},
                 }
@@ -1827,6 +2226,9 @@ class SearchLatencyTests(unittest.TestCase):
                         "id": f"MPRE-queen-album-{index}",
                         "title": f"Queen Album {index}",
                         "artist": "Queen",
+                        "thumbnail": (
+                            f"https://example.test/queen-album-{index}.jpg"
+                        ),
                     },
                     "source_scores": {"artist_discography": 4.6},
                 }
@@ -1851,19 +2253,24 @@ class SearchLatencyTests(unittest.TestCase):
                     {
                         "id": "UC-DavidBowie",
                         "name": "David Bowie",
-                        "thumbnail": "bowie.jpg",
+                        "thumbnail": "https://example.test/bowie.jpg",
                     },
                     {
                         "id": "UC-MilesKane-1",
                         "name": "Miles Kane",
-                        "thumbnail": "miles-one.jpg",
+                        "thumbnail": "https://example.test/miles-one.jpg",
                     },
                     {
                         "id": "UC-MilesKane-2",
                         "name": "Miles Kane",
-                        "thumbnail": "miles-two.jpg",
+                        "thumbnail": "https://example.test/miles-two.jpg",
                     },
                 ],
+            ),
+            patch.object(
+                service,
+                "_visible_artists",
+                side_effect=_visible_declared_artwork,
             ),
             patch(
                 "auralis_backend.search.service.catalog_playable_tracks_for_artist",
@@ -1879,7 +2286,7 @@ class SearchLatencyTests(unittest.TestCase):
                     "artist": {
                         "id": "UC-Queen",
                         "name": "Queen",
-                        "thumbnail": "queen.jpg",
+                        "thumbnail": "https://example.test/queen.jpg",
                     },
                     "tracks": [
                         entry["payload"]
@@ -1938,6 +2345,19 @@ class SearchLatencyTests(unittest.TestCase):
         query = "snapshot anthem"
         mock_retrieve.return_value = {
             "query_intent": "track",
+            "resolved_target": _test_resolved_target(
+                "track",
+                {
+                    "id": "track-0",
+                    "playback": {
+                        "provider": "youtube",
+                        "source_id": "00000000000",
+                    },
+                    "title": "Snapshot Anthem 0",
+                    "channel": "Test Artist",
+                },
+                lead_artist={"id": "artist", "name": "Test Artist"},
+            ),
             "normalized_anchor_artists": {"test artist"},
             "track_candidates": {
                 f"track-{index}": {
@@ -1994,6 +2414,10 @@ class SearchLatencyTests(unittest.TestCase):
 
         self.assertEqual(len(first.get("tracks") or []), 16)
         self.assertEqual(len(second.get("tracks") or []), 8)
+        self.assertEqual(
+            ((second.get("top_result") or {}).get("item") or {}).get("id"),
+            "track-0",
+        )
         self.assertEqual(mock_retrieve.call_count, 1)
         self.assertTrue(
             bool((second.get("diagnostics") or {}).get("search_snapshot_hit"))
@@ -2010,7 +2434,9 @@ class SearchLatencyTests(unittest.TestCase):
                 {
                     "id": "artist-lead",
                     "name": "Lead Artist",
-                    "thumbnail": "lead.jpg" if expanded else "",
+                    "thumbnail": (
+                        "https://example.test/lead.jpg" if expanded else ""
+                    ),
                 }
             ]
             if expanded:
@@ -2019,17 +2445,21 @@ class SearchLatencyTests(unittest.TestCase):
                         {
                             "id": "artist-related-1",
                             "name": "Related One",
-                            "thumbnail": "one.jpg",
+                            "thumbnail": "https://example.test/one.jpg",
                         },
                         {
                             "id": "artist-related-2",
                             "name": "Related Two",
-                            "thumbnail": "two.jpg",
+                            "thumbnail": "https://example.test/two.jpg",
                         },
                     ]
                 )
             return {
                 "query_intent": "artist",
+                "resolved_target": _test_resolved_target(
+                    "artist",
+                    artist_payloads[0],
+                ),
                 "normalized_anchor_artists": {"lead artist"},
                 "track_candidates": (
                     {
@@ -2063,6 +2493,9 @@ class SearchLatencyTests(unittest.TestCase):
                                 "id": "MPRE-lead-album",
                                 "title": "Lead Album",
                                 "artist": "Lead Artist",
+                                "thumbnail": (
+                                    "https://example.test/lead-album.jpg"
+                                ),
                             },
                             "source_scores": {"artist_discography": 4.0},
                         }
@@ -2075,7 +2508,7 @@ class SearchLatencyTests(unittest.TestCase):
                         {
                             "id": "artist-neighbour",
                             "name": "Close Neighbour",
-                            "thumbnail": "neighbour.jpg",
+                            "thumbnail": "https://example.test/neighbour.jpg",
                         }
                     ]
                     if expanded
@@ -2092,7 +2525,7 @@ class SearchLatencyTests(unittest.TestCase):
                 "artist": {
                     "id": "artist-lead",
                     "name": "Lead Artist",
-                    "thumbnail": "lead.jpg",
+                    "thumbnail": "https://example.test/lead.jpg",
                 },
                 "tracks": [
                     {
@@ -2110,13 +2543,14 @@ class SearchLatencyTests(unittest.TestCase):
                         "id": "MPRE-lead-album",
                         "title": "Lead Album",
                         "artist": "Lead Artist",
+                        "thumbnail": "https://example.test/lead-album.jpg",
                     }
                 ],
                 "related_artists": [
                     {
                         "id": "artist-neighbour",
                         "name": "Close Neighbour",
-                        "thumbnail": "neighbour.jpg",
+                        "thumbnail": "https://example.test/neighbour.jpg",
                     }
                 ],
                 "catalog_status": "complete",
@@ -2130,14 +2564,35 @@ class SearchLatencyTests(unittest.TestCase):
             ),
             patch.object(
                 service,
+                "_visible_artists",
+                side_effect=_visible_declared_artwork,
+            ),
+            patch.object(
+                service,
+                "_hydrate_artist_artwork",
+                side_effect=lambda artists, **_kwargs: artists,
+            ),
+            patch.object(
+                service,
+                "_artist_has_usable_artwork",
+                side_effect=lambda artist: bool(
+                    str((artist or {}).get("thumbnail") or "").strip()
+                ),
+            ),
+            patch.object(
+                service,
                 "_lastfm_related_artists",
                 return_value=[
                     {
-                        "id": "musicbrainz:artist:lastfm-neighbour",
-                        "name": "Last.fm Neighbour",
+                        "id": f"UC-LastFmNeighbour-{index}",
+                        "name": f"Last.fm Neighbour {index}",
                         "relationship_provider": "lastfm",
-                        "thumbnail": "lastfm-neighbour.jpg",
+                        "thumbnail": (
+                            "https://example.test/"
+                            f"lastfm-neighbour-{index}.jpg"
+                        ),
                     }
+                    for index in range(1, 6)
                 ],
             ),
             patch.object(
@@ -2173,15 +2628,22 @@ class SearchLatencyTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(len(first.get("artists") or []), 1)
+        self.assertEqual(first.get("artists") or [], [])
         self.assertEqual(mock_retrieve.call_count, 1)
         self.assertEqual(
             (second.get("artists") or [])[0].get("thumbnail"),
-            "lead.jpg",
+            "https://example.test/lead.jpg",
         )
         self.assertEqual(
             [item.get("name") for item in second.get("similar_artists") or []],
-            ["Last.fm Neighbour", "Close Neighbour"],
+            [
+                "Last.fm Neighbour 1",
+                "Last.fm Neighbour 2",
+                "Last.fm Neighbour 3",
+                "Last.fm Neighbour 4",
+                "Last.fm Neighbour 5",
+                "Close Neighbour",
+            ],
         )
         self.assertEqual(
             [item.get("id") for item in second.get("artist_tracks") or []],
@@ -2273,6 +2735,14 @@ class SearchLatencyTests(unittest.TestCase):
     ) -> None:
         mock_retrieve_fast.return_value = {
             "query_intent": "artist",
+            "resolved_target": _test_resolved_target(
+                "artist",
+                {
+                    "id": "artist_1",
+                    "name": "Aerosmith",
+                    "thumbnail": "https://example.test/aerosmith.jpg",
+                },
+            ),
             "normalized_anchor_artists": {"aerosmith"},
             "track_candidates": {
                 "track_1": {
@@ -2288,7 +2758,11 @@ class SearchLatencyTests(unittest.TestCase):
             },
             "artist_candidates": {
                 "artist_1": {
-                    "payload": {"id": "artist_1", "name": "Aerosmith"},
+                    "payload": {
+                        "id": "artist_1",
+                        "name": "Aerosmith",
+                        "thumbnail": "https://example.test/aerosmith.jpg",
+                    },
                     "source_scores": {"artists.fast": 1.0},
                 },
             },
@@ -2298,6 +2772,7 @@ class SearchLatencyTests(unittest.TestCase):
                         "id": "MPRE-album-1",
                         "title": "Aerosmith",
                         "artist": "Aerosmith",
+                        "thumbnail": "https://example.test/aerosmith-album.jpg",
                     },
                     "source_scores": {"albums.fast": 1.0},
                 },
@@ -2306,17 +2781,22 @@ class SearchLatencyTests(unittest.TestCase):
             "retrieval_diagnostics": {},
         }
         service = SearchService(server)
-        response = service.search(
-            SimpleNamespace(
-                query="aerosmith",
-                user_scope_id="guest",
-                surface="search",
-                force_refresh=False,
-                limit=12,
-                defer_side_surfaces=True,
-                search_mode="entity",
+        with patch.object(
+            service,
+            "_visible_artists",
+            side_effect=_visible_declared_artwork,
+        ):
+            response = service.search(
+                SimpleNamespace(
+                    query="aerosmith",
+                    user_scope_id="guest",
+                    surface="search",
+                    force_refresh=False,
+                    limit=12,
+                    defer_side_surfaces=True,
+                    search_mode="entity",
+                )
             )
-        )
         self.assertEqual(response.get("status"), "success")
         self.assertEqual(len(list(response.get("tracks") or [])), 1)
         self.assertEqual((response.get("artists") or [])[0].get("name"), "Aerosmith")

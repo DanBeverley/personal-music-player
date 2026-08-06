@@ -431,49 +431,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         trackResults: searchPage.tracks,
         artistResults: searchPage.artists,
       );
-      final topTrack = _lastSearchRecommendationAnchorTracks.isEmpty
-          ? null
-          : _lastSearchRecommendationAnchorTracks.first;
-      final queryKey = q.trim().toLowerCase();
-      final titleKey =
-          topTrack?['title']?.toString().trim().toLowerCase() ?? '';
-      if (topTrack != null &&
-          queryKey.isNotEmpty &&
-          (titleKey == queryKey || titleKey.startsWith('$queryKey '))) {
-        final topArtists = extractTrackArtists(topTrack)
-            .map((value) => value.trim().toLowerCase())
-            .where((value) => value.isNotEmpty)
-            .toSet();
-        final intentItem = Map<String, dynamic>.from(topTrack);
-        intentItem['artist_tracks'] = _lastSearchRecommendationAnchorTracks
-            .where((track) {
-              if (extractTrackId(track) == extractTrackId(topTrack)) {
-                return false;
-              }
-              final artists = extractTrackArtists(track)
-                  .map((value) => value.trim().toLowerCase())
-                  .toSet();
-              return artists.intersection(topArtists).isNotEmpty;
-            })
-            .take(8)
-            .map((track) => Map<String, dynamic>.from(track))
-            .toList(growable: false);
-        await recordProxySearchEvent(
-          q,
-          resultCount: searchPage.tracks.length +
-              searchPage.artists.length +
-              searchPage.albums.length +
-              searchPage.similarTracks.length +
-              searchPage.similarArtists.length,
-          searchScope: 'search_page',
-          metadata: <String, dynamic>{
-            'event_type': 'exact_query_intent',
-            'selected_entity_type': 'track',
-            'top_result_item': intentItem,
-            'confidence': 0.75,
-          },
-        );
-      }
     } else {
       _clearSearchRecommendationContext();
     }

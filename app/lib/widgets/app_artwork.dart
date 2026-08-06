@@ -54,15 +54,17 @@ class ArtistArtwork extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return AppArtwork(
-      thumbnail: thumbnail,
-      width: width,
-      height: height,
-      radius: 0,
-      fit: BoxFit.cover,
-      heroTag: heroTag,
-      expandForeground: false,
-      showBorder: false,
+    return ClipOval(
+      child: AppArtwork(
+        thumbnail: thumbnail,
+        width: width,
+        height: height,
+        radius: 0,
+        fit: BoxFit.cover,
+        heroTag: heroTag,
+        expandForeground: false,
+        showBorder: false,
+      ),
     );
   }
 }

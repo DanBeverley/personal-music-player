@@ -188,12 +188,6 @@ class SearchPageState {
         .map((entry) => normalizeTrack(Map<String, dynamic>.from(entry)))
         .where((track) => extractTrackId(track)?.isNotEmpty ?? false)
         .toList(growable: false);
-    if (normalizedTopResult == null && normalizedTracks.isNotEmpty) {
-      normalizedTopResult = <String, dynamic>{
-        'entity_type': 'track',
-        'item': normalizedTracks.first,
-      };
-    }
     return SearchPageState(
       requestState: (json['request_state'] ?? '').toString().trim().isNotEmpty
           ? json['request_state'].toString()
@@ -278,6 +272,8 @@ class SearchPageState {
     Map<String, dynamic>? leadArtist,
     Map<String, dynamic>? containingAlbum,
     bool clearTopResult = false,
+    bool clearLeadArtist = false,
+    bool clearContainingAlbum = false,
     List<Map<String, dynamic>>? tracks,
     List<Map<String, dynamic>>? artists,
     List<Map<String, dynamic>>? albums,
@@ -300,8 +296,10 @@ class SearchPageState {
       modelVersion: modelVersion ?? this.modelVersion,
       queryIntent: queryIntent ?? this.queryIntent,
       topResult: clearTopResult ? null : topResult ?? this.topResult,
-      leadArtist: leadArtist ?? this.leadArtist,
-      containingAlbum: containingAlbum ?? this.containingAlbum,
+      leadArtist: clearLeadArtist ? null : leadArtist ?? this.leadArtist,
+      containingAlbum: clearContainingAlbum
+          ? null
+          : containingAlbum ?? this.containingAlbum,
       tracks: tracks ?? this.tracks,
       artists: artists ?? this.artists,
       albums: albums ?? this.albums,
@@ -531,6 +529,7 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
   }
 
   bool _artistSurfaceNeedsRefresh() {
+    if (state.diagnostics['target_revalidation_pending'] == true) return true;
     final pendingSurfaces = state.diagnostics['search_pending_surfaces'];
     if (pendingSurfaces is List &&
         pendingSurfaces.any((surface) => surface.toString() == 'artists')) {
@@ -686,13 +685,31 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
         return output;
       }
 
+      final previousSnapshotRevision =
+          (state.diagnostics['search_snapshot_revision'] as num?)?.toInt() ??
+              0;
+      final incomingSnapshotRevision =
+          (next.diagnostics['search_snapshot_revision'] as num?)?.toInt() ?? 0;
+      final currentTargetIdentity =
+          state.diagnostics['target_identity']?.toString().trim() ?? '';
+      final incomingTargetIdentity =
+          next.diagnostics['target_identity']?.toString().trim() ?? '';
+      final targetWasCorrected = normalizedSurface == 'artists' &&
+          incomingSnapshotRevision > previousSnapshotRevision &&
+          incomingTargetIdentity.isNotEmpty &&
+          currentTargetIdentity.isNotEmpty &&
+          incomingTargetIdentity != currentTargetIdentity;
       final mergedArtists = normalizedSurface == 'artists'
-          ? appendArtists(state.artists, next.artists)
+          ? targetWasCorrected
+              ? next.artists
+              : appendArtists(state.artists, next.artists)
           : state.artists;
       Map<String, dynamic>? refreshedTopResult = state.topResult;
       final incomingTopResult = next.topResult;
       final currentTopItem = state.topResult?['item'];
-      if (normalizedSurface == 'artists' &&
+      if (targetWasCorrected) {
+        refreshedTopResult = incomingTopResult;
+      } else if (normalizedSurface == 'artists' &&
           incomingTopResult?['entity_type']?.toString() == 'artist') {
         refreshedTopResult = incomingTopResult;
       } else if (normalizedSurface == 'artists' &&
@@ -715,7 +732,9 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
       if (normalizedSurface == 'artists') {
         final currentLead = state.leadArtist;
         final incomingLead = next.leadArtist;
-        if (currentLead == null) {
+        if (targetWasCorrected) {
+          refreshedLeadArtist = incomingLead;
+        } else if (currentLead == null) {
           refreshedLeadArtist = incomingLead;
         } else if (incomingLead != null &&
             _sameSearchArtist(currentLead, incomingLead)) {
@@ -730,9 +749,6 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
         if (next.pagination[normalizedSurface] != null)
           normalizedSurface: next.pagination[normalizedSurface],
       };
-      final previousSnapshotRevision =
-          (state.diagnostics['search_snapshot_revision'] as num?)?.toInt() ??
-              0;
       state = state.copyWith(
         tracks: normalizedSurface == 'tracks'
             ? appendUnique(
@@ -751,41 +767,55 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
                 (item) => (item['id'] ?? item['name'] ?? '').toString())
             : state.playlists,
         similarArtists: normalizedSurface == 'artists'
-            ? appendArtists(state.similarArtists, next.similarArtists)
+            ? targetWasCorrected
+                ? next.similarArtists
+                : appendArtists(state.similarArtists, next.similarArtists)
             : state.similarArtists,
         artistTracks: normalizedSurface == 'artists'
-            ? appendUnique(
-                state.artistTracks,
-                next.artistTracks,
-                (item) => extractTrackId(item) ?? '',
-              )
+            ? targetWasCorrected
+                ? next.artistTracks
+                : appendUnique(
+                    state.artistTracks,
+                    next.artistTracks,
+                    (item) => extractTrackId(item) ?? '',
+                  )
             : state.artistTracks,
         artistAlbums: normalizedSurface == 'artists'
-            ? appendUnique(
-                state.artistAlbums,
-                next.artistAlbums,
-                (item) => (item['canonical_album_identity'] ??
-                        item['id'] ??
-                        '${item['title']}|${item['artist']}')
-                    .toString()
-                    .toLowerCase(),
-              )
-            : state.artistAlbums,
-        relatedAlbums:
-            normalizedSurface == 'artists' || normalizedSurface == 'albums'
-                ? appendUnique(
-                    state.relatedAlbums,
-                    next.relatedAlbums,
+            ? targetWasCorrected
+                ? next.artistAlbums
+                : appendUnique(
+                    state.artistAlbums,
+                    next.artistAlbums,
                     (item) => (item['canonical_album_identity'] ??
                             item['id'] ??
                             '${item['title']}|${item['artist']}')
                         .toString()
                         .toLowerCase(),
                   )
+            : state.artistAlbums,
+        relatedAlbums:
+            normalizedSurface == 'artists' || normalizedSurface == 'albums'
+                ? targetWasCorrected
+                    ? next.relatedAlbums
+                    : appendUnique(
+                        state.relatedAlbums,
+                        next.relatedAlbums,
+                        (item) => (item['canonical_album_identity'] ??
+                                item['id'] ??
+                                '${item['title']}|${item['artist']}')
+                            .toString()
+                            .toLowerCase(),
+                      )
                 : state.relatedAlbums,
         topResult: refreshedTopResult,
         leadArtist: refreshedLeadArtist,
-        containingAlbum: state.containingAlbum ?? next.containingAlbum,
+        containingAlbum: targetWasCorrected
+            ? next.containingAlbum
+            : state.containingAlbum ?? next.containingAlbum,
+        clearTopResult: targetWasCorrected && refreshedTopResult == null,
+        clearLeadArtist: targetWasCorrected && refreshedLeadArtist == null,
+        clearContainingAlbum:
+            targetWasCorrected && next.containingAlbum == null,
         pagination: nextPagination,
         appendedItemKeys: appendedKeys,
         diagnostics: <String, dynamic>{

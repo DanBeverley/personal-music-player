@@ -162,8 +162,8 @@ class _AuralisAppState extends ConsumerState<AuralisApp>
                       child: Center(
                         child: Image.asset(
                           'assets/branding/neatie_3rd.png',
-                          width: 46,
-                          height: 46,
+                          width: 37,
+                          height: 37,
                           fit: BoxFit.contain,
                         ),
                       ),

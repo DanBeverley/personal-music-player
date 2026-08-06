@@ -630,23 +630,127 @@ class AuthNotifier extends StateNotifier<AppAuthState> {
 
   Future<void> signInWithGitHub() => signInWithOAuth(OAuthProvider.github);
 
-  Future<void> sendMagicLink(String email) async {
+  void clearError() {
+    if (state.error == null) return;
+    state = state.copyWith(clearError: true);
+  }
+
+  Future<void> signInWithPassword(String email, String password) async {
     final client = supabaseClientOrNull;
     if (client == null) return;
+    final normalizedEmail = email.trim();
+    if (normalizedEmail.isEmpty || password.isEmpty) {
+      state = state.copyWith(
+        isBusy: false,
+        error: 'Enter your email address and password.',
+      );
+      return;
+    }
     state = state.copyWith(isBusy: true, clearError: true);
     try {
-      await client.auth.signInWithOtp(
-        email: email,
+      await client.auth.signInWithPassword(
+        email: normalizedEmail,
+        password: password,
+      );
+      state = state.copyWith(isBusy: false, clearError: true);
+    } catch (error) {
+      state = state.copyWith(
+        isBusy: false,
+        error: _friendlyAuthError(error),
+      );
+    }
+  }
+
+  Future<void> signUpWithPassword({
+    required String fullName,
+    required String email,
+    required String password,
+    required String confirmPassword,
+  }) async {
+    final client = supabaseClientOrNull;
+    if (client == null) return;
+    final normalizedName = fullName.trim();
+    final normalizedEmail = email.trim();
+    if (normalizedName.isEmpty || normalizedEmail.isEmpty || password.isEmpty) {
+      state = state.copyWith(
+        isBusy: false,
+        error: 'Enter your name, email address, and password.',
+      );
+      return;
+    }
+    if (password != confirmPassword) {
+      state = state.copyWith(
+        isBusy: false,
+        error: 'Your passwords do not match.',
+      );
+      return;
+    }
+    state = state.copyWith(isBusy: true, clearError: true);
+    try {
+      final response = await client.auth.signUp(
+        email: normalizedEmail,
+        password: password,
+        data: <String, dynamic>{'full_name': normalizedName},
         emailRedirectTo: kIsWeb ? null : supabaseRedirectUrl,
       );
       state = state.copyWith(
         isBusy: false,
-        error: 'Magic link sent to $email',
+        error: response.session == null
+            ? 'Account created. Check your email to verify it, then sign in.'
+            : null,
+        clearError: response.session != null,
       );
     } catch (error) {
       state = state.copyWith(
         isBusy: false,
-        error: error.toString(),
+        error: _friendlyAuthError(error),
+      );
+    }
+  }
+
+  String _friendlyAuthError(Object error) {
+    final message = error.toString();
+    final lowerMessage = message.toLowerCase();
+    if (lowerMessage.contains('invalid login credentials')) {
+      return 'The email or password is incorrect.';
+    }
+    if (lowerMessage.contains('email not confirmed')) {
+      return 'Please verify your email before signing in.';
+    }
+    if (lowerMessage.contains('user already registered')) {
+      return 'An account with this email already exists. Try signing in.';
+    }
+    if (lowerMessage.contains('password should be at least')) {
+      return 'Your password must be at least 6 characters.';
+    }
+    return message;
+  }
+
+  Future<void> sendMagicLink(String email) async {
+    final client = supabaseClientOrNull;
+    if (client == null) return;
+    final normalizedEmail = email.trim();
+    if (normalizedEmail.isEmpty) {
+      state = state.copyWith(
+        isBusy: false,
+        error: 'Enter your email address first.',
+      );
+      return;
+    }
+    state = state.copyWith(isBusy: true, clearError: true);
+    try {
+      await client.auth.signInWithOtp(
+        email: normalizedEmail,
+        emailRedirectTo: kIsWeb ? null : supabaseRedirectUrl,
+      );
+      state = state.copyWith(
+        isBusy: false,
+        error: 'Magic link sent to $normalizedEmail',
+      );
+    } catch (error) {
+      state = state.copyWith(
+        isBusy: false,
+        error: _friendlyAuthError(error),
       );
     }
   }

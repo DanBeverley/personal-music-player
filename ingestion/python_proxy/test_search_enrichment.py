@@ -41,6 +41,7 @@ from auralis_backend.search.intelligence import (
     enrich_query_with_musicbrainz,
     load_catalog_artist_records,
     load_catalog_entity_memories,
+    load_fuzzy_catalog_entity_memories,
     load_canonical_entity,
     load_query_aliases,
     load_query_memory,
@@ -49,17 +50,20 @@ from auralis_backend.search.intelligence import (
     remember_search_resolution,
     remember_source_identities,
     remember_source_identity,
+    remove_unconfirmed_display_memories,
     remove_untrusted_catalog_query_aliases,
 )
 from auralis_backend.storage.artist_artwork import (
     attach_cached_artist_artwork,
     artist_artwork_path,
     artist_artwork_token,
+    schedule_artist_artwork_cache,
 )
 from auralis_backend.search.musicbrainz import (
     musicbrainz_artist_to_item,
     musicbrainz_recording_to_item,
     musicbrainz_release_group_to_item,
+    search_musicbrainz_recording_items,
 )
 from auralis_backend.recommend.store_runtime import open_recommendation_store_connection
 from auralis_backend.search.server_adapter import SearchServerAdapter
@@ -84,6 +88,265 @@ class _MemoryTestServer:
 
 
 class SearchEnrichmentTests(unittest.TestCase):
+    def test_short_alias_lookup_is_not_starved_by_internal_substrings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            memory_server = _MemoryTestServer(
+                str(pathlib.Path(temp_dir) / "short-alias.sqlite")
+            )
+            connection = open_recommendation_store_connection(memory_server)
+            now = time.time()
+            for index in range(1250):
+                entity_key = f"provider:artist:radio-studio-{index}"
+                connection.execute(
+                    """
+                    INSERT OR REPLACE INTO catalog_entities(
+                        entity_type, entity_key, display_title, display_artist,
+                        display_album, confidence, popularity,
+                        learned_popularity, payload_json, updated_at
+                    ) VALUES('artist', ?, '', ?, '', 1, 1, 1, ?, ?)
+                    """,
+                    [
+                        entity_key,
+                        f"Radio Studio {index}",
+                        json.dumps(
+                            {
+                                "id": f"UC-Radio-Studio-{index}",
+                                "name": f"Radio Studio {index}",
+                            }
+                        ),
+                        now,
+                    ],
+                )
+                connection.execute(
+                    """
+                    INSERT OR REPLACE INTO catalog_entity_aliases(
+                        alias_key, entity_type, entity_key, score,
+                        confidence, source, updated_at
+                    ) VALUES(?, 'artist', ?, 100, 1, 'fixture', ?)
+                    """,
+                    [f"radio studio {index}", entity_key, now],
+                )
+
+            fixtures = [
+                (
+                    "artist",
+                    "provider:artist:dio",
+                    "",
+                    "Dio",
+                    {"id": "UC-Dio", "name": "Dio"},
+                ),
+                (
+                    "track",
+                    "provider:track:holy-diver",
+                    "Holy Diver",
+                    "Dio",
+                    {
+                        "id": "holy-diver",
+                        "title": "Holy Diver",
+                        "channel": "Dio",
+                        "playback": {
+                            "provider": "youtube",
+                            "source_id": "holy-diver",
+                        },
+                    },
+                ),
+                (
+                    "track",
+                    "provider:track:dio-tameer",
+                    "Dio",
+                    "Tameer Hassan",
+                    {
+                        "id": "dio-tameer",
+                        "title": "Dio",
+                        "channel": "Tameer Hassan",
+                    },
+                ),
+            ]
+            for entity_type, entity_key, title, artist, payload in fixtures:
+                connection.execute(
+                    """
+                    INSERT OR REPLACE INTO catalog_entities(
+                        entity_type, entity_key, display_title, display_artist,
+                        display_album, confidence, popularity,
+                        learned_popularity, payload_json, updated_at
+                    ) VALUES(?, ?, ?, ?, '', 1, 1, 1, ?, ?)
+                    """,
+                    [
+                        entity_type,
+                        entity_key,
+                        title,
+                        artist,
+                        json.dumps(payload),
+                        now,
+                    ],
+                )
+                connection.execute(
+                    """
+                    INSERT OR REPLACE INTO catalog_entity_aliases(
+                        alias_key, entity_type, entity_key, score,
+                        confidence, source, updated_at
+                    ) VALUES('dio', ?, ?, 1, 1, 'fixture', ?)
+                    """,
+                    [entity_type, entity_key, now],
+                )
+            connection.commit()
+            connection.close()
+
+            memories = load_fuzzy_catalog_entity_memories(
+                memory_server,
+                query="dio",
+                limit=12,
+                scan_limit=1200,
+            )
+
+        identities = {
+            (memory.get("entity_type"), memory.get("entity_key"))
+            for memory in memories
+        }
+        self.assertIn(("artist", "provider:artist:dio"), identities)
+        self.assertIn(("track", "provider:track:holy-diver"), identities)
+        self.assertIn(("track", "provider:track:dio-tameer"), identities)
+        self.assertFalse(
+            any("radio-studio" in str(entity_key) for _, entity_key in identities)
+        )
+
+    def test_automatic_resolution_memory_is_removed_without_user_action(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            memory_server = _MemoryTestServer(
+                str(pathlib.Path(temp_dir) / "automatic-resolution.sqlite")
+            )
+            self.assertTrue(
+                remember_search_resolution(
+                    memory_server,
+                    user_scope_id="guest",
+                    query="dio",
+                    entity_type="track",
+                    item={
+                        "id": "dio-tameer",
+                        "title": "Dio",
+                        "artist": "Tameer Hassan",
+                    },
+                    confidence=0.99,
+                    event_weight=0.1,
+                    event_type="search_resolution",
+                    source="canonical_search_response",
+                )
+            )
+            self.assertTrue(
+                load_query_memory(
+                    memory_server,
+                    user_scope_id="guest",
+                    query="dio",
+                )
+            )
+
+            removed = remove_unconfirmed_display_memories(
+                memory_server,
+                query="dio",
+            )
+
+            self.assertGreater(removed, 0)
+            self.assertEqual(
+                load_query_memory(
+                    memory_server,
+                    user_scope_id="guest",
+                    query="dio",
+                ),
+                [],
+            )
+
+    def test_fuzzy_catalog_lookup_filters_by_query_before_popularity_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            memory_server = _MemoryTestServer(
+                str(pathlib.Path(temp_dir) / "catalog.sqlite")
+            )
+            connection = open_recommendation_store_connection(memory_server)
+            now = time.time()
+            for index in range(1225):
+                entity_key = f"provider:artist:unrelated-{index}"
+                connection.execute(
+                    """
+                    INSERT OR REPLACE INTO catalog_entities(
+                        entity_type, entity_key, display_title, display_artist,
+                        display_album, confidence, popularity,
+                        learned_popularity, payload_json, updated_at
+                    ) VALUES('artist', ?, '', ?, '', 1, 1, 1, ?, ?)
+                    """,
+                    [
+                        entity_key,
+                        f"Popular Unrelated {index}",
+                        json.dumps(
+                            {
+                                "id": f"UC-Unrelated-{index}",
+                                "name": f"Popular Unrelated {index}",
+                            }
+                        ),
+                        now,
+                    ],
+                )
+                connection.execute(
+                    """
+                    INSERT OR REPLACE INTO catalog_entity_aliases(
+                        alias_key, entity_type, entity_key, score,
+                        confidence, source, updated_at
+                    ) VALUES(?, 'artist', ?, 100, 1, 'test', ?)
+                    """,
+                    [f"popular unrelated {index}", entity_key, now],
+                )
+            target_key = "provider:artist:eric-clapton"
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO catalog_entities(
+                    entity_type, entity_key, display_title, display_artist,
+                    display_album, confidence, popularity,
+                    learned_popularity, payload_json, updated_at
+                ) VALUES('artist', ?, '', 'Eric Clapton', '', 0.8, 0, 0, ?, ?)
+                """,
+                [
+                    target_key,
+                    json.dumps({"id": "UC-EricClapton", "name": "Eric Clapton"}),
+                    now,
+                ],
+            )
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO catalog_entity_aliases(
+                    alias_key, entity_type, entity_key, score,
+                    confidence, source, updated_at
+                ) VALUES('eric clapton', 'artist', ?, 0.1, 0.8, 'test', ?)
+                """,
+                [target_key, now],
+            )
+            connection.commit()
+            connection.close()
+
+            memories = load_fuzzy_catalog_entity_memories(
+                memory_server,
+                query="Eric Clapton",
+                entity_type="artist",
+                limit=8,
+                scan_limit=1200,
+            )
+
+        self.assertEqual(len(memories), 1)
+        self.assertEqual(
+            (memories[0].get("payload") or {}).get("id"),
+            "UC-EricClapton",
+        )
+
+    def test_provider_album_stays_detail_ready_after_canonical_enrichment(self) -> None:
+        self.assertTrue(
+            catalog_album_is_detail_ready(
+                {
+                    "id": "MPREb_everlong",
+                    "title": "The Colour and the Shape",
+                    "artist": "Foo Fighters",
+                    "musicbrainz_release_group_id": "release-group-everlong",
+                    "playable": False,
+                }
+            )
+        )
+
     def test_unprepared_musicbrainz_album_is_not_detail_ready(self) -> None:
         self.assertFalse(
             catalog_album_is_detail_ready(
@@ -746,6 +1009,81 @@ class SearchEnrichmentTests(unittest.TestCase):
         )
         self.assertTrue(mock_cache.called)
 
+    def test_malformed_artist_thumbnail_is_replaced_from_artist_detail(self) -> None:
+        provider_id = "UCrPe3hLA51968GwxHSZ1llw"
+        artist = {
+            "id": provider_id,
+            "provider_artist_id": provider_id,
+            "name": "Nirvana",
+            "thumbnail": (
+                "https://i.ytimg.com/vi/"
+                f"{provider_id}/hqdefault.jpg"
+            ),
+        }
+        valid_source = "https://yt3.googleusercontent.com/nirvana-avatar"
+        with (
+            patch.object(
+                search_service_module.SearchServerAdapter,
+                "build_artist_details_payload",
+                return_value={
+                    "id": provider_id,
+                    "name": "Nirvana",
+                    "thumbnail": valid_source,
+                },
+            ) as mock_details,
+            patch.object(
+                search_service_module,
+                "_persist_search_artist",
+            ) as mock_persist,
+            patch.object(
+                search_service_module,
+                "schedule_artist_artwork_cache",
+                return_value=True,
+            ) as mock_cache,
+        ):
+            search_service_module._resolve_artist_metadata_background(
+                server=_MemoryTestServer(":memory:"),
+                query="in bloom",
+                artist=artist,
+            )
+
+        mock_details.assert_called_once()
+        resolved = mock_persist.call_args.kwargs["artist"]
+        self.assertEqual(resolved.get("thumbnail"), valid_source)
+        mock_cache.assert_called_once()
+
+    def test_existing_artist_artwork_source_is_scheduled_for_verified_cache(self) -> None:
+        artist = {
+            "id": "UC-Nirvana",
+            "name": "Nirvana",
+            "thumbnail": "https://example.test/nirvana.jpg",
+        }
+        with (
+            patch.object(
+                search_service_module,
+                "attach_cached_artist_artwork",
+                return_value=dict(artist),
+            ),
+            patch.object(
+                search_service_module,
+                "schedule_artist_artwork_cache",
+                return_value=True,
+            ) as mock_cache,
+            patch.object(
+                search_service_module,
+                "_schedule_artist_metadata_resolution",
+            ) as mock_metadata,
+        ):
+            hydrated = search_service_module._ensure_verified_artist_artwork(
+                server=_MemoryTestServer(":memory:"),
+                query="in bloom",
+                artist=artist,
+            )
+
+        self.assertEqual(hydrated.get("thumbnail"), artist["thumbnail"])
+        mock_cache.assert_called_once()
+        mock_metadata.assert_not_called()
+
     def test_musicbrainz_artist_id_is_resolved_before_artist_detail_lookup(self) -> None:
         artist = {
             "id": "musicbrainz:artist:mbid-nirvana",
@@ -857,6 +1195,125 @@ class SearchEnrichmentTests(unittest.TestCase):
         self.assertEqual(
             artist_artwork_path("artist-name:queen"),
             f"/artist_artwork/{first}",
+        )
+
+    def test_artist_artwork_rejects_channel_id_video_thumbnail(self) -> None:
+        valid_source = "https://yt3.googleusercontent.com/nirvana-avatar"
+        artist = normalized_artist_payload(
+            {
+                "id": "UCrPe3hLA51968GwxHSZ1llw",
+                "name": "Nirvana",
+                "thumbnail": (
+                    "https://i.ytimg.com/vi/"
+                    "UCrPe3hLA51968GwxHSZ1llw/hqdefault.jpg"
+                ),
+                "artwork_source_urls": [valid_source],
+            }
+        )
+
+        self.assertEqual(artist.get("thumbnail"), valid_source)
+        self.assertEqual(artist.get("artwork_source_urls"), [valid_source])
+
+    def test_canonical_artist_reuses_valid_provider_artwork_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            memory_server = _MemoryTestServer(
+                str(pathlib.Path(tmp_dir) / "artist-artwork-repair.sqlite")
+            )
+            provider_id = "UCrPe3hLA51968GwxHSZ1llw"
+            valid_source = "https://yt3.googleusercontent.com/nirvana-avatar"
+            self.assertTrue(
+                remember_catalog_entity(
+                    memory_server,
+                    user_scope_id="global",
+                    query="Nirvana",
+                    entity_type="artist",
+                    item={
+                        "id": provider_id,
+                        "provider_artist_id": provider_id,
+                        "name": "Nirvana",
+                        "thumbnail": valid_source,
+                    },
+                    confidence=0.88,
+                    event_weight=0.0,
+                    event_type="artist_metadata",
+                    source="provider_artist_detail",
+                )
+            )
+            self.assertTrue(
+                remember_catalog_entity(
+                    memory_server,
+                    user_scope_id="global",
+                    query="Nirvana",
+                    entity_type="artist",
+                    item={
+                        "id": "musicbrainz:artist:mbid-nirvana",
+                        "provider_artist_id": provider_id,
+                        "musicbrainz_artist_id": "mbid-nirvana",
+                        "canonical_artist_id": (
+                            "musicbrainz:artist:mbid-nirvana"
+                        ),
+                        "name": "Nirvana",
+                        "thumbnail": (
+                            "https://i.ytimg.com/vi/"
+                            f"{provider_id}/hqdefault.jpg"
+                        ),
+                    },
+                    confidence=0.92,
+                    event_weight=0.0,
+                    event_type="artist_metadata",
+                    source="musicbrainz_artist",
+                )
+            )
+
+            loaded = load_catalog_artist_records(
+                memory_server,
+                artist_names=["Nirvana"],
+            )["nirvana"]
+
+        self.assertEqual(loaded.get("thumbnail"), valid_source)
+        self.assertEqual(loaded.get("artwork_source_urls"), [valid_source])
+
+    def test_artist_artwork_cache_tries_next_valid_source(self) -> None:
+        first_source = "https://yt3.googleusercontent.com/unavailable-avatar"
+        second_source = "https://example.test/verified-avatar.jpg"
+        cache = SimpleNamespace(
+            head=Mock(return_value=None),
+            store=Mock(side_effect=[False, True]),
+        )
+        completed = []
+
+        def run_immediately(callback):
+            callback()
+            future = Future()
+            future.set_result(None)
+            return future
+
+        with (
+            patch(
+                "auralis_backend.storage.artist_artwork.get_artist_artwork_cache",
+                return_value=cache,
+            ),
+            patch(
+                "auralis_backend.storage.artist_artwork._EXECUTOR.submit",
+                side_effect=run_immediately,
+            ),
+        ):
+            scheduled = schedule_artist_artwork_cache(
+                object(),
+                {
+                    "id": "UC-Nirvana",
+                    "name": "Nirvana",
+                    "artwork_source_urls": [first_source, second_source],
+                },
+                on_cached=completed.append,
+            )
+
+        self.assertTrue(scheduled)
+        self.assertEqual(cache.store.call_count, 2)
+        self.assertEqual(completed[0].get("artwork_source_url"), second_source)
+        self.assertEqual(
+            completed[0].get("artwork_failed_source_urls"),
+            [first_source],
         )
 
     def test_existing_provider_artwork_object_is_reused_without_source_url(
@@ -1068,6 +1525,277 @@ class SearchEnrichmentTests(unittest.TestCase):
             ["Elf"],
         )
 
+    def test_background_identity_recovery_keeps_catalog_retryable(self) -> None:
+        service = SearchService(_MemoryTestServer(":memory:"))
+        recovered_target = {
+            "entity_type": "track",
+            "confidence_tier": "authoritative",
+            "target_identity": "musicbrainz:recording:mb-everlong",
+            "lead_artist": {
+                "id": "UC-FooFighters",
+                "name": "Foo Fighters",
+                "thumbnail": "https://example.test/foo.jpg",
+            },
+            "containing_album": {
+                "id": "MPRE-ColourAndShape",
+                "title": "The Colour and the Shape",
+                "artist": "Foo Fighters",
+                "thumbnail": "https://example.test/colour.jpg",
+            },
+        }
+        snapshot = {
+            "query_intent": "mixed",
+            "resolved_target": {},
+            "lead_artist": {},
+            "tracks": [],
+            "artists": [],
+            "albums": [],
+            "artist_tracks": [],
+            "artist_albums": [],
+            "related_artists": [],
+            "related_albums": [],
+            "expansion_state": {
+                "tracks": "retryable",
+                "artists": "retryable",
+                "albums": "retryable",
+            },
+        }
+
+        with (
+            patch(
+                "auralis_backend.search.service.retrieve_search_candidates_fast",
+                return_value={
+                    "resolved_target": recovered_target,
+                    "related_artists": [],
+                },
+            ),
+            patch(
+                "auralis_backend.search.service.rank_artist_candidates_fast_path",
+                return_value=[recovered_target["lead_artist"]],
+            ),
+            patch(
+                "auralis_backend.search.service.rank_track_candidates_fast_path",
+                return_value=[],
+            ),
+            patch(
+                "auralis_backend.search.service.rank_album_candidates_fast_path",
+                return_value=[],
+            ),
+            patch.object(
+                service,
+                "_hydrate_artist_artwork",
+                side_effect=lambda items, **_kwargs: list(items),
+            ),
+            patch.object(service, "_lastfm_related_artists", return_value=[]),
+        ):
+            refreshed = service._expand_search_snapshot_surface(
+                req=SimpleNamespace(user_scope_id="user-1"),
+                query="Everlong",
+                search_mode="exact",
+                surface="artists",
+                snapshot=snapshot,
+            )
+
+        self.assertEqual(
+            (refreshed.get("lead_artist") or {}).get("name"),
+            "Foo Fighters",
+        )
+        self.assertEqual(
+            (refreshed.get("containing_album") or {}).get("title"),
+            "The Colour and the Shape",
+        )
+        self.assertEqual(
+            refreshed.get("expansion_state"),
+            {
+                "tracks": "retryable",
+                "artists": "retryable",
+                "albums": "retryable",
+            },
+        )
+
+    def test_target_essentials_resolve_artist_and_album_in_one_window(self) -> None:
+        class InlineExecutor:
+            def submit(self, function, *args, **kwargs):
+                future = Future()
+                try:
+                    future.set_result(function(*args, **kwargs))
+                except Exception as exc:
+                    future.set_exception(exc)
+                return future
+
+        test_server = _MemoryTestServer(":memory:")
+        test_server.search_executor = InlineExecutor()
+        service = SearchService(test_server)
+        target = {
+            "entity_type": "track",
+            "item": {
+                "id": "hail-video",
+                "title": "Hail to the King",
+                "channel": "Avenged Sevenfold",
+                "album": "Hail to the King",
+            },
+            "lead_artist": {"name": "Avenged Sevenfold"},
+            "containing_album": {
+                "title": "Hail to the King",
+                "artist": "Avenged Sevenfold",
+            },
+        }
+        with (
+            patch(
+                "auralis_backend.search.service.search_artists_direct_cached",
+                return_value=[
+                    {
+                        "id": "UC-A7X",
+                        "name": "Avenged Sevenfold",
+                        "thumbnail": "https://example.test/a7x.jpg",
+                        "source_authority": "official_artist_channel",
+                    }
+                ],
+            ),
+            patch(
+                "auralis_backend.search.service.search_canonical_album_for_track",
+                return_value={
+                    "id": "MPRE-Hail",
+                    "provider_album_id": "MPRE-Hail",
+                    "title": "Hail to the King",
+                    "artist": "Avenged Sevenfold",
+                    "thumbnail": "https://example.test/hail.jpg",
+                },
+            ),
+        ):
+            hydrated = service._hydrate_accepted_target_essentials(target)
+
+        self.assertEqual(
+            (hydrated.get("lead_artist") or {}).get("id"),
+            "UC-A7X",
+        )
+        self.assertEqual(
+            (hydrated.get("containing_album") or {}).get("id"),
+            "MPRE-Hail",
+        )
+
+    def test_background_revalidation_replaces_wrong_cross_type_target(self) -> None:
+        service = SearchService(_MemoryTestServer(":memory:"))
+        corrected_target = {
+            "entity_type": "track",
+            "confidence_tier": "corroborated",
+            "identity_confidence": 0.99,
+            "confidence": 0.96,
+            "target_identity": "musicbrainz:recording:mb-hail",
+            "evidence": [
+                "provider_structural_lead",
+                "containing_album_relationship",
+            ],
+            "item": {
+                "id": "hail-video",
+                "title": "Hail to the King",
+                "channel": "Avenged Sevenfold",
+            },
+            "lead_artist": {"id": "UC-A7X", "name": "Avenged Sevenfold"},
+            "containing_album": {
+                "id": "MPRE-Hail",
+                "title": "Hail to the King",
+                "artist": "Avenged Sevenfold",
+            },
+        }
+        snapshot = {
+            "query_intent": "artist",
+            "resolved_target": {
+                "entity_type": "artist",
+                "confidence_tier": "authoritative",
+                "confidence": 0.88,
+                "target_identity": "provider:artist:wrong-hail",
+                "item": {"id": "wrong-hail", "name": "Hail to the King"},
+                "lead_artist": {
+                    "id": "wrong-hail",
+                    "name": "Hail to the King",
+                },
+            },
+            "lead_artist": {"id": "wrong-hail", "name": "Hail to the King"},
+            "tracks": [corrected_target["item"]],
+            "artists": [{"id": "wrong-hail", "name": "Hail to the King"}],
+            "albums": [],
+            "artist_tracks": [{"id": "wrong-track", "channel": "Wrong"}],
+            "artist_albums": [{"id": "MPRE-Wrong", "artist": "Wrong"}],
+            "related_artists": [{"id": "wrong-related", "name": "Wrong"}],
+            "related_albums": [],
+            "playlists": [],
+            "expansion_state": {"artists": "retryable"},
+            "target_revalidation_state": "complete",
+        }
+        self.assertTrue(
+            service._snapshot_target_needs_revalidation(
+                "Hail to the King",
+                snapshot,
+            )
+        )
+        with (
+            patch(
+                "auralis_backend.search.service.retrieve_search_candidates_fast",
+                return_value={
+                    "resolved_target": corrected_target,
+                    "related_artists": [],
+                },
+            ),
+            patch(
+                "auralis_backend.search.service.rank_artist_candidates_fast_path",
+                return_value=[corrected_target["lead_artist"]],
+            ),
+            patch(
+                "auralis_backend.search.service.rank_track_candidates_fast_path",
+                return_value=[corrected_target["item"]],
+            ),
+            patch(
+                "auralis_backend.search.service.rank_album_candidates_fast_path",
+                return_value=[],
+            ),
+            patch.object(
+                service,
+                "_hydrate_artist_artwork",
+                side_effect=lambda items, **_kwargs: list(items),
+            ),
+            patch.object(service, "_lastfm_related_artists", return_value=[]),
+        ):
+            refreshed = service._expand_search_snapshot_surface(
+                req=SimpleNamespace(user_scope_id="user-1"),
+                query="Hail to the King",
+                search_mode="exact",
+                surface="artists",
+                snapshot=snapshot,
+                revalidate_target=True,
+            )
+
+        self.assertEqual(refreshed.get("query_intent"), "track")
+        self.assertEqual(
+            (refreshed.get("lead_artist") or {}).get("name"),
+            "Avenged Sevenfold",
+        )
+        self.assertNotIn(
+            "wrong-track",
+            [item.get("id") for item in refreshed.get("artist_tracks") or []],
+        )
+        self.assertEqual(refreshed.get("target_revalidation_state"), "complete")
+        self.assertEqual(refreshed.get("target_revalidation_attempts"), 1)
+
+    def test_artist_retry_metadata_does_not_advance_visible_revision(self) -> None:
+        snapshot_key = "progressive-test||nirvana-retry"
+        search_service_module._store_search_snapshot(
+            snapshot_key,
+            {
+                "revision": 4,
+                "lead_artist": {"id": "UC-Nirvana", "name": "Nirvana"},
+                "artists": [{"id": "UC-Nirvana", "name": "Nirvana"}],
+                "related_artists": [],
+            },
+        )
+
+        search_service_module._record_artist_resolution_attempt(
+            {"id": "UC-Nirvana", "name": "Nirvana"}
+        )
+
+        refreshed = search_service_module._load_search_snapshot(snapshot_key)
+        self.assertEqual(refreshed.get("revision"), 4)
+
     @patch(
         "auralis_backend.search.runtime.resolve_ytmusic_song_search",
         side_effect=AssertionError("typeahead must not run full song search"),
@@ -1258,6 +1986,105 @@ class SearchEnrichmentTests(unittest.TestCase):
         self.assertEqual(item.get("musicbrainz_recording_id"), "mb-rec-evanescence")
         self.assertEqual(item.get("album"), "Fallen")
         self.assertIn("Evanescence Bring Me to Life", item.get("aliases") or [])
+
+    def test_recording_prefers_original_album_over_single_and_compilation(self) -> None:
+        item = musicbrainz_recording_to_item(
+            {
+                "id": "mb-rec-in-bloom",
+                "title": "In Bloom",
+                "score": "100",
+                "artist-credit": [
+                    {"name": "Nirvana", "artist": {"id": "mb-artist-nirvana"}}
+                ],
+                "releases": [
+                    {
+                        "id": "mb-release-compilation",
+                        "title": "Greatest Hits",
+                        "date": "2002-10-29",
+                        "status": "Official",
+                        "release-group": {
+                            "id": "mb-rg-compilation",
+                            "primary-type": "Album",
+                            "secondary-types": ["Compilation"],
+                        },
+                    },
+                    {
+                        "id": "mb-release-single",
+                        "title": "In Bloom",
+                        "date": "1992-11-30",
+                        "status": "Official",
+                        "release-group": {
+                            "id": "mb-rg-single",
+                            "primary-type": "Single",
+                        },
+                    },
+                    {
+                        "id": "mb-release-nevermind",
+                        "title": "Nevermind",
+                        "date": "1991-09-24",
+                        "status": "Official",
+                        "release-group": {
+                            "id": "mb-rg-nevermind",
+                            "primary-type": "Album",
+                        },
+                    },
+                ],
+            },
+            query="In Bloom",
+        )
+
+        self.assertEqual(item.get("album"), "Nevermind")
+        self.assertEqual(
+            item.get("musicbrainz_release_group_id"),
+            "mb-rg-nevermind",
+        )
+        self.assertEqual(
+            len(item.get("musicbrainz_release_candidates") or []),
+            3,
+        )
+
+    def test_recording_lookup_constrains_title_artist_and_release_kind(self) -> None:
+        class RecordingClient:
+            def __init__(self) -> None:
+                self.query = ""
+                self.limit = 0
+
+            def search_recordings(self, query, *, limit):
+                self.query = query
+                self.limit = limit
+                return []
+
+        client = RecordingClient()
+        results = search_musicbrainz_recording_items(
+            "The Trooper",
+            artist="Iron Maiden",
+            official_non_live=True,
+            raise_errors=True,
+            client=client,
+            limit=25,
+        )
+
+        self.assertEqual(results, [])
+        self.assertEqual(client.limit, 25)
+        self.assertIn('recording:"The Trooper"', client.query)
+        self.assertIn('artistname:"Iron Maiden"', client.query)
+        self.assertIn("status:official", client.query)
+        self.assertIn("-secondarytype:live", client.query)
+        self.assertIn("video:false", client.query)
+
+    def test_recording_lookup_can_report_provider_failure(self) -> None:
+        class FailingRecordingClient:
+            def search_recordings(self, _query, *, limit):
+                del limit
+                raise TimeoutError("musicbrainz timed out")
+
+        with self.assertRaises(TimeoutError):
+            search_musicbrainz_recording_items(
+                "In Bloom",
+                artist="Nirvana",
+                raise_errors=True,
+                client=FailingRecordingClient(),
+            )
 
     def test_musicbrainz_artist_and_release_group_map_to_verified_catalog_items(self) -> None:
         artist = musicbrainz_artist_to_item(
@@ -2284,6 +3111,37 @@ class SearchEnrichmentTests(unittest.TestCase):
         )
 
         self.assertEqual((album or {}).get("id"), "right")
+
+    @patch("auralis_backend.search.service.search_canonical_album_for_track")
+    def test_accepted_track_hydrates_exact_containing_album(
+        self,
+        mock_album_lookup,
+    ) -> None:
+        mock_album_lookup.return_value = {
+            "id": "MPREb_everlong",
+            "provider_album_id": "MPREb_everlong",
+            "title": "The Colour and the Shape",
+            "artist": "Foo Fighters",
+            "thumbnail": "https://example.test/colour.jpg",
+        }
+
+        album = search_service_module._hydrate_containing_album_from_accepted_target(
+            {
+                "title": "The Colour and the Shape",
+                "artist": "Foo Fighters",
+                "musicbrainz_release_group_id": "mb-release-group",
+                "playable": False,
+            },
+            [],
+            {"id": "UC-FooFighters", "name": "Foo Fighters"},
+            server=server,
+        )
+
+        self.assertEqual(album.get("id"), "MPREb_everlong")
+        self.assertEqual(
+            album.get("musicbrainz_release_group_id"),
+            "mb-release-group",
+        )
 
 
     def test_user_history_catalog_seed_creates_playable_alias_memory(self) -> None:

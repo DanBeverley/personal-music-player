@@ -188,7 +188,7 @@ def search_artists_direct(server: Any, query: str, limit: int):
     from .cache_runtime import lookup_search_result, store_search_result
 
     cached = lookup_search_result("artists_direct", cache_key)
-    if cached is not None:
+    if cached:
         return [dict(item) for item in cached]
 
     raw_results = server.search_upstream_call_with_retry(
@@ -225,7 +225,8 @@ def search_artists_direct(server: Any, query: str, limit: int):
         reverse=True,
     )
     results = artists[:limit]
-    store_search_result("artists_direct", cache_key, results)
+    if results:
+        store_search_result("artists_direct", cache_key, results)
     return [dict(item) for item in results]
 
 

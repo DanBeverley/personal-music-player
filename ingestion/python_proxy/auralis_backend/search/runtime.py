@@ -121,7 +121,7 @@ def search_tracks_direct(query: str, limit: int, *, server: Any | None = None):
         return []
     cache_key = _search_cache_key(query, limit, server=server)
     cached = lookup_search_result("tracks_direct", cache_key)
-    if cached is not None:
+    if cached:
         return [dict(item) for item in cached]
 
     ytmusic_started = time.perf_counter()
@@ -133,7 +133,8 @@ def search_tracks_direct(query: str, limit: int, *, server: Any | None = None):
         flush=True,
     )
     final_results = [dict(item) for item in list(results or [])[:limit] if isinstance(item, dict)]
-    store_search_result("tracks_direct", cache_key, final_results)
+    if final_results:
+        store_search_result("tracks_direct", cache_key, final_results)
     return [dict(item) for item in final_results]
 
 
@@ -193,12 +194,14 @@ def search_artists_direct_cached(query: str, limit: int, *, server: Any | None =
         return []
     cache_key = _search_cache_key(query, limit, server=server)
     cached = lookup_search_result("artists_direct", cache_key)
-    if cached is not None:
+    if cached:
         return [dict(item) for item in cached]
 
     results = resolve_search_artists_direct(server, query, limit)
     final_results = [dict(item) for item in list(results or [])[:limit] if isinstance(item, dict)]
-    store_search_result("artists_direct", cache_key, final_results)
+    # `resolve_search_artists_direct` owns this cache namespace. Do not store
+    # the same response twice, and never turn a transient empty provider call
+    # into a ten-minute successful result.
     return [dict(item) for item in final_results]
 
 
@@ -210,7 +213,7 @@ def search_albums_direct(query: str, limit: int, *, server: Any | None = None):
         return []
     cache_key = _search_cache_key(query, limit, server=server)
     cached = lookup_search_result("albums_direct", cache_key)
-    if cached is not None:
+    if cached:
         return _resolved_albums(server, cached)[:limit]
 
     direct_results = server.search_upstream_call_with_retry(
@@ -225,7 +228,8 @@ def search_albums_direct(query: str, limit: int, *, server: Any | None = None):
         )
         albums = server.normalize_album_results(fallback_results)
     final_results = _resolved_albums(server, albums)[:limit]
-    store_search_result("albums_direct", cache_key, final_results)
+    if final_results:
+        store_search_result("albums_direct", cache_key, final_results)
     return [dict(item) for item in final_results]
 
 

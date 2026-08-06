@@ -29,6 +29,9 @@ from auralis_backend.search.intelligence import search_text_similarity
 from auralis_backend.search.query_mode import resolve_search_mode
 from auralis_backend.search.service import (
     SearchService,
+    _bind_containing_album_from_artist_catalog,
+    _cache_search_payload_background,
+    _materialize_resolved_target,
     _repair_search_artwork,
     _search_album_is_publishable,
     _search_playlist_is_publishable,
@@ -97,6 +100,257 @@ class SearchLatencyTests(unittest.TestCase):
         )
         self._musicbrainz_patch.start()
         self.addCleanup(self._musicbrainz_patch.stop)
+
+    def _retrieve_provider_fixture(
+        self,
+        *,
+        query,
+        tracks,
+        artists,
+        albums,
+        musicbrainz_tracks=(),
+    ):
+        with (
+            patch(
+                "auralis_backend.domain.retrieval._retrieval_cache_get",
+                return_value=None,
+            ),
+            patch("auralis_backend.domain.retrieval._retrieval_cache_set"),
+            patch(
+                "auralis_backend.domain.retrieval.load_catalog_entity_memories",
+                return_value=[],
+            ),
+            patch(
+                "auralis_backend.domain.retrieval.load_fuzzy_catalog_entity_memories",
+                return_value=[],
+            ),
+            patch(
+                "auralis_backend.domain.retrieval.search_tracks_direct",
+                return_value=list(tracks),
+            ),
+            patch(
+                "auralis_backend.domain.retrieval.search_artists_direct_cached",
+                return_value=list(artists),
+            ),
+            patch(
+                "auralis_backend.domain.retrieval.search_albums_direct",
+                return_value=list(albums),
+            ),
+            patch(
+                "auralis_backend.domain.retrieval.search_musicbrainz_recording_items",
+                return_value=list(musicbrainz_tracks),
+            ),
+        ):
+            return retrieve_search_candidates_fast(
+                SimpleNamespace(
+                    query=query,
+                    surface="search",
+                    force_refresh=True,
+                    search_mode="exact",
+                    anchor_track_snapshots=[],
+                ),
+                {
+                    "user_scope_id": "guest",
+                    "recent_queries": [],
+                    "last_played_tracks": [],
+                },
+                limit=24,
+            )
+
+    def test_exact_recording_family_beats_weak_same_name_artist(self) -> None:
+        payload = self._retrieve_provider_fixture(
+            query="Hail to the King",
+            tracks=[
+                {
+                    "id": "hail-a7x",
+                    "title": "Hail to the King",
+                    "channel": "Avenged Sevenfold",
+                    "artist_id": "UC-A7X",
+                    "album": "Hail to the King",
+                    "album_id": "MPRE-Hail-A7X",
+                    "source_authority": "search_only",
+                },
+                {
+                    "id": "hail-cover",
+                    "title": "Hail to the King",
+                    "channel": "Cover Artist",
+                    "artist_id": "UC-Cover",
+                    "album": "Metal Covers",
+                    "album_id": "MPRE-Covers",
+                    "source_authority": "search_only",
+                },
+                {
+                    "id": "namesake-catalog-track",
+                    "title": "Coronation",
+                    "channel": "Hail to the King",
+                    "artist_id": "UC-Hail-Namesake",
+                    "album": "Coronation",
+                    "album_id": "MPRE-Coronation",
+                },
+            ],
+            artists=[
+                {
+                    "id": "UC-Hail-Namesake",
+                    "name": "Hail to the King",
+                    "subscribers": "2K",
+                    "source_authority": "search_only",
+                }
+            ],
+            albums=[
+                {
+                    "id": "MPRE-Hail-A7X",
+                    "title": "Hail to the King",
+                    "artist": "Avenged Sevenfold",
+                    "artist_id": "UC-A7X",
+                },
+                {
+                    "id": "MPRE-Hail-Namesake",
+                    "title": "Hail to the King",
+                    "artist": "Hail to the King",
+                    "artist_id": "UC-Hail-Namesake",
+                },
+            ],
+        )
+
+        target = dict(payload.get("resolved_target") or {})
+        self.assertEqual(payload.get("query_intent"), "track")
+        self.assertEqual((target.get("lead_artist") or {}).get("name"), "Avenged Sevenfold")
+        self.assertEqual(
+            (target.get("containing_album") or {}).get("id"),
+            "MPRE-Hail-A7X",
+        )
+
+    def test_provider_leading_recording_resolves_canonical_same_title_credits(self) -> None:
+        payload = self._retrieve_provider_fixture(
+            query="Made in Heaven",
+            tracks=[
+                {
+                    "id": "made-queen",
+                    "title": "Made in Heaven",
+                    "channel": "Queen",
+                    "artist_id": "UC-Queen",
+                    "album": "Made in Heaven",
+                    "album_id": "MPRE-Made-Queen",
+                    "source_authority": "topic",
+                },
+                {
+                    "id": "made-freddie",
+                    "title": "Made in Heaven",
+                    "channel": "Freddie Mercury",
+                    "artist_id": "UC-Freddie",
+                    "album": "Mr. Bad Guy",
+                    "album_id": "MPRE-Mr-Bad-Guy",
+                    "source_authority": "topic",
+                },
+                {
+                    "id": "namesake-made-track",
+                    "title": "Another Song",
+                    "channel": "Made in Heaven",
+                    "artist_id": "UC-Made-Namesake",
+                    "album": "Another Album",
+                    "album_id": "MPRE-Another",
+                },
+            ],
+            artists=[
+                {
+                    "id": "UC-Made-Namesake",
+                    "name": "Made in Heaven",
+                    "subscribers": "3K",
+                    "source_authority": "search_only",
+                }
+            ],
+            albums=[
+                {
+                    "id": "MPRE-Made-Queen",
+                    "title": "Made in Heaven",
+                    "artist": "Queen",
+                    "artist_id": "UC-Queen",
+                },
+                {
+                    "id": "MPRE-Mr-Bad-Guy",
+                    "title": "Mr. Bad Guy",
+                    "artist": "Freddie Mercury",
+                    "artist_id": "UC-Freddie",
+                },
+            ],
+            musicbrainz_tracks=[
+                {
+                    "musicbrainz_recording_id": "mb-made-queen",
+                    "musicbrainz_artist_id": "mb-queen",
+                    "title": "Made in Heaven",
+                    "artist": "Queen",
+                    "album": "Made in Heaven",
+                    "musicbrainz_score": 1.0,
+                },
+                {
+                    "musicbrainz_recording_id": "mb-made-freddie",
+                    "musicbrainz_artist_id": "mb-freddie",
+                    "title": "Made in Heaven",
+                    "artist": "Freddie Mercury",
+                    "album": "Mr. Bad Guy",
+                    "musicbrainz_score": 1.0,
+                },
+            ],
+        )
+
+        target = dict(payload.get("resolved_target") or {})
+        self.assertEqual(payload.get("query_intent"), "track")
+        self.assertEqual((target.get("lead_artist") or {}).get("name"), "Queen")
+        self.assertEqual(
+            (target.get("containing_album") or {}).get("id"),
+            "MPRE-Made-Queen",
+        )
+
+    def test_established_exact_artist_still_beats_obscure_same_title_track(self) -> None:
+        payload = self._retrieve_provider_fixture(
+            query="Dio",
+            tracks=[
+                {
+                    "id": "obscure-dio",
+                    "title": "Dio",
+                    "channel": "Tameer Hassan",
+                    "artist_id": "UC-Tameer",
+                    "album": "Dio",
+                    "album_id": "MPRE-Obscure-Dio",
+                },
+                {
+                    "id": "holy-diver",
+                    "title": "Holy Diver",
+                    "channel": "Dio",
+                    "artist_id": "UC-Dio",
+                    "album": "Holy Diver",
+                    "album_id": "MPRE-Holy-Diver",
+                },
+                {
+                    "id": "rainbow-dark",
+                    "title": "Rainbow in the Dark",
+                    "channel": "Dio",
+                    "artist_id": "UC-Dio",
+                    "album": "Holy Diver",
+                    "album_id": "MPRE-Holy-Diver",
+                },
+            ],
+            artists=[
+                {
+                    "id": "UC-Dio",
+                    "name": "Dio",
+                    "subscribers": "1.2M",
+                    "source_authority": "official_artist_channel",
+                }
+            ],
+            albums=[
+                {
+                    "id": "MPRE-Obscure-Dio",
+                    "title": "Dio",
+                    "artist": "Tameer Hassan",
+                    "artist_id": "UC-Tameer",
+                }
+            ],
+        )
+
+        target = dict(payload.get("resolved_target") or {})
+        self.assertEqual(payload.get("query_intent"), "artist")
+        self.assertEqual((target.get("lead_artist") or {}).get("name"), "Dio")
 
     def test_entity_names_containing_genres_stay_on_fast_path(self) -> None:
         self.assertEqual(
@@ -472,6 +726,47 @@ class SearchLatencyTests(unittest.TestCase):
         self.assertNotIn(
             "Tameer Hassan",
             [item.get("channel") for item in ranked],
+        )
+
+    def test_provisional_track_type_does_not_lock_out_established_artist(self) -> None:
+        resolved = resolve_search_target(
+            server=server,
+            query="dio",
+            tracks=[
+                {
+                    "id": "dio-tameer",
+                    "title": "Dio",
+                    "channel": "Tameer Hassan",
+                    "popularity": 0.01,
+                }
+            ],
+            artists=[
+                {
+                    "id": "UC-Dio",
+                    "name": "Dio",
+                    "popularity": 1.0,
+                }
+            ],
+            albums=[],
+            canonical_resolution={
+                "title": "Dio",
+                "artist": "Tameer Hassan",
+                "musicbrainz_recording_id": "mb-dio-tameer",
+                "independent_provider_corroboration": True,
+            },
+            entity_type_hint="track",
+        )
+
+        self.assertEqual(resolved.get("entity_type"), "artist")
+        self.assertEqual((resolved.get("item") or {}).get("id"), "UC-Dio")
+        self.assertIn("catalog_popularity_advantage", resolved.get("evidence") or [])
+        self.assertGreater(
+            float(resolved.get("identity_confidence") or 0.0),
+            0.0,
+        )
+        self.assertGreater(
+            float(resolved.get("intent_confidence") or 0.0),
+            0.0,
         )
 
     def test_exact_raw_artist_name_beats_punctuation_homonym(self) -> None:
@@ -1377,6 +1672,13 @@ class SearchLatencyTests(unittest.TestCase):
                 "artist": "Nirvana",
                 "confidence": 0.98,
                 "musicbrainz_recording_id": "mb-in-bloom",
+                "musicbrainz_artist_id": "mb-nirvana",
+                "musicbrainz_artist_ids": ["mb-nirvana"],
+                "musicbrainz_release_id": "mb-release-nevermind",
+                "musicbrainz_release_group_id": "mb-rg-nevermind",
+                "release_date": "1991-09-24",
+                "release_year": "1991",
+                "independent_provider_corroboration": True,
             },
         )
 
@@ -1386,6 +1688,272 @@ class SearchLatencyTests(unittest.TestCase):
         self.assertEqual(
             (target.get("containing_album") or {}).get("title"),
             "Nevermind",
+        )
+        self.assertEqual(
+            (target.get("item") or {}).get("musicbrainz_recording_id"),
+            "mb-in-bloom",
+        )
+        self.assertEqual(
+            (target.get("lead_artist") or {}).get("musicbrainz_artist_id"),
+            "mb-nirvana",
+        )
+        self.assertEqual(
+            (target.get("containing_album") or {}).get("provider_album_id"),
+            "MPRE-Nevermind",
+        )
+        self.assertEqual(
+            (target.get("containing_album") or {}).get(
+                "musicbrainz_release_group_id"
+            ),
+            "mb-rg-nevermind",
+        )
+
+    def test_track_target_binds_canonical_release_to_matching_provider_album(self) -> None:
+        target = resolve_search_target(
+            server=server,
+            query="In Bloom",
+            tracks=[
+                {
+                    "id": "nirvana-in-bloom",
+                    "title": "In Bloom",
+                    "channel": "Nirvana",
+                    "artist_id": "UC-Nirvana",
+                    "album": "Nevermind",
+                }
+            ],
+            artists=[{"id": "UC-Nirvana", "name": "Nirvana"}],
+            albums=[
+                {
+                    "id": "MPRE-Nevermind",
+                    "title": "Nevermind",
+                    "artist": "Nirvana",
+                },
+                {
+                    "id": "MPRE-Tribute",
+                    "title": "In Bloom: A Tribute",
+                    "artist": "Various Artists",
+                },
+            ],
+            canonical_resolution={
+                "title": "In Bloom",
+                "artist": "Nirvana",
+                "album": "Nevermind",
+                "musicbrainz_recording_id": "mb-in-bloom",
+                "musicbrainz_artist_id": "mb-nirvana",
+                "musicbrainz_release_id": "mb-release-nevermind",
+                "musicbrainz_release_group_id": "mb-rg-nevermind",
+                "independent_provider_corroboration": True,
+            },
+        )
+
+        self.assertEqual(target.get("entity_type"), "track")
+        self.assertEqual(
+            (target.get("containing_album") or {}).get("id"),
+            "MPRE-Nevermind",
+        )
+        self.assertEqual(
+            (target.get("containing_album") or {}).get(
+                "musicbrainz_release_group_id"
+            ),
+            "mb-rg-nevermind",
+        )
+
+    def test_canonical_release_rebinds_to_accepted_artist_catalog_album(self) -> None:
+        bound = _bind_containing_album_from_artist_catalog(
+            {
+                "id": "musicbrainz:release-group:mb-rg-jazz",
+                "title": "Jazz",
+                "artist": "Queen",
+                "musicbrainz_release_group_id": "mb-rg-jazz",
+                "playable": False,
+            },
+            [
+                {
+                    "id": "MPRE-Jazz",
+                    "title": "Jazz (Deluxe Edition)",
+                    "artist": "Queen",
+                    "thumbnail": "https://example.test/jazz.jpg",
+                },
+                {
+                    "id": "MPRE-NewsOfTheWorld",
+                    "title": "News of the World",
+                    "artist": "Queen",
+                    "thumbnail": "https://example.test/news.jpg",
+                },
+            ],
+            {"id": "UC-Queen", "name": "Queen"},
+        )
+
+        self.assertEqual(bound.get("id"), "MPRE-Jazz")
+        self.assertEqual(
+            bound.get("musicbrainz_release_group_id"),
+            "mb-rg-jazz",
+        )
+        self.assertTrue(bound.get("playable"))
+
+    def test_accepted_lead_artist_is_returned_while_artwork_is_pending(self) -> None:
+        service = SearchService(server)
+        response = service._build_direct_search_response(
+            req=SimpleNamespace(
+                query="In Bloom",
+                search_mode="exact",
+                user_scope_id="guest",
+            ),
+            trace={"request_id": "lead-without-artwork"},
+            query_intent="track",
+            resolved_target=_test_resolved_target(
+                "track",
+                {
+                    "id": "in-bloom",
+                    "playback": {
+                        "provider": "youtube",
+                        "source_id": "00000000001",
+                    },
+                    "title": "In Bloom",
+                    "channel": "Nirvana",
+                    "artist_id": "UC-Nirvana",
+                },
+                lead_artist={"id": "UC-Nirvana", "name": "Nirvana"},
+            ),
+            limit=16,
+            track_model_version="test",
+            tracks=[
+                {
+                    "id": "in-bloom",
+                    "playback": {
+                        "provider": "youtube",
+                        "source_id": "00000000001",
+                    },
+                    "title": "In Bloom",
+                    "channel": "Nirvana",
+                    "artist_id": "UC-Nirvana",
+                }
+            ],
+            artists=[],
+            albums=[],
+            similar_artists=[],
+            direct_lookup_ms=1,
+            lead_artist={"id": "UC-Nirvana", "name": "Nirvana"},
+            write_resolution_memory=False,
+        )
+
+        self.assertEqual(
+            (response.get("lead_artist") or {}).get("name"),
+            "Nirvana",
+        )
+
+    def test_materialized_track_keeps_canonical_identity_and_provider_album(self) -> None:
+        target = _materialize_resolved_target(
+            {
+                "entity_type": "track",
+                "item": {
+                    "videoId": "provider-in-bloom",
+                    "title": "In Bloom",
+                    "channel": "Nirvana",
+                    "track_key": "recording:mb-in-bloom",
+                    "canonical_recording_id": "mb-in-bloom",
+                    "musicbrainz_recording_id": "mb-in-bloom",
+                    "musicbrainz_artist_id": "mb-nirvana",
+                    "musicbrainz_release_id": "mb-release-nevermind",
+                    "musicbrainz_release_group_id": "mb-rg-nevermind",
+                },
+                "lead_artist": {
+                    "id": "UC-Nirvana",
+                    "name": "Nirvana",
+                    "musicbrainz_artist_id": "mb-nirvana",
+                },
+                "containing_album": {
+                    "id": "MPRE-Nevermind",
+                    "provider_album_id": "MPRE-Nevermind",
+                    "title": "Nevermind",
+                    "artist": "Nirvana",
+                    "musicbrainz_release_id": "mb-release-nevermind",
+                    "musicbrainz_release_group_id": "mb-rg-nevermind",
+                },
+                "target_identity": "musicbrainz:recording:mb-in-bloom",
+            },
+            tracks=[
+                {
+                    "videoId": "provider-in-bloom",
+                    "title": "In Bloom",
+                    "channel": "Nirvana",
+                    "thumbnail": "https://img.example/in-bloom.jpg",
+                }
+            ],
+            artists=[{"id": "UC-Nirvana", "name": "Nirvana"}],
+            albums=[
+                {
+                    "id": "MPRE-Nevermind",
+                    "title": "Nevermind",
+                    "artist": "Nirvana",
+                    "thumbnail": "https://img.example/nevermind.jpg",
+                }
+            ],
+        )
+
+        self.assertEqual(
+            (target.get("item") or {}).get("track_key"),
+            "recording:mb-in-bloom",
+        )
+        self.assertEqual(
+            (target.get("item") or {}).get("musicbrainz_release_group_id"),
+            "mb-rg-nevermind",
+        )
+        self.assertEqual(
+            (target.get("containing_album") or {}).get("id"),
+            "MPRE-Nevermind",
+        )
+        self.assertEqual(
+            (target.get("containing_album") or {}).get(
+                "musicbrainz_release_group_id"
+            ),
+            "mb-rg-nevermind",
+        )
+
+    @patch("auralis_backend.search.service.remember_catalog_entity")
+    @patch("auralis_backend.search.service.cache_search_payload")
+    def test_accepted_track_and_album_are_persisted_before_ranked_rows(
+        self,
+        _mock_payload_cache,
+        mock_remember,
+    ) -> None:
+        _cache_search_payload_background(
+            server=server,
+            query="In Bloom",
+            tracks=[{"id": "other", "title": "Other", "channel": "Other"}],
+            artists=[],
+            albums=[],
+            resolved_target={
+                "entity_type": "track",
+                "item": {
+                    "id": "nirvana-in-bloom",
+                    "title": "In Bloom",
+                    "channel": "Nirvana",
+                    "musicbrainz_recording_id": "mb-in-bloom",
+                },
+                "containing_album": {
+                    "id": "MPRE-Nevermind",
+                    "title": "Nevermind",
+                    "artist": "Nirvana",
+                    "musicbrainz_release_group_id": "mb-rg-nevermind",
+                },
+            },
+        )
+
+        calls = mock_remember.call_args_list
+        self.assertEqual(calls[0].kwargs.get("entity_type"), "track")
+        self.assertEqual(
+            calls[0].kwargs.get("item", {}).get("musicbrainz_recording_id"),
+            "mb-in-bloom",
+        )
+        album_call = next(
+            call
+            for call in calls
+            if call.kwargs.get("entity_type") == "album"
+        )
+        self.assertEqual(
+            album_call.kwargs.get("item", {}).get("musicbrainz_release_group_id"),
+            "mb-rg-nevermind",
         )
 
     def test_competing_recording_credits_fail_closed(self) -> None:
@@ -1426,6 +1994,166 @@ class SearchLatencyTests(unittest.TestCase):
         self.assertTrue(resolution.get("ambiguous"))
         self.assertEqual(resolution.get("reason"), "competing_recording_credits")
         self.assertEqual(len(resolution.get("candidate_credits") or []), 2)
+
+    def test_track_resolution_finds_original_album_beyond_first_twelve_rows(self) -> None:
+        later_live_rows = [
+            {
+                "musicbrainz_recording_id": f"mb-trooper-live-{index}",
+                "title": "The Trooper",
+                "artist": "Iron Maiden",
+                "musicbrainz_score": 1.0,
+                "release_status": "Official",
+                "release_primary_type": "Album",
+                "release_secondary_types": ["Live"],
+                "first_release_date": f"{1990 + index}-01-01",
+                "musicbrainz_release_candidates": [
+                    {
+                        "album": f"Live After Live {index}",
+                        "release_id": f"mb-live-release-{index}",
+                        "release_group_id": f"mb-live-group-{index}",
+                        "release_date": f"{1990 + index}-01-01",
+                        "status": "Official",
+                        "primary_type": "Album",
+                        "secondary_types": ["Live"],
+                    }
+                ],
+            }
+            for index in range(18)
+        ]
+        original = {
+            "musicbrainz_recording_id": "mb-trooper-studio",
+            "title": "The Trooper",
+            "artist": "Iron Maiden",
+            "musicbrainz_score": 0.99,
+            "release_status": "Official",
+            "release_primary_type": "Album",
+            "release_secondary_types": [],
+            "first_release_date": "1983-05-16",
+            "musicbrainz_release_candidates": [
+                {
+                    "album": "Piece of Mind",
+                    "release_id": "mb-piece-of-mind-release",
+                    "release_group_id": "mb-piece-of-mind-group",
+                    "release_date": "1983-05-16",
+                    "status": "Official",
+                    "primary_type": "Album",
+                    "secondary_types": [],
+                }
+            ],
+        }
+
+        resolution = _canonical_track_resolution(
+            server,
+            query="The Trooper",
+            provider_tracks=[
+                {
+                    "id": "provider-trooper",
+                    "title": "The Trooper",
+                    "channel": "Iron Maiden",
+                    "artist_id": "UC-IronMaiden",
+                    "album_id": "MPRE-PieceOfMind",
+                    "album": "Piece of Mind",
+                    "views": "275M",
+                }
+            ],
+            fuzzy_tracks=[],
+            musicbrainz_tracks=[*later_live_rows, original],
+        )
+
+        self.assertEqual(
+            resolution.get("musicbrainz_recording_id"),
+            "mb-trooper-studio",
+        )
+        self.assertEqual(resolution.get("album"), "Piece of Mind")
+        self.assertEqual(
+            resolution.get("musicbrainz_release_group_id"),
+            "mb-piece-of-mind-group",
+        )
+
+    def test_provider_dominance_keeps_track_target_when_musicbrainz_times_out(self) -> None:
+        provider_tracks = [
+            {
+                "id": "nirvana-in-bloom",
+                "playback": {"provider": "youtube", "source_id": "00000000002"},
+                "title": "In Bloom",
+                "channel": "Nirvana",
+                "artist_id": "UC-Nirvana",
+                "album_id": "MPRE-Nevermind",
+                "album": "Nevermind",
+                "views": "300M",
+                "source_provider": "ytmusic",
+            },
+            {
+                "id": "zerobaseone-in-bloom",
+                "playback": {"provider": "youtube", "source_id": "00000000003"},
+                "title": "In Bloom",
+                "channel": "ZEROBASEONE",
+                "artist_id": "UC-Zerobaseone",
+                "album_id": "MPRE-YouthInTheShade",
+                "album": "Youth in the Shade",
+                "views": "57M",
+                "source_provider": "ytmusic",
+            },
+        ]
+        with (
+            patch(
+                "auralis_backend.domain.retrieval._retrieval_cache_get",
+                return_value=None,
+            ),
+            patch("auralis_backend.domain.retrieval._retrieval_cache_set"),
+            patch(
+                "auralis_backend.domain.retrieval.load_catalog_entity_memories",
+                return_value=[],
+            ),
+            patch(
+                "auralis_backend.domain.retrieval.load_fuzzy_catalog_entity_memories",
+                return_value=[],
+            ),
+            patch(
+                "auralis_backend.domain.retrieval.search_tracks_direct",
+                return_value=provider_tracks,
+            ),
+            patch(
+                "auralis_backend.domain.retrieval.search_artists_direct_cached",
+                return_value=[],
+            ),
+            patch(
+                "auralis_backend.domain.retrieval.search_albums_direct",
+                return_value=[],
+            ),
+            patch(
+                "auralis_backend.domain.retrieval.search_musicbrainz_recording_items",
+                side_effect=TimeoutError("musicbrainz timed out"),
+            ),
+        ):
+            payload = retrieve_search_candidates_fast(
+                SimpleNamespace(
+                    query="In Bloom",
+                    surface="search",
+                    force_refresh=False,
+                    search_mode="exact",
+                    defer_side_surfaces=True,
+                    anchor_track_snapshots=[],
+                ),
+                {
+                    "user_scope_id": "guest",
+                    "recent_queries": [],
+                    "last_played_tracks": [],
+                },
+                limit=8,
+            )
+
+        target = dict(payload.get("resolved_target") or {})
+        self.assertEqual(payload.get("query_intent"), "track")
+        self.assertEqual((target.get("item") or {}).get("id"), "nirvana-in-bloom")
+        self.assertEqual((target.get("lead_artist") or {}).get("name"), "Nirvana")
+        self.assertIn("provider_rank_dominance", target.get("evidence") or [])
+        self.assertEqual(
+            (payload.get("retrieval_diagnostics") or {}).get(
+                "canonical_evidence_outcome"
+            ),
+            "timeout",
+        )
 
     def test_resolver_is_invariant_to_candidate_order(self) -> None:
         tracks = [
@@ -1473,6 +2201,61 @@ class SearchLatencyTests(unittest.TestCase):
 
         self.assertEqual(first.get("target_identity"), reversed_result.get("target_identity"))
 
+    def test_authoritative_recording_beats_unknown_same_name_artist(self) -> None:
+        target = resolve_search_target(
+            server=server,
+            query="Everlong",
+            tracks=[
+                {
+                    "id": "foo-everlong",
+                    "playback": {
+                        "provider": "youtube",
+                        "source_id": "foo-everlong",
+                    },
+                    "title": "Everlong",
+                    "channel": "Foo Fighters",
+                    "artist_id": "UC-FooFighters",
+                    "views": "900M",
+                    "source_authority": "topic",
+                },
+                *[
+                    {
+                        "id": f"other-everlong-{index}",
+                        "title": title,
+                        "channel": "Everlong",
+                        "artist_id": "UC-OtherEverlong",
+                        "views": "1K",
+                    }
+                    for index, title in enumerate(
+                        ["Deep Breath", "Gila", "Klara", "Stale Viac"]
+                    )
+                ],
+            ],
+            artists=[
+                {
+                    "id": "UC-OtherEverlong",
+                    "name": "Everlong",
+                    "source_authority": "unknown",
+                    "subscribers": "17",
+                }
+            ],
+            albums=[],
+            canonical_resolution={
+                "title": "Everlong",
+                "artist": "Foo Fighters",
+                "musicbrainz_recording_id": "mb-everlong",
+                "musicbrainz_artist_id": "mb-foo-fighters",
+                "independent_provider_corroboration": True,
+            },
+        )
+
+        self.assertEqual(target.get("entity_type"), "track")
+        self.assertEqual(
+            target.get("target_identity"),
+            "musicbrainz:recording:mb-everlong",
+        )
+        self.assertEqual((target.get("lead_artist") or {}).get("name"), "Foo Fighters")
+
     def test_famous_artist_beats_obscure_same_name_recording(self) -> None:
         target = resolve_search_target(
             server=server,
@@ -1483,34 +2266,56 @@ class SearchLatencyTests(unittest.TestCase):
                     "title": "Dio",
                     "channel": "Tameer Hassan",
                     "views": "10K",
-                },
+                }
+            ],
+            relationship_tracks=[
                 {
                     "id": "holy-diver",
                     "title": "Holy Diver",
                     "channel": "Dio",
-                    "artist_id": "UC-Dio",
+                    "artist_id": "UCgxv4igPRzlBIyCKEzDwiYQ",
                     "views": "100M",
                 },
                 {
                     "id": "rainbow-dark",
                     "title": "Rainbow in the Dark",
                     "channel": "Dio",
-                    "artist_id": "UC-Dio",
+                    "artist_id": "UCgxv4igPRzlBIyCKEzDwiYQ",
                     "views": "100M",
                 },
             ],
-            artists=[{"id": "UC-Dio", "name": "Dio", "subscribers": "1.2M"}],
+            artists=[
+                {
+                    "id": "musicbrainz:artist:c55193fb-f5d2-4839-a263-4c044fca1456",
+                    "musicbrainz_artist_id": "c55193fb-f5d2-4839-a263-4c044fca1456",
+                    "name": "Dio",
+                    "popularity": 1.0,
+                },
+                {
+                    "id": "UCgxv4igPRzlBIyCKEzDwiYQ",
+                    "provider_artist_id": "UCgxv4igPRzlBIyCKEzDwiYQ",
+                    "canonical_artist_id": "musicbrainz:artist:c55193fb-f5d2-4839-a263-4c044fca1456",
+                    "name": "Dio",
+                    "source_authority": "verified_catalog",
+                    "subscribers": "1.2M",
+                },
+            ],
             albums=[],
             canonical_resolution={
                 "title": "Dio",
                 "artist": "Tameer Hassan",
                 "confidence": 0.98,
                 "musicbrainz_recording_id": "mb-dio",
+                "independent_provider_corroboration": True,
             },
         )
 
         self.assertEqual(target.get("entity_type"), "artist")
-        self.assertEqual(target.get("target_identity"), "provider:artist:uc-dio")
+        self.assertEqual(
+            target.get("target_identity"),
+            "provider:artist:ucgxv4igprzlbiyckezdwiyq",
+        )
+        self.assertTrue((target.get("item") or {}).get("canonical_identity_linked"))
 
     def test_track_query_admits_same_artist_catalog_below_exact_match(self) -> None:
         candidates = {
@@ -1774,6 +2579,304 @@ class SearchLatencyTests(unittest.TestCase):
             "UC-ArcticMonkeys",
         )
 
+    def test_polluted_local_aliases_do_not_replace_exact_provider_artist(self) -> None:
+        cases = (
+            ("Michael Jackson", "UC-MichaelJackson", "Billie Jean"),
+            ("Eric Clapton", "UC-EricClapton", "Layla"),
+            ("Pink Floyd", "UC-PinkFloyd", "Time"),
+            ("ACDC", "UC-ACDC", "Back in Black"),
+        )
+        for query, artist_id, first_title in cases:
+            provider_tracks = [
+                {
+                    "id": f"{artist_id}-track-{index}",
+                    "title": title,
+                    "channel": query if query != "ACDC" else "AC/DC",
+                    "artist_id": artist_id,
+                    "album_id": f"MPRE-{artist_id}-{index}",
+                    "album": f"Album {index}",
+                    "playback": {
+                        "provider": "youtube",
+                        "source_id": f"source-{index}",
+                    },
+                }
+                for index, title in enumerate(
+                    (first_title, "Catalog Song Two", "Catalog Song Three")
+                )
+            ]
+            provider_name = query if query != "ACDC" else "AC/DC"
+            with self.subTest(query=query):
+                with (
+                    patch(
+                    "auralis_backend.domain.retrieval._retrieval_cache_get",
+                    return_value=None,
+                    ),
+                    patch("auralis_backend.domain.retrieval._retrieval_cache_set"),
+                    patch(
+                    "auralis_backend.domain.retrieval.load_catalog_entity_memories",
+                    return_value=[],
+                    ),
+                    patch(
+                    "auralis_backend.domain.retrieval.load_fuzzy_catalog_entity_memories",
+                    return_value=[
+                        {
+                            "entity_type": "artist",
+                            "payload": {
+                                "id": "UC-Wrong",
+                                "name": "Various Artists",
+                                "artist_aliases": [query],
+                            },
+                        },
+                        {
+                            "entity_type": "track",
+                            "payload": {
+                                "id": "wrong-title",
+                                "title": query,
+                                "channel": "Unrelated Artist",
+                            },
+                        },
+                    ],
+                    ),
+                    patch(
+                    "auralis_backend.domain.retrieval.search_tracks_direct",
+                    return_value=provider_tracks,
+                    ),
+                    patch(
+                    "auralis_backend.domain.retrieval.search_artists_direct_cached",
+                    return_value=[
+                        {
+                            "id": artist_id,
+                            "name": provider_name,
+                            "subscribers": "5M",
+                        }
+                    ],
+                    ),
+                    patch(
+                    "auralis_backend.domain.retrieval.search_albums_direct",
+                    return_value=[
+                        {
+                            "id": f"MPRE-{artist_id}",
+                            "title": "Greatest Album",
+                            "artist": provider_name,
+                        }
+                    ],
+                    ),
+                ):
+                    payload = retrieve_search_candidates_fast(
+                        SimpleNamespace(
+                            query=query,
+                            surface="search",
+                            force_refresh=True,
+                            search_mode="exact",
+                            anchor_track_snapshots=[],
+                        ),
+                        {
+                            "user_scope_id": "guest",
+                            "recent_queries": [],
+                            "last_played_tracks": [],
+                        },
+                        limit=24,
+                    )
+
+            self.assertEqual(payload.get("query_intent"), "artist")
+            self.assertEqual(
+                (payload.get("resolved_artist") or {}).get("id"),
+                artist_id,
+            )
+            diagnostics = dict(payload.get("retrieval_diagnostics") or {})
+            self.assertIn("artists.fast", diagnostics.get("completed_sources") or [])
+            self.assertIn("albums.fast", diagnostics.get("completed_sources") or [])
+
+    def test_ambiguous_exact_recording_uses_musicbrainz_before_failing_closed(self) -> None:
+        provider_tracks = [
+            {
+                "id": "pink-floyd-comfortably-numb",
+                "title": "Comfortably Numb",
+                "channel": "Pink Floyd",
+                "artist_id": "UC-PinkFloyd",
+                "album_id": "MPRE-TheWall",
+                "album": "The Wall",
+                "playback": {"provider": "youtube", "source_id": "pink-floyd"},
+            },
+            {
+                "id": "cover-comfortably-numb",
+                "title": "Comfortably Numb",
+                "channel": "Cover Artist",
+                "artist_id": "UC-Cover",
+                "album_id": "MPRE-Cover",
+                "album": "Covers",
+                "playback": {"provider": "youtube", "source_id": "cover"},
+            },
+        ]
+        with (
+            patch(
+                "auralis_backend.domain.retrieval._retrieval_cache_get",
+                return_value=None,
+            ),
+            patch("auralis_backend.domain.retrieval._retrieval_cache_set"),
+            patch(
+                "auralis_backend.domain.retrieval.load_catalog_entity_memories",
+                return_value=[],
+            ),
+            patch(
+                "auralis_backend.domain.retrieval.load_fuzzy_catalog_entity_memories",
+                return_value=[],
+            ),
+            patch(
+                "auralis_backend.domain.retrieval.search_tracks_direct",
+                return_value=provider_tracks,
+            ),
+            patch(
+                "auralis_backend.domain.retrieval.search_artists_direct_cached",
+                return_value=[],
+            ),
+            patch(
+                "auralis_backend.domain.retrieval.search_albums_direct",
+                return_value=[
+                    {"id": "MPRE-TheWall", "title": "The Wall", "artist": "Pink Floyd"}
+                ],
+            ),
+            patch(
+                "auralis_backend.domain.retrieval.search_musicbrainz_recording_items",
+                return_value=[
+                    {
+                        "musicbrainz_recording_id": "mb-comfortably-numb",
+                        "musicbrainz_artist_id": "mb-pink-floyd",
+                        "musicbrainz_release_id": "mb-release-the-wall",
+                        "musicbrainz_release_group_id": "mb-rg-the-wall",
+                        "title": "Comfortably Numb",
+                        "artist": "Pink Floyd",
+                        "album": "The Wall",
+                        "musicbrainz_score": 1.0,
+                    }
+                ],
+            ),
+        ):
+            payload = retrieve_search_candidates_fast(
+                SimpleNamespace(
+                    query="Comfortably Numb",
+                    surface="search",
+                    force_refresh=True,
+                    search_mode="exact",
+                    anchor_track_snapshots=[],
+                ),
+                {
+                    "user_scope_id": "guest",
+                    "recent_queries": [],
+                    "last_played_tracks": [],
+                },
+                limit=24,
+            )
+
+        self.assertEqual(payload.get("query_intent"), "track")
+        target = dict(payload.get("resolved_target") or {})
+        self.assertEqual(
+            target.get("target_identity"),
+            "musicbrainz:recording:mb-comfortably-numb",
+        )
+        self.assertEqual((target.get("lead_artist") or {}).get("name"), "Pink Floyd")
+        self.assertEqual(
+            (target.get("containing_album") or {}).get("title"),
+            "The Wall",
+        )
+
+    def test_retrieval_allows_canonical_recording_to_challenge_exact_artist(self) -> None:
+        provider_tracks = [
+            {
+                "id": "foo-everlong",
+                "title": "Everlong",
+                "channel": "Foo Fighters",
+                "artist_id": "UC-FooFighters",
+                "album": "The Colour and the Shape",
+                "album_id": "MPRE-ColourAndShape",
+                "views": "900M",
+                "source_authority": "topic",
+            },
+            *[
+                {
+                    "id": f"other-everlong-{index}",
+                    "title": title,
+                    "channel": "Everlong",
+                    "artist_id": "UC-OtherEverlong",
+                    "views": "1K",
+                }
+                for index, title in enumerate(
+                    ["Deep Breath", "Gila", "Klara", "Stale Viac"]
+                )
+            ],
+        ]
+        with (
+            patch(
+                "auralis_backend.domain.retrieval._retrieval_cache_get",
+                return_value=None,
+            ),
+            patch("auralis_backend.domain.retrieval._retrieval_cache_set"),
+            patch(
+                "auralis_backend.domain.retrieval.load_catalog_entity_memories",
+                return_value=[],
+            ),
+            patch(
+                "auralis_backend.domain.retrieval.load_fuzzy_catalog_entity_memories",
+                return_value=[],
+            ),
+            patch(
+                "auralis_backend.domain.retrieval.search_tracks_direct",
+                return_value=provider_tracks,
+            ),
+            patch(
+                "auralis_backend.domain.retrieval.search_artists_direct_cached",
+                return_value=[
+                    {
+                        "id": "UC-OtherEverlong",
+                        "name": "Everlong",
+                        "source_authority": "unknown",
+                        "subscribers": "17",
+                    }
+                ],
+            ),
+            patch(
+                "auralis_backend.domain.retrieval.search_albums_direct",
+                return_value=[],
+            ),
+            patch(
+                "auralis_backend.domain.retrieval.search_musicbrainz_recording_items",
+                return_value=[
+                    {
+                        "musicbrainz_recording_id": "mb-everlong",
+                        "musicbrainz_artist_id": "mb-foo-fighters",
+                        "musicbrainz_release_group_id": "mb-colour-shape",
+                        "title": "Everlong",
+                        "artist": "Foo Fighters",
+                        "album": "The Colour and the Shape",
+                        "musicbrainz_score": 1.0,
+                    }
+                ],
+            ),
+        ):
+            payload = retrieve_search_candidates_fast(
+                SimpleNamespace(
+                    query="Everlong",
+                    surface="search",
+                    force_refresh=True,
+                    search_mode="exact",
+                    anchor_track_snapshots=[],
+                ),
+                {
+                    "user_scope_id": "guest",
+                    "recent_queries": [],
+                    "last_played_tracks": [],
+                },
+                limit=24,
+            )
+
+        self.assertEqual(payload.get("query_intent"), "track")
+        target = dict(payload.get("resolved_target") or {})
+        self.assertEqual(
+            target.get("target_identity"),
+            "musicbrainz:recording:mb-everlong",
+        )
+        self.assertEqual((target.get("lead_artist") or {}).get("name"), "Foo Fighters")
+
     def test_exact_track_search_rejects_unrelated_history_fillers(self) -> None:
         retrieval_payload = {
             "query_intent": "track",
@@ -1874,19 +2977,25 @@ class SearchLatencyTests(unittest.TestCase):
         mock_musicbrainz.return_value = canonical_rows
         mock_track_search.return_value = [
             {
-                "id": "butchers-in-bloom",
-                "playback": {"provider": "youtube", "source_id": "00000000001"},
-                "title": "In Bloom",
-                "channel": "The Butchers",
-                "views": "10K",
-                "source_provider": "ytmusic",
-            },
-            {
                 "id": "nirvana-in-bloom",
                 "playback": {"provider": "youtube", "source_id": "00000000002"},
                 "title": "In Bloom",
                 "channel": "Nirvana",
+                "artist_id": "UC-Nirvana",
+                "album_id": "MPRE-Nevermind",
+                "album": "Nevermind",
                 "views": "300M",
+                "source_provider": "ytmusic",
+            },
+            {
+                "id": "butchers-in-bloom",
+                "playback": {"provider": "youtube", "source_id": "00000000001"},
+                "title": "In Bloom",
+                "channel": "The Butchers",
+                "artist_id": "UC-TheButchers",
+                "album_id": "MPRE-TheButchers",
+                "album": "In Bloom",
+                "views": "10K",
                 "source_provider": "ytmusic",
             },
         ]
@@ -1928,13 +3037,119 @@ class SearchLatencyTests(unittest.TestCase):
             ["In Bloom"],
         )
 
+    def test_recording_evidence_starts_while_other_provider_branches_run(self) -> None:
+        timeline = {}
+
+        def tracks(*_args, **_kwargs):
+            time.sleep(0.12)
+            timeline["tracks_done"] = time.perf_counter()
+            return [
+                {
+                    "id": "provider-in-bloom",
+                    "title": "In Bloom",
+                    "channel": "Nirvana",
+                    "artist_id": "UC-Nirvana",
+                    "album_id": "MPRE-Nevermind",
+                    "album": "Nevermind",
+                }
+            ]
+
+        def artists(*_args, **_kwargs):
+            time.sleep(0.15)
+            timeline["artists_done"] = time.perf_counter()
+            return []
+
+        def albums(*_args, **_kwargs):
+            time.sleep(0.15)
+            timeline["albums_done"] = time.perf_counter()
+            return []
+
+        def recording_evidence(*_args, **_kwargs):
+            timeline["musicbrainz_started"] = time.perf_counter()
+            return [
+                {
+                    "musicbrainz_recording_id": "mb-in-bloom",
+                    "musicbrainz_artist_id": "mb-nirvana",
+                    "musicbrainz_release_id": "mb-release-nevermind",
+                    "musicbrainz_release_group_id": "mb-rg-nevermind",
+                    "title": "In Bloom",
+                    "artist": "Nirvana",
+                    "album": "Nevermind",
+                    "musicbrainz_score": 1.0,
+                }
+            ]
+
+        with (
+            patch(
+                "auralis_backend.domain.retrieval.load_fuzzy_catalog_entity_memories",
+                return_value=[],
+            ),
+            patch(
+                "auralis_backend.domain.retrieval.search_tracks_direct",
+                side_effect=tracks,
+            ),
+            patch(
+                "auralis_backend.domain.retrieval.search_artists_direct_cached",
+                side_effect=artists,
+            ),
+            patch(
+                "auralis_backend.domain.retrieval.search_albums_direct",
+                side_effect=albums,
+            ),
+            patch(
+                "auralis_backend.domain.retrieval.search_musicbrainz_recording_items",
+                side_effect=recording_evidence,
+            ),
+        ):
+            payload = retrieve_search_candidates_fast(
+                SimpleNamespace(
+                    query="In Bloom",
+                    surface="search",
+                    force_refresh=True,
+                    search_mode="exact",
+                    defer_side_surfaces=False,
+                    anchor_track_snapshots=[],
+                ),
+                {
+                    "user_scope_id": "guest",
+                    "recent_queries": [],
+                    "last_played_tracks": [],
+                },
+                limit=8,
+                server=server,
+            )
+
+        self.assertLess(
+            timeline["musicbrainz_started"],
+            timeline["tracks_done"],
+        )
+        self.assertLess(
+            timeline["musicbrainz_started"],
+            timeline["artists_done"],
+        )
+        self.assertLess(
+            timeline["musicbrainz_started"],
+            timeline["albums_done"],
+        )
+        self.assertEqual(payload.get("query_intent"), "track")
+        self.assertEqual(
+            (payload.get("resolved_target") or {}).get("target_identity"),
+            "musicbrainz:recording:mb-in-bloom",
+        )
+        self.assertEqual(
+            (payload.get("retrieval_diagnostics") or {}).get(
+                "canonical_evidence_outcome"
+            ),
+            "hit",
+        )
+
     @patch("auralis_backend.domain.retrieval._retrieval_cache_set")
     @patch("auralis_backend.domain.retrieval._retrieval_cache_get", return_value=None)
     @patch("auralis_backend.domain.retrieval.load_fuzzy_catalog_entity_memories")
     @patch("auralis_backend.domain.retrieval.search_albums_direct", return_value=[])
     @patch("auralis_backend.domain.retrieval.search_artists_direct_cached")
     @patch("auralis_backend.domain.retrieval.search_tracks_direct")
-    def test_artist_query_never_runs_recording_lookup_or_conditioned_search(
+    def test_artist_query_survives_empty_recording_challenge(
         self,
         mock_track_search,
         mock_artist_search,
@@ -1961,7 +3176,8 @@ class SearchLatencyTests(unittest.TestCase):
         ]
         mock_fuzzy.return_value = []
         with patch(
-            "auralis_backend.domain.retrieval.search_musicbrainz_recording_items"
+            "auralis_backend.domain.retrieval.search_musicbrainz_recording_items",
+            return_value=[],
         ) as recording_lookup:
             payload = retrieve_search_candidates_fast(
                 SimpleNamespace(
@@ -1980,7 +3196,17 @@ class SearchLatencyTests(unittest.TestCase):
             )
 
         self.assertEqual(payload.get("query_intent"), "artist")
-        recording_lookup.assert_not_called()
+        self.assertEqual(
+            (payload.get("resolved_artist") or {}).get("id"),
+            "UC-EricClapton",
+        )
+        self.assertEqual(recording_lookup.call_count, 1)
+        self.assertEqual(
+            (payload.get("retrieval_diagnostics") or {}).get(
+                "canonical_evidence_outcome"
+            ),
+            "empty",
+        )
         self.assertEqual(
             [call.args[0] for call in mock_track_search.call_args_list],
             ["Eric Clapton"],
@@ -2062,7 +3288,7 @@ class SearchLatencyTests(unittest.TestCase):
         )
         mock_albums_direct.assert_called_once()
 
-    def test_strong_local_artist_memory_skips_redundant_typed_provider_calls(self) -> None:
+    def test_strong_local_artist_memory_does_not_suppress_typed_provider_calls(self) -> None:
         with (
             patch(
                 "auralis_backend.domain.retrieval._retrieval_cache_get",
@@ -2136,8 +3362,8 @@ class SearchLatencyTests(unittest.TestCase):
             "fast_query_fallback",
         )
         live_tracks.assert_called_once()
-        live_artists.assert_not_called()
-        live_albums.assert_not_called()
+        live_artists.assert_called_once()
+        live_albums.assert_called_once()
 
     @patch("auralis_backend.search.service.retrieve_search_candidates_fast")
     def test_two_word_exact_query_uses_direct_path_without_profile_build(
@@ -2178,6 +3404,10 @@ class SearchLatencyTests(unittest.TestCase):
         self.assertEqual((response.get("tracks") or [])[0].get("id"), "purple-rain")
         self.assertTrue(bool((response.get("diagnostics") or {}).get("direct_search_only")))
         self.assertTrue(bool((response.get("diagnostics") or {}).get("profile_build_skipped")))
+        self.assertIn(
+            "retrieval",
+            dict((response.get("diagnostics") or {}).get("stage_timings_ms") or {}),
+        )
 
     @patch("auralis_backend.search.service.retrieve_search_candidates_fast")
     def test_complete_first_page_reuses_one_retrieval_for_all_surfaces(
@@ -2807,6 +4037,150 @@ class SearchLatencyTests(unittest.TestCase):
         diagnostics = dict(response.get("diagnostics") or {})
         self.assertEqual(diagnostics.get("ranking_backend"), "canonical_search_v1")
         self.assertTrue(bool(diagnostics.get("profile_build_skipped")))
+
+    def test_exact_title_recording_family_is_provider_order_independent(self) -> None:
+        obscure_track = {
+            "id": "bk-made-in-heaven",
+            "videoId": "bk-made-in-heaven",
+            "title": "Made in Heaven",
+            "channel": "BK",
+            "artist_id": "UC-BK",
+            "album": "Gangstas Paradise",
+            "album_id": "MPRE-BK-Gangstas",
+            "source_authority": "topic",
+            "views": "2K",
+        }
+        intended_track = {
+            "id": "queen-made-in-heaven",
+            "videoId": "queen-made-in-heaven",
+            "title": "Made in Heaven",
+            "channel": "Queen",
+            "artist_id": "UC-Queen",
+            "album": "Made in Heaven",
+            "album_id": "MPRE-Queen-MadeInHeaven",
+            "source_authority": "topic",
+            "views": "250M",
+        }
+        artists = [
+            {"id": "UC-BK", "name": "BK", "subscribers": "500"},
+            {
+                "id": "UC-Queen",
+                "name": "Queen",
+                "subscribers": "20M",
+                "source_authority": "official_artist_channel",
+            },
+        ]
+        albums = [
+            {
+                "id": "MPRE-BK-Gangstas",
+                "title": "Gangstas Paradise",
+                "artist": "BK",
+            },
+            {
+                "id": "MPRE-Queen-MadeInHeaven",
+                "title": "Made in Heaven",
+                "artist": "Queen",
+            },
+        ]
+        canonical = [
+            {
+                "title": "Made in Heaven",
+                "artist": "BK",
+                "musicbrainz_recording_id": "mb-bk-made-in-heaven",
+                "musicbrainz_artist_id": "mb-bk",
+                "musicbrainz_score": 1.0,
+                "musicbrainz_release_candidates": [
+                    {
+                        "album": "Gangstas Paradise",
+                        "release_id": "mb-release-bk",
+                        "release_group_id": "mb-group-bk",
+                    }
+                ],
+            },
+            {
+                "title": "Made in Heaven",
+                "artist": "Queen",
+                "musicbrainz_recording_id": "mb-queen-made-in-heaven",
+                "musicbrainz_artist_id": "mb-queen",
+                "musicbrainz_score": 1.0,
+                "musicbrainz_release_candidates": [
+                    {
+                        "album": "Made in Heaven",
+                        "release_id": "mb-release-queen",
+                        "release_group_id": "mb-group-queen",
+                    }
+                ],
+            },
+        ]
+
+        def resolve(provider_tracks):
+            canonical_resolution = _canonical_track_resolution(
+                server,
+                query="Made in Heaven",
+                provider_tracks=provider_tracks,
+                fuzzy_tracks=[],
+                musicbrainz_tracks=canonical,
+                provider_artists=artists,
+                provider_albums=albums,
+            )
+            return resolve_search_target(
+                server=server,
+                query="Made in Heaven",
+                tracks=provider_tracks,
+                artists=artists,
+                albums=albums,
+                canonical_resolution=canonical_resolution,
+            )
+
+        obscure_first = resolve([obscure_track, intended_track])
+        intended_first = resolve([intended_track, obscure_track])
+
+        for target in (obscure_first, intended_first):
+            self.assertEqual(target.get("entity_type"), "track")
+            self.assertEqual((target.get("lead_artist") or {}).get("name"), "Queen")
+            self.assertEqual(
+                target.get("target_identity"),
+                "musicbrainz:recording:mb-queen-made-in-heaven",
+            )
+            self.assertIn(
+                "recording_family_comparison",
+                set(target.get("evidence") or []),
+            )
+
+    def test_legacy_authoritative_track_snapshot_is_revalidated_once(self) -> None:
+        service = SearchService(server)
+        legacy_snapshot = {
+            "resolved_target": {
+                "entity_type": "track",
+                "target_identity": "musicbrainz:recording:legacy",
+                "confidence_tier": "authoritative",
+                "evidence": ["canonical_recording_credit", "provider_structural_lead"],
+            },
+            "target_revalidation_attempts": 0,
+        }
+        current_snapshot = {
+            **legacy_snapshot,
+            "resolved_target": {
+                **legacy_snapshot["resolved_target"],
+                "evidence": [
+                    "canonical_recording_credit",
+                    "recording_family_comparison",
+                ],
+            },
+        }
+
+        self.assertTrue(
+            service._snapshot_target_needs_revalidation(
+                "Made in Heaven",
+                legacy_snapshot,
+            )
+        )
+        self.assertFalse(
+            service._snapshot_target_needs_revalidation(
+                "Made in Heaven",
+                current_snapshot,
+            )
+        )
 
 
 if __name__ == "__main__":

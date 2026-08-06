@@ -837,7 +837,6 @@ def _recommendation_store_search_event(req: RecommendationSearchEventRequest):
     for key in (
         "selected_item",
         "clicked_item",
-        "top_result_item",
         "track",
         "item",
         "entity",

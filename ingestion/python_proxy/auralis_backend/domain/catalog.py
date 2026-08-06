@@ -417,6 +417,12 @@ def catalog_thumbnail_url(
     """Read entity artwork without treating every entity ID as a video ID."""
     if not isinstance(item, dict):
         return ""
+    internal_thumbnail = _text(item.get("thumbnail"))
+    if internal_thumbnail.startswith(("/artist_artwork/", "/entity_artwork/")):
+        return internal_thumbnail
+    source_urls = catalog_artwork_source_urls(item, entity_type=entity_type)
+    if source_urls:
+        return source_urls[0]
     for key in (
         "thumbnail",
         "artwork_url",
@@ -427,31 +433,11 @@ def catalog_thumbnail_url(
         "image",
     ):
         value = item.get(key)
-        if isinstance(value, str) and value.strip():
-            url = value.strip()
-            youtube_match = _YOUTUBE_THUMBNAIL_ID_RE.search(url)
-            if youtube_match and str(entity_type or "").strip().lower() == "track":
-                source = verified_playback_source(item)
-                if (
-                    not _YOUTUBE_VIDEO_ID_RE.fullmatch(youtube_match.group(1))
-                    or source.get("provider") != "youtube"
-                    or source.get("source_id") != youtube_match.group(1)
-                ):
-                    continue
-            return url
         if isinstance(value, dict):
-            url = _text(value.get("url") or value.get("src"))
-            if url:
-                return url
-    thumbnails = item.get("thumbnails") or item.get("images")
-    if isinstance(thumbnails, list):
-        for raw in reversed(thumbnails):
-            if isinstance(raw, str) and raw.strip():
-                return raw.strip()
-            if isinstance(raw, dict):
-                url = _text(raw.get("url") or raw.get("src"))
-                if url:
-                    return url
+            value = value.get("url") or value.get("src")
+        fallback = _text(value)
+        if fallback and not fallback.startswith(("http://", "https://")):
+            return fallback
 
     if str(entity_type or "").strip().lower() != "track":
         return ""
@@ -459,6 +445,71 @@ def catalog_thumbnail_url(
     if source.get("provider") == "youtube":
         return f"https://i.ytimg.com/vi/{source['source_id']}/hqdefault.jpg"
     return ""
+
+
+def catalog_artwork_source_urls(
+    item: Dict[str, Any],
+    *,
+    entity_type: str,
+) -> List[str]:
+    """Return valid remote artwork candidates in provider priority order."""
+    if not isinstance(item, dict):
+        return []
+    normalized_type = str(entity_type or "").strip().lower()
+    urls: List[str] = []
+
+    def add(value: Any) -> None:
+        if isinstance(value, dict):
+            value = value.get("url") or value.get("src")
+        url = _text(value)
+        if not url.startswith(("http://", "https://")):
+            return
+        youtube_match = _YOUTUBE_THUMBNAIL_ID_RE.search(url)
+        if youtube_match:
+            source_id = youtube_match.group(1)
+            if not _YOUTUBE_VIDEO_ID_RE.fullmatch(source_id):
+                return
+            if normalized_type == "track":
+                source = verified_playback_source(item)
+                if (
+                    source.get("provider") != "youtube"
+                    or source.get("source_id") != source_id
+                ):
+                    return
+        if url not in urls:
+            urls.append(url)
+
+    for value in item.get("artwork_source_urls") or []:
+        add(value)
+    for key in (
+        "artwork_source_url",
+        "thumbnail",
+        "artwork_url",
+        "artwork",
+        "cover_url",
+        "cover",
+        "image_url",
+        "image",
+    ):
+        add(item.get(key))
+    thumbnails = item.get("thumbnails") or item.get("images")
+    if isinstance(thumbnails, list):
+        for raw in reversed(thumbnails):
+            add(raw)
+    if normalized_type == "artist":
+        urls.sort(
+            key=lambda url: (
+                3
+                if "yt3.googleusercontent.com" in url.casefold()
+                else 2
+                if "googleusercontent.com" in url.casefold()
+                else 0
+                if "i.ytimg.com/vi/" in url.casefold()
+                else 1
+            ),
+            reverse=True,
+        )
+    return urls
 
 
 def canonical_track_identity(track: Dict[str, Any]) -> str:
@@ -790,6 +841,13 @@ def normalized_artist_payload(artist: Dict[str, Any]) -> Dict[str, Any]:
             **_shared_catalog_metadata(artist, entity_type="artist"),
         }
     )
+    artwork_sources = catalog_artwork_source_urls(payload, entity_type="artist")
+    if artwork_sources:
+        payload["artwork_source_urls"] = artwork_sources
+        payload["artwork_source_url"] = artwork_sources[0]
+    else:
+        payload.pop("artwork_source_urls", None)
+        payload.pop("artwork_source_url", None)
     thumbnail = catalog_thumbnail_url(payload, entity_type="artist")
     if thumbnail:
         payload["thumbnail"] = thumbnail

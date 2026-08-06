@@ -7,6 +7,8 @@ import threading
 import time
 from typing import Any, Callable, Dict
 
+from ..domain.catalog import catalog_artwork_source_urls
+
 try:
     import boto3
     from botocore.config import Config
@@ -28,6 +30,7 @@ _PENDING_LOCK = threading.Lock()
 _UPDATE_LISTENERS: list[Callable[[Dict[str, Any]], None]] = []
 _UPDATE_LISTENERS_LOCK = threading.Lock()
 _TOKEN_RE = re.compile(r"^[a-f0-9]{32}$")
+_SOURCE_RETRY_SECONDS = 6 * 60 * 60
 
 
 def _clean(value: Any) -> str:
@@ -57,6 +60,40 @@ def _http_artwork_url(value: Any) -> str:
     return url if url.startswith(("http://", "https://")) else ""
 
 
+def _artist_artwork_source_urls(artist: Dict[str, Any]) -> list[str]:
+    now = time.time()
+    raw_failures = artist.get("artwork_source_failures") or {}
+    failures = raw_failures if isinstance(raw_failures, dict) else {}
+
+    def retry_ready(url: str) -> bool:
+        try:
+            failed_at = float(failures.get(url) or 0.0)
+        except (TypeError, ValueError):
+            failed_at = 0.0
+        return now - failed_at >= _SOURCE_RETRY_SECONDS
+
+    return [
+        url
+        for url in catalog_artwork_source_urls(artist, entity_type="artist")
+        if retry_ready(url)
+    ]
+
+
+def _valid_image_bytes(data: bytes, content_type: str) -> bool:
+    normalized_type = _clean(content_type).casefold()
+    if normalized_type in {"image/jpeg", "image/jpg"}:
+        return data.startswith(b"\xff\xd8\xff")
+    if normalized_type == "image/png":
+        return data.startswith(b"\x89PNG\r\n\x1a\n")
+    if normalized_type == "image/gif":
+        return data.startswith((b"GIF87a", b"GIF89a"))
+    if normalized_type == "image/webp":
+        return len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WEBP"
+    if normalized_type in {"image/avif", "image/heif", "image/heic"}:
+        return len(data) >= 12 and data[4:8] == b"ftyp"
+    return False
+
+
 def _download_artwork(
     server: Any,
     source_url: str,
@@ -83,7 +120,7 @@ def _download_artwork(
                 return None
             chunks.append(chunk)
         data = b"".join(chunks)
-        return (data, content_type) if data else None
+        return (data, content_type) if _valid_image_bytes(data, content_type) else None
     except Exception:
         return None
 
@@ -138,7 +175,14 @@ def attach_cached_artist_artwork(
     """Attach an existing R2 object before attempting a live artwork lookup."""
     updated = dict(artist or {})
     thumbnail = _clean(updated.get("thumbnail"))
-    source_url = _http_artwork_url(updated.get("artwork_source_url"))
+    source_urls = _artist_artwork_source_urls(updated)
+    source_url = source_urls[0] if source_urls else ""
+    if source_urls:
+        updated["artwork_source_urls"] = source_urls
+        updated["artwork_source_url"] = source_url
+    else:
+        updated.pop("artwork_source_urls", None)
+        updated.pop("artwork_source_url", None)
     identities = _artist_cache_identities(updated)
     allowed_tokens = {
         artist_artwork_token(identity)
@@ -161,8 +205,11 @@ def attach_cached_artist_artwork(
         else:
             updated.pop("thumbnail", None)
     elif _http_artwork_url(thumbnail):
-        source_url = thumbnail
-        updated["artwork_source_url"] = source_url
+        if thumbnail in source_urls:
+            source_url = thumbnail
+            updated["artwork_source_url"] = source_url
+        else:
+            updated.pop("thumbnail", None)
     elif thumbnail:
         updated.pop("thumbnail", None)
     cache = get_artist_artwork_cache(server)
@@ -492,10 +539,7 @@ def schedule_artist_artwork_cache(
             on_cached(cached_artist)
         return True
 
-    source_url = _clean(
-        cached_artist.get("artwork_source_url")
-        or cached_artist.get("thumbnail")
-    )
+    source_urls = _artist_artwork_source_urls(cached_artist)
     canonical_artist_id = _clean(
         cached_artist.get("canonical_artist_id")
         or cached_artist.get("canonical_artist_key")
@@ -522,7 +566,7 @@ def schedule_artist_artwork_cache(
             cached_artist.get("normalized_name") or cached_artist.get("name")
         )
     if (
-        not source_url.startswith(("http://", "https://"))
+        not source_urls
         or not canonical_artist_id
     ):
         return False
@@ -540,14 +584,51 @@ def schedule_artist_artwork_cache(
 
     def run() -> None:
         try:
-            if not cache.store(
-                token=token,
-                source_url=source_url,
-                canonical_artist_id=canonical_artist_id,
-            ):
+            selected_source = ""
+            failure_times = dict(
+                cached_artist.get("artwork_source_failures") or {}
+                if isinstance(cached_artist.get("artwork_source_failures"), dict)
+                else {}
+            )
+            failed_sources = list(
+                dict.fromkeys(
+                    _clean(value)
+                    for value in cached_artist.get("artwork_failed_source_urls") or []
+                    if _clean(value)
+                )
+            )
+            for source_url in source_urls:
+                if cache.store(
+                    token=token,
+                    source_url=source_url,
+                    canonical_artist_id=canonical_artist_id,
+                ):
+                    selected_source = source_url
+                    break
+                if source_url not in failed_sources:
+                    failed_sources.append(source_url)
+                failure_times[source_url] = time.time()
+            if not selected_source:
+                failed = dict(cached_artist)
+                failed["artwork_failed_source_urls"] = failed_sources
+                failed["artwork_source_failures"] = failure_times
+                failed["artwork_cache_status"] = "source_failed"
+                notify_artist_metadata_updated(failed)
+                if on_cached is not None:
+                    on_cached(failed)
                 return
             updated = dict(cached_artist)
-            updated["artwork_source_url"] = source_url
+            updated["artwork_source_url"] = selected_source
+            updated["artwork_source_urls"] = [
+                selected_source,
+                *(url for url in source_urls if url != selected_source),
+            ]
+            updated["artwork_failed_source_urls"] = [
+                url for url in failed_sources if url != selected_source
+            ]
+            failure_times.pop(selected_source, None)
+            updated["artwork_source_failures"] = failure_times
+            updated["artwork_cache_status"] = "cached"
             updated["artwork_cached_at"] = int(time.time())
             updated["artwork_cache_identity"] = canonical_artist_id
             updated["artwork_cache_token"] = token

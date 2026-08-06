@@ -36,6 +36,11 @@ def _text(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _lucene_phrase(value: Any) -> str:
+    text = _text(value).replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{text}"'
+
+
 def _identity_text(value: Any) -> str:
     normalized = unicodedata.normalize("NFKD", _text(value).casefold())
     normalized = "".join(char for char in normalized if not unicodedata.combining(char))
@@ -79,9 +84,54 @@ def _artist_credit_ids(artist_credit: Any) -> List[str]:
     return ids
 
 
-def _recording_release_fields(recording: Dict[str, Any]) -> Dict[str, str]:
+def _recording_release_candidates(recording: Dict[str, Any]) -> List[Dict[str, Any]]:
     releases = recording.get("releases")
     if not isinstance(releases, list) or not releases:
+        return []
+    candidates: List[Dict[str, Any]] = []
+    for release in releases:
+        if not isinstance(release, dict):
+            continue
+        release_group = release.get("release-group")
+        release_group = release_group if isinstance(release_group, dict) else {}
+        release_date = _text(release.get("date"))
+        secondary_types = [
+            _text(value)
+            for value in list(release_group.get("secondary-types") or [])
+            if _text(value)
+        ]
+        candidates.append(
+            {
+                "album": _text(release.get("title")),
+                "release_id": _text(release.get("id")),
+                "release_group_id": _text(release_group.get("id")),
+                "release_date": release_date,
+                "release_year": release_date[:4] if len(release_date) >= 4 else "",
+                "country": _text(release.get("country")),
+                "status": _text(release.get("status")),
+                "primary_type": _text(release_group.get("primary-type")),
+                "secondary_types": secondary_types,
+            }
+        )
+    # A recording can appear on its original album, singles, compilations and
+    # later reissues. Prefer a normal official album before falling back to the
+    # earliest other release. This keeps containing-album identity useful
+    # without treating the first MusicBrainz row as authoritative.
+    candidates.sort(
+        key=lambda item: (
+            _text(item.get("primary_type")).casefold() != "album",
+            bool(item.get("secondary_types")),
+            _text(item.get("status")).casefold() not in {"", "official"},
+            _text(item.get("release_date")) or "9999",
+            _text(item.get("album")),
+        )
+    )
+    return candidates
+
+
+def _recording_release_fields(recording: Dict[str, Any]) -> Dict[str, Any]:
+    candidates = _recording_release_candidates(recording)
+    if not candidates:
         return {
             "album": "",
             "release_id": "",
@@ -89,28 +139,12 @@ def _recording_release_fields(recording: Dict[str, Any]) -> Dict[str, str]:
             "release_date": "",
             "release_year": "",
             "country": "",
+            "release_candidates": [],
         }
-    # Prefer earliest official-looking release. MusicBrainz search commonly
-    # returns multiple releases for one recording.
-    release = sorted(
-        [item for item in releases if isinstance(item, dict)],
-        key=lambda item: (
-            _text(item.get("date")) or "9999",
-            _text(item.get("title")),
-        ),
-    )[0]
-    release_group = release.get("release-group")
-    release_group_id = (
-        _text(release_group.get("id")) if isinstance(release_group, dict) else ""
-    )
-    release_date = _text(release.get("date"))
+    selected = dict(candidates[0])
     return {
-        "album": _text(release.get("title")),
-        "release_id": _text(release.get("id")),
-        "release_group_id": release_group_id,
-        "release_date": release_date,
-        "release_year": release_date[:4] if len(release_date) >= 4 else "",
-        "country": _text(release.get("country")),
+        **selected,
+        "release_candidates": candidates,
     }
 
 
@@ -193,9 +227,17 @@ def musicbrainz_recording_to_item(
         "musicbrainz_artist_ids": artist_ids,
         "musicbrainz_release_id": release["release_id"],
         "musicbrainz_release_group_id": release["release_group_id"],
+        "musicbrainz_release_candidates": list(
+            release.get("release_candidates") or []
+        ),
         "release_date": release["release_date"],
         "release_year": release["release_year"],
         "country": release["country"],
+        "release_status": release.get("status") or "",
+        "release_primary_type": release.get("primary_type") or "",
+        "release_secondary_types": list(release.get("secondary_types") or []),
+        "first_release_date": _text(recording.get("first-release-date")),
+        "duration": int(float(recording.get("length") or 0) / 1000.0),
         "aliases": aliases,
         "popularity": max(0.0, min(score, 1.0)),
         "musicbrainz_score": score,
@@ -207,6 +249,7 @@ def musicbrainz_recording_to_item(
             "score": recording.get("score"),
             "disambiguation": recording.get("disambiguation"),
             "length": recording.get("length"),
+            "video": bool(recording.get("video")),
         },
     }
 
@@ -638,16 +681,38 @@ def browse_musicbrainz_release_group_tracks(
 def search_musicbrainz_recording_items(
     query: str,
     *,
+    artist: str = "",
+    official_non_live: bool = False,
+    raise_errors: bool = False,
     client: MusicBrainzClient | None = None,
     limit: int = 5,
 ) -> List[Dict[str, Any]]:
+    normalized_query = _text(query)
+    normalized_artist = _text(artist)
+    search_query = normalized_query
+    if normalized_query and normalized_artist:
+        clauses = [
+            f"recording:{_lucene_phrase(normalized_query)}",
+            f"artistname:{_lucene_phrase(normalized_artist)}",
+        ]
+        if official_non_live:
+            clauses.extend(
+                [
+                    "status:official",
+                    "-secondarytype:live",
+                    "video:false",
+                ]
+            )
+        search_query = " AND ".join(clauses)
     try:
         resolved_client = client or MusicBrainzClient()
-        recordings = resolved_client.search_recordings(query, limit=limit)
+        recordings = resolved_client.search_recordings(search_query, limit=limit)
     except Exception:
+        if raise_errors:
+            raise
         return []
     items = [
-        musicbrainz_recording_to_item(recording, query=query)
+        musicbrainz_recording_to_item(recording, query=normalized_query)
         for recording in recordings
         if isinstance(recording, dict)
     ]

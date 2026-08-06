@@ -1009,6 +1009,11 @@ def catalog_album_is_detail_ready(payload: Dict[str, Any]) -> bool:
         payload.get("musicbrainz_release_group_id")
         or payload.get("mb_release_group_id")
     )
+    # A real YTMusic browse id remains detail-ready after MusicBrainz metadata
+    # is attached. Canonical enrichment must not turn a usable provider album
+    # back into an unresolved MusicBrainz-only placeholder.
+    if album_id.startswith("MPRE"):
+        return True
     is_canonical_release = bool(release_group_id) or album_id.startswith(
         "musicbrainz:release-group:"
     )
@@ -1028,7 +1033,7 @@ def catalog_album_is_detail_ready(payload: Dict[str, Any]) -> bool:
     # The non-canonical detail route calls YTMusic get_album. Only a real
     # YTMusic album browse ID can satisfy that route; recording titles, video
     # IDs and text-search placeholders must not be published as albums.
-    return album_id.startswith("MPRE")
+    return False
 
 
 def _artist_key_matches(candidate_artist: str, requested_artist: str) -> bool:
@@ -1075,12 +1080,22 @@ def catalog_playable_tracks_for_artist(
                    confidence, popularity, learned_popularity, payload_json, updated_at
             FROM catalog_entities
             WHERE entity_type = 'track'
-              AND lower(display_artist) LIKE lower(?)
-            ORDER BY learned_popularity DESC, popularity DESC, confidence DESC, updated_at DESC
+              AND (
+                    lower(trim(display_artist)) = lower(trim(?))
+                    OR lower(display_artist) LIKE lower(?)
+                  )
+            ORDER BY CASE
+                       WHEN lower(trim(display_artist)) = lower(trim(?)) THEN 1
+                       ELSE 0
+                     END DESC,
+                     learned_popularity DESC, popularity DESC,
+                     confidence DESC, updated_at DESC
             LIMIT ?
             """,
             [
+                artist_name,
                 f"%{artist_name}%",
+                artist_name,
                 max(int(limit or 0), 1) * 24,
             ],
         ).fetchall()

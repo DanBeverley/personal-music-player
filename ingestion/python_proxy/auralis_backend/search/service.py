@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from concurrent.futures import (
+    ThreadPoolExecutor,
+    TimeoutError as FutureTimeoutError,
+    wait,
+)
 from copy import deepcopy
 import re
 import threading
@@ -40,6 +44,7 @@ from .catalog_pipeline import (
 )
 from .runtime import (
     search_artists_direct_cached,
+    search_canonical_album_for_track,
     search_playlists_direct,
     search_query_intent,
     semantic_search_suggestion_items,
@@ -49,7 +54,6 @@ from .intelligence import (
     catalog_entity_key,
     load_catalog_artist_records,
     remember_catalog_entity,
-    remember_search_resolution,
     search_text_similarity,
 )
 from ..storage.artist_artwork import (
@@ -78,6 +82,8 @@ _SEARCH_RELATED_ARTIST_VISIBLE_TARGET = 6
 _SEARCH_RELATED_ARTIST_RESOLUTION_BATCH = 3
 _SEARCH_SNAPSHOT_COMPLETION_LOCK = threading.Lock()
 _SEARCH_SNAPSHOT_COMPLETION_PENDING: set[str] = set()
+_SEARCH_TARGET_ESSENTIAL_BUDGET_SECONDS = 1.4
+_SEARCH_TARGET_REVALIDATION_MAX_ATTEMPTS = 2
 
 
 def _search_snapshot_key(user_scope_id: str, query: str, search_mode: str) -> str:
@@ -116,6 +122,117 @@ def _store_search_snapshot(key: str, snapshot: Dict[str, Any]) -> None:
         _SEARCH_SNAPSHOTS.move_to_end(key)
         while len(_SEARCH_SNAPSHOTS) > _SEARCH_SNAPSHOT_MAX_ENTRIES:
             _SEARCH_SNAPSHOTS.popitem(last=False)
+
+
+def _search_snapshot_visible_fingerprint(snapshot: Dict[str, Any]) -> tuple:
+    """Return customer-visible search content, excluding retry metadata."""
+
+    def item_fingerprint(item: Any) -> tuple:
+        if not isinstance(item, dict):
+            return ()
+        return tuple(
+            str(item.get(key) or "").strip()
+            for key in (
+                "entity_type",
+                "track_key",
+                "canonical_recording_id",
+                "canonical_artist_id",
+                "musicbrainz_recording_id",
+                "musicbrainz_artist_id",
+                "musicbrainz_release_id",
+                "musicbrainz_release_group_id",
+                "provider_artist_id",
+                "provider_album_id",
+                "videoId",
+                "browseId",
+                "id",
+                "title",
+                "name",
+                "artist",
+                "channel",
+                "thumbnail",
+                "year",
+                "release_year",
+            )
+        )
+
+    resolved_target = dict(snapshot.get("resolved_target") or {})
+    surfaces = (
+        "tracks",
+        "artists",
+        "albums",
+        "playlists",
+        "related_artists",
+        "artist_tracks",
+        "artist_albums",
+        "related_albums",
+    )
+    return (
+        str(snapshot.get("query_intent") or ""),
+        str(resolved_target.get("entity_type") or ""),
+        str(resolved_target.get("target_identity") or ""),
+        item_fingerprint(resolved_target.get("item")),
+        item_fingerprint(snapshot.get("lead_artist")),
+        item_fingerprint(snapshot.get("containing_album")),
+        tuple(
+            (
+                surface,
+                tuple(
+                    item_fingerprint(item)
+                    for item in list(snapshot.get(surface) or [])
+                    if isinstance(item, dict)
+                ),
+            )
+            for surface in surfaces
+        ),
+    )
+
+
+def _target_quality(
+    target: Dict[str, Any],
+) -> tuple[float, float, float, float, float]:
+    tier = str(target.get("confidence_tier") or "").strip().casefold()
+    tier_score = {
+        "authoritative": 4.0,
+        "corroborated": 3.0,
+        "supported": 2.0,
+        "ambiguous": 0.0,
+    }.get(tier, 1.0)
+    canonical_score = 1.0 if (
+        _target_identity(target).startswith("musicbrainz:")
+        or "canonical_recording_credit" in set(target.get("evidence") or [])
+    ) else 0.0
+    return (
+        tier_score,
+        canonical_score,
+        float(target.get("identity_confidence") or 0.0),
+        float(target.get("confidence") or 0.0),
+        float(target.get("decision_margin") or 0.0),
+    )
+
+
+def _target_identity(target: Dict[str, Any]) -> str:
+    return str(target.get("target_identity") or "").strip().casefold()
+
+
+def _target_has_recording_family_evidence(target: Dict[str, Any]) -> bool:
+    if str(target.get("entity_type") or "").strip().casefold() != "track":
+        return False
+    evidence = {
+        str(value or "").strip().casefold()
+        for value in list(target.get("evidence") or [])
+    }
+    return bool(
+        evidence.intersection(
+            {
+                "canonical_recording_credit",
+                "provider_rank_dominance",
+                "provider_structural_lead",
+                "containing_album_relationship",
+                "recording_family_comparison",
+            }
+        )
+    )
 
 
 def _artist_provider_id(artist: Dict[str, Any]) -> str:
@@ -425,6 +542,155 @@ def _search_playlist_is_publishable(playlist: Dict[str, Any]) -> bool:
     return bool(catalog_thumbnail_url(playlist, entity_type="playlist"))
 
 
+def _hydrate_containing_album_from_accepted_target(
+    expected: Dict[str, Any],
+    artist_albums: List[Dict[str, Any]],
+    lead_artist: Dict[str, Any] | None,
+    *,
+    server: Any,
+) -> Dict[str, Any]:
+    """Resolve one accepted track's canonical release to a provider album."""
+    expected = dict(expected or {})
+    bound = _bind_containing_album_from_artist_catalog(
+        expected,
+        artist_albums,
+        lead_artist,
+    )
+    if bound:
+        return bound
+
+    expected_title = str(
+        expected.get("title")
+        or expected.get("name")
+        or expected.get("album")
+        or ""
+    ).strip()
+    expected_artist = str(
+        expected.get("artist")
+        or expected.get("artist_name")
+        or (lead_artist or {}).get("name")
+        or ""
+    ).strip()
+    if not expected_title or not expected_artist:
+        return {}
+
+    resolved = search_canonical_album_for_track(
+        {
+            "album": expected_title,
+            "channel": expected_artist,
+            "artist": expected_artist,
+            "thumbnail": expected.get("thumbnail"),
+            "year": expected.get("year") or expected.get("release_year") or "",
+        },
+        server=server,
+    )
+    if not isinstance(resolved, dict) or not str(
+        resolved.get("provider_album_id") or resolved.get("id") or ""
+    ).strip():
+        return {}
+    resolved = {
+        **expected,
+        **{
+            key: value
+            for key, value in resolved.items()
+            if value not in (None, "", [], {})
+        },
+    }
+    return _bind_containing_album_from_artist_catalog(
+        expected,
+        [resolved],
+        lead_artist,
+    )
+
+
+def _bind_containing_album_from_artist_catalog(
+    expected: Dict[str, Any],
+    artist_albums: List[Dict[str, Any]],
+    lead_artist: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    """Bind an accepted canonical release to one usable provider album."""
+    expected = dict(expected or {})
+    if not expected:
+        return {}
+    if catalog_album_is_detail_ready(expected):
+        return expected
+    expected_title = str(
+        expected.get("title")
+        or expected.get("name")
+        or expected.get("album")
+        or ""
+    ).strip()
+    expected_artist = str(
+        expected.get("artist")
+        or expected.get("artist_name")
+        or (lead_artist or {}).get("name")
+        or ""
+    ).strip()
+    expected_release_group = str(
+        expected.get("musicbrainz_release_group_id") or ""
+    ).strip().casefold()
+    expected_release = str(
+        expected.get("musicbrainz_release_id") or ""
+    ).strip().casefold()
+
+    def score(album: Dict[str, Any]) -> tuple[float, float, float]:
+        if not catalog_album_is_detail_ready(album):
+            return (0.0, 0.0, 0.0)
+        release_group = str(
+            album.get("musicbrainz_release_group_id") or ""
+        ).strip().casefold()
+        release_id = str(
+            album.get("musicbrainz_release_id") or ""
+        ).strip().casefold()
+        canonical_match = bool(
+            (expected_release_group and expected_release_group == release_group)
+            or (expected_release and expected_release == release_id)
+        )
+        title_match = search_text_similarity(
+            expected_title,
+            str(album.get("title") or album.get("name") or "").strip(),
+        )
+        album_artist = str(
+            album.get("artist") or album.get("artist_name") or ""
+        ).strip()
+        artist_match = (
+            search_text_similarity(expected_artist, album_artist)
+            if expected_artist and album_artist
+            else 1.0
+            if lead_artist and _artist_item_matches(album, lead_artist)
+            else 0.0
+        )
+        accepted = canonical_match or (
+            title_match >= 0.84 and artist_match >= 0.78
+        )
+        return (
+            1.0 if accepted else 0.0,
+            2.0 if canonical_match else title_match + artist_match,
+            normalized_popularity(album),
+        )
+
+    candidates = [
+        dict(album)
+        for album in artist_albums
+        if isinstance(album, dict)
+    ]
+    matched = max(candidates, key=score, default={})
+    if not matched or score(matched)[0] <= 0.0:
+        return {}
+    merged = {**expected, **matched}
+    for key in (
+        "musicbrainz_release_id",
+        "musicbrainz_release_group_id",
+        "release_date",
+        "release_year",
+        "year",
+    ):
+        if expected.get(key) not in (None, "", [], {}):
+            merged[key] = deepcopy(expected[key])
+    merged["playable"] = True
+    return merged
+
+
 def _target_item_matches(
     entity_type: str,
     item: Dict[str, Any],
@@ -516,10 +782,25 @@ def _materialize_resolved_target(
             ],
         }
 
-    target["item"] = matched
+    materialized_item = {**expected, **matched}
+    for key in (
+        "track_key",
+        "canonical_recording_id",
+        "canonical_artist_id",
+        "musicbrainz_recording_id",
+        "musicbrainz_artist_id",
+        "musicbrainz_artist_ids",
+        "musicbrainz_release_id",
+        "musicbrainz_release_group_id",
+        "release_date",
+        "release_year",
+    ):
+        if expected.get(key) not in (None, "", [], {}):
+            materialized_item[key] = deepcopy(expected[key])
+    target["item"] = materialized_item
     target["ranked_target_validated"] = True
     if entity_type == "artist":
-        target["lead_artist"] = matched
+        target["lead_artist"] = materialized_item
     else:
         expected_lead = dict(target.get("lead_artist") or {})
         expected_lead_id = _artist_provider_id(expected_lead)
@@ -538,7 +819,7 @@ def _materialize_resolved_target(
             else expected_lead
         )
     if entity_type == "album":
-        target["containing_album"] = matched
+        target["containing_album"] = materialized_item
     elif entity_type == "track":
         expected_album = dict(target.get("containing_album") or {})
         ranked_album = next(
@@ -549,7 +830,20 @@ def _materialize_resolved_target(
             ),
             {},
         )
-        target["containing_album"] = ranked_album or expected_album
+        if ranked_album:
+            materialized_album = {**expected_album, **ranked_album}
+            for key in (
+                "provider_album_id",
+                "musicbrainz_release_id",
+                "musicbrainz_release_group_id",
+                "release_date",
+                "release_year",
+            ):
+                if expected_album.get(key) not in (None, "", [], {}):
+                    materialized_album[key] = deepcopy(expected_album[key])
+            target["containing_album"] = materialized_album
+        else:
+            target["containing_album"] = expected_album
     return target
 
 
@@ -599,6 +893,7 @@ def _update_search_snapshots_artist(artist: Dict[str, Any]) -> None:
         return
     with _SEARCH_SNAPSHOT_LOCK:
         for snapshot in _SEARCH_SNAPSHOTS.values():
+            visible_before = _search_snapshot_visible_fingerprint(snapshot)
             changed = False
             for surface in ("artists", "related_artists"):
                 values = list(snapshot.get(surface) or [])
@@ -614,6 +909,7 @@ def _update_search_snapshots_artist(artist: Dict[str, Any]) -> None:
                             key: item
                             for key, item in artist.items()
                             if item not in (None, "", [], {})
+                            and not str(key).startswith("_")
                         },
                     }
                     if merged != value:
@@ -631,6 +927,7 @@ def _update_search_snapshots_artist(artist: Dict[str, Any]) -> None:
                         key: item
                         for key, item in artist.items()
                         if item not in (None, "", [], {})
+                        and not str(key).startswith("_")
                     },
                 }
                 if merged_lead != lead_artist:
@@ -657,7 +954,9 @@ def _update_search_snapshots_artist(artist: Dict[str, Any]) -> None:
                     changed = True
             if resolved_target:
                 snapshot["resolved_target"] = resolved_target
-            if changed:
+            if changed and (
+                _search_snapshot_visible_fingerprint(snapshot) != visible_before
+            ):
                 snapshot["revision"] = int(snapshot.get("revision") or 1) + 1
 
 
@@ -910,6 +1209,42 @@ def _schedule_artist_metadata_resolution(
     return True
 
 
+def _ensure_verified_artist_artwork(
+    *,
+    server: Any,
+    query: str,
+    artist: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Reuse verified artwork or start the one job that can create it."""
+    hydrated = attach_cached_artist_artwork(server, dict(artist or {}))
+    thumbnail = str(hydrated.get("thumbnail") or "").strip()
+    if thumbnail.startswith("/artist_artwork/"):
+        return hydrated
+
+    source_url = str(
+        hydrated.get("artwork_source_url")
+        or (thumbnail if thumbnail.startswith(("http://", "https://")) else "")
+        or ""
+    ).strip()
+    if source_url and _artist_provider_id(hydrated):
+        schedule_artist_artwork_cache(
+            server,
+            hydrated,
+            on_cached=lambda cached: _persist_search_artist(
+                server=server,
+                query=query,
+                artist=cached,
+            ),
+        )
+    else:
+        _schedule_artist_metadata_resolution(
+            server=server,
+            query=query,
+            artist=hydrated,
+        )
+    return hydrated
+
+
 def _cache_search_payload_background(
     *,
     server: Any,
@@ -917,6 +1252,7 @@ def _cache_search_payload_background(
     tracks: List[Dict[str, Any]],
     artists: List[Dict[str, Any]],
     albums: List[Dict[str, Any]],
+    resolved_target: Dict[str, Any] | None = None,
 ) -> None:
     try:
         cache_search_payload(
@@ -930,9 +1266,27 @@ def _cache_search_payload_background(
     # Persist the accepted result set in the existing canonical catalog. The
     # next query can then build the same complete surfaces without repeating
     # provider work, even after the backend process restarts.
+    accepted_target = dict(resolved_target or {})
+    accepted_type = str(accepted_target.get("entity_type") or "").strip().lower()
+    accepted_item = dict(accepted_target.get("item") or {})
+    accepted_album = dict(accepted_target.get("containing_album") or {})
+    persisted_tracks = [
+        *([accepted_item] if accepted_type == "track" and accepted_item else []),
+        *tracks,
+    ]
+    persisted_albums = [
+        *(
+            [accepted_album]
+            if accepted_type == "track" and accepted_album
+            else [accepted_item]
+            if accepted_type == "album" and accepted_item
+            else []
+        ),
+        *albums,
+    ]
     for entity_type, values, confidence, cap in (
-        ("track", tracks, 0.84, 96),
-        ("album", albums, 0.84, 48),
+        ("track", persisted_tracks, 0.84, 96),
+        ("album", persisted_albums, 0.84, 48),
     ):
         seen: set[str] = set()
         for raw_item in values[:cap]:
@@ -1196,6 +1550,9 @@ class SearchService:
                     )
                     or {}
                 )
+            provider_record = persisted_by_id.get(artist_id) or {}
+            if provider_record:
+                persisted = _merge_artist_values(persisted, provider_record)
             persisted_thumbnail = str(persisted.get("thumbnail") or "").strip()
             current_thumbnail = str(artist.get("thumbnail") or "").strip()
             if not current_thumbnail:
@@ -1403,6 +1760,194 @@ class SearchService:
             0,
         )
 
+    def _snapshot_target_needs_revalidation(
+        self,
+        query: str,
+        snapshot: Dict[str, Any],
+    ) -> bool:
+        state = str(
+            snapshot.get("target_revalidation_state") or ""
+        ).strip().casefold()
+        attempts = int(snapshot.get("target_revalidation_attempts") or 0)
+        target = dict(snapshot.get("resolved_target") or {})
+        if not _target_identity(target):
+            return True
+        target_type = str(target.get("entity_type") or "").casefold()
+        target_evidence = {
+            str(value or "").strip().casefold()
+            for value in list(target.get("evidence") or [])
+        }
+        if (
+            target_type == "track"
+            and "recording_family_comparison" not in target_evidence
+            and attempts < _SEARCH_TARGET_REVALIDATION_MAX_ATTEMPTS
+        ):
+            # Track snapshots created before exact-title family comparison can
+            # contain a perfectly valid recording for the wrong credited
+            # artist. Re-evaluate those once through the current resolver.
+            return True
+        target_artist = dict(snapshot.get("lead_artist") or {})
+        target_artist_name = normalize_artist_name(
+            target_artist.get("name")
+            or target_artist.get("artist")
+            or (target.get("item") or {}).get("artist")
+            or (target.get("item") or {}).get("name")
+        )
+        # Cross-type homonyms need one independent retry. For example, an
+        # exact-name artist must not permanently hide an exact-title recording
+        # credited to a different artist.
+        cross_type_recording_conflict = bool(
+            target_type in {"artist", "album"}
+            and target_artist_name
+            and any(
+            search_text_similarity(
+                query,
+                str(track.get("title") or track.get("name") or ""),
+            )
+            >= 0.94
+            and normalize_artist_name(
+                track.get("channel") or track.get("artist")
+            )
+            not in {"", target_artist_name}
+            for track in list(snapshot.get("tracks") or [])
+            if isinstance(track, dict)
+            )
+        )
+        if (
+            cross_type_recording_conflict
+            and attempts < _SEARCH_TARGET_REVALIDATION_MAX_ATTEMPTS
+        ):
+            return True
+        if state == "complete" or attempts >= _SEARCH_TARGET_REVALIDATION_MAX_ATTEMPTS:
+            return False
+        if str(target.get("confidence_tier") or "").casefold() != "authoritative":
+            return True
+        if target_type not in {"artist", "album"}:
+            return False
+        return not target_artist_name
+
+    def _hydrate_accepted_target_essentials(
+        self,
+        target: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Resolve only the accepted track's artist and containing album."""
+        hydrated = deepcopy(target or {})
+        if str(hydrated.get("entity_type") or "").casefold() != "track":
+            return hydrated
+        item = dict(hydrated.get("item") or {})
+        lead_artist = dict(hydrated.get("lead_artist") or {})
+        containing_album = dict(hydrated.get("containing_album") or {})
+        artist_name = str(
+            lead_artist.get("name")
+            or lead_artist.get("artist")
+            or item.get("channel")
+            or item.get("artist")
+            or ""
+        ).strip()
+        expected_album_title = str(
+            containing_album.get("title")
+            or containing_album.get("name")
+            or containing_album.get("album")
+            or item.get("album")
+            or item.get("album_title")
+            or ""
+        ).strip()
+        executor = getattr(self._server, "search_executor", None)
+        if executor is None:
+            return hydrated
+
+        futures: Dict[Any, str] = {}
+        if artist_name and not _artist_provider_id(lead_artist):
+            futures[
+                executor.submit(
+                    search_artists_direct_cached,
+                    artist_name,
+                    8,
+                    server=self._server,
+                )
+            ] = "artist"
+        if expected_album_title and not catalog_album_is_detail_ready(
+            containing_album
+        ):
+            album_probe = {
+                **item,
+                "album": expected_album_title,
+                "album_title": expected_album_title,
+                "channel": artist_name,
+                "artist": artist_name,
+            }
+            futures[
+                executor.submit(
+                    search_canonical_album_for_track,
+                    album_probe,
+                    server=self._server,
+                )
+            ] = "album"
+        if not futures:
+            return hydrated
+
+        completed, _ = wait(
+            set(futures),
+            timeout=_SEARCH_TARGET_ESSENTIAL_BUDGET_SECONDS,
+        )
+        for future in completed:
+            try:
+                result = future.result()
+            except Exception:
+                continue
+            if futures[future] == "artist":
+                candidates = [
+                    dict(candidate)
+                    for candidate in list(result or [])
+                    if isinstance(candidate, dict)
+                    and search_text_similarity(
+                        artist_name,
+                        str(
+                            candidate.get("name")
+                            or candidate.get("artist")
+                            or ""
+                        ),
+                    )
+                    >= 0.98
+                    and _artist_provider_id(candidate)
+                ]
+                if candidates:
+                    provider_artist = max(
+                        candidates,
+                        key=lambda candidate: (
+                            str(candidate.get("source_authority") or "").casefold()
+                            in {
+                                "official",
+                                "official_artist_channel",
+                                "verified_catalog",
+                                "ytmusic_artist_detail",
+                            },
+                            normalized_popularity(candidate),
+                            bool(candidate.get("thumbnail")),
+                        ),
+                    )
+                    lead_artist = _merge_artist_values(
+                        lead_artist,
+                        provider_artist,
+                    )
+            elif isinstance(result, dict) and result:
+                expected_album = {
+                    **containing_album,
+                    "title": expected_album_title,
+                    "artist": artist_name,
+                }
+                bound_album = _bind_containing_album_from_artist_catalog(
+                    expected_album,
+                    [dict(result)],
+                    lead_artist,
+                )
+                if bound_album:
+                    containing_album = bound_album
+
+        hydrated["lead_artist"] = lead_artist
+        hydrated["containing_album"] = containing_album
+        return hydrated
+
     def _schedule_search_snapshot_completion(
         self,
         *,
@@ -1426,6 +1971,10 @@ class SearchService:
                     user_scope_id=user_scope_id or "guest",
                     result_type="artists",
                 )
+                revalidate_target = self._snapshot_target_needs_revalidation(
+                    query,
+                    snapshot,
+                )
                 try:
                     completed = self._expand_search_snapshot_surface(
                         req=request,
@@ -1433,6 +1982,7 @@ class SearchService:
                         search_mode=search_mode,
                         surface="artists",
                         snapshot=snapshot,
+                        revalidate_target=revalidate_target,
                     )
                 except Exception as exc:
                     completed = snapshot
@@ -1451,6 +2001,7 @@ class SearchService:
                     latest = deepcopy(
                         _SEARCH_SNAPSHOTS.get(snapshot_key) or {}
                     )
+                    visible_before = _search_snapshot_visible_fingerprint(latest)
                     for surface in ("artists", "related_artists"):
                         completed[surface] = self._merge_snapshot_items(
                             surface,
@@ -1458,15 +2009,26 @@ class SearchService:
                             list(latest.get(surface) or []),
                         )
                     latest_lead = latest.get("lead_artist")
-                    if isinstance(latest_lead, dict):
+                    completed_lead = completed.get("lead_artist")
+                    if (
+                        isinstance(latest_lead, dict)
+                        and isinstance(completed_lead, dict)
+                        and _same_artist_identity(completed_lead, latest_lead)
+                    ):
                         completed["lead_artist"] = _merge_artist_values(
-                            dict(completed.get("lead_artist") or {}),
+                            dict(completed_lead),
                             latest_lead,
                         )
-                    completed["revision"] = max(
+                    current_revision = max(
                         starting_revision,
                         int(latest.get("revision") or 1),
-                    ) + 1
+                    )
+                    completed["revision"] = current_revision + (
+                        1
+                        if _search_snapshot_visible_fingerprint(completed)
+                        != visible_before
+                        else 0
+                    )
                     completed["expires_at"] = (
                         time.time() + _SEARCH_SNAPSHOT_TTL_SECONDS
                     )
@@ -1494,6 +2056,13 @@ class SearchService:
         expansion_state = dict(snapshot.get("expansion_state") or {})
         return {
             "search_snapshot_revision": int(snapshot.get("revision") or 1),
+            "target_revalidation_pending": (
+                str(snapshot.get("target_revalidation_state") or "").casefold()
+                in {"pending", "retryable"}
+            ),
+            "target_revalidation_attempts": int(
+                snapshot.get("target_revalidation_attempts") or 0
+            ),
             "search_pending_surfaces": sorted(
                 surface
                 for surface, state in expansion_state.items()
@@ -1664,22 +2233,11 @@ class SearchService:
         catalog_artist = dict(catalog.get("artist") or {})
         if catalog_artist:
             lead_artist = _merge_artist_values(lead_artist, catalog_artist)
-        hydrated_lead = self._hydrate_artist_artwork(
-            [lead_artist],
-            allow_live_lead_lookup=False,
-            schedule_background=False,
+        lead_artist = _ensure_verified_artist_artwork(
+            server=self._server,
+            query=query,
+            artist=lead_artist,
         )
-        if hydrated_lead:
-            lead_artist = hydrated_lead[0]
-        if (
-            not str(lead_artist.get("thumbnail") or "").strip()
-            or not _artist_provider_id(lead_artist)
-        ):
-            _schedule_artist_metadata_resolution(
-                server=self._server,
-                query=query,
-                artist=lead_artist,
-            )
 
         canonical_tracks = self._merge_snapshot_items(
             "tracks",
@@ -1978,6 +2536,9 @@ class SearchService:
             "album_tracklists_loaded": int(
                 catalog.get("album_tracklists_loaded") or 0
             ),
+            "catalog_stage_timings_ms": dict(
+                catalog.get("stage_timings_ms") or {}
+            ),
         }
 
     def _resolve_search_mode(
@@ -2073,8 +2634,15 @@ class SearchService:
         search_mode: str,
         surface: str,
         snapshot: Dict[str, Any],
+        revalidate_target: bool = False,
     ) -> Dict[str, Any]:
-        lead_artist = dict(snapshot.get("lead_artist") or {})
+        lead_artist = (
+            {}
+            if revalidate_target
+            else dict(snapshot.get("lead_artist") or {})
+        )
+        recovered_target_identity = False
+        target_revalidation_succeeded = False
         query_intent = str(
             snapshot.get("query_intent") or ""
         ).strip().lower()
@@ -2150,7 +2718,7 @@ class SearchService:
             canonical_req = SimpleNamespace(
                 query=query,
                 surface="search",
-                force_refresh=False,
+                force_refresh=revalidate_target,
                 search_mode=search_mode,
                 anchor_track_snapshots=[],
                 recent_track_snapshots=[],
@@ -2174,26 +2742,82 @@ class SearchService:
             refreshed_target = dict(
                 retrieval_payload.get("resolved_target") or {}
             )
+            refreshed_target = self._hydrate_accepted_target_essentials(
+                refreshed_target
+            )
             current_target = dict(snapshot.get("resolved_target") or {})
             refreshed_lead = dict(refreshed_target.get("lead_artist") or {})
             current_lead = dict(snapshot.get("lead_artist") or {})
-            refreshed_is_authoritative = (
-                str(refreshed_target.get("confidence_tier") or "").casefold()
-                == "authoritative"
+            refreshed_identity = _target_identity(refreshed_target)
+            current_identity = _target_identity(current_target)
+            same_target = bool(
+                refreshed_identity
+                and refreshed_identity == current_identity
             )
-            current_is_authoritative = (
-                str(current_target.get("confidence_tier") or "").casefold()
-                == "authoritative"
+            stronger_target = bool(
+                refreshed_identity
+                and (
+                    not current_identity
+                    or _target_quality(refreshed_target)
+                    > _target_quality(current_target)
+                )
             )
-            if refreshed_lead and (
-                not current_lead
-                or (refreshed_is_authoritative and not current_is_authoritative)
-            ):
+            recording_family_correction = bool(
+                refreshed_identity
+                and refreshed_identity != current_identity
+                and _target_has_recording_family_evidence(refreshed_target)
+                and (
+                    str(current_target.get("entity_type") or "").casefold()
+                    in {"artist", "album", "mixed"}
+                    or (
+                        str(current_target.get("entity_type") or "").casefold()
+                        == "track"
+                        and "recording_family_comparison"
+                        not in {
+                            str(value or "").strip().casefold()
+                            for value in list(current_target.get("evidence") or [])
+                        }
+                    )
+                )
+            )
+            if same_target:
+                target_revalidation_succeeded = True
+                snapshot["resolved_target"] = {
+                    **current_target,
+                    **{
+                        key: value
+                        for key, value in refreshed_target.items()
+                        if value not in (None, "", [], {})
+                    },
+                }
+                if refreshed_lead and current_lead:
+                    snapshot["lead_artist"] = _merge_artist_values(
+                        current_lead,
+                        refreshed_lead,
+                    )
+                elif refreshed_lead:
+                    snapshot["lead_artist"] = refreshed_lead
+            elif refreshed_lead and (stronger_target or recording_family_correction):
+                target_revalidation_succeeded = True
                 snapshot["resolved_target"] = refreshed_target
                 snapshot["query_intent"] = str(
                     refreshed_target.get("entity_type") or "mixed"
                 )
                 snapshot["lead_artist"] = refreshed_lead
+                containing_album = dict(
+                    refreshed_target.get("containing_album") or {}
+                )
+                if containing_album:
+                    snapshot["containing_album"] = containing_album
+                else:
+                    snapshot.pop("containing_album", None)
+                # These surfaces belong to the previously selected artist and
+                # cannot be merged into a corrected canonical target.
+                snapshot["artist_tracks"] = []
+                snapshot["artist_albums"] = []
+                snapshot["related_artists"] = []
+                snapshot["related_albums"] = []
+                recovered_target_identity = True
             if surface == "tracks":
                 expanded = rank_track_candidates_fast_path(
                     self._server,
@@ -2329,8 +2953,40 @@ class SearchService:
                     list(snapshot.get("albums") or []),
                     expanded,
                 )
+        if revalidate_target:
+            attempts = int(snapshot.get("target_revalidation_attempts") or 0) + 1
+            snapshot["target_revalidation_attempts"] = attempts
+            refreshed_target = dict(snapshot.get("resolved_target") or {})
+            snapshot["target_revalidation_state"] = (
+                "complete"
+                if (
+                    target_revalidation_succeeded
+                    and _target_identity(refreshed_target)
+                    and (
+                        str(
+                            refreshed_target.get("confidence_tier") or ""
+                        ).casefold()
+                        == "authoritative"
+                        or _target_has_recording_family_evidence(refreshed_target)
+                        or attempts >= _SEARCH_TARGET_REVALIDATION_MAX_ATTEMPTS
+                    )
+                )
+                else "retryable"
+            )
         expansion_state = dict(snapshot.get("expansion_state") or {})
-        if surface == "artists" and self._missing_artist_artwork(snapshot):
+        if recovered_target_identity:
+            # The first pass recovered the authoritative artist/recording.
+            # Leave the artist/catalog surfaces retryable so the next bounded
+            # pass can build that artist's works instead of declaring the
+            # formerly-unresolved snapshot complete.
+            expansion_state.update(
+                {
+                    "tracks": "retryable",
+                    "artists": "retryable",
+                    "albums": "retryable",
+                }
+            )
+        elif surface == "artists" and self._missing_artist_artwork(snapshot):
             expansion_state[surface] = "pending_artwork"
             artwork_poll_attempts = dict(
                 snapshot.get("artwork_poll_attempts") or {}
@@ -2379,11 +3035,26 @@ class SearchService:
         playlists = list(playlists or [])
         enrichment_completed_surfaces = list(enrichment_completed_surfaces or [])
         enrichment_timed_out_surfaces = list(enrichment_timed_out_surfaces or [])
-        bound_target = _materialize_resolved_target(
-            dict(resolved_target or {}),
-            tracks=tracks,
-            artists=artists,
-            albums=albums,
+        candidate_target = dict(resolved_target or {})
+        candidate_type = str(
+            candidate_target.get("entity_type") or "mixed"
+        ).strip().lower()
+        # The initial search path binds the accepted target before storing the
+        # snapshot. Pagination and response serialization must not judge that
+        # identity a second time against a partial page. Direct unit callers
+        # can still supply an unbound concrete target and receive one binding.
+        bound_target = (
+            candidate_target
+            if (
+                candidate_type == "mixed"
+                or candidate_target.get("ranked_target_validated") is True
+            )
+            else _materialize_resolved_target(
+                candidate_target,
+                tracks=tracks,
+                artists=artists,
+                albums=albums,
+            )
         )
         bound_type = str(bound_target.get("entity_type") or "mixed")
         query_intent = bound_type
@@ -2401,18 +3072,26 @@ class SearchService:
             containing_album = None
         else:
             expected_lead = dict(bound_target.get("lead_artist") or {})
-            expected_lead_id = _artist_provider_id(expected_lead)
-            response_lead_id = _artist_provider_id(dict(lead_artist or {}))
-            if not expected_lead_id or expected_lead_id != response_lead_id:
+            if not (
+                expected_lead
+                and isinstance(lead_artist, dict)
+                and _same_artist_identity(expected_lead, lead_artist)
+            ):
                 lead_artist = None
+            else:
+                lead_artist = _merge_artist_values(expected_lead, lead_artist)
             if bound_type == "album":
                 containing_album = bound_item
-            elif not _target_item_matches(
-                "album",
-                dict(containing_album or {}),
-                dict(bound_target.get("containing_album") or {}),
-            ):
-                containing_album = None
+            else:
+                rebound_album = _hydrate_containing_album_from_accepted_target(
+                    dict(bound_target.get("containing_album") or {}),
+                    [dict(containing_album or {})] if containing_album else [],
+                    dict(lead_artist or {}),
+                    server=self._server,
+                )
+                containing_album = rebound_album or None
+                if rebound_album:
+                    bound_target["containing_album"] = rebound_album
         search.trace_put(trace, "candidate_counts", "search.tracks", len(tracks))
         search.trace_put(trace, "candidate_counts", "search.artists", len(artists))
         search.trace_put(trace, "candidate_counts", "search.albums", len(albums))
@@ -2495,20 +3174,12 @@ class SearchService:
                 automatic_confidence,
                 4,
             )
-            if automatic_confidence >= 0.78 and write_resolution_memory:
-                response["diagnostics"]["query_memory_written"] = (
-                    remember_search_resolution(
-                        self._server,
-                        user_scope_id=req.user_scope_id or "guest",
-                        query=req.query or "",
-                        entity_type=entity_type,
-                        item=top_item,
-                        confidence=automatic_confidence,
-                        event_weight=0.1,
-                        event_type="search_resolution",
-                        source="canonical_search_response",
-                    )
-                )
+            # Rendering an automatic result is not user intent.  Persisted
+            # query associations are written only by explicit click/open/play
+            # interactions; otherwise one false resolution trains itself on
+            # every repeat search.
+            if write_resolution_memory:
+                response["diagnostics"]["query_memory_written"] = False
         search.trace_log_request(
             trace,
             request_type="search",
@@ -2529,6 +3200,7 @@ class SearchService:
     ) -> Dict[str, Any]:
         server = self._server
         direct_started_at = time.perf_counter()
+        request_stage_timings_ms: Dict[str, int] = {}
         requested_surface = str(
             getattr(req, "result_type", "") or ""
         ).strip().lower()
@@ -2560,11 +3232,23 @@ class SearchService:
                 snapshot = refreshed_snapshot
                 _store_search_snapshot(snapshot_key, snapshot)
             expansion_state = dict(snapshot.get("expansion_state") or {})
+            target_revalidation_pending = self._snapshot_target_needs_revalidation(
+                query,
+                snapshot,
+            )
+            if target_revalidation_pending:
+                snapshot["target_revalidation_state"] = "pending"
+                expansion_state["artists"] = "retryable"
+                snapshot["expansion_state"] = expansion_state
+                _store_search_snapshot(snapshot_key, snapshot)
             if (
                 str(getattr(req, "context_surface", "") or "")
                 == "interactive_search"
-                and expansion_state.get("artists")
-                in {"pending", "retryable", "pending_artwork"}
+                and (
+                    target_revalidation_pending
+                    or expansion_state.get("artists")
+                    in {"pending", "retryable", "pending_artwork"}
+                )
             ):
                 self._schedule_search_snapshot_completion(
                     snapshot_key=snapshot_key,
@@ -2608,10 +3292,11 @@ class SearchService:
                     snapshot["expansion_state"] = expansion_state
                 _store_search_snapshot(snapshot_key, snapshot)
             snapshot_lead = dict(snapshot.get("lead_artist") or {})
-            visible_lead = self._visible_artists(
-                [snapshot_lead] if snapshot_lead else []
+            response_lead = (
+                attach_cached_artist_artwork(self._server, snapshot_lead)
+                if snapshot_lead and _artist_provider_id(snapshot_lead)
+                else None
             )
-            response_lead = visible_lead[0] if visible_lead else None
             pages: Dict[str, Any] = {}
             paged: Dict[str, List[Dict[str, Any]]] = {}
             for surface_name in (
@@ -2715,6 +3400,7 @@ class SearchService:
             if requested_surface
             else 48
         )
+        retrieval_started_at = time.perf_counter()
         retrieval_payload = retrieve_search_candidates_fast(
             canonical_req,
             {
@@ -2725,7 +3411,11 @@ class SearchService:
             limit=candidate_limit,
             server=server,
         )
+        request_stage_timings_ms["retrieval"] = int(
+            (time.perf_counter() - retrieval_started_at) * 1000
+        )
         query_intent = str(retrieval_payload.get("query_intent") or "mixed")
+        ranking_started_at = time.perf_counter()
         tracks = rank_track_candidates_fast_path(
             server,
             canonical_req,
@@ -2743,6 +3433,9 @@ class SearchService:
             canonical_req,
             retrieval_payload,
             limit=36,
+        )
+        request_stage_timings_ms["ranking"] = int(
+            (time.perf_counter() - ranking_started_at) * 1000
         )
         artists = self._hydrate_artist_artwork(
             artists,
@@ -2762,11 +3455,18 @@ class SearchService:
         playlists = list(retrieval_payload.get("playlists") or [])
         if requested_surface == "playlists":
             playlists = search_playlists_direct(query, 36, server=server)
+        essential_target_started_at = time.perf_counter()
         resolved_target = _materialize_resolved_target(
             dict(retrieval_payload.get("resolved_target") or {}),
             tracks=tracks,
             artists=artists,
             albums=albums,
+        )
+        resolved_target = self._hydrate_accepted_target_essentials(
+            resolved_target
+        )
+        request_stage_timings_ms["essential_target"] = int(
+            (time.perf_counter() - essential_target_started_at) * 1000
         )
         query_intent = str(
             resolved_target.get("entity_type") or "mixed"
@@ -2816,9 +3516,11 @@ class SearchService:
         catalog_source = "none"
         local_catalog_ms = 0
         live_catalog_ms = 0
+        catalog_stage_timings_ms: Dict[str, int] = {}
         defer_side_surfaces = bool(
             getattr(req, "defer_side_surfaces", False)
         )
+        artist_completion_started_at = time.perf_counter()
         if isinstance(lead_artist, dict) and not defer_side_surfaces:
             completed_artist = self._complete_artist_search_surfaces(
                 query=query,
@@ -2854,6 +3556,9 @@ class SearchService:
             catalog_source = str(completed_artist["catalog_source"])
             local_catalog_ms = int(completed_artist["local_catalog_ms"])
             live_catalog_ms = int(completed_artist["live_catalog_ms"])
+            catalog_stage_timings_ms = dict(
+                completed_artist.get("catalog_stage_timings_ms") or {}
+            )
             # Keep these query-scoped lists intact. `artist_tracks` and
             # `artist_albums` own the selected artist's catalog below.
         elif isinstance(lead_artist, dict):
@@ -2881,7 +3586,31 @@ class SearchService:
             catalog_status = "retryable"
             related_status = "retryable"
             playlists_complete = False
+        request_stage_timings_ms["artist_surface_completion"] = int(
+            (time.perf_counter() - artist_completion_started_at) * 1000
+        )
+        for stage, elapsed_ms in catalog_stage_timings_ms.items():
+            request_stage_timings_ms[f"artist_catalog.{stage}"] = int(
+                elapsed_ms or 0
+            )
 
+        if query_intent == "track" and isinstance(lead_artist, dict):
+            expected_containing_album = dict(containing_album or {})
+            if not expected_containing_album:
+                expected_containing_album = dict(
+                    resolved_target.get("containing_album") or {}
+                )
+            rebound_album = _hydrate_containing_album_from_accepted_target(
+                expected_containing_album,
+                artist_albums,
+                lead_artist,
+                server=self._server,
+            )
+            if rebound_album:
+                containing_album = rebound_album
+                resolved_target["containing_album"] = rebound_album
+
+        artwork_publication_started_at = time.perf_counter()
         tracks, albums = _repair_search_artwork(
             tracks,
             albums,
@@ -2934,6 +3663,9 @@ class SearchService:
             for playlist in playlists
             if _search_playlist_is_publishable(playlist)
         ]
+        request_stage_timings_ms["artwork_and_publication"] = int(
+            (time.perf_counter() - artwork_publication_started_at) * 1000
+        )
 
         snapshot = {
             "revision": 1,
@@ -2953,18 +3685,22 @@ class SearchService:
             "expansion_state": {
                 "tracks": (
                     "retryable"
-                    if isinstance(lead_artist, dict)
-                    and catalog_status != "complete"
+                    if (
+                        not isinstance(lead_artist, dict)
+                        or catalog_status != "complete"
+                    )
                     else "pending"
                     if bool(getattr(req, "defer_side_surfaces", False))
                     else "complete"
                 ),
                 "artists": (
                     "retryable"
-                    if isinstance(lead_artist, dict)
-                    and (
-                        catalog_status != "complete"
-                        or related_status != "complete"
+                    if (
+                        not isinstance(lead_artist, dict)
+                        or (
+                            catalog_status != "complete"
+                            or related_status != "complete"
+                        )
                     )
                     else "pending"
                     if bool(getattr(req, "defer_side_surfaces", False))
@@ -2972,16 +3708,20 @@ class SearchService:
                 ),
                 "albums": (
                     "retryable"
-                    if isinstance(lead_artist, dict)
-                    and catalog_status != "complete"
+                    if (
+                        not isinstance(lead_artist, dict)
+                        or catalog_status != "complete"
+                    )
                     else "pending"
                     if bool(getattr(req, "defer_side_surfaces", False))
                     else "complete"
                 ),
                 "playlists": (
                     "retryable"
-                    if isinstance(lead_artist, dict)
-                    and not playlists_complete
+                    if (
+                        not isinstance(lead_artist, dict)
+                        or not playlists_complete
+                    )
                     else "pending"
                     if bool(getattr(req, "defer_side_surfaces", False))
                     else "complete"
@@ -2996,7 +3736,21 @@ class SearchService:
             )
         ):
             snapshot["expansion_state"]["artists"] = "retryable"
+        target_revalidation_pending = self._snapshot_target_needs_revalidation(
+            query,
+            snapshot,
+        )
+        snapshot["target_revalidation_state"] = (
+            "pending" if target_revalidation_pending else "complete"
+        )
+        snapshot["target_revalidation_attempts"] = 0
+        if target_revalidation_pending:
+            snapshot["expansion_state"]["artists"] = "retryable"
+        snapshot_started_at = time.perf_counter()
         _store_search_snapshot(snapshot_key, snapshot)
+        request_stage_timings_ms["snapshot_store"] = int(
+            (time.perf_counter() - snapshot_started_at) * 1000
+        )
         if (
             str(getattr(req, "context_surface", "") or "")
             == "interactive_search"
@@ -3017,10 +3771,11 @@ class SearchService:
             limit=page_size,
         )
         visible_artists = self._visible_artists(artists)
-        visible_lead = self._visible_artists(
-            [lead_artist] if isinstance(lead_artist, dict) else []
+        response_lead = (
+            attach_cached_artist_artwork(self._server, lead_artist)
+            if isinstance(lead_artist, dict) and _artist_provider_id(lead_artist)
+            else None
         )
-        response_lead = visible_lead[0] if visible_lead else None
         paged_artists, pages["artists"] = self._surface_page(
             visible_artists,
             offset=offset if requested_surface == "artists" else 0,
@@ -3065,6 +3820,9 @@ class SearchService:
                 f"playlists={len(playlists)} catalog_status={catalog_status} "
                 f"catalog_source={catalog_source} local_ms={local_catalog_ms} "
                 f"live_ms={live_catalog_ms} album_tracklists={album_tracklists_loaded} "
+                f"stages={request_stage_timings_ms} "
+                f"retrieval_stages={dict((retrieval_payload.get('retrieval_diagnostics') or {}).get('stage_timings_ms') or {})} "
+                f"providers={dict((retrieval_payload.get('retrieval_diagnostics') or {}).get('provider_timings_ms') or {})} "
                 f"lookup_ms={direct_lookup_ms}",
                 flush=True,
             )
@@ -3075,6 +3833,7 @@ class SearchService:
             tracks=tracks,
             artists=artists,
             albums=albums,
+            resolved_target=resolved_target,
         )
         response = self._build_direct_search_response(
             req=req,
@@ -3108,6 +3867,7 @@ class SearchService:
             "lastfm_related": lastfm_ms,
             "related_artist_artwork": related_artwork_ms,
         }
+        diagnostics["stage_timings_ms"] = dict(request_stage_timings_ms)
         diagnostics["artist_catalog"] = {
             "status": catalog_status,
             "source": catalog_source,

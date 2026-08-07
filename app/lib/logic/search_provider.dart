@@ -414,6 +414,56 @@ bool _sameSearchArtist(
       (leftTokens.isEmpty || rightTokens.isEmpty);
 }
 
+String _searchVisibleItemFingerprint(Map<String, dynamic>? item) {
+  if (item == null) return '';
+  const fields = <String>[
+    'entity_type',
+    'canonical_recording_id',
+    'canonical_album_identity',
+    'canonical_artist_id',
+    'musicbrainz_recording_id',
+    'musicbrainz_release_id',
+    'musicbrainz_artist_id',
+    'provider_artist_id',
+    'provider_album_id',
+    'track_key',
+    'videoId',
+    'browseId',
+    'id',
+    'title',
+    'name',
+    'artist',
+    'channel',
+    'thumbnail',
+    'year',
+    'release_year',
+  ];
+  return fields.map((field) => '$field:${item[field] ?? ''}').join('|');
+}
+
+String _searchVisibleStateFingerprint(SearchPageState value) {
+  String listFingerprint(Iterable<Map<String, dynamic>> items) =>
+      items.map((item) => _searchVisibleItemFingerprint(item)).join('||');
+  final topItem = value.topResult?['item'];
+  return <String>[
+    value.queryIntent,
+    'top_type:${value.topResult?['entity_type'] ?? ''}',
+    _searchVisibleItemFingerprint(
+      topItem is Map ? Map<String, dynamic>.from(topItem) : null,
+    ),
+    _searchVisibleItemFingerprint(value.leadArtist),
+    _searchVisibleItemFingerprint(value.containingAlbum),
+    listFingerprint(value.tracks),
+    listFingerprint(value.artists),
+    listFingerprint(value.albums),
+    listFingerprint(value.similarArtists),
+    listFingerprint(value.artistTracks),
+    listFingerprint(value.artistAlbums),
+    listFingerprint(value.relatedAlbums),
+    listFingerprint(value.playlists),
+  ].join('###');
+}
+
 class SearchPageNotifier extends StateNotifier<SearchPageState> {
   final Ref ref;
   int _requestVersion = 0;
@@ -427,6 +477,9 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
     Duration(milliseconds: 1700),
     Duration(milliseconds: 2500),
     Duration(milliseconds: 3500),
+    Duration(milliseconds: 4500),
+    Duration(milliseconds: 5500),
+    Duration(milliseconds: 6500),
   ];
 
   SearchPageNotifier(this.ref) : super(const SearchPageState());
@@ -529,6 +582,11 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
   }
 
   bool _artistSurfaceNeedsRefresh() {
+    final exhaustedSurfaces = state.diagnostics['search_exhausted_surfaces'];
+    if (exhaustedSurfaces is List &&
+        exhaustedSurfaces.any((surface) => surface.toString() == 'artists')) {
+      return false;
+    }
     if (state.diagnostics['target_revalidation_pending'] == true) return true;
     final pendingSurfaces = state.diagnostics['search_pending_surfaces'];
     if (pendingSurfaces is List &&
@@ -749,6 +807,7 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
         if (next.pagination[normalizedSurface] != null)
           normalizedSurface: next.pagination[normalizedSurface],
       };
+      final visibleBefore = _searchVisibleStateFingerprint(state);
       state = state.copyWith(
         tracks: normalizedSurface == 'tracks'
             ? appendUnique(
@@ -824,10 +883,12 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
         },
       );
       if (normalizedSurface == 'artists') {
+        final visibleChanged =
+            _searchVisibleStateFingerprint(state) != visibleBefore;
         final snapshotRevision =
             (state.diagnostics['search_snapshot_revision'] as num?)?.toInt() ??
                 0;
-        if (snapshotRevision > previousSnapshotRevision) {
+        if (visibleChanged) {
           final primaryTrackIds = state.tracks
               .map(extractTrackId)
               .whereType<String>()

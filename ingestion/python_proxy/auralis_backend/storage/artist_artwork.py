@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import json
 import re
 import threading
 import time
 from typing import Any, Callable, Dict
 
 from ..domain.catalog import catalog_artwork_source_urls
+from ..recommend.store_runtime import open_recommendation_store_connection
 
 try:
     import boto3
@@ -19,8 +21,6 @@ except Exception:  # pragma: no cover - optional production dependency
 
 _CLIENTS: Dict[int, "ArtistArtworkCache | None"] = {}
 _ENTITY_CLIENTS: Dict[int, "ArtistArtworkCache | None"] = {}
-_ENTITY_SOURCES: Dict[str, tuple[Any, list[str], str]] = {}
-_ENTITY_SOURCES_LOCK = threading.Lock()
 _EXECUTOR = ThreadPoolExecutor(
     max_workers=2,
     thread_name_prefix="auralis-artist-artwork",
@@ -29,8 +29,19 @@ _PENDING: set[str] = set()
 _PENDING_LOCK = threading.Lock()
 _UPDATE_LISTENERS: list[Callable[[Dict[str, Any]], None]] = []
 _UPDATE_LISTENERS_LOCK = threading.Lock()
+_ENTITY_UPDATE_LISTENERS: list[Callable[[Dict[str, Any]], None]] = []
+_ENTITY_UPDATE_LISTENERS_LOCK = threading.Lock()
+_ENTITY_INVALIDATION_LISTENERS: list[
+    Callable[[Any, Dict[str, Any]], None]
+] = []
+_ENTITY_INVALIDATION_LISTENERS_LOCK = threading.Lock()
+_ENTITY_RECORDS: Dict[str, tuple[Any, Dict[str, Any]]] = {}
+_ENTITY_RECORDS_LOCK = threading.Lock()
+_ENTITY_PENDING: set[str] = set()
+_ENTITY_PENDING_LOCK = threading.Lock()
 _TOKEN_RE = re.compile(r"^[a-f0-9]{32}$")
 _SOURCE_RETRY_SECONDS = 6 * 60 * 60
+_ENTITY_SOURCE_ATTEMPT_LIMIT = 4
 
 
 def _clean(value: Any) -> str:
@@ -292,6 +303,7 @@ class ArtistArtworkCache:
             config=Config(signature_version="s3v4", retries={"max_attempts": 2}),
         )
         self._verified_tokens: set[str] = set()
+        self._missing_tokens: set[str] = set()
         self._verified_tokens_lock = threading.Lock()
 
     def _key(self, token: str) -> str:
@@ -315,6 +327,7 @@ class ArtistArtworkCache:
             return None
         with self._verified_tokens_lock:
             self._verified_tokens.add(token)
+            self._missing_tokens.discard(token)
         return {
             "content_type": _clean(response.get("ContentType")) or "image/jpeg",
             "content_length": content_length,
@@ -333,13 +346,32 @@ class ArtistArtworkCache:
                 data = body.read()
             finally:
                 body.close()
-        except Exception:
+        except Exception as exc:
+            response = getattr(exc, "response", {}) or {}
+            error = response.get("Error") or {}
+            code = _clean(error.get("Code")).casefold()
+            status = int(
+                (response.get("ResponseMetadata") or {}).get("HTTPStatusCode")
+                or 0
+            )
+            if code in {"404", "nosuchkey", "notfound"} or status == 404:
+                with self._verified_tokens_lock:
+                    self._missing_tokens.add(token)
+                    self._verified_tokens.discard(token)
             return None
         if not data:
+            with self._verified_tokens_lock:
+                self._missing_tokens.add(token)
+                self._verified_tokens.discard(token)
             return None
         with self._verified_tokens_lock:
             self._verified_tokens.add(token)
+            self._missing_tokens.discard(token)
         return data, _clean(response.get("ContentType")) or "image/jpeg"
+
+    def object_missing(self, token: str) -> bool:
+        with self._verified_tokens_lock:
+            return token in self._missing_tokens
 
     def store(
         self,
@@ -373,6 +405,7 @@ class ArtistArtworkCache:
             )
             with self._verified_tokens_lock:
                 self._verified_tokens.add(token)
+                self._missing_tokens.discard(token)
             return True
         except Exception:
             return False
@@ -392,35 +425,83 @@ def get_artist_artwork_cache(server: Any) -> ArtistArtworkCache | None:
     return cache
 
 
-def _entity_artwork_identity(
+def entity_artwork_identity(
     item: Dict[str, Any],
     *,
     entity_type: str,
 ) -> str:
     normalized_type = _clean(entity_type).casefold()
     if normalized_type == "album":
-        stable_id = _clean(
-            item.get("canonical_album_identity")
-            or item.get("musicbrainz_release_group_id")
-            or item.get("provider_album_id")
+        existing_identity = _clean(item.get("artwork_cache_identity"))
+        if existing_identity.startswith("album:"):
+            return existing_identity
+        explicit_provider_id = _clean(
+            item.get("provider_album_id")
             or item.get("browseId")
-            or item.get("album_id")
-            or item.get("id")
         )
-        if not stable_id:
-            stable_id = "|".join(
-                value
-                for value in (
-                    _clean(item.get("title") or item.get("name")).casefold(),
-                    _clean(item.get("artist") or item.get("artist_name")).casefold(),
-                )
-                if value
-            )
+        album_id = _clean(item.get("album_id"))
+        item_id = _clean(item.get("id"))
+        canonical_id = _clean(item.get("canonical_album_identity"))
+        stable_id = explicit_provider_id or (
+            album_id if album_id.startswith("MPRE") else ""
+        ) or (
+            item_id if item_id.startswith("MPRE") else ""
+        ) or (
+            canonical_id if canonical_id.startswith("MPRE") else ""
+        )
     elif normalized_type == "playlist":
         stable_id = _clean(item.get("id") or item.get("browseId"))
     else:
         stable_id = ""
     return f"{normalized_type}:{stable_id}" if stable_id else ""
+
+
+def entity_artwork_token(
+    item: Dict[str, Any],
+    *,
+    entity_type: str,
+) -> str:
+    return artist_artwork_token(
+        entity_artwork_identity(item, entity_type=entity_type)
+    )
+
+
+def entity_artwork_path(
+    item: Dict[str, Any],
+    *,
+    entity_type: str,
+) -> str:
+    token = entity_artwork_token(item, entity_type=entity_type)
+    return f"/entity_artwork/{token}" if token else ""
+
+
+def _entity_artwork_source_urls(
+    item: Dict[str, Any],
+    *,
+    entity_type: str,
+) -> list[str]:
+    now = time.time()
+    try:
+        retry_after = float(item.get("artwork_retry_after") or 0.0)
+    except (TypeError, ValueError):
+        retry_after = 0.0
+    if retry_after > now:
+        return []
+    raw_failures = item.get("artwork_source_failures") or {}
+    failures = raw_failures if isinstance(raw_failures, dict) else {}
+
+    def retry_ready(url: str) -> bool:
+        try:
+            failed_at = float(failures.get(url) or 0.0)
+        except (TypeError, ValueError):
+            failed_at = 0.0
+        return now - failed_at >= _SOURCE_RETRY_SECONDS
+
+    return [
+        url
+        for url in catalog_artwork_source_urls(item, entity_type=entity_type)
+        if retry_ready(url)
+    ][:_ENTITY_SOURCE_ATTEMPT_LIMIT]
 
 
 def get_entity_artwork_cache(server: Any) -> ArtistArtworkCache | None:
@@ -441,56 +522,248 @@ def get_entity_artwork_cache(server: Any) -> ArtistArtworkCache | None:
     return cache
 
 
+def attach_cached_entity_artwork(
+    server: Any,
+    item: Dict[str, Any],
+    *,
+    entity_type: str,
+) -> Dict[str, Any]:
+    """Attach only artwork whose persisted object has verified bytes."""
+    server = getattr(server, "raw", server)
+    updated = dict(item or {})
+    normalized_type = _clean(entity_type).casefold()
+    if normalized_type not in {"album", "playlist"}:
+        return updated
+    identity = entity_artwork_identity(updated, entity_type=normalized_type)
+    token = artist_artwork_token(identity)
+    if not identity or not token:
+        updated.pop("thumbnail", None)
+        return updated
+
+    # A background callback may complete before the search snapshot is
+    # materialized. Reattach the verified record by stable identity so the
+    # subsequent snapshot does not report playlists=0 merely because its
+    # incoming item lacked the callback's metadata.
+    with _ENTITY_RECORDS_LOCK:
+        remembered = next(
+            (
+                dict(record)
+                for _token, (_server, record) in _ENTITY_RECORDS.items()
+                if _server is server
+                and _clean(record.get("artwork_cache_identity")) == identity
+                and _clean(record.get("artwork_cache_status")).casefold() == "cached"
+            ),
+            None,
+        )
+    if remembered:
+        updated = {**updated, **remembered}
+    if not remembered:
+        # Rehydrate the verified catalog payload after a backend restart. The
+        # stable artwork identity is persisted with the entity record; this is
+        # a single local lookup and does not perform an R2 HEAD in the served
+        # snapshot path.
+        try:
+            connection = open_recommendation_store_connection(server)
+            row = connection.execute(
+                "SELECT payload_json FROM catalog_entities WHERE entity_type = ? AND entity_key = ? LIMIT 1",
+                [normalized_type, _clean(updated.get("id") or updated.get("browseId"))],
+            ).fetchone()
+            connection.close()
+            persisted = json.loads(row[0]) if row and row[0] else None
+            if isinstance(persisted, dict) and _clean(persisted.get("artwork_cache_status")).casefold() == "cached":
+                updated = {**updated, **persisted}
+                remembered = persisted
+        except Exception:
+            pass
+
+    existing_path = _clean(updated.get("thumbnail"))
+    source_urls = catalog_artwork_source_urls(
+        updated,
+        entity_type=normalized_type,
+    )
+    if source_urls:
+        updated["artwork_source_urls"] = source_urls
+        updated["artwork_source_url"] = source_urls[0]
+    persisted_token = _clean(updated.get("artwork_cache_token"))
+    persisted_identity = _clean(updated.get("artwork_cache_identity"))
+    persisted_status = _clean(updated.get("artwork_cache_status")).casefold()
+    updated["artwork_entity_type"] = normalized_type
+    updated["artwork_cache_identity"] = identity
+    updated["artwork_cache_token"] = token
+    cache = get_entity_artwork_cache(server)
+    current_token = (
+        existing_path.removeprefix("/entity_artwork/")
+        if existing_path.startswith("/entity_artwork/")
+        else ""
+    )
+    if (
+        cache is not None
+        and persisted_status == "cached"
+        and persisted_token == token
+        and persisted_identity == identity
+        and (not current_token or current_token == token)
+    ):
+        updated["artwork_cache_status"] = "cached"
+        updated["thumbnail"] = f"/entity_artwork/{token}"
+        with _ENTITY_RECORDS_LOCK:
+            _ENTITY_RECORDS[token] = (server, dict(updated))
+        return updated
+    # Source URLs and proxy tokens are resolution inputs, never publication
+    # proof. Keep them as metadata while the visible thumbnail stays absent.
+    updated.pop("thumbnail", None)
+    if updated.get("artwork_cache_status") == "cached":
+        updated["artwork_cache_status"] = "pending"
+    return updated
+
+
+def register_entity_metadata_listener(
+    listener: Callable[[Dict[str, Any]], None],
+) -> None:
+    with _ENTITY_UPDATE_LISTENERS_LOCK:
+        if listener not in _ENTITY_UPDATE_LISTENERS:
+            _ENTITY_UPDATE_LISTENERS.append(listener)
+
+
+def register_entity_invalidation_listener(
+    listener: Callable[[Any, Dict[str, Any]], None],
+) -> None:
+    with _ENTITY_INVALIDATION_LISTENERS_LOCK:
+        if listener not in _ENTITY_INVALIDATION_LISTENERS:
+            _ENTITY_INVALIDATION_LISTENERS.append(listener)
+
+
+def notify_entity_metadata_updated(item: Dict[str, Any]) -> None:
+    with _ENTITY_UPDATE_LISTENERS_LOCK:
+        listeners = list(_ENTITY_UPDATE_LISTENERS)
+    for listener in listeners:
+        try:
+            listener(dict(item))
+        except Exception:
+            continue
+
+
+def schedule_entity_artwork_cache(
+    server: Any,
+    item: Dict[str, Any],
+    *,
+    entity_type: str,
+    on_cached: Callable[[Dict[str, Any]], None] | None = None,
+) -> bool:
+    """Resolve bounded sources in background and publish only stored bytes."""
+    server = getattr(server, "raw", server)
+    normalized_type = _clean(entity_type).casefold()
+    cached_item = attach_cached_entity_artwork(
+        server,
+        item,
+        entity_type=normalized_type,
+    )
+    thumbnail = _clean(cached_item.get("thumbnail"))
+    if thumbnail.startswith("/entity_artwork/"):
+        notify_entity_metadata_updated(cached_item)
+        if on_cached is not None:
+            on_cached(cached_item)
+        return True
+
+    identity = entity_artwork_identity(
+        cached_item,
+        entity_type=normalized_type,
+    )
+    token = artist_artwork_token(identity)
+    source_urls = _entity_artwork_source_urls(
+        cached_item,
+        entity_type=normalized_type,
+    )
+    cache = get_entity_artwork_cache(server)
+    if not identity or not token or not source_urls or cache is None:
+        return False
+    pending_key = f"{id(server)}:{normalized_type}:{token}"
+    with _ENTITY_PENDING_LOCK:
+        if pending_key in _ENTITY_PENDING:
+            return False
+        _ENTITY_PENDING.add(pending_key)
+
+    def run() -> None:
+        try:
+            selected_source = ""
+            failure_times = dict(
+                cached_item.get("artwork_source_failures") or {}
+                if isinstance(cached_item.get("artwork_source_failures"), dict)
+                else {}
+            )
+            failed_sources = list(
+                dict.fromkeys(
+                    _clean(value)
+                    for value in cached_item.get("artwork_failed_source_urls") or []
+                    if _clean(value)
+                )
+            )
+            for source_url in source_urls:
+                if cache.store(
+                    token=token,
+                    source_url=source_url,
+                    cache_identity=identity,
+                ):
+                    selected_source = source_url
+                    break
+                if source_url not in failed_sources:
+                    failed_sources.append(source_url)
+                failure_times[source_url] = time.time()
+            updated = dict(cached_item)
+            updated["artwork_entity_type"] = normalized_type
+            updated["artwork_cache_identity"] = identity
+            updated["artwork_cache_token"] = token
+            updated["artwork_failed_source_urls"] = failed_sources
+            updated["artwork_source_failures"] = failure_times
+            if selected_source:
+                updated["artwork_source_url"] = selected_source
+                updated["artwork_source_urls"] = [
+                    selected_source,
+                    *(url for url in source_urls if url != selected_source),
+                ]
+                updated["artwork_failed_source_urls"] = [
+                    url for url in failed_sources if url != selected_source
+                ]
+                failure_times.pop(selected_source, None)
+                updated["artwork_source_failures"] = failure_times
+                updated["artwork_cache_status"] = "cached"
+                updated["artwork_cached_at"] = int(time.time())
+                updated.pop("artwork_retry_after", None)
+                updated["thumbnail"] = f"/entity_artwork/{token}"
+                with _ENTITY_RECORDS_LOCK:
+                    _ENTITY_RECORDS[token] = (server, dict(updated))
+            else:
+                updated["artwork_cache_status"] = "source_failed"
+                updated["artwork_retry_after"] = time.time() + _SOURCE_RETRY_SECONDS
+                updated.pop("thumbnail", None)
+            notify_entity_metadata_updated(updated)
+            if on_cached is not None:
+                on_cached(updated)
+        finally:
+            with _ENTITY_PENDING_LOCK:
+                _ENTITY_PENDING.discard(pending_key)
+
+    _EXECUTOR.submit(run)
+    return True
+
+
 def attach_entity_artwork_proxy(
     server: Any,
     item: Dict[str, Any],
     *,
     entity_type: str,
 ) -> Dict[str, Any]:
-    """Make album/playlist artwork backend-owned without blocking search."""
-    server = getattr(server, "raw", server)
-    updated = dict(item or {})
-    existing_path = _clean(updated.get("thumbnail"))
-    if existing_path.startswith("/entity_artwork/"):
-        return updated
-    source_urls: list[str] = []
-
-    def add_source(value: Any) -> None:
-        url = _http_artwork_url(value)
-        if url and url not in source_urls:
-            source_urls.append(url)
-
-    for value in (
-        updated.get("artwork_source_url"),
-        existing_path,
-        updated.get("artwork_url"),
-        updated.get("cover_url"),
-        updated.get("image_url"),
-        updated.get("artwork"),
-        updated.get("cover"),
-        updated.get("image"),
-    ):
-        if isinstance(value, dict):
-            add_source(value.get("url") or value.get("src"))
-        else:
-            add_source(value)
-    for value in reversed(list(updated.get("thumbnails") or updated.get("images") or [])):
-        if isinstance(value, dict):
-            add_source(value.get("url") or value.get("src"))
-        else:
-            add_source(value)
-    identity = _entity_artwork_identity(updated, entity_type=entity_type)
-    if not source_urls or not identity:
-        return updated
-    token = artist_artwork_token(identity)
-    if not token:
-        return updated
-    with _ENTITY_SOURCES_LOCK:
-        _ENTITY_SOURCES[token] = (server, source_urls, identity)
-    updated["artwork_source_url"] = source_urls[0]
-    updated["artwork_cache_identity"] = identity
-    updated["artwork_cache_token"] = token
-    updated["thumbnail"] = f"/entity_artwork/{token}"
+    """Compatibility wrapper; no proxy is attached until bytes exist."""
+    updated = attach_cached_entity_artwork(
+        server,
+        item,
+        entity_type=entity_type,
+    )
+    if not _clean(updated.get("thumbnail")).startswith("/entity_artwork/"):
+        schedule_entity_artwork_cache(
+            server,
+            updated,
+            entity_type=entity_type,
+        )
     return updated
 
 
@@ -502,26 +775,31 @@ def read_entity_artwork(
     cache = get_entity_artwork_cache(server)
     if not _TOKEN_RE.match(_clean(token)):
         return None
-    cached = cache.read(token) if cache is not None else None
-    if cached is not None:
-        return cached
-    with _ENTITY_SOURCES_LOCK:
-        source = _ENTITY_SOURCES.get(token)
-    if source is None:
+    if cache is None:
         return None
-    _source_server, source_urls, identity = source
-    for source_url in source_urls:
-        if cache is not None and cache.store(
-            token=token,
-            source_url=source_url,
-            cache_identity=identity,
-        ):
-            cached = cache.read(token)
-            if cached is not None:
-                return cached
-        downloaded = _download_artwork(server, source_url)
-        if downloaded is not None:
-            return downloaded
+    result = cache.read(token)
+    if result is not None or not bool(
+        getattr(cache, "object_missing", lambda _token: False)(token)
+    ):
+        return result
+
+    with _ENTITY_RECORDS_LOCK:
+        registered = _ENTITY_RECORDS.pop(token, None)
+    if registered is None:
+        return None
+    registered_server, record = registered
+    invalidated = dict(record)
+    invalidated.pop("thumbnail", None)
+    invalidated["artwork_cache_status"] = "missing"
+    invalidated["artwork_cache_invalidated_at"] = int(time.time())
+    notify_entity_metadata_updated(invalidated)
+    with _ENTITY_INVALIDATION_LISTENERS_LOCK:
+        listeners = list(_ENTITY_INVALIDATION_LISTENERS)
+    for listener in listeners:
+        try:
+            listener(registered_server, dict(invalidated))
+        except Exception:
+            continue
     return None
 
 

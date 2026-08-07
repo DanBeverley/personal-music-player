@@ -3,8 +3,10 @@ from __future__ import annotations
 from typing import Any, Dict
 
 from ..domain.catalog import (
+    cache_albums,
     cache_artists,
     normalize_artist_name,
+    normalized_album_payload,
     normalized_artist_payload,
 )
 from ..search.intelligence import (
@@ -12,7 +14,9 @@ from ..search.intelligence import (
     remember_catalog_entity,
 )
 from ..storage.artist_artwork import (
+    attach_cached_entity_artwork,
     notify_artist_metadata_updated,
+    schedule_entity_artwork_cache,
     schedule_artist_artwork_cache,
 )
 from .server_adapter import adapt_detail_server
@@ -73,6 +77,51 @@ def _with_persisted_artist_artwork(
     if persisted.get("canonical_artist_id"):
         artist["canonical_artist_id"] = persisted["canonical_artist_id"]
     return artist
+
+
+def _persist_album_details(
+    server: Any,
+    cache_key: str,
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    album = normalized_album_payload(dict(payload or {}))
+
+    def persist(record: Dict[str, Any]) -> None:
+        if cache_key:
+            server.cache_store("album", cache_key, record)
+        cache_albums([record])
+        remember_catalog_entity(
+            server,
+            user_scope_id="global",
+            query=str(record.get("title") or ""),
+            entity_type="album",
+            item=record,
+            confidence=0.98,
+            event_weight=0.0,
+            event_type="album_detail_metadata",
+            source="ytmusic_album_detail",
+            learn_query_alias=False,
+        )
+
+    prepared = attach_cached_entity_artwork(
+        server,
+        album,
+        entity_type="album",
+    )
+    try:
+        persist(prepared)
+        if not str(prepared.get("thumbnail") or "").startswith(
+            "/entity_artwork/"
+        ):
+            schedule_entity_artwork_cache(
+                server,
+                prepared,
+                entity_type="album",
+                on_cached=persist,
+            )
+    except Exception:
+        return prepared
+    return prepared
 
 
 def build_artist_details_payload(
@@ -281,7 +330,7 @@ def build_album_details_payload(server: Any, album_id: str) -> Dict[str, Any]:
     if cache_key:
         cached = server.cache_lookup("album", cache_key)
         if cached is not None:
-            return dict(cached)
+            return _persist_album_details(server, cache_key, dict(cached))
 
     album = server.ytmusic.get_album(album_id)
     album_thumbnail = server.extract_thumbnail(album)
@@ -318,6 +367,4 @@ def build_album_details_payload(server: Any, album_id: str) -> Dict[str, Any]:
         "track_count": len(tracks),
         "tracks": tracks,
     }
-    if cache_key:
-        server.cache_store("album", cache_key, payload)
-    return payload
+    return _persist_album_details(server, cache_key, payload)

@@ -1992,7 +1992,31 @@ def _merge_entity_metadata_payload(
             "images",
         )
     )
-    if incoming_thumbnail and (
+    existing_has_verified_entity_artwork = existing_thumbnail.startswith(
+        "/entity_artwork/"
+    )
+    incoming_has_verified_entity_artwork = incoming_thumbnail.startswith(
+        "/entity_artwork/"
+    )
+    incoming_invalidates_entity_artwork = bool(
+        entity_type in {"album", "playlist"}
+        and _text(incoming.get("artwork_cache_status")).casefold() == "missing"
+        and _text(incoming.get("artwork_cache_token"))
+        == _text(existing.get("artwork_cache_token"))
+    )
+    if incoming_invalidates_entity_artwork:
+        merged.pop("thumbnail", None)
+    elif existing_has_verified_entity_artwork and not incoming_has_verified_entity_artwork:
+        merged["thumbnail"] = existing_thumbnail
+        for key in (
+            "artwork_cache_status",
+            "artwork_cache_identity",
+            "artwork_cache_token",
+            "artwork_cached_at",
+        ):
+            if existing.get(key) not in (None, "", [], {}):
+                merged[key] = existing[key]
+    elif incoming_thumbnail and (
         incoming_has_explicit_artwork or not existing_thumbnail
     ):
         merged["thumbnail"] = incoming_thumbnail

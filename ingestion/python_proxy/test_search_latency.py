@@ -37,6 +37,10 @@ from auralis_backend.search.service import (
     _search_playlist_is_publishable,
 )
 from auralis_backend.search.upstream_runtime import normalize_song_result
+from auralis_backend.storage.artist_artwork import (
+    entity_artwork_identity,
+    entity_artwork_token,
+)
 
 
 def _visible_declared_artwork(
@@ -61,6 +65,21 @@ def _visible_declared_artwork(
             == excluded_name
         )
     ]
+
+
+def _verified_declared_entity_artwork(_server, item, *, entity_type):
+    updated = dict(item or {})
+    source = str(updated.get("thumbnail") or "").strip()
+    identity = entity_artwork_identity(updated, entity_type=entity_type)
+    token = entity_artwork_token(updated, entity_type=entity_type)
+    if source.startswith(("http://", "https://")):
+        updated["artwork_source_url"] = source
+    updated["artwork_entity_type"] = entity_type
+    updated["artwork_cache_identity"] = identity
+    updated["artwork_cache_token"] = token
+    updated["artwork_cache_status"] = "cached"
+    updated["thumbnail"] = f"/entity_artwork/{token}"
+    return updated
 
 
 def _test_resolved_target(
@@ -403,7 +422,7 @@ class SearchLatencyTests(unittest.TestCase):
                 }
             )
         )
-        self.assertTrue(
+        self.assertFalse(
             _search_album_is_publishable(
                 {
                     "id": "MPRE-with-cover",
@@ -418,7 +437,7 @@ class SearchLatencyTests(unittest.TestCase):
                 {"id": "playlist-without-cover", "name": "No Cover"}
             )
         )
-        self.assertTrue(
+        self.assertFalse(
             _search_playlist_is_publishable(
                 {
                     "id": "generated-playlist",
@@ -430,23 +449,78 @@ class SearchLatencyTests(unittest.TestCase):
         )
 
     def test_album_artwork_is_owned_by_backend_when_server_is_available(self) -> None:
-        _tracks, albums = _repair_search_artwork(
-            [],
-            [
-                {
-                    "id": "MPRE-backend-owned-cover",
-                    "title": "Backend Owned Cover",
-                    "artist": "Test Artist",
-                    "thumbnail": "https://example.test/cover.jpg",
-                }
-            ],
-            server=SimpleNamespace(),
-        )
+        with patch(
+            "auralis_backend.search.service.schedule_entity_artwork_cache",
+            return_value=True,
+        ) as scheduled:
+            _tracks, albums = _repair_search_artwork(
+                [],
+                [
+                    {
+                        "id": "MPRE-backend-owned-cover",
+                        "title": "Backend Owned Cover",
+                        "artist": "Test Artist",
+                        "thumbnail": "https://example.test/cover.jpg",
+                    }
+                ],
+                server=SimpleNamespace(),
+            )
 
-        self.assertTrue(albums[0]["thumbnail"].startswith("/entity_artwork/"))
+        self.assertFalse(albums[0].get("thumbnail"))
         self.assertEqual(
             albums[0]["artwork_source_url"],
             "https://example.test/cover.jpg",
+        )
+        scheduled.assert_called_once()
+
+    def test_verified_persisted_album_artwork_is_publishable_immediately(self) -> None:
+        album = {
+            "id": "MPRE-verified-cover",
+            "title": "Verified Cover",
+            "artist": "Test Artist",
+        }
+        identity = entity_artwork_identity(album, entity_type="album")
+        token = entity_artwork_token(album, entity_type="album")
+        album.update(
+            {
+                "artwork_cache_identity": identity,
+                "artwork_cache_token": token,
+                "artwork_cache_status": "cached",
+                "thumbnail": f"/entity_artwork/{token}",
+            }
+        )
+
+        with patch(
+            "auralis_backend.storage.artist_artwork.get_entity_artwork_cache",
+            return_value=SimpleNamespace(),
+        ):
+            _tracks, albums = _repair_search_artwork(
+                [],
+                [album],
+                server=SimpleNamespace(),
+            )
+
+        self.assertEqual(albums[0].get("thumbnail"), f"/entity_artwork/{token}")
+        self.assertTrue(_search_album_is_publishable(albums[0]))
+
+    def test_album_artwork_identity_prefers_provider_detail_id_across_aliases(self) -> None:
+        search_album = {
+            "id": "MPRE-shared-album",
+            "provider_album_id": "MPRE-shared-album",
+            "canonical_album_identity": "musicbrainz:release-group:rg-1",
+            "musicbrainz_release_group_id": "rg-1",
+            "title": "Shared Album",
+            "artist": "Test Artist",
+        }
+        detail_album = {
+            "id": "MPRE-shared-album",
+            "title": "Shared Album",
+            "artist": "Test Artist",
+        }
+
+        self.assertEqual(
+            entity_artwork_token(search_album, entity_type="album"),
+            entity_artwork_token(detail_album, entity_type="album"),
         )
 
     def test_artist_details_adapter_preserves_lightweight_contract(self) -> None:
@@ -871,6 +945,10 @@ class SearchLatencyTests(unittest.TestCase):
             return output
 
         with (
+            patch(
+                "auralis_backend.search.service._prepare_search_entity_artwork",
+                side_effect=_verified_declared_entity_artwork,
+            ),
             patch.object(service, "_hydrate_artist_artwork", side_effect=hydrate),
             patch.object(
                 service,
@@ -1060,6 +1138,10 @@ class SearchLatencyTests(unittest.TestCase):
         ]
         service = SearchService(server)
         with (
+            patch(
+                "auralis_backend.search.service._prepare_search_entity_artwork",
+                side_effect=_verified_declared_entity_artwork,
+            ),
             patch.object(
                 service,
                 "_lastfm_related_artists",
@@ -1273,6 +1355,10 @@ class SearchLatencyTests(unittest.TestCase):
         ]
         service = SearchService(server)
         with (
+            patch(
+                "auralis_backend.search.service._prepare_search_entity_artwork",
+                side_effect=_verified_declared_entity_artwork,
+            ),
             patch.object(
                 service,
                 "_lastfm_related_artists",
@@ -3476,6 +3562,10 @@ class SearchLatencyTests(unittest.TestCase):
         }
         service = SearchService(server)
         with (
+            patch(
+                "auralis_backend.search.service._prepare_search_entity_artwork",
+                side_effect=_verified_declared_entity_artwork,
+            ),
             patch.object(
                 service,
                 "_lastfm_related_artists",
@@ -3789,6 +3879,10 @@ class SearchLatencyTests(unittest.TestCase):
 
         with (
             patch(
+                "auralis_backend.search.service._prepare_search_entity_artwork",
+                side_effect=_verified_declared_entity_artwork,
+            ),
+            patch(
                 "auralis_backend.search.service.load_artist_entity_expansion",
                 side_effect=catalog_result,
             ),
@@ -4011,10 +4105,16 @@ class SearchLatencyTests(unittest.TestCase):
             "retrieval_diagnostics": {},
         }
         service = SearchService(server)
-        with patch.object(
-            service,
-            "_visible_artists",
-            side_effect=_visible_declared_artwork,
+        with (
+            patch(
+                "auralis_backend.search.service._prepare_search_entity_artwork",
+                side_effect=_verified_declared_entity_artwork,
+            ),
+            patch.object(
+                service,
+                "_visible_artists",
+                side_effect=_visible_declared_artwork,
+            ),
         ):
             response = service.search(
                 SimpleNamespace(

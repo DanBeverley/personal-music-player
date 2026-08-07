@@ -15,12 +15,15 @@ if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
 
 import server
+from auralis_backend.details import detail_runtime as detail_runtime_module
 from auralis_backend.search.runtime import (
     search_canonical_album_for_track,
     semantic_search_suggestion_items,
 )
 from auralis_backend.search.service import SearchService
 from auralis_backend.search import service as search_service_module
+from auralis_backend.search import intelligence as search_intelligence_module
+from auralis_backend.storage import artist_artwork as artist_artwork_module
 from auralis_backend.search.canonical import resolve_canonical_tracks, source_quality_score
 from auralis_backend.search.catalog_pipeline import (
     catalog_album_is_detail_ready,
@@ -54,9 +57,14 @@ from auralis_backend.search.intelligence import (
     remove_untrusted_catalog_query_aliases,
 )
 from auralis_backend.storage.artist_artwork import (
+    attach_cached_entity_artwork,
     attach_cached_artist_artwork,
     artist_artwork_path,
     artist_artwork_token,
+    entity_artwork_identity,
+    entity_artwork_token,
+    read_entity_artwork,
+    schedule_entity_artwork_cache,
     schedule_artist_artwork_cache,
 )
 from auralis_backend.search.musicbrainz import (
@@ -704,6 +712,144 @@ class SearchEnrichmentTests(unittest.TestCase):
             search_service_module._SEARCH_RELATED_ARTIST_RESOLUTION_BATCH,
         )
 
+    def test_relationship_enrichment_uses_visible_count_not_raw_candidates(self) -> None:
+        service = SearchService(_MemoryTestServer(":memory:"))
+        candidates = [{"id": f"UC-{index}", "name": f"Artist {index}"} for index in range(8)]
+        with patch.object(service, "_visible_artists", return_value=candidates[:2]):
+            self.assertTrue(
+                service._related_artists_need_relationship_enrichment(candidates, {})
+            )
+
+    def test_related_artist_inflight_does_not_exhaust_at_attempt_cap(self) -> None:
+        service = SearchService(_MemoryTestServer(":memory:"))
+        pending = {"id": "UC-pending", "name": "Pending", "_provider_resolution_attempted_at": time.time()}
+        snapshot = {
+            "lead_artist": {"id": "UC-lead", "name": "Lead"},
+            "related_artists": [pending],
+            "_surface_attempts": {"artists": search_service_module._SEARCH_SURFACE_MAX_ATTEMPTS},
+            "expansion_state": {"artists": "retryable"},
+        }
+        with (
+            patch.object(service, "_complete_artist_search_surfaces", return_value={
+                "lead_artist": snapshot["lead_artist"], "artists": [], "tracks": [], "albums": [],
+                "related_artists": snapshot["related_artists"], "related_albums": [], "playlists": [],
+                "catalog_status": "complete", "related_status": "retryable",
+                "_pending_entity_artwork": {},
+            }),
+            patch.object(service, "_visible_artists", return_value=[]),
+            patch.object(
+                search_service_module,
+                "_SEARCH_ARTIST_METADATA_PENDING",
+                {search_service_module._artist_metadata_pending_key(pending)},
+            ),
+        ):
+            refreshed = service._expand_search_snapshot_surface(
+                req=SimpleNamespace(user_scope_id="test"), query="Lead", search_mode="exact",
+                surface="artists", snapshot=snapshot,
+            )
+        self.assertNotEqual((refreshed.get("expansion_state") or {}).get("artists"), "exhausted")
+
+    def test_related_artist_resolution_fills_visible_deficit(self) -> None:
+        service = SearchService(_MemoryTestServer(":memory:"))
+        candidates = [{"id": f"UC-{index}", "name": f"Artist {index}"} for index in range(6)]
+        with (
+            patch.object(service, "_hydrate_artist_artwork", side_effect=lambda artists, **_: artists),
+            patch.object(
+                service,
+                "_artist_has_usable_artwork",
+                side_effect=lambda artist: str(artist.get("id")) in {"UC-0", "UC-1"},
+            ),
+            patch("auralis_backend.search.service._SEARCH_CATALOG_WRITER.submit"),
+            patch("auralis_backend.search.service._schedule_artist_metadata_resolution", return_value=True) as scheduled,
+        ):
+            service._resolve_first_page_related_artists(candidates, query="Lead", limit=6)
+        self.assertEqual(scheduled.call_count, 4)
+
+    def test_related_artist_settled_failures_can_exhaust(self) -> None:
+        service = SearchService(_MemoryTestServer(":memory:"))
+        failed = {
+            "id": "UC-failed",
+            "name": "Failed",
+            "_provider_resolution_attempted_at": time.time(),
+            "_provider_resolution_attempts": (
+                search_service_module._SEARCH_ARTIST_MAX_ATTEMPTS
+            ),
+            "_provider_resolution_state": "exhausted",
+        }
+        snapshot = {
+            "lead_artist": {"id": "UC-lead", "name": "Lead"}, "related_artists": [failed],
+            "_surface_attempts": {"artists": search_service_module._SEARCH_SURFACE_MAX_ATTEMPTS},
+            "expansion_state": {"artists": "retryable"},
+        }
+        with (
+            patch.object(service, "_complete_artist_search_surfaces", return_value={
+                "lead_artist": snapshot["lead_artist"], "artists": [], "tracks": [], "albums": [],
+                "related_artists": snapshot["related_artists"], "related_albums": [], "playlists": [],
+                "catalog_status": "complete", "related_status": "retryable", "_pending_entity_artwork": {},
+            }),
+            patch.object(service, "_visible_artists", return_value=[]),
+            patch.object(search_service_module, "_SEARCH_ARTIST_METADATA_PENDING", set()),
+        ):
+            refreshed = service._expand_search_snapshot_surface(
+                req=SimpleNamespace(user_scope_id="test"), query="Lead", search_mode="exact",
+                surface="artists", snapshot=snapshot,
+            )
+        self.assertEqual((refreshed.get("expansion_state") or {}).get("artists"), "exhausted")
+
+    def test_related_artist_retryable_failure_does_not_exhaust(self) -> None:
+        service = SearchService(_MemoryTestServer(":memory:"))
+        retryable = {
+            "id": "UC-retryable",
+            "name": "Retryable",
+            "_provider_resolution_attempted_at": time.time(),
+            "_provider_resolution_attempts": 1,
+            "_provider_resolution_state": "retryable",
+            "_provider_resolution_retry_after": time.time() + 30,
+        }
+        snapshot = {
+            "lead_artist": {"id": "UC-lead", "name": "Lead"},
+            "related_artists": [retryable],
+            "_surface_attempts": {
+                "artists": search_service_module._SEARCH_SURFACE_MAX_ATTEMPTS,
+            },
+            "expansion_state": {"artists": "retryable"},
+        }
+        with (
+            patch.object(
+                service,
+                "_complete_artist_search_surfaces",
+                return_value={
+                    "lead_artist": snapshot["lead_artist"],
+                    "artists": [],
+                    "tracks": [],
+                    "albums": [],
+                    "related_artists": snapshot["related_artists"],
+                    "related_albums": [],
+                    "playlists": [],
+                    "catalog_status": "complete",
+                    "related_status": "retryable",
+                    "_pending_entity_artwork": {},
+                },
+            ),
+            patch.object(service, "_visible_artists", return_value=[]),
+            patch.object(
+                search_service_module,
+                "_SEARCH_ARTIST_METADATA_PENDING",
+                set(),
+            ),
+        ):
+            refreshed = service._expand_search_snapshot_surface(
+                req=SimpleNamespace(user_scope_id="test"),
+                query="Lead",
+                search_mode="exact",
+                surface="artists",
+                snapshot=snapshot,
+            )
+        self.assertNotEqual(
+            (refreshed.get("expansion_state") or {}).get("artists"),
+            "exhausted",
+        )
+
     def test_thin_artist_update_cannot_erase_cached_r2_artwork(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             memory_server = _MemoryTestServer(
@@ -1316,6 +1462,455 @@ class SearchEnrichmentTests(unittest.TestCase):
             [first_source],
         )
 
+    def test_entity_artwork_cache_bounds_alternates_and_persists_retry_state(
+        self,
+    ) -> None:
+        sources = [f"https://example.test/cover-{index}.jpg" for index in range(6)]
+        cache = SimpleNamespace(store=Mock(return_value=False))
+        completed = []
+
+        def run_immediately(callback):
+            callback()
+            future = Future()
+            future.set_result(None)
+            return future
+
+        item = {
+            "id": "MPRE-bounded-artwork",
+            "title": "Bounded Artwork",
+            "artist": "Test Artist",
+            "artwork_source_urls": sources,
+        }
+        with (
+            patch(
+                "auralis_backend.storage.artist_artwork.get_entity_artwork_cache",
+                return_value=cache,
+            ),
+            patch(
+                "auralis_backend.storage.artist_artwork._EXECUTOR.submit",
+                side_effect=run_immediately,
+            ),
+        ):
+            scheduled = schedule_entity_artwork_cache(
+                object(),
+                item,
+                entity_type="album",
+                on_cached=completed.append,
+            )
+            retry_scheduled = schedule_entity_artwork_cache(
+                object(),
+                completed[0],
+                entity_type="album",
+            )
+
+        self.assertTrue(scheduled)
+        self.assertFalse(retry_scheduled)
+        self.assertEqual(cache.store.call_count, 4)
+        self.assertEqual(completed[0].get("artwork_cache_status"), "source_failed")
+        self.assertEqual(len(completed[0].get("artwork_source_failures") or {}), 4)
+        self.assertFalse(completed[0].get("thumbnail"))
+
+    def test_entity_artwork_success_notifies_active_search_snapshot(self) -> None:
+        snapshot_key = "entity-artwork-test||album"
+        album = {
+            "id": "MPRE-visible-after-cache",
+            "title": "Visible After Cache",
+            "artist": "Test Artist",
+            "track_count": 8,
+        }
+        search_service_module._store_search_snapshot(
+            snapshot_key,
+            {
+                "revision": 1,
+                "albums": [],
+                "_pending_entity_artwork": {"albums": [album]},
+            },
+        )
+        identity = entity_artwork_identity(album, entity_type="album")
+        token = entity_artwork_token(album, entity_type="album")
+
+        search_service_module._update_search_snapshots_entity(
+            {
+                **album,
+                "artwork_entity_type": "album",
+                "artwork_cache_identity": identity,
+                "artwork_cache_token": token,
+                "artwork_cache_status": "cached",
+                "thumbnail": f"/entity_artwork/{token}",
+            }
+        )
+
+        refreshed = search_service_module._load_search_snapshot(snapshot_key)
+        self.assertEqual(refreshed.get("revision"), 2)
+        self.assertEqual(len(refreshed.get("albums") or []), 1)
+        self.assertEqual(
+            refreshed["albums"][0].get("thumbnail"),
+            f"/entity_artwork/{token}",
+        )
+        self.assertFalse(
+            (refreshed.get("_pending_entity_artwork") or {}).get("albums")
+        )
+
+    def test_pending_entity_artwork_is_rescheduled_after_snapshot_store(self) -> None:
+        snapshot_key = "entity-artwork-test||post-store-rehydrate"
+        album = {
+            "id": "MPRE-post-store-rehydrate",
+            "title": "Post Store Rehydrate",
+            "artist": "Test Artist",
+            "track_count": 8,
+        }
+        identity = entity_artwork_identity(album, entity_type="album")
+        token = entity_artwork_token(album, entity_type="album")
+        verified = {
+            **album,
+            "artwork_entity_type": "album",
+            "artwork_cache_identity": identity,
+            "artwork_cache_token": token,
+            "artwork_cache_status": "cached",
+            "thumbnail": f"/entity_artwork/{token}",
+        }
+
+        # A completion notification that wins the race with initial snapshot
+        # storage cannot find the snapshot yet.
+        search_service_module._update_search_snapshots_entity(verified)
+        snapshot = {
+            "revision": 1,
+            "albums": [],
+            "_pending_entity_artwork": {"albums": [album]},
+            "expansion_state": {"albums": "pending_artwork"},
+        }
+        search_service_module._store_search_snapshot(snapshot_key, snapshot)
+
+        def complete_after_store(_server, _item, *, entity_type, on_cached):
+            self.assertEqual(entity_type, "album")
+            search_service_module._update_search_snapshots_entity(verified)
+            on_cached(verified)
+            return True
+
+        with (
+            patch.object(
+                search_service_module,
+                "schedule_entity_artwork_cache",
+                side_effect=complete_after_store,
+            ),
+            patch.object(
+                search_service_module,
+                "_persist_entity_artwork_record",
+            ),
+        ):
+            search_service_module._schedule_snapshot_entity_artwork(
+                object(),
+                snapshot,
+            )
+
+        refreshed = search_service_module._load_search_snapshot(snapshot_key)
+        self.assertEqual(len(refreshed.get("albums") or []), 1)
+        self.assertEqual(
+            refreshed["albums"][0].get("thumbnail"),
+            f"/entity_artwork/{token}",
+        )
+        self.assertEqual(refreshed["expansion_state"]["albums"], "complete")
+
+    def test_pending_entity_artwork_controls_progressive_surface_state(self) -> None:
+        snapshot = {
+            "_pending_entity_artwork": {
+                "albums": [{"id": "MPRE-album"}],
+                "playlists": [{"id": "VL-playlist"}],
+                "artist_albums": [{"id": "MPRE-artist-album"}],
+            },
+            "expansion_state": {
+                "albums": "complete",
+                "playlists": "complete",
+                "artists": "complete",
+            },
+        }
+        search_service_module._sync_entity_artwork_expansion_state(snapshot)
+        self.assertEqual(
+            snapshot["expansion_state"],
+            {
+                "albums": "pending_artwork",
+                "playlists": "pending_artwork",
+                "artists": "pending_artwork",
+            },
+        )
+
+        snapshot["_pending_entity_artwork"] = {}
+        search_service_module._sync_entity_artwork_expansion_state(snapshot)
+        self.assertEqual(
+            snapshot["expansion_state"],
+            {
+                "albums": "complete",
+                "playlists": "complete",
+                "artists": "complete",
+            },
+        )
+
+        snapshot["_pending_entity_artwork"] = {
+            "albums": [{"id": "MPRE-still-pending"}],
+        }
+        snapshot["expansion_state"]["albums"] = "exhausted"
+        search_service_module._sync_entity_artwork_expansion_state(snapshot)
+        self.assertEqual(snapshot["expansion_state"]["albums"], "exhausted")
+
+    def test_missing_entity_object_invalidates_registered_catalog_record(self) -> None:
+        server_instance = object()
+        album = {
+            "id": "MPRE-missing-object",
+            "title": "Missing Object",
+            "artist": "Test Artist",
+            "track_count": 8,
+        }
+        identity = entity_artwork_identity(album, entity_type="album")
+        token = entity_artwork_token(album, entity_type="album")
+        record = {
+            **album,
+            "artwork_entity_type": "album",
+            "artwork_cache_identity": identity,
+            "artwork_cache_token": token,
+            "artwork_cache_status": "cached",
+            "thumbnail": f"/entity_artwork/{token}",
+        }
+        cache = SimpleNamespace(
+            read=Mock(return_value=None),
+            object_missing=Mock(return_value=True),
+        )
+        invalidated_records = []
+        with (
+            patch.object(
+                artist_artwork_module,
+                "get_entity_artwork_cache",
+                return_value=cache,
+            ),
+            patch.object(
+                artist_artwork_module,
+                "_ENTITY_RECORDS",
+                {token: (server_instance, record)},
+            ),
+            patch.object(
+                artist_artwork_module,
+                "_ENTITY_INVALIDATION_LISTENERS",
+                [lambda _server, item: invalidated_records.append(item)],
+            ),
+            patch.object(
+                artist_artwork_module,
+                "notify_entity_metadata_updated",
+            ) as notified,
+        ):
+            self.assertIsNone(read_entity_artwork(server_instance, token))
+
+        self.assertEqual(len(invalidated_records), 1)
+        invalidated = invalidated_records[0]
+        self.assertEqual(invalidated.get("artwork_cache_status"), "missing")
+        self.assertFalse(invalidated.get("thumbnail"))
+        notified.assert_called_once()
+        merged = search_intelligence_module._merge_entity_metadata_payload(
+            record,
+            invalidated,
+            entity_type="album",
+        )
+        self.assertFalse(merged.get("thumbnail"))
+        self.assertEqual(merged.get("artwork_cache_status"), "missing")
+
+        snapshot_key = "entity-artwork-test||missing-object"
+        search_service_module._store_search_snapshot(
+            snapshot_key,
+            {
+                "revision": 1,
+                "albums": [record],
+                "_pending_entity_artwork": {"albums": []},
+                "expansion_state": {"albums": "complete"},
+            },
+        )
+        search_service_module._update_search_snapshots_entity(invalidated)
+        refreshed = search_service_module._load_search_snapshot(snapshot_key)
+        self.assertFalse(refreshed.get("albums"))
+        self.assertEqual(
+            len(
+                (refreshed.get("_pending_entity_artwork") or {}).get("albums")
+                or []
+            ),
+            1,
+        )
+        self.assertEqual(
+            refreshed["expansion_state"]["albums"],
+            "pending_artwork",
+        )
+
+    def test_transient_entity_object_read_failure_does_not_invalidate(self) -> None:
+        token = "a" * 32
+        cache = SimpleNamespace(
+            read=Mock(return_value=None),
+            object_missing=Mock(return_value=False),
+        )
+        listener = Mock()
+        with (
+            patch.object(
+                artist_artwork_module,
+                "get_entity_artwork_cache",
+                return_value=cache,
+            ),
+            patch.object(
+                artist_artwork_module,
+                "_ENTITY_RECORDS",
+                {token: (object(), {"artwork_cache_token": token})},
+            ),
+            patch.object(
+                artist_artwork_module,
+                "_ENTITY_INVALIDATION_LISTENERS",
+                [listener],
+            ),
+        ):
+            self.assertIsNone(read_entity_artwork(object(), token))
+
+        listener.assert_not_called()
+
+    def test_album_artwork_identity_requires_stable_id_and_preserves_bridge(
+        self,
+    ) -> None:
+        release_only = {
+            "musicbrainz_release_group_id": "release-group-only",
+            "title": "Shared Title",
+            "artist": "Shared Artist",
+        }
+        self.assertEqual(
+            entity_artwork_identity(release_only, entity_type="album"),
+            "",
+        )
+        provider_album = {"id": "MPRE-stable-one", **release_only}
+        identity = entity_artwork_identity(provider_album, entity_type="album")
+        self.assertEqual(identity, "album:MPRE-stable-one")
+        self.assertEqual(
+            entity_artwork_identity(
+                {
+                    **provider_album,
+                    "id": "MPRE-later-alias",
+                    "artwork_cache_identity": identity,
+                },
+                entity_type="album",
+            ),
+            identity,
+        )
+
+    def test_unverified_entity_proxy_is_not_reused_without_persisted_state(
+        self,
+    ) -> None:
+        album = {
+            "id": "MPRE-unverified-token",
+            "title": "Unverified Token",
+            "artist": "Test Artist",
+        }
+        token = entity_artwork_token(album, entity_type="album")
+
+        attached = attach_cached_entity_artwork(
+            object(),
+            {
+                **album,
+                "thumbnail": f"/entity_artwork/{token}",
+                "artwork_cache_token": token,
+            },
+            entity_type="album",
+        )
+
+        self.assertFalse(attached.get("thumbnail"))
+
+    def test_persisted_entity_state_fails_closed_when_object_cache_is_disabled(
+        self,
+    ) -> None:
+        album = {
+            "id": "MPRE-cache-disabled",
+            "title": "Cache Disabled",
+            "artist": "Test Artist",
+        }
+        identity = entity_artwork_identity(album, entity_type="album")
+        token = entity_artwork_token(album, entity_type="album")
+        with patch(
+            "auralis_backend.storage.artist_artwork.get_entity_artwork_cache",
+            return_value=None,
+        ):
+            attached = attach_cached_entity_artwork(
+                object(),
+                {
+                    **album,
+                    "artwork_cache_identity": identity,
+                    "artwork_cache_token": token,
+                    "artwork_cache_status": "cached",
+                    "thumbnail": f"/entity_artwork/{token}",
+                },
+                entity_type="album",
+            )
+
+        self.assertFalse(attached.get("thumbnail"))
+
+    def test_album_detail_hydration_persists_shared_entity_artwork_state(self) -> None:
+        album = {
+            "status": "success",
+            "id": "MPRE-detail-artwork",
+            "title": "Detail Artwork",
+            "artist": "Test Artist",
+            "thumbnail": "https://example.test/detail-cover.jpg",
+            "track_count": 8,
+            "tracks": [],
+        }
+        identity = entity_artwork_identity(album, entity_type="album")
+        token = entity_artwork_token(album, entity_type="album")
+        adapter = SimpleNamespace(
+            cache_lookup=Mock(return_value=album),
+            cache_store=Mock(),
+            trim_text=Mock(return_value="MPRE-detail-artwork"),
+        )
+
+        def attach(_server, item, *, entity_type):
+            prepared = dict(item)
+            prepared.pop("thumbnail", None)
+            prepared["artwork_source_url"] = album["thumbnail"]
+            prepared["artwork_cache_identity"] = identity
+            prepared["artwork_cache_token"] = token
+            prepared["artwork_entity_type"] = entity_type
+            return prepared
+
+        def schedule(_server, item, *, entity_type, on_cached):
+            on_cached(
+                {
+                    **item,
+                    "artwork_entity_type": entity_type,
+                    "artwork_cache_status": "cached",
+                    "thumbnail": f"/entity_artwork/{token}",
+                }
+            )
+            return True
+
+        with (
+            patch.object(
+                detail_runtime_module,
+                "adapt_detail_server",
+                return_value=adapter,
+            ),
+            patch.object(
+                detail_runtime_module,
+                "attach_cached_entity_artwork",
+                side_effect=attach,
+            ),
+            patch.object(
+                detail_runtime_module,
+                "schedule_entity_artwork_cache",
+                side_effect=schedule,
+            ) as scheduled,
+            patch.object(detail_runtime_module, "cache_albums") as cached_albums,
+            patch.object(detail_runtime_module, "remember_catalog_entity") as remembered,
+        ):
+            payload = detail_runtime_module.build_album_details_payload(
+                object(),
+                "MPRE-detail-artwork",
+            )
+
+        self.assertFalse(payload.get("thumbnail"))
+        scheduled.assert_called_once()
+        self.assertGreaterEqual(adapter.cache_store.call_count, 2)
+        self.assertGreaterEqual(cached_albums.call_count, 2)
+        persisted = remembered.call_args.kwargs["item"]
+        self.assertEqual(persisted.get("artwork_cache_identity"), identity)
+        self.assertEqual(persisted.get("thumbnail"), f"/entity_artwork/{token}")
+
     def test_existing_provider_artwork_object_is_reused_without_source_url(
         self,
     ) -> None:
@@ -1488,7 +2083,7 @@ class SearchEnrichmentTests(unittest.TestCase):
                 {
                     "id": "UC-Elf",
                     "name": "Elf",
-                    "thumbnail": "https://example.test/elf.jpg",
+                    "thumbnail": "/artist_artwork/elf-token",
                 }
             ]
             snapshot["expansion_state"] = {"artists": "complete"}
@@ -1524,6 +2119,118 @@ class SearchEnrichmentTests(unittest.TestCase):
             [artist.get("name") for artist in refreshed["related_artists"]],
             ["Elf"],
         )
+
+    def test_snapshot_store_revision_tracks_published_changes_only(self) -> None:
+        snapshot_key = "progressive-test||semantic-store"
+        base = {
+            "revision": 3,
+            "lead_artist": {
+                "id": "UC-Dio",
+                "name": "Dio",
+                "thumbnail": "/artist_artwork/dio-token",
+            },
+            "artists": [],
+            "related_artists": [],
+        }
+        search_service_module._store_search_snapshot(snapshot_key, base)
+        search_service_module._store_search_snapshot(
+            snapshot_key,
+            {**base, "_provider_resolution_attempted_at": time.time()},
+        )
+        unchanged = search_service_module._load_search_snapshot(snapshot_key)
+        self.assertEqual(unchanged.get("revision"), 3)
+        search_service_module._store_search_snapshot(
+            snapshot_key,
+            {
+                **base,
+                "artists": [
+                    {
+                        "id": "UC-Dio",
+                        "name": "Dio",
+                        "thumbnail": "/artist_artwork/dio-token",
+                    }
+                ],
+            },
+        )
+        changed = search_service_module._load_search_snapshot(snapshot_key)
+        self.assertEqual(changed.get("revision"), 4)
+
+    def test_background_completion_preserves_newer_latest_surfaces(self) -> None:
+        service = SearchService(_MemoryTestServer(":memory:"))
+        snapshot_key = "progressive-test||latest-surfaces"
+        initial = {
+            "revision": 1,
+            "tracks": [{"id": "old-track", "title": "Old"}],
+            "artist_tracks": [{"id": "old-artist-track", "title": "Old"}],
+            "artists": [],
+            "related_artists": [],
+            "albums": [],
+            "artist_albums": [],
+            "related_albums": [],
+            "playlists": [],
+            "expansion_state": {"artists": "retryable"},
+        }
+        search_service_module._store_search_snapshot(snapshot_key, initial)
+
+        def complete(*, snapshot, **_kwargs):
+            latest = {
+                **snapshot,
+                "tracks": [{"id": "new-track", "title": "New"}],
+                "artist_tracks": [
+                    {"id": "new-artist-track", "title": "New"}
+                ],
+                "expansion_state": {"artists": "complete"},
+            }
+            search_service_module._store_search_snapshot(snapshot_key, latest)
+            return snapshot
+
+        with (
+            patch.object(
+                service,
+                "_expand_search_snapshot_surface",
+                side_effect=complete,
+            ),
+            patch.object(
+                search_service_module._SEARCH_ARTIST_METADATA_WRITER,
+                "submit",
+                side_effect=lambda function, *args, **kwargs: function(
+                    *args,
+                    **kwargs,
+                ),
+            ),
+        ):
+            service._schedule_search_snapshot_completion(
+                snapshot_key=snapshot_key,
+                query="Dio",
+                search_mode="exact",
+                user_scope_id="progressive-test",
+            )
+
+        refreshed = search_service_module._load_search_snapshot(snapshot_key)
+        self.assertEqual(
+            {item.get("id") for item in refreshed.get("tracks") or []},
+            {"old-track", "new-track"},
+        )
+        self.assertEqual(
+            {
+                item.get("id") for item in refreshed.get("artist_tracks") or []
+            },
+            {"old-artist-track", "new-artist-track"},
+        )
+
+    def test_exhausted_surfaces_are_not_reported_as_pending(self) -> None:
+        service = SearchService(_MemoryTestServer(":memory:"))
+        diagnostics = service._snapshot_progress_diagnostics(
+            {
+                "expansion_state": {
+                    "artists": "exhausted",
+                    "albums": "complete",
+                },
+                "related_artists": [],
+            }
+        )
+        self.assertEqual(diagnostics["search_pending_surfaces"], [])
+        self.assertEqual(diagnostics["search_exhausted_surfaces"], ["artists"])
 
     def test_background_identity_recovery_keeps_catalog_retryable(self) -> None:
         service = SearchService(_MemoryTestServer(":memory:"))
@@ -1610,6 +2317,7 @@ class SearchEnrichmentTests(unittest.TestCase):
                 "tracks": "retryable",
                 "artists": "retryable",
                 "albums": "retryable",
+                "playlists": "retryable",
             },
         )
 
@@ -1719,7 +2427,30 @@ class SearchEnrichmentTests(unittest.TestCase):
             "artist_albums": [{"id": "MPRE-Wrong", "artist": "Wrong"}],
             "related_artists": [{"id": "wrong-related", "name": "Wrong"}],
             "related_albums": [],
-            "playlists": [],
+            "playlists": [
+                {
+                    "id": "search-generated:wrong-hail:essentials",
+                    "generated": True,
+                    "name": "Wrong Essentials",
+                },
+                {
+                    "id": "provider-playlist",
+                    "name": "Provider Playlist",
+                    "thumbnail": "/entity_artwork/provider-playlist",
+                },
+            ],
+            "_pending_entity_artwork": {
+                "artist_albums": [{"id": "pending-wrong-album"}],
+                "related_albums": [{"id": "pending-wrong-related"}],
+                "containing_album": [{"id": "pending-wrong-containing"}],
+                "playlists": [
+                    {
+                        "id": "search-generated:wrong-hail:catalog",
+                        "generated": True,
+                    },
+                    {"id": "pending-provider-playlist"},
+                ],
+            },
             "expansion_state": {"artists": "retryable"},
             "target_revalidation_state": "complete",
         }
@@ -1774,8 +2505,79 @@ class SearchEnrichmentTests(unittest.TestCase):
             "wrong-track",
             [item.get("id") for item in refreshed.get("artist_tracks") or []],
         )
+        self.assertFalse(
+            any(
+                str(item.get("id") or "").startswith("search-generated:")
+                for item in refreshed.get("playlists") or []
+            )
+        )
+        pending = refreshed.get("_pending_entity_artwork") or {}
+        self.assertEqual(pending.get("artist_albums") or [], [])
+        self.assertEqual(pending.get("related_albums") or [], [])
+        self.assertEqual(pending.get("containing_album") or [], [])
+        self.assertFalse(
+            any(
+                str(item.get("id") or "").startswith("search-generated:")
+                for item in pending.get("playlists") or []
+            )
+        )
         self.assertEqual(refreshed.get("target_revalidation_state"), "complete")
         self.assertEqual(refreshed.get("target_revalidation_attempts"), 1)
+
+    def test_empty_target_revalidation_becomes_terminal_after_bound(self) -> None:
+        service = SearchService(_MemoryTestServer(":memory:"))
+        snapshot = {
+            "resolved_target": {},
+            "target_revalidation_attempts": 2,
+            "target_revalidation_state": "retryable",
+            "expansion_state": {"artists": "retryable"},
+        }
+        self.assertFalse(
+            service._snapshot_target_needs_revalidation("Unknown", snapshot)
+        )
+        self.assertEqual(snapshot.get("target_revalidation_state"), "exhausted")
+        self.assertEqual(snapshot["expansion_state"].get("artists"), "exhausted")
+
+    def test_terminal_empty_target_does_not_schedule_completion_work(self) -> None:
+        service = SearchService(_MemoryTestServer(":memory:"))
+        snapshot_key = "progressive-test||terminal-empty"
+        search_service_module._store_search_snapshot(
+            snapshot_key,
+            {
+                "revision": 2,
+                "resolved_target": {},
+                "target_revalidation_attempts": 2,
+                "target_revalidation_state": "retryable",
+                "expansion_state": {"artists": "retryable"},
+            },
+        )
+        with (
+            patch.object(
+                service,
+                "_expand_search_snapshot_surface",
+            ) as expand,
+            patch.object(
+                search_service_module._SEARCH_ARTIST_METADATA_WRITER,
+                "submit",
+                side_effect=lambda function, *args, **kwargs: function(
+                    *args,
+                    **kwargs,
+                ),
+            ),
+        ):
+            service._schedule_search_snapshot_completion(
+                snapshot_key=snapshot_key,
+                query="Unknown",
+                search_mode="exact",
+                user_scope_id="progressive-test",
+            )
+        expand.assert_not_called()
+        refreshed = search_service_module._load_search_snapshot(snapshot_key)
+        self.assertEqual(refreshed.get("target_revalidation_state"), "exhausted")
+        self.assertEqual(
+            (refreshed.get("expansion_state") or {}).get("artists"),
+            "exhausted",
+        )
 
     def test_artist_retry_metadata_does_not_advance_visible_revision(self) -> None:
         snapshot_key = "progressive-test||nirvana-retry"
@@ -3208,6 +4010,115 @@ class SearchEnrichmentTests(unittest.TestCase):
 
             self.assertEqual(result.get("reason"), "ran_inline")
             self.assertEqual(playable[0].get("id"), "radiohead-creep")
+
+    def test_related_artist_resolution_records_retryable_state(self) -> None:
+        artist = {"name": "Transient Artist", "canonical_artist_id": "musicbrainz:artist:mb-1"}
+        captured = {}
+        with patch.object(search_service_module, "_update_search_snapshots_artist", lambda value: captured.update(value)):
+            search_service_module._record_artist_resolution_attempt(artist)
+        self.assertEqual(captured.get("_provider_resolution_state"), "retryable")
+        self.assertEqual(captured.get("_provider_resolution_failure_reason"), "provider_or_details_miss")
+        self.assertGreater(captured.get("_provider_resolution_retry_after", 0), time.time())
+
+    def test_cached_playlist_artwork_reattaches_by_identity(self) -> None:
+        server_instance = object()
+        playlist = {
+            "id": "playlist-1",
+            "title": "Generated Mix",
+            "artwork_cache_identity": "playlist:playlist-1",
+            "artwork_cache_status": "cached",
+            "artwork_cache_token": entity_artwork_token(
+                {"id": "playlist-1", "title": "Generated Mix"}, entity_type="playlist"
+            ),
+        }
+        token = playlist["artwork_cache_token"]
+        playlist["thumbnail"] = f"/entity_artwork/{token}"
+        with artist_artwork_module._ENTITY_RECORDS_LOCK:
+            artist_artwork_module._ENTITY_RECORDS[token] = (server_instance, dict(playlist))
+        with patch.object(artist_artwork_module, "get_entity_artwork_cache", return_value=object()):
+            incoming = attach_cached_entity_artwork(
+                server_instance,
+                {"id": "playlist-1", "title": "Generated Mix"},
+                entity_type="playlist",
+            )
+        self.assertEqual(incoming.get("thumbnail"), f"/entity_artwork/{token}")
+
+    def test_related_resolution_skips_delayed_and_exhausted_candidates(self) -> None:
+        service = SearchService(object())
+        blocked = [
+            {"name": f"Blocked {i}", "_provider_resolution_state": "exhausted"}
+            if i < 2 else
+            {"name": f"Blocked {i}", "_provider_resolution_retry_after": time.time() + 600}
+            for i in range(4)
+        ]
+        fresh = [{"name": f"Fresh {i}"} for i in range(4)]
+        scheduled = []
+        with patch.object(service, "_hydrate_artist_artwork", return_value=blocked + fresh), \
+             patch.object(search_service_module, "_cache_search_payload_background", return_value=None), \
+             patch.object(search_service_module, "_schedule_artist_metadata_resolution", side_effect=lambda **kwargs: scheduled.append(kwargs["artist"]) or True):
+            service._resolve_first_page_related_artists(blocked + fresh, query="Lead", limit=10)
+        self.assertEqual([a["name"] for a in scheduled], [f"Fresh {i}" for i in range(4)])
+
+    def test_related_resolution_state_rehydrates_after_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            memory_server = _MemoryTestServer(str(pathlib.Path(temp_dir) / "restart.sqlite"))
+            exhausted = {"name": "Persisted Artist", "canonical_artist_id": "musicbrainz:artist:persisted", "_provider_resolution_state": "exhausted", "_provider_resolution_attempts": 4, "_provider_resolution_failure_reason": "details_miss", "_provider_resolution_retry_after": time.time() + 600}
+            search_service_module._persist_search_artist(server=memory_server, query="Lead", artist=exhausted)
+            service = SearchService(memory_server)
+            candidate = {
+                "name": "Persisted Artist",
+                "canonical_artist_id": "musicbrainz:artist:persisted",
+            }
+            hydrated = service._hydrate_artist_artwork(
+                [candidate],
+                allow_live_lead_lookup=False,
+                schedule_background=False,
+            )
+            with patch.object(
+                service,
+                "_hydrate_artist_artwork",
+                return_value=hydrated,
+            ), patch.object(
+                search_service_module,
+                "_cache_search_payload_background",
+                return_value=None,
+            ), patch.object(
+                search_service_module,
+                "_schedule_artist_metadata_resolution",
+            ) as schedule:
+                self.assertEqual(hydrated[0].get("_provider_resolution_state"), "exhausted")
+                service._resolve_first_page_related_artists(
+                    hydrated,
+                    query="Lead",
+                    limit=10,
+                )
+                schedule.assert_not_called()
+
+    def test_cached_playlist_artwork_rehydrates_from_catalog_after_memory_reset(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            memory_server = _MemoryTestServer(str(pathlib.Path(temp_dir) / "playlist.sqlite"))
+            playlist = {"id": "generated-playlist", "title": "Generated", "artwork_cache_identity": "playlist:generated-playlist", "artwork_cache_status": "cached"}
+            playlist["artwork_cache_token"] = entity_artwork_token(playlist, entity_type="playlist")
+            remember_catalog_entity(memory_server, user_scope_id="global", query="Generated", entity_type="playlist", item=playlist, confidence=0.98, event_weight=0.0, event_type="entity_artwork_metadata", source="verified_entity_artwork", learn_query_alias=False)
+            with artist_artwork_module._ENTITY_RECORDS_LOCK:
+                artist_artwork_module._ENTITY_RECORDS.clear()
+            with patch.object(artist_artwork_module, "get_entity_artwork_cache", return_value=object()):
+                restored = attach_cached_entity_artwork(memory_server, {"id": "generated-playlist", "title": "Generated"}, entity_type="playlist")
+            self.assertTrue(str(restored.get("thumbnail") or "").startswith("/entity_artwork/"))
+
+    def test_related_resolution_rich_target_schedules_bounded_batch(self) -> None:
+        service = SearchService(object())
+        visible = [{"name": f"Visible {i}", "provider_artist_id": f"v{i}", "thumbnail": "/artist_artwork/ok"} for i in range(2)]
+        fresh = [{"name": f"Fresh {i}"} for i in range(8)]
+        scheduled = []
+        with patch.object(service, "_hydrate_artist_artwork", return_value=visible + fresh), patch.object(search_service_module, "_cache_search_payload_background", return_value=None), patch.object(search_service_module, "_schedule_artist_metadata_resolution", side_effect=lambda **kwargs: scheduled.append(kwargs["artist"]) or True):
+            service._resolve_first_page_related_artists(visible + fresh, query="Lead", limit=10)
+        self.assertEqual(len(scheduled), 4)
+
+    def test_distinct_jackson_mbids_remain_separate(self) -> None:
+        service = SearchService(object())
+        rows = service._merge_snapshot_items("related_artists", [], [{"name": "The Jacksons", "musicbrainz_artist_id": "mb-jacksons"}, {"name": "Jackson 5", "musicbrainz_artist_id": "mb-jackson5"}, {"name": "The Jacksons", "musicbrainz_artist_id": "mb-jacksons", "provider_artist_id": "p1"}])
+        self.assertEqual(len(rows), 2)
 
 if __name__ == "__main__":
     unittest.main()

@@ -77,7 +77,9 @@ class SearchSuggestion {
 class SuggestNotifier extends StateNotifier<List<SearchSuggestion>> {
   final Ref ref;
   int _requestVersion = 0;
-  static const Duration _suggestDebounce = Duration(milliseconds: 80);
+  bool _requestInFlight = false;
+  String? _pendingQuery;
+  List<Map<String, dynamic>> _pendingRecentTracks = const <Map<String, dynamic>>[];
 
   SuggestNotifier(this.ref) : super(const <SearchSuggestion>[]);
 
@@ -117,13 +119,18 @@ class SuggestNotifier extends StateNotifier<List<SearchSuggestion>> {
       return;
     }
     final requestVersion = ++_requestVersion;
+    if (_requestInFlight) {
+      _pendingQuery = query;
+      _pendingRecentTracks = recentTracks;
+      return;
+    }
+    _requestInFlight = true;
     final recentQueries = peekRecentCloudSearchQueries(limit: 8);
     final localSuggestions = _localSuggestions(query, recentQueries);
     if (localSuggestions.isNotEmpty) {
       state = localSuggestions;
     }
     try {
-      await Future<void>.delayed(_suggestDebounce);
       if (requestVersion != _requestVersion) return;
       final body = buildSuggestRequestBody(
         ref,
@@ -155,11 +162,22 @@ class SuggestNotifier extends StateNotifier<List<SearchSuggestion>> {
       }
     } catch (_) {
       // Suggest remains best-effort and silent on failure.
+    } finally {
+      _requestInFlight = false;
+      final pending = _pendingQuery;
+      final pendingTracks = _pendingRecentTracks;
+      _pendingQuery = null;
+      _pendingRecentTracks = const <Map<String, dynamic>>[];
+      if (pending != null) {
+        unawaited(fetchSuggestions(pending, recentTracks: pendingTracks));
+      }
     }
   }
 
   void clear() {
     _requestVersion++;
+    _pendingQuery = null;
+    _pendingRecentTracks = const <Map<String, dynamic>>[];
     state = const <SearchSuggestion>[];
   }
 }

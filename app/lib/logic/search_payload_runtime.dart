@@ -22,6 +22,8 @@ Future<Map<String, dynamic>> buildSemanticSearchRequestBody(
   String searchMode = '',
   String resultType = '',
   int offset = 0,
+  int? revision,
+  int? revisionWaitMs,
 }) async {
   final normalizedQuery = query.trim();
   final normalizedSearchMode = searchMode.isNotEmpty
@@ -38,6 +40,8 @@ Future<Map<String, dynamic>> buildSemanticSearchRequestBody(
       'defer_side_surfaces': deferSideSurfaces,
       'result_type': resultType,
       'offset': offset,
+      if (revision != null) 'revision': revision,
+      if (revisionWaitMs != null) 'revision_wait_ms': revisionWaitMs,
     };
   }
   final playlists = read(playlistProvider);
@@ -240,12 +244,14 @@ String _searchRequestKey(
   String searchMode = '',
   String resultType = '',
   int offset = 0,
+  int? revision,
+  int? revisionWaitMs,
 }) {
   final normalizedQuery = query.trim().toLowerCase();
   final storageScopeId = read(authProvider).storageScopeId;
   final normalizedSearchMode =
       searchMode.isNotEmpty ? searchMode : classifySearchQueryMode(query);
-  return '$storageScopeId|$limit|$normalizedQuery|${deferSideSurfaces ? 'tracks_first' : 'full'}|$normalizedSearchMode|$resultType|$offset';
+  return '$storageScopeId|$limit|$normalizedQuery|${deferSideSurfaces ? 'tracks_first' : 'full'}|$normalizedSearchMode|$resultType|$offset|${revision ?? 0}|${revisionWaitMs ?? 0}';
 }
 
 Future<SearchFetchResult> fetchSearchPayload(
@@ -257,6 +263,8 @@ Future<SearchFetchResult> fetchSearchPayload(
   String searchMode = '',
   String resultType = '',
   int offset = 0,
+  int? revision,
+  int? revisionWaitMs,
 }) async {
   final normalizedQuery = query.trim();
   if (normalizedQuery.isEmpty) {
@@ -273,6 +281,8 @@ Future<SearchFetchResult> fetchSearchPayload(
     searchMode: normalizedSearchMode,
     resultType: resultType,
     offset: offset,
+    revision: revision,
+    revisionWaitMs: revisionWaitMs,
   );
   final inflight = _searchPayloadInflight[requestKey];
   if (inflight != null) {
@@ -289,6 +299,8 @@ Future<SearchFetchResult> fetchSearchPayload(
         searchMode: normalizedSearchMode,
         resultType: resultType,
         offset: offset,
+        revision: revision,
+        revisionWaitMs: revisionWaitMs,
       );
       final timedResponse = await _runSearchRequest(
         proxyControlHttpClient.post(

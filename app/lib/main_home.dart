@@ -1962,56 +1962,40 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                       },
                     ),
                     const SizedBox(height: 12),
-                    AnimatedSwitcher(
-                      duration: const Duration(milliseconds: 220),
-                      switchInCurve: Curves.easeOutCubic,
-                      switchOutCurve: Curves.easeInCubic,
-                      transitionBuilder: (child, animation) {
-                        final slide = Tween<Offset>(
-                          begin: const Offset(0.035, 0),
-                          end: Offset.zero,
-                        ).animate(animation);
-                        return FadeTransition(
-                          opacity: animation,
-                          child: SlideTransition(position: slide, child: child),
-                        );
-                      },
-                      child: NeatieSearchResultsSection(
-                        key: ValueKey<String>(
-                          'search-results:$_selectedSearchTab',
-                        ),
-                        query: submittedQuery,
-                        queryIntent: searchPage.queryIntent,
-                        topResult: searchPage.topResult,
-                        leadArtist: searchPage.leadArtist,
-                        containingAlbum: searchPage.containingAlbum,
-                        selectedTab: _selectedSearchTab,
-                        isLoading: isSearchLoading,
-                        loadingSurfaces: searchPage.loadingSurfaces,
-                        appendedItemKeys: searchPage.appendedItemKeys,
-                        tracks: displaySearchTracks,
-                        artists: searchPage.artists,
-                        albums: displayAlbums,
-                        recentlyPlayedTracks: lastPlayedTracks,
-                        similarArtists: searchPage.similarArtists,
-                        artistTracks: searchPage.artistTracks,
-                        artistAlbums: searchPage.artistAlbums,
-                        similarTracks: similarTracks,
-                        playlists: matchingPlaylists,
-                        errorMessage: searchPage.errorMessage,
-                        onPrimeTrack: (track) =>
-                            _warmTrack(extractTrackId(track)),
-                        onPlayTrack: (track) =>
-                            unawaited(_playSearchDiscoveryTrack(track)),
-                        onOpenTrack: (track) =>
-                            unawaited(_openSearchTrackDetails(track)),
-                        onOpenArtist: (artist) =>
-                            unawaited(_openSearchArtist(artist)),
-                        onOpenAlbum: (album) =>
-                            unawaited(_openSearchAlbum(album)),
-                        onOpenPlaylist: (playlist) =>
-                            unawaited(_openSearchPlaylist(playlist)),
-                      ),
+                    NeatieSearchResultsSection(
+                      key: ValueKey<String>(
+                          'search-results:$_selectedSearchTab'),
+                      query: submittedQuery,
+                      queryIntent: searchPage.queryIntent,
+                      topResult: searchPage.topResult,
+                      leadArtist: searchPage.leadArtist,
+                      containingAlbum: searchPage.containingAlbum,
+                      selectedTab: _selectedSearchTab,
+                      isLoading: isSearchLoading,
+                      loadingSurfaces: searchPage.loadingSurfaces,
+                      appendedItemKeys: searchPage.appendedItemKeys,
+                      tracks: displaySearchTracks,
+                      artists: searchPage.artists,
+                      albums: displayAlbums,
+                      recentlyPlayedTracks: lastPlayedTracks,
+                      similarArtists: searchPage.similarArtists,
+                      artistTracks: searchPage.artistTracks,
+                      artistAlbums: searchPage.artistAlbums,
+                      similarTracks: similarTracks,
+                      playlists: matchingPlaylists,
+                      errorMessage: searchPage.errorMessage,
+                      onPrimeTrack: (track) =>
+                          _warmTrack(extractTrackId(track)),
+                      onPlayTrack: (track) =>
+                          unawaited(_playSearchDiscoveryTrack(track)),
+                      onOpenTrack: (track) =>
+                          unawaited(_openSearchTrackDetails(track)),
+                      onOpenArtist: (artist) =>
+                          unawaited(_openSearchArtist(artist)),
+                      onOpenAlbum: (album) =>
+                          unawaited(_openSearchAlbum(album)),
+                      onOpenPlaylist: (playlist) =>
+                          unawaited(_openSearchPlaylist(playlist)),
                     ),
                   ],
                 ] else ...[

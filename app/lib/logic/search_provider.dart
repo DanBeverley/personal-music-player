@@ -297,9 +297,8 @@ class SearchPageState {
       queryIntent: queryIntent ?? this.queryIntent,
       topResult: clearTopResult ? null : topResult ?? this.topResult,
       leadArtist: clearLeadArtist ? null : leadArtist ?? this.leadArtist,
-      containingAlbum: clearContainingAlbum
-          ? null
-          : containingAlbum ?? this.containingAlbum,
+      containingAlbum:
+          clearContainingAlbum ? null : containingAlbum ?? this.containingAlbum,
       tracks: tracks ?? this.tracks,
       artists: artists ?? this.artists,
       albums: albums ?? this.albums,
@@ -468,19 +467,12 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
   final Ref ref;
   int _requestVersion = 0;
   bool isLoading = false;
+  bool _revisionWaitInFlight = false;
+  int _revisionWaitSerial = 0;
   String _currentQuery = '';
   static const Duration _searchDebounce = Duration.zero;
   static const Duration _searchTimeout = Duration(seconds: 15);
-  static const List<Duration> _progressiveRefreshDelays = <Duration>[
-    Duration(milliseconds: 700),
-    Duration(milliseconds: 1100),
-    Duration(milliseconds: 1700),
-    Duration(milliseconds: 2500),
-    Duration(milliseconds: 3500),
-    Duration(milliseconds: 4500),
-    Duration(milliseconds: 5500),
-    Duration(milliseconds: 6500),
-  ];
+  static const Duration _revisionWaitCadence = Duration(milliseconds: 180);
 
   SearchPageNotifier(this.ref) : super(const SearchPageState());
 
@@ -492,6 +484,8 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
     }
     final requestVersion = ++_requestVersion;
     _currentQuery = normalizedQuery;
+    _revisionWaitSerial++;
+    _revisionWaitInFlight = false;
     isLoading = true;
     state = state.copyWith(requestState: 'loading', clearError: true);
     try {
@@ -604,19 +598,20 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
     required String query,
     required int requestVersion,
   }) async {
-    for (final delay in _progressiveRefreshDelays) {
+    while (true) {
       if (requestVersion != _requestVersion ||
           query != _currentQuery ||
           !_artistSurfaceNeedsRefresh()) {
         return;
       }
-      await Future<void>.delayed(delay);
+      await Future<void>.delayed(_revisionWaitCadence);
       if (requestVersion != _requestVersion || query != _currentQuery) return;
       await loadMore(
         'artists',
         expectedQuery: query,
         expectedRequestVersion: requestVersion,
         refreshVisiblePage: true,
+        revisionWait: true,
       );
     }
   }
@@ -626,6 +621,7 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
     String? expectedQuery,
     int? expectedRequestVersion,
     bool refreshVisiblePage = false,
+    bool revisionWait = false,
   }) async {
     final normalizedSurface = surface.trim().toLowerCase();
     if ((expectedQuery != null && expectedQuery != _currentQuery) ||
@@ -653,13 +649,26 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
     final hasMore =
         surfaceIsEmpty || pageMap.isEmpty || pageMap['has_more'] == true;
     if (!hasMore && !refreshVisiblePage) return;
+    if (normalizedSurface == 'artists') {
+      if (revisionWait) {
+        if (_revisionWaitInFlight) return;
+        _revisionWaitInFlight = true;
+      } else if (_revisionWaitInFlight) {
+        // Let the passive long-poll finish before a manual refresh to avoid
+        // duplicate requests against the same snapshot revision.
+        return;
+      }
+    }
+    final revisionWaitSerial = _revisionWaitSerial;
     final offset = refreshVisiblePage || surfaceIsEmpty
         ? 0
         : (pageMap['next_offset'] as num?)?.toInt() ?? 0;
-    state = state.copyWith(
-      loadingSurfaces: {...state.loadingSurfaces, normalizedSurface},
-      appendedItemKeys: const {},
-    );
+    if (!revisionWait) {
+      state = state.copyWith(
+        loadingSurfaces: {...state.loadingSurfaces, normalizedSurface},
+        appendedItemKeys: const {},
+      );
+    }
     try {
       final result = await fetchSearchPayload(
         ref.read,
@@ -669,6 +678,12 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
         deferSideSurfaces: false,
         resultType: normalizedSurface,
         offset: offset,
+        revision: revisionWait
+            ? ((state.diagnostics['search_snapshot_revision'] as num?)
+                    ?.toInt() ??
+                0)
+            : null,
+        revisionWaitMs: revisionWait ? 3000 : null,
       );
       if (!result.hasPayload ||
           submittedQuery != _currentQuery ||
@@ -676,6 +691,16 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
         return;
       }
       final next = SearchPageState.fromJson(result.payload!);
+      if (next.diagnostics['revision_wait_timed_out'] == true) {
+        return;
+      }
+      // A polling revision that carries no visible improvement must not
+      // trigger a rebuild or animation. The loading flag is cleared in the
+      // finally block below, while the established snapshot remains intact.
+      if (_searchVisibleStateFingerprint(next) ==
+          _searchVisibleStateFingerprint(state)) {
+        return;
+      }
       final appendedKeys = <String>{};
       bool hasUsefulValue(dynamic value) {
         if (value == null) return false;
@@ -688,8 +713,9 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
       List<Map<String, dynamic>> appendUnique(
         List<Map<String, dynamic>> current,
         List<Map<String, dynamic>> incoming,
-        String Function(Map<String, dynamic>) keyOf,
-      ) {
+        String Function(Map<String, dynamic>) keyOf, {
+        String? animationSurface,
+      }) {
         final output = <Map<String, dynamic>>[...current];
         final positions = <String, int>{};
         for (final entry in current.indexed) {
@@ -713,7 +739,7 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
           }
           positions[key] = output.length;
           output.add(item);
-          appendedKeys.add('$normalizedSurface:$key');
+          appendedKeys.add('${animationSurface ?? normalizedSurface}:$key');
         }
         return output;
       }
@@ -744,8 +770,7 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
       }
 
       final previousSnapshotRevision =
-          (state.diagnostics['search_snapshot_revision'] as num?)?.toInt() ??
-              0;
+          (state.diagnostics['search_snapshot_revision'] as num?)?.toInt() ?? 0;
       final incomingSnapshotRevision =
           (next.diagnostics['search_snapshot_revision'] as num?)?.toInt() ?? 0;
       final currentTargetIdentity =
@@ -837,6 +862,7 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
                     state.artistTracks,
                     next.artistTracks,
                     (item) => extractTrackId(item) ?? '',
+                    animationSurface: 'tracks',
                   )
             : state.artistTracks,
         artistAlbums: normalizedSurface == 'artists'
@@ -850,6 +876,7 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
                             '${item['title']}|${item['artist']}')
                         .toString()
                         .toLowerCase(),
+                    animationSurface: 'albums',
                   )
             : state.artistAlbums,
         relatedAlbums:
@@ -864,6 +891,7 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
                                 '${item['title']}|${item['artist']}')
                             .toString()
                             .toLowerCase(),
+                        animationSurface: 'albums',
                       )
                 : state.relatedAlbums,
         topResult: refreshedTopResult,
@@ -896,8 +924,7 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
               .toSet();
           final visibleMoreCount = state.artistTracks
               .where(
-                (track) =>
-                    !primaryTrackIds.contains(extractTrackId(track)),
+                (track) => !primaryTrackIds.contains(extractTrackId(track)),
               )
               .length;
           debugProxyLog(
@@ -907,9 +934,15 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
         }
       }
     } finally {
-      state = state.copyWith(
-        loadingSurfaces: state.loadingSurfaces.difference({normalizedSurface}),
-      );
+      if (revisionWait && revisionWaitSerial == _revisionWaitSerial) {
+        _revisionWaitInFlight = false;
+      }
+      if (state.loadingSurfaces.contains(normalizedSurface)) {
+        state = state.copyWith(
+          loadingSurfaces:
+              state.loadingSurfaces.difference({normalizedSurface}),
+        );
+      }
     }
   }
 
@@ -920,6 +953,8 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
 
   void clear() {
     _requestVersion++;
+    _revisionWaitSerial++;
+    _revisionWaitInFlight = false;
     isLoading = false;
     _currentQuery = '';
     state = const SearchPageState(requestState: 'idle');

@@ -617,21 +617,6 @@ class NeatieSearchResultsSection extends StatelessWidget {
           ),
         );
       }
-      final recentMatches = _matchingRecentTracks(
-        query,
-        recentlyPlayedTracks,
-      );
-      if (recentMatches.isNotEmpty) {
-        sections.add(
-          _SearchTrackSection(
-            title: 'Recently played',
-            tracks: recentMatches,
-            onPlay: onPlayTrack,
-            onPrime: onPrimeTrack,
-            onOpen: onOpenTrack,
-          ),
-        );
-      }
       if (tracks.isNotEmpty) {
         final topId = backendTopType == 'track'
             ? extractTrackId(backendTop ?? const {})
@@ -652,20 +637,8 @@ class NeatieSearchResultsSection extends StatelessWidget {
             title: 'Artists',
             artists: artists,
             appendedItemKeys: appendedItemKeys,
+            horizontalShelf: true,
             onOpen: onOpenArtist));
-      }
-      if (artistAlbums.isNotEmpty) {
-        sections.add(_SearchAlbumSection(
-            title: artistAlbumTitle,
-            albums: artistAlbums,
-            appendedItemKeys: appendedItemKeys,
-            onOpen: onOpenAlbum));
-      }
-      if (regularAlbums.isNotEmpty) {
-        sections.add(_SearchAlbumSection(
-            albums: regularAlbums,
-            appendedItemKeys: appendedItemKeys,
-            onOpen: onOpenAlbum));
       }
       if (additionalArtistTracks.isNotEmpty) {
         sections.add(_SearchTrackSection(
@@ -678,18 +651,26 @@ class NeatieSearchResultsSection extends StatelessWidget {
           onOpen: onOpenTrack,
         ));
       }
-      if (similarTracks.isNotEmpty) {
-        sections.add(_SearchTrackSection(
-            title: 'Similar tracks',
-            tracks: similarTracks,
-            onPlay: onPlayTrack,
-            onPrime: onPrimeTrack,
-            onOpen: onOpenTrack));
+      if (artistAlbums.isNotEmpty) {
+        sections.add(_SearchAlbumSection(
+            title: artistAlbumTitle,
+            albums: artistAlbums,
+            appendedItemKeys: appendedItemKeys,
+            horizontalShelf: true,
+            onOpen: onOpenAlbum));
+      }
+      if (regularAlbums.isNotEmpty) {
+        sections.add(_SearchAlbumSection(
+            albums: regularAlbums,
+            appendedItemKeys: appendedItemKeys,
+            horizontalShelf: true,
+            onOpen: onOpenAlbum));
       }
       if (playlists.isNotEmpty) {
         sections.add(_SearchPlaylistSection(
             playlists: playlists,
             appendedItemKeys: appendedItemKeys,
+            horizontalShelf: true,
             onOpen: onOpenPlaylist));
       }
       if (similarArtists.isNotEmpty) {
@@ -697,8 +678,32 @@ class NeatieSearchResultsSection extends StatelessWidget {
             title: 'Related artists',
             artists: similarArtists,
             appendedItemKeys: appendedItemKeys,
+            horizontalShelf: true,
             animateSection: true,
             onOpen: onOpenArtist));
+      }
+      final recentMatches = _matchingRecentTracks(
+        query,
+        recentlyPlayedTracks,
+      );
+      if (recentMatches.isNotEmpty) {
+        sections.add(
+          _SearchTrackSection(
+            title: 'Recently played',
+            tracks: recentMatches,
+            onPlay: onPlayTrack,
+            onPrime: onPrimeTrack,
+            onOpen: onOpenTrack,
+          ),
+        );
+      }
+      if (similarTracks.isNotEmpty) {
+        sections.add(_SearchTrackSection(
+            title: 'Similar tracks',
+            tracks: similarTracks,
+            onPlay: onPlayTrack,
+            onPrime: onPrimeTrack,
+            onOpen: onOpenTrack));
       }
     } else if (normalizedTab == 'songs') {
       if (tracks.isNotEmpty) {
@@ -844,8 +849,11 @@ class _SearchAppendAnimation extends StatelessWidget {
       builder: (context, value, animatedChild) => Opacity(
         opacity: value,
         child: Transform.translate(
-          offset: Offset(0, 14 * (1 - value)),
-          child: animatedChild,
+          offset: Offset(18 * (1 - value), 0),
+          child: Transform.scale(
+            scale: 0.97 + (0.03 * value),
+            child: animatedChild,
+          ),
         ),
       ),
       child: child,
@@ -858,11 +866,13 @@ class _SearchPlaylistSection extends StatelessWidget {
     required this.playlists,
     required this.onOpen,
     this.appendedItemKeys = const {},
+    this.horizontalShelf = false,
   });
 
   final List<Map<String, dynamic>> playlists;
   final ValueChanged<Map<String, dynamic>> onOpen;
   final Set<String> appendedItemKeys;
+  final bool horizontalShelf;
 
   @override
   Widget build(BuildContext context) {
@@ -876,67 +886,81 @@ class _SearchPlaylistSection extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         const _SearchSectionTitle('Playlists'),
-        GridView.builder(
-            shrinkWrap: true,
-            physics: const NeverScrollableScrollPhysics(),
-            gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-              crossAxisCount: 2,
-              mainAxisSpacing: 18,
-              crossAxisSpacing: 14,
-              childAspectRatio: 0.78,
-            ),
-            itemCount: visiblePlaylists.length,
-            itemBuilder: (context, index) {
-              final playlist = visiblePlaylists[index];
-              final count = (playlist['track_count'] as num?)?.toInt() ?? 0;
-              final key = (playlist['id'] ?? playlist['name'] ?? '').toString();
-              return _SearchAppendAnimation(
-                key: ValueKey('playlist:$key'),
-                animate: appendedItemKeys.contains('playlists:$key'),
-                order: index,
-                child: InkWell(
-                  borderRadius: BorderRadius.circular(10),
-                  onTap: () => onOpen(playlist),
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(vertical: 7),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        AppArtwork(
-                          thumbnail: playlist['thumbnail'],
-                          width: double.infinity,
-                          height: 138,
-                          radius: 10,
-                        ),
-                        const SizedBox(height: 9),
-                        Text(
-                          playlist['name']?.toString() ?? 'Playlist',
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontWeight: FontWeight.w700,
+        SizedBox(
+          height: horizontalShelf ? 210 : null,
+          child: GridView.builder(
+              scrollDirection:
+                  horizontalShelf ? Axis.horizontal : Axis.vertical,
+              shrinkWrap: true,
+              physics: horizontalShelf
+                  ? const BouncingScrollPhysics()
+                  : const NeverScrollableScrollPhysics(),
+              gridDelegate: horizontalShelf
+                  ? const SliverGridDelegateWithFixedCrossAxisCount(
+                      crossAxisCount: 1,
+                      mainAxisExtent: 150,
+                      mainAxisSpacing: 14,
+                    )
+                  : const SliverGridDelegateWithFixedCrossAxisCount(
+                      crossAxisCount: 2,
+                      mainAxisSpacing: 18,
+                      crossAxisSpacing: 14,
+                      childAspectRatio: 0.78,
+                    ),
+              itemCount: visiblePlaylists.length,
+              itemBuilder: (context, index) {
+                final playlist = visiblePlaylists[index];
+                final count = (playlist['track_count'] as num?)?.toInt() ?? 0;
+                final key =
+                    (playlist['id'] ?? playlist['name'] ?? '').toString();
+                return _SearchAppendAnimation(
+                  key: ValueKey('playlist:$key'),
+                  animate: appendedItemKeys.contains('playlists:$key'),
+                  order: index,
+                  child: InkWell(
+                    borderRadius: BorderRadius.circular(10),
+                    onTap: () => onOpen(playlist),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 7),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          AppArtwork(
+                            thumbnail: playlist['thumbnail'],
+                            width: double.infinity,
+                            height: 138,
+                            radius: 10,
                           ),
-                        ),
-                        const SizedBox(height: 3),
-                        Text(
-                          [
-                            playlist['author']?.toString().trim(),
-                            if (count > 0)
-                              '$count ${count == 1 ? 'track' : 'tracks'}',
-                          ]
-                              .where((value) => value?.isNotEmpty == true)
-                              .join(' • '),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(color: neatieMutedText),
-                        ),
-                      ],
+                          const SizedBox(height: 9),
+                          Text(
+                            playlist['name']?.toString() ?? 'Playlist',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                          const SizedBox(height: 3),
+                          Text(
+                            [
+                              playlist['author']?.toString().trim(),
+                              if (count > 0)
+                                '$count ${count == 1 ? 'track' : 'tracks'}',
+                            ]
+                                .where((value) => value?.isNotEmpty == true)
+                                .join(' • '),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(color: neatieMutedText),
+                          ),
+                        ],
+                      ),
                     ),
                   ),
-                ),
-              );
-            }),
+                );
+              }),
+        ),
       ],
     );
   }
@@ -1274,6 +1298,7 @@ class _SearchArtistSection extends StatelessWidget {
     required this.onOpen,
     this.appendedItemKeys = const {},
     this.animateSection = false,
+    this.horizontalShelf = false,
   });
 
   final String title;
@@ -1281,6 +1306,7 @@ class _SearchArtistSection extends StatelessWidget {
   final ValueChanged<Map<String, dynamic>> onOpen;
   final Set<String> appendedItemKeys;
   final bool animateSection;
+  final bool horizontalShelf;
 
   @override
   Widget build(BuildContext context) {
@@ -1294,49 +1320,62 @@ class _SearchArtistSection extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         _SearchSectionTitle(title),
-        GridView.builder(
-          shrinkWrap: true,
-          physics: const NeverScrollableScrollPhysics(),
-          gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-            crossAxisCount: 2,
-            mainAxisSpacing: 18,
-            crossAxisSpacing: 16,
-            childAspectRatio: 0.88,
-          ),
-          itemCount: artists.length,
-          itemBuilder: (context, index) {
-            final artist = artists[index];
-            final key = _searchArtistIdentityKey(artist);
-            return _SearchAppendAnimation(
-              key: ValueKey('artist:$key'),
-              animate: appendedItemKeys.contains('artists:$key'),
-              order: index,
-              child: InkWell(
-                onTap: () => onOpen(artist),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    ArtistArtwork(
-                      thumbnail: artist['thumbnail'],
-                      width: 138,
-                      height: 138,
-                    ),
-                    const SizedBox(height: 8),
-                    Text(
-                      artist['name']?.toString() ?? 'Artist',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                          color: Colors.white, fontWeight: FontWeight.w700),
-                    ),
-                    const SizedBox(height: 2),
-                    const Text('Artist',
-                        style: TextStyle(color: neatieMutedText, fontSize: 12)),
-                  ],
+        SizedBox(
+          height: horizontalShelf ? 210 : null,
+          child: GridView.builder(
+            scrollDirection: horizontalShelf ? Axis.horizontal : Axis.vertical,
+            shrinkWrap: true,
+            physics: horizontalShelf
+                ? const BouncingScrollPhysics()
+                : const NeverScrollableScrollPhysics(),
+            gridDelegate: horizontalShelf
+                ? const SliverGridDelegateWithFixedCrossAxisCount(
+                    crossAxisCount: 1,
+                    mainAxisExtent: 150,
+                    mainAxisSpacing: 16,
+                  )
+                : const SliverGridDelegateWithFixedCrossAxisCount(
+                    crossAxisCount: 2,
+                    mainAxisSpacing: 18,
+                    crossAxisSpacing: 16,
+                    childAspectRatio: 0.88,
+                  ),
+            itemCount: artists.length,
+            itemBuilder: (context, index) {
+              final artist = artists[index];
+              final key = _searchArtistIdentityKey(artist);
+              return _SearchAppendAnimation(
+                key: ValueKey('artist:$key'),
+                animate: appendedItemKeys.contains('artists:$key'),
+                order: index,
+                child: InkWell(
+                  onTap: () => onOpen(artist),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      ArtistArtwork(
+                        thumbnail: artist['thumbnail'],
+                        width: 138,
+                        height: 138,
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        artist['name']?.toString() ?? 'Artist',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                            color: Colors.white, fontWeight: FontWeight.w700),
+                      ),
+                      const SizedBox(height: 2),
+                      const Text('Artist',
+                          style:
+                              TextStyle(color: neatieMutedText, fontSize: 12)),
+                    ],
+                  ),
                 ),
-              ),
-            );
-          },
+              );
+            },
+          ),
         ),
       ],
     );
@@ -1355,12 +1394,14 @@ class _SearchAlbumSection extends StatelessWidget {
     required this.albums,
     required this.onOpen,
     this.appendedItemKeys = const {},
+    this.horizontalShelf = false,
   });
 
   final String title;
   final List<Map<String, dynamic>> albums;
   final ValueChanged<Map<String, dynamic>> onOpen;
   final Set<String> appendedItemKeys;
+  final bool horizontalShelf;
 
   @override
   Widget build(BuildContext context) {
@@ -1374,63 +1415,78 @@ class _SearchAlbumSection extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         _SearchSectionTitle(title),
-        GridView.builder(
-            shrinkWrap: true,
-            physics: const NeverScrollableScrollPhysics(),
-            gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-              crossAxisCount: 2,
-              mainAxisSpacing: 18,
-              crossAxisSpacing: 14,
-              childAspectRatio: 0.72,
-            ),
-            itemCount: visibleAlbums.length,
-            itemBuilder: (context, index) {
-              final album = visibleAlbums[index];
-              final key = _searchAlbumIdentityKey(album);
-              return _SearchAppendAnimation(
-                key: ValueKey('album:$key'),
-                animate: appendedItemKeys.contains('albums:$key'),
-                order: index,
-                child: InkWell(
-                  onTap: () => onOpen(album),
-                  borderRadius: BorderRadius.circular(12),
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(vertical: 7),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        AppArtwork(
-                          thumbnail: album['thumbnail'],
-                          width: double.infinity,
-                          height: 150,
-                          radius: 9,
-                        ),
-                        const SizedBox(height: 8),
-                        Text(
-                          album['title']?.toString() ?? 'Album',
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontWeight: FontWeight.w700,
+        SizedBox(
+          // Android's font metrics need a little more room beneath the 150px
+          // cover for both album text lines.
+          height: horizontalShelf ? 218 : null,
+          child: GridView.builder(
+              scrollDirection:
+                  horizontalShelf ? Axis.horizontal : Axis.vertical,
+              shrinkWrap: true,
+              physics: horizontalShelf
+                  ? const BouncingScrollPhysics()
+                  : const NeverScrollableScrollPhysics(),
+              gridDelegate: horizontalShelf
+                  ? const SliverGridDelegateWithFixedCrossAxisCount(
+                      crossAxisCount: 1,
+                      mainAxisExtent: 170,
+                      mainAxisSpacing: 14,
+                    )
+                  : const SliverGridDelegateWithFixedCrossAxisCount(
+                      crossAxisCount: 2,
+                      mainAxisSpacing: 18,
+                      crossAxisSpacing: 14,
+                      childAspectRatio: 0.72,
+                    ),
+              itemCount: visibleAlbums.length,
+              itemBuilder: (context, index) {
+                final album = visibleAlbums[index];
+                final key = _searchAlbumIdentityKey(album);
+                return _SearchAppendAnimation(
+                  key: ValueKey('album:$key'),
+                  animate: appendedItemKeys.contains('albums:$key'),
+                  order: index,
+                  child: InkWell(
+                    onTap: () => onOpen(album),
+                    borderRadius: BorderRadius.circular(12),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 7),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          AppArtwork(
+                            thumbnail: album['thumbnail'],
+                            width: double.infinity,
+                            height: 150,
+                            radius: 9,
                           ),
-                        ),
-                        const SizedBox(height: 4),
-                        Text(
-                          album['artist']?.toString() ?? '',
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            color: neatieMutedText,
-                            fontSize: 12,
+                          const SizedBox(height: 8),
+                          Text(
+                            album['title']?.toString() ?? 'Album',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontWeight: FontWeight.w700,
+                            ),
                           ),
-                        ),
-                      ],
+                          const SizedBox(height: 4),
+                          Text(
+                            album['artist']?.toString() ?? '',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              color: neatieMutedText,
+                              fontSize: 12,
+                            ),
+                          ),
+                        ],
+                      ),
                     ),
                   ),
-                ),
-              );
-            }),
+                );
+              }),
+        ),
       ],
     );
   }

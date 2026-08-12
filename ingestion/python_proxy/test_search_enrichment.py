@@ -9,6 +9,7 @@ from concurrent.futures import Future
 from threading import Lock
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+import pytest
 
 CURRENT_DIR = pathlib.Path(__file__).resolve().parent
 if str(CURRENT_DIR) not in sys.path:
@@ -95,6 +96,7 @@ class _MemoryTestServer:
         ]
 
 
+@pytest.mark.search_enrichment
 class SearchEnrichmentTests(unittest.TestCase):
     def test_short_alias_lookup_is_not_starved_by_internal_substrings(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1022,6 +1024,8 @@ class SearchEnrichmentTests(unittest.TestCase):
                 "https://example.test/piece-of-mind.jpg",
             )
 
+    @pytest.mark.search_artwork
+    @pytest.mark.search_snapshot
     def test_snapshot_rehydrates_artwork_cached_after_initial_search(self) -> None:
         service = SearchService(_MemoryTestServer(":memory:"))
         cached_path = artist_artwork_path(
@@ -1462,6 +1466,7 @@ class SearchEnrichmentTests(unittest.TestCase):
             [first_source],
         )
 
+    @pytest.mark.search_artwork
     def test_entity_artwork_cache_bounds_alternates_and_persists_retry_state(
         self,
     ) -> None:
@@ -1510,6 +1515,8 @@ class SearchEnrichmentTests(unittest.TestCase):
         self.assertEqual(len(completed[0].get("artwork_source_failures") or {}), 4)
         self.assertFalse(completed[0].get("thumbnail"))
 
+    @pytest.mark.search_artwork
+    @pytest.mark.search_snapshot
     def test_entity_artwork_success_notifies_active_search_snapshot(self) -> None:
         snapshot_key = "entity-artwork-test||album"
         album = {
@@ -1841,6 +1848,7 @@ class SearchEnrichmentTests(unittest.TestCase):
 
         self.assertFalse(attached.get("thumbnail"))
 
+    @pytest.mark.search_artwork
     def test_album_detail_hydration_persists_shared_entity_artwork_state(self) -> None:
         album = {
             "status": "success",
@@ -2012,6 +2020,7 @@ class SearchEnrichmentTests(unittest.TestCase):
 
         self.assertFalse(artist.get("thumbnail"))
 
+    @pytest.mark.search_artwork
     def test_related_artist_visibility_requires_usable_artwork(self) -> None:
         service = SearchService(_MemoryTestServer(":memory:"))
         valid_token = artist_artwork_token("provider:artist:uc-valid")
@@ -2120,6 +2129,7 @@ class SearchEnrichmentTests(unittest.TestCase):
             ["Elf"],
         )
 
+    @pytest.mark.search_snapshot
     def test_snapshot_store_revision_tracks_published_changes_only(self) -> None:
         snapshot_key = "progressive-test||semantic-store"
         base = {
@@ -2703,6 +2713,138 @@ class SearchEnrichmentTests(unittest.TestCase):
             self.assertTrue(suggestions[0].get("direct_play"))
             self.assertEqual(suggestions[0].get("track", {}).get("id"), "radiohead-creep")
 
+    def test_suggestions_filter_placeholder_entities_but_keep_real_unknown_names(self) -> None:
+        class InlineExecutor:
+            def submit(self, fn, *args, **kwargs):
+                future = Future()
+                future.set_result(fn(*args, **kwargs))
+                return future
+
+        class PlaceholderSuggestionServer(_MemoryTestServer):
+            class FakeYtMusic:
+                def get_search_suggestions(self, _query: str):
+                    return ["[unknown]", "Unknown Artist", "Unknown Soldier", "Iron Maiden"]
+
+            def __init__(self, db_path: str) -> None:
+                super().__init__(db_path)
+                self.ytmusic = self.FakeYtMusic()
+                self.search_upstream_executor = InlineExecutor()
+
+            def _recommendation_trim_text(self, value):
+                return str(value or "").strip()
+
+            def _recommendation_unique_strings(self, values, limit=None):
+                result = []
+                for value in values or []:
+                    text = str(value or "").strip()
+                    if text and text not in result:
+                        result.append(text)
+                    if limit and len(result) >= limit:
+                        break
+                return result
+
+        with tempfile.TemporaryDirectory() as tmp_dir, patch(
+            "auralis_backend.search.runtime.load_fuzzy_catalog_entity_memories",
+            return_value=[],
+        ), patch(
+            "auralis_backend.search.runtime.lookup_search_result",
+            return_value=None,
+        ), patch(
+            "auralis_backend.search.runtime.lookup_persistent_suggestion_base",
+            return_value=None,
+        ):
+            suggestion_server = PlaceholderSuggestionServer(
+                str(pathlib.Path(tmp_dir) / "placeholder-suggestions.sqlite")
+            )
+            req = SimpleNamespace(
+                query="unk",
+                limit=5,
+                recent_queries=[],
+                taste_queries=[],
+                recent_tracks=[],
+                last_played_tracks=[],
+                recent_track_snapshots=[],
+                top_track_snapshots=[],
+                anchor_track_snapshots=[],
+            )
+            suggestions = semantic_search_suggestion_items(req, server=suggestion_server)
+            texts = [item.get("text") for item in suggestions]
+
+        self.assertNotIn("[unknown]", texts)
+        self.assertNotIn("Unknown Artist", texts)
+        self.assertIn("Unknown Soldier", texts)
+
+    def test_persistent_suggestion_base_is_shared_without_repeating_upstream(self) -> None:
+        class InlineExecutor:
+            def submit(self, fn, *args, **kwargs):
+                future = Future()
+                future.set_result(fn(*args, **kwargs))
+                return future
+
+        class CountingYtMusic:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def get_search_suggestions(self, _query: str):
+                self.calls += 1
+                return ["Metallica", "Master of Puppets", "Metallica albums"]
+
+        class PersistentSuggestionServer(_MemoryTestServer):
+            def __init__(self, db_path: str) -> None:
+                super().__init__(db_path)
+                self.ytmusic = CountingYtMusic()
+                self.search_upstream_executor = InlineExecutor()
+
+            def _recommendation_trim_text(self, value):
+                return str(value or "").strip()
+
+            def _recommendation_unique_strings(self, values, limit=None):
+                result = []
+                for value in values or []:
+                    text = str(value or "").strip()
+                    if text and text not in result:
+                        result.append(text)
+                    if limit and len(result) >= limit:
+                        break
+                return result
+
+        with tempfile.TemporaryDirectory() as tmp_dir, patch(
+            "auralis_backend.search.runtime.load_fuzzy_catalog_entity_memories",
+            return_value=[],
+        ), patch(
+            "auralis_backend.search.runtime.lookup_search_result",
+            return_value=None,
+        ):
+            suggestion_server = PersistentSuggestionServer(
+                str(pathlib.Path(tmp_dir) / "persistent-suggestions.sqlite")
+            )
+            base_req = dict(
+                query="master puppets",
+                limit=5,
+                recent_queries=[],
+                taste_queries=[],
+                recent_tracks=[],
+                last_played_tracks=[],
+                recent_track_snapshots=[],
+                top_track_snapshots=[],
+                anchor_track_snapshots=[],
+            )
+            first = semantic_search_suggestion_items(
+                SimpleNamespace(**base_req, user_scope_id="user-a"),
+                server=suggestion_server,
+            )
+            second = semantic_search_suggestion_items(
+                SimpleNamespace(**base_req, user_scope_id="user-b"),
+                server=suggestion_server,
+            )
+
+        self.assertEqual(suggestion_server.ytmusic.calls, 1)
+        self.assertEqual(
+            [item.get("text") for item in second],
+            [item.get("text") for item in first],
+        )
+
+    @pytest.mark.search_latency
     def test_direct_play_suggestion_returns_without_upstream_wait(self) -> None:
         class FailingExecutor:
             def submit(self, *_args, **_kwargs):

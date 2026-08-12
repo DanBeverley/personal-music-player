@@ -4,6 +4,7 @@ import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
+import pytest
 
 CURRENT_DIR = pathlib.Path(__file__).resolve().parent
 if str(CURRENT_DIR) not in sys.path:
@@ -35,6 +36,8 @@ from auralis_backend.search.service import (
     _repair_search_artwork,
     _search_album_is_publishable,
     _search_playlist_is_publishable,
+    _search_snapshot_key,
+    _store_search_snapshot,
 )
 from auralis_backend.search.upstream_runtime import normalize_song_result
 from auralis_backend.storage.artist_artwork import (
@@ -111,6 +114,7 @@ def _test_resolved_target(
     }
 
 
+@pytest.mark.search_core
 class SearchLatencyTests(unittest.TestCase):
     def setUp(self) -> None:
         self._musicbrainz_patch = patch(
@@ -164,7 +168,7 @@ class SearchLatencyTests(unittest.TestCase):
                 SimpleNamespace(
                     query=query,
                     surface="search",
-                    force_refresh=True,
+                    force_refresh=False,
                     search_mode="exact",
                     anchor_track_snapshots=[],
                 ),
@@ -387,6 +391,7 @@ class SearchLatencyTests(unittest.TestCase):
             "exact",
         )
 
+    @pytest.mark.search_artwork
     def test_search_artwork_repair_uses_matching_playable_track(self) -> None:
         tracks, albums = _repair_search_artwork(
             [
@@ -412,6 +417,7 @@ class SearchLatencyTests(unittest.TestCase):
         self.assertEqual(tracks[0].get("thumbnail"), expected)
         self.assertEqual(albums[0].get("thumbnail"), expected)
 
+    @pytest.mark.search_artwork
     def test_search_cards_require_artwork_before_publication(self) -> None:
         self.assertFalse(
             _search_album_is_publishable(
@@ -448,6 +454,7 @@ class SearchLatencyTests(unittest.TestCase):
             )
         )
 
+    @pytest.mark.search_artwork
     def test_album_artwork_is_owned_by_backend_when_server_is_available(self) -> None:
         with patch(
             "auralis_backend.search.service.schedule_entity_artwork_cache",
@@ -473,6 +480,33 @@ class SearchLatencyTests(unittest.TestCase):
         )
         scheduled.assert_called_once()
 
+    @pytest.mark.search_artwork
+    def test_first_response_artwork_lookup_does_not_schedule_remote_cache(self) -> None:
+        with patch(
+            "auralis_backend.search.service.schedule_entity_artwork_cache",
+            return_value=True,
+        ) as scheduled:
+            _tracks, albums = _repair_search_artwork(
+                [],
+                [
+                    {
+                        "id": "MPRE-deferred-cover",
+                        "title": "Deferred Cover",
+                        "artist": "Test Artist",
+                        "thumbnail": "https://example.test/cover.jpg",
+                    }
+                ],
+                server=None,
+            )
+
+        self.assertEqual(
+            albums[0].get("thumbnail"),
+            "https://example.test/cover.jpg",
+        )
+        self.assertFalse(_search_album_is_publishable(albums[0]))
+        scheduled.assert_not_called()
+
+    @pytest.mark.search_artwork
     def test_verified_persisted_album_artwork_is_publishable_immediately(self) -> None:
         album = {
             "id": "MPRE-verified-cover",
@@ -503,6 +537,7 @@ class SearchLatencyTests(unittest.TestCase):
         self.assertEqual(albums[0].get("thumbnail"), f"/entity_artwork/{token}")
         self.assertTrue(_search_album_is_publishable(albums[0]))
 
+    @pytest.mark.search_artwork
     def test_album_artwork_identity_prefers_provider_detail_id_across_aliases(self) -> None:
         search_album = {
             "id": "MPRE-shared-album",
@@ -991,7 +1026,9 @@ class SearchLatencyTests(unittest.TestCase):
                     query="Ronnie James Dio",
                     user_scope_id="canonical-artist-user",
                     surface="search",
-                    force_refresh=False,
+                    # This test exercises fresh canonical construction, not
+                    # the persisted snapshot fast path.
+                    force_refresh=True,
                     limit=16,
                     search_mode="entity",
                     defer_side_surfaces=False,
@@ -3123,6 +3160,7 @@ class SearchLatencyTests(unittest.TestCase):
             ["In Bloom"],
         )
 
+    @pytest.mark.search_latency
     def test_recording_evidence_starts_while_other_provider_branches_run(self) -> None:
         timeline = {}
 
@@ -3227,6 +3265,319 @@ class SearchLatencyTests(unittest.TestCase):
                 "canonical_evidence_outcome"
             ),
             "hit",
+        )
+
+    @pytest.mark.search_latency
+    def test_decisive_provider_evidence_caps_only_canonical_wait(self) -> None:
+        provider_tracks = [
+            {
+                "id": "nirvana-in-bloom",
+                "title": "In Bloom",
+                "channel": "Nirvana",
+                "artist_id": "UC-Nirvana",
+                "album_id": "MPRE-Nevermind",
+                "album": "Nevermind",
+                "views": "300M",
+                "source_authority": "topic",
+            },
+            {
+                "id": "other-in-bloom",
+                "title": "In Bloom",
+                "channel": "Other Artist",
+                "artist_id": "UC-Other",
+                "album_id": "MPRE-Other",
+                "album": "Other Album",
+                "views": "10K",
+            },
+        ]
+
+        def slow_recording_evidence(*_args, **_kwargs):
+            time.sleep(0.30)
+            return []
+
+        with (
+            patch(
+                "auralis_backend.domain.retrieval._retrieval_cache_get",
+                return_value=None,
+            ),
+            patch("auralis_backend.domain.retrieval._retrieval_cache_set"),
+            patch(
+                "auralis_backend.domain.retrieval.load_catalog_entity_memories",
+                return_value=[],
+            ),
+            patch(
+                "auralis_backend.domain.retrieval.load_fuzzy_catalog_entity_memories",
+                return_value=[],
+            ),
+            patch(
+                "auralis_backend.domain.retrieval.search_tracks_direct",
+                return_value=provider_tracks,
+            ),
+            patch(
+                "auralis_backend.domain.retrieval.search_artists_direct_cached",
+                return_value=[
+                    {
+                        "id": "UC-Nirvana",
+                        "name": "Nirvana",
+                        "source_authority": "official_artist_channel",
+                    }
+                ],
+            ),
+            patch(
+                "auralis_backend.domain.retrieval.search_albums_direct",
+                return_value=[
+                    {
+                        "id": "MPRE-Nevermind",
+                        "title": "Nevermind",
+                        "artist": "Nirvana",
+                        "artist_id": "UC-Nirvana",
+                    }
+                ],
+            ),
+            patch(
+                "auralis_backend.domain.retrieval.search_musicbrainz_recording_items",
+                side_effect=slow_recording_evidence,
+            ),
+            patch(
+                "auralis_backend.domain.retrieval._SEARCH_DECISIVE_CANONICAL_GRACE_SECONDS",
+                0.05,
+            ),
+        ):
+            payload = retrieve_search_candidates_fast(
+                SimpleNamespace(
+                    query="In Bloom",
+                    surface="search",
+                    force_refresh=True,
+                    search_mode="exact",
+                    defer_side_surfaces=False,
+                    anchor_track_snapshots=[],
+                ),
+                {
+                    "user_scope_id": "guest",
+                    "recent_queries": [],
+                    "last_played_tracks": [],
+                },
+                limit=8,
+                server=server,
+            )
+
+        diagnostics = payload.get("retrieval_diagnostics") or {}
+        self.assertEqual(payload.get("query_intent"), "track")
+        self.assertEqual(
+            ((payload.get("resolved_target") or {}).get("lead_artist") or {}).get(
+                "name"
+            ),
+            "Nirvana",
+        )
+        self.assertEqual(
+            set(diagnostics.get("branches_required") or []),
+            {"tracks.fast", "artists.fast", "albums.fast"},
+        )
+        self.assertEqual(diagnostics.get("branches_skipped_from_critical_path"), [])
+        self.assertTrue(
+            {"tracks.fast", "artists.fast", "albums.fast"}.issubset(
+                set(diagnostics.get("completed_sources") or [])
+            )
+        )
+        self.assertEqual(diagnostics.get("canonical_evidence_outcome"), "timeout")
+        self.assertLess(
+            (diagnostics.get("stage_timings_ms") or {}).get(
+                "canonical_evidence_wait", 1000
+            ),
+            150,
+        )
+
+    @pytest.mark.search_latency
+    def test_multi_branch_corroboration_caps_wait_without_authority_label(self) -> None:
+        provider_tracks = [
+            {
+                "id": "metallica-master-of-puppets",
+                "title": "Master of Puppets",
+                "channel": "Metallica",
+                "artist_id": "UC-Metallica",
+                "album_id": "MPRE-MasterOfPuppets",
+                "album": "Master of Puppets",
+                "views": "500M",
+            },
+            {
+                "id": "cover-master-of-puppets",
+                "title": "Master of Puppets",
+                "channel": "Cover Artist",
+                "artist_id": "UC-Cover",
+                "album_id": "MPRE-Cover",
+                "album": "Metal Covers",
+                "views": "10K",
+            },
+        ]
+
+        def slow_recording_evidence(*_args, **_kwargs):
+            time.sleep(0.30)
+            return []
+
+        with (
+            patch(
+                "auralis_backend.domain.retrieval._retrieval_cache_get",
+                return_value=None,
+            ),
+            patch("auralis_backend.domain.retrieval._retrieval_cache_set"),
+            patch(
+                "auralis_backend.domain.retrieval.load_catalog_entity_memories",
+                return_value=[],
+            ),
+            patch(
+                "auralis_backend.domain.retrieval.load_fuzzy_catalog_entity_memories",
+                return_value=[],
+            ),
+            patch(
+                "auralis_backend.domain.retrieval.search_tracks_direct",
+                return_value=provider_tracks,
+            ),
+            patch(
+                "auralis_backend.domain.retrieval.search_artists_direct_cached",
+                return_value=[{"id": "UC-Metallica", "name": "Metallica"}],
+            ),
+            patch(
+                "auralis_backend.domain.retrieval.search_albums_direct",
+                return_value=[
+                    {
+                        "id": "MPRE-MasterOfPuppets",
+                        "title": "Master of Puppets",
+                        "artist": "Metallica",
+                        "artist_id": "UC-Metallica",
+                    }
+                ],
+            ),
+            patch(
+                "auralis_backend.domain.retrieval.search_musicbrainz_recording_items",
+                side_effect=slow_recording_evidence,
+            ),
+            patch(
+                "auralis_backend.domain.retrieval._SEARCH_DECISIVE_CANONICAL_GRACE_SECONDS",
+                0.05,
+            ),
+        ):
+            payload = retrieve_search_candidates_fast(
+                SimpleNamespace(
+                    query="Master of Puppets",
+                    surface="search",
+                    force_refresh=True,
+                    search_mode="exact",
+                    defer_side_surfaces=False,
+                    anchor_track_snapshots=[],
+                ),
+                {"user_scope_id": "", "recent_queries": [], "last_played_tracks": []},
+                limit=8,
+                server=server,
+            )
+
+        diagnostics = payload.get("retrieval_diagnostics") or {}
+        decision = diagnostics.get("provider_recording_decision") or {}
+        self.assertTrue(decision.get("independent_branch_corroboration"))
+        self.assertEqual(diagnostics.get("canonical_evidence_outcome"), "timeout")
+        self.assertLess(
+            (diagnostics.get("stage_timings_ms") or {}).get(
+                "canonical_evidence_wait", 1000
+            ),
+            150,
+        )
+        self.assertEqual(
+            ((payload.get("resolved_target") or {}).get("lead_artist") or {}).get(
+                "name"
+            ),
+            "Metallica",
+        )
+
+    @pytest.mark.search_latency
+    def test_conflicting_album_branch_does_not_cap_canonical_wait(self) -> None:
+        provider_tracks = [
+            {
+                "id": "lead-track",
+                "title": "Same Title",
+                "channel": "Lead Artist",
+                "artist_id": "UC-Lead",
+                "album_id": "MPRE-Lead",
+                "album": "Lead Album",
+                "views": "500M",
+            },
+            {
+                "id": "runner-track",
+                "title": "Same Title",
+                "channel": "Runner Artist",
+                "artist_id": "UC-Runner",
+                "album_id": "MPRE-Runner",
+                "album": "Runner Album",
+                "views": "10K",
+            },
+        ]
+
+        def bounded_recording_evidence(*_args, **_kwargs):
+            time.sleep(0.18)
+            return []
+
+        with (
+            patch(
+                "auralis_backend.domain.retrieval._retrieval_cache_get",
+                return_value=None,
+            ),
+            patch("auralis_backend.domain.retrieval._retrieval_cache_set"),
+            patch(
+                "auralis_backend.domain.retrieval.load_catalog_entity_memories",
+                return_value=[],
+            ),
+            patch(
+                "auralis_backend.domain.retrieval.load_fuzzy_catalog_entity_memories",
+                return_value=[],
+            ),
+            patch(
+                "auralis_backend.domain.retrieval.search_tracks_direct",
+                return_value=provider_tracks,
+            ),
+            patch(
+                "auralis_backend.domain.retrieval.search_artists_direct_cached",
+                return_value=[{"id": "UC-Lead", "name": "Lead Artist"}],
+            ),
+            patch(
+                "auralis_backend.domain.retrieval.search_albums_direct",
+                return_value=[
+                    {
+                        "id": "MPRE-Different",
+                        "title": "Different Album",
+                        "artist": "Lead Artist",
+                    }
+                ],
+            ),
+            patch(
+                "auralis_backend.domain.retrieval.search_musicbrainz_recording_items",
+                side_effect=bounded_recording_evidence,
+            ),
+            patch(
+                "auralis_backend.domain.retrieval._SEARCH_DECISIVE_CANONICAL_GRACE_SECONDS",
+                0.02,
+            ),
+        ):
+            payload = retrieve_search_candidates_fast(
+                SimpleNamespace(
+                    query="Same Title",
+                    surface="search",
+                    force_refresh=True,
+                    search_mode="exact",
+                    defer_side_surfaces=False,
+                    anchor_track_snapshots=[],
+                ),
+                {"user_scope_id": "", "recent_queries": [], "last_played_tracks": []},
+                limit=8,
+                server=server,
+            )
+
+        diagnostics = payload.get("retrieval_diagnostics") or {}
+        decision = diagnostics.get("provider_recording_decision") or {}
+        self.assertFalse(decision.get("independent_branch_corroboration"))
+        self.assertEqual(diagnostics.get("canonical_evidence_outcome"), "empty")
+        self.assertGreaterEqual(
+            (diagnostics.get("stage_timings_ms") or {}).get(
+                "canonical_evidence_wait", 0
+            ),
+            140,
         )
 
     @patch("auralis_backend.domain.retrieval._retrieval_cache_set")
@@ -3658,6 +4009,7 @@ class SearchLatencyTests(unittest.TestCase):
         )
 
     @patch("auralis_backend.search.service.retrieve_search_candidates_fast")
+    @pytest.mark.search_snapshot
     def test_load_more_reads_ranked_search_snapshot_without_retrieval(
         self,
         mock_retrieve,
@@ -3705,31 +4057,44 @@ class SearchLatencyTests(unittest.TestCase):
             "retrieval_diagnostics": {},
         }
         service = SearchService(server)
-        first = service.search(
-            SimpleNamespace(
-                query=query,
-                user_scope_id="snapshot-user",
-                surface="search",
-                force_refresh=False,
-                limit=16,
-                search_mode="exact",
-                defer_side_surfaces=True,
-                result_type="",
-                offset=0,
+        import auralis_backend.search.service as service_module
+
+        queued_completion = []
+        with patch.object(
+            service_module._SEARCH_ARTIST_METADATA_WRITER,
+            "submit",
+            side_effect=lambda fn, *args, **kwargs: queued_completion.append(
+                (fn, args, kwargs)
+            ),
+        ):
+            first = service.search(
+                SimpleNamespace(
+                    query=query,
+                    user_scope_id="snapshot-user",
+                    surface="search",
+                    force_refresh=True,
+                    limit=16,
+                    search_mode="exact",
+                    defer_side_surfaces=True,
+                    result_type="",
+                    offset=0,
+                )
             )
-        )
-        second = service.search(
-            SimpleNamespace(
-                query=query,
-                user_scope_id="snapshot-user",
-                surface="search",
-                force_refresh=False,
-                limit=16,
-                search_mode="exact",
-                defer_side_surfaces=False,
-                result_type="tracks",
-                offset=16,
+            second = service.search(
+                SimpleNamespace(
+                    query=query,
+                    user_scope_id="snapshot-user",
+                    surface="search",
+                    force_refresh=False,
+                    limit=16,
+                    search_mode="exact",
+                    defer_side_surfaces=False,
+                    result_type="tracks",
+                    offset=16,
+                )
             )
+        service_module._SEARCH_SNAPSHOT_COMPLETION_PENDING.discard(
+            _search_snapshot_key("", query, "exact")
         )
 
         self.assertEqual(len(first.get("tracks") or []), 16)
@@ -3743,6 +4108,119 @@ class SearchLatencyTests(unittest.TestCase):
             bool((second.get("diagnostics") or {}).get("search_snapshot_hit"))
         )
 
+    @pytest.mark.search_snapshot
+    def test_completed_snapshot_hit_is_read_only_and_does_not_schedule(self) -> None:
+        query = "completed snapshot"
+        key = _search_snapshot_key("", query, "exact")
+        _store_search_snapshot(
+            key,
+            {
+                "revision": 4,
+                "query_intent": "mixed",
+                "resolved_target": {"entity_type": "mixed"},
+                "tracks": [], "artists": [], "albums": [],
+                "playlists": [], "related_artists": [],
+                "artist_tracks": [], "artist_albums": [], "related_albums": [],
+                "expansion_state": {
+                    "tracks": "complete", "artists": "complete",
+                    "albums": "complete", "playlists": "complete",
+                },
+            },
+            server,
+        )
+        service = SearchService(server)
+        with (
+            patch.object(service, "_rehydrate_search_snapshot") as rehydrate,
+            patch.object(service, "_schedule_search_snapshot_completion") as schedule,
+        ):
+            response = service.search(SimpleNamespace(
+                query=query, user_scope_id="snapshot-user", surface="search",
+                force_refresh=False, limit=16, search_mode="exact",
+                defer_side_surfaces=False, result_type="", offset=0,
+            ))
+        rehydrate.assert_not_called()
+        schedule.assert_not_called()
+        diagnostics = response.get("diagnostics") or {}
+        self.assertFalse(diagnostics.get("background_scheduled"))
+        self.assertEqual(diagnostics.get("search_snapshot_revision"), 4)
+
+    @pytest.mark.search_snapshot
+    def test_incomplete_snapshot_hit_schedules_one_deduplicated_job(self) -> None:
+        query = "incomplete snapshot"
+        key = _search_snapshot_key("", query, "exact")
+        _store_search_snapshot(
+            key,
+            {
+                "revision": 1,
+                "query_intent": "mixed",
+                "resolved_target": {"entity_type": "mixed"},
+                "tracks": [], "artists": [], "albums": [],
+                "playlists": [], "related_artists": [],
+                "artist_tracks": [], "artist_albums": [], "related_albums": [],
+                "expansion_state": {"artists": "retryable"},
+            },
+            server,
+        )
+        service = SearchService(server)
+        submitted = []
+        import auralis_backend.search.service as service_module
+        service_module._SEARCH_SNAPSHOT_COMPLETION_PENDING.discard(key)
+        with patch.object(
+            service_module._SEARCH_ARTIST_METADATA_WRITER,
+            "submit",
+            side_effect=lambda fn: submitted.append(fn),
+        ):
+            first = service.search(SimpleNamespace(
+                query=query, user_scope_id="snapshot-user", surface="search",
+                force_refresh=False, limit=16, search_mode="exact",
+                defer_side_surfaces=False, result_type="", offset=0,
+            ))
+            second = service.search(SimpleNamespace(
+                query=query, user_scope_id="snapshot-user", surface="search",
+                force_refresh=False, limit=16, search_mode="exact",
+                defer_side_surfaces=False, result_type="", offset=0,
+            ))
+        service_module._SEARCH_SNAPSHOT_COMPLETION_PENDING.discard(key)
+        self.assertTrue((first.get("diagnostics") or {}).get("background_scheduled"))
+        self.assertFalse((second.get("diagnostics") or {}).get("background_scheduled"))
+        self.assertEqual(len(submitted), 1)
+        self.assertIn("incomplete_surface", (first.get("diagnostics") or {}).get("background_reasons", []))
+
+    @pytest.mark.search_snapshot
+    def test_artwork_only_snapshot_completion_skips_provider_expansion(self) -> None:
+        query = "artwork only snapshot"
+        key = _search_snapshot_key("", query, "exact")
+        _store_search_snapshot(
+            key,
+            {
+                "revision": 1, "query_intent": "mixed",
+                "resolved_target": {"entity_type": "mixed"},
+                "tracks": [], "artists": [], "albums": [], "playlists": [],
+                "related_artists": [], "artist_tracks": [],
+                "artist_albums": [], "related_albums": [],
+                "expansion_state": {"artists": "pending_artwork"},
+                "_pending_entity_artwork": {"albums": [{"id": "a1"}]},
+            },
+            server,
+        )
+        service = SearchService(server)
+        import auralis_backend.search.service as service_module
+        submitted = []
+        with patch.object(
+            service_module._SEARCH_ARTIST_METADATA_WRITER,
+            "submit",
+            side_effect=lambda fn, *args, **kwargs: submitted.append((fn, args, kwargs)),
+        ), patch.object(service, "_expand_search_snapshot_surface") as expand:
+            response = service.search(SimpleNamespace(
+                query=query, user_scope_id="snapshot-user", surface="search",
+                force_refresh=False, limit=16, search_mode="exact",
+                defer_side_surfaces=False, result_type="", offset=0,
+            ))
+        service_module._SEARCH_SNAPSHOT_COMPLETION_PENDING.discard(key)
+        self.assertTrue((response.get("diagnostics") or {}).get("background_scheduled"))
+        self.assertFalse(expand.called)
+        self.assertEqual(len(submitted), 1)
+
     @patch("auralis_backend.search.service.retrieve_search_candidates_fast")
     def test_deferred_artist_surface_expands_after_snapshot_is_consumed(
         self,
@@ -3752,10 +4230,10 @@ class SearchLatencyTests(unittest.TestCase):
             expanded = getattr(request, "result_type", "") == "artists"
             artist_payloads = [
                 {
-                    "id": "artist-lead",
+                    "id": "UC-artist-lead",
                     "name": "Lead Artist",
                     "thumbnail": (
-                        "https://example.test/lead.jpg" if expanded else ""
+                        "/artist_artwork/lead" if expanded else ""
                     ),
                 }
             ]
@@ -3763,14 +4241,14 @@ class SearchLatencyTests(unittest.TestCase):
                 artist_payloads.extend(
                     [
                         {
-                            "id": "artist-related-1",
+                            "id": "UC-artist-related-1",
                             "name": "Related One",
-                            "thumbnail": "https://example.test/one.jpg",
+                            "thumbnail": "/artist_artwork/related-one",
                         },
                         {
-                            "id": "artist-related-2",
+                            "id": "UC-artist-related-2",
                             "name": "Related Two",
-                            "thumbnail": "https://example.test/two.jpg",
+                            "thumbnail": "/artist_artwork/related-two",
                         },
                     ]
                 )
@@ -3826,9 +4304,9 @@ class SearchLatencyTests(unittest.TestCase):
                 "related_artists": (
                     [
                         {
-                            "id": "artist-neighbour",
+                            "id": "UC-artist-neighbour",
                             "name": "Close Neighbour",
-                            "thumbnail": "https://example.test/neighbour.jpg",
+                            "thumbnail": "/artist_artwork/neighbour",
                         }
                     ]
                     if expanded
@@ -3839,13 +4317,16 @@ class SearchLatencyTests(unittest.TestCase):
 
         mock_retrieve.side_effect = payload_for
         service = SearchService(server)
+        import auralis_backend.search.service as service_module
+
+        queued_completion = []
 
         def catalog_result(*_args, **_kwargs):
             return {
                 "artist": {
-                    "id": "artist-lead",
+                    "id": "UC-artist-lead",
                     "name": "Lead Artist",
-                    "thumbnail": "https://example.test/lead.jpg",
+                    "thumbnail": "/artist_artwork/lead",
                 },
                 "tracks": [
                     {
@@ -3868,9 +4349,9 @@ class SearchLatencyTests(unittest.TestCase):
                 ],
                 "related_artists": [
                     {
-                        "id": "artist-neighbour",
+                        "id": "UC-artist-neighbour",
                         "name": "Close Neighbour",
-                        "thumbnail": "https://example.test/neighbour.jpg",
+                        "thumbnail": "/artist_artwork/neighbour",
                     }
                 ],
                 "catalog_status": "complete",
@@ -3911,10 +4392,7 @@ class SearchLatencyTests(unittest.TestCase):
                         "id": f"UC-LastFmNeighbour-{index}",
                         "name": f"Last.fm Neighbour {index}",
                         "relationship_provider": "lastfm",
-                        "thumbnail": (
-                            "https://example.test/"
-                            f"lastfm-neighbour-{index}.jpg"
-                        ),
+                        "thumbnail": f"/artist_artwork/lastfm-{index}",
                     }
                     for index in range(1, 6)
                 ],
@@ -3924,13 +4402,21 @@ class SearchLatencyTests(unittest.TestCase):
                 "_resolve_first_page_related_artists",
                 side_effect=lambda artists, **_kwargs: artists,
             ),
+            patch.object(
+                service_module._SEARCH_ARTIST_METADATA_WRITER,
+                "submit",
+                side_effect=lambda fn, *args, **kwargs: queued_completion.append(
+                    (fn, args, kwargs)
+                ),
+            ),
         ):
             first = service.search(
                 SimpleNamespace(
                     query="Lead Artist",
                     user_scope_id="progressive-user",
                     surface="search",
-                    force_refresh=False,
+                    context_surface="interactive_search",
+                    force_refresh=True,
                     limit=16,
                     search_mode="entity",
                     defer_side_surfaces=True,
@@ -3938,6 +4424,9 @@ class SearchLatencyTests(unittest.TestCase):
                     offset=0,
                 )
             )
+            self.assertEqual(len(queued_completion), 1)
+            completion, completion_args, completion_kwargs = queued_completion.pop(0)
+            completion(*completion_args, **completion_kwargs)
             second = service.search(
                 SimpleNamespace(
                     query="Lead Artist",
@@ -3948,15 +4437,15 @@ class SearchLatencyTests(unittest.TestCase):
                     search_mode="entity",
                     defer_side_surfaces=False,
                     result_type="artists",
-                    offset=1,
+                    offset=0,
                 )
             )
 
         self.assertEqual(first.get("artists") or [], [])
-        self.assertEqual(mock_retrieve.call_count, 1)
+        self.assertEqual(mock_retrieve.call_count, 2)
         self.assertEqual(
             (second.get("artists") or [])[0].get("thumbnail"),
-            "https://example.test/lead.jpg",
+            "/artist_artwork/lead",
         )
         self.assertEqual(
             [item.get("name") for item in second.get("similar_artists") or []],

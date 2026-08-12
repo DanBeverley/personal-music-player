@@ -18,9 +18,14 @@ ingestion/python_proxy/venv/
 ingestion/python_proxy/.venv/
 ingestion/python_proxy/__pycache__/
 ingestion/python_proxy/.pytest_cache/
+.pytest_tmp/
+.pytest_latency_logs/
 *.pyc
 *.pyo
 .env
+
+# Local Codex worker/checkpoint artifacts
+.codex/
 
 # Native C++
 core_native/build/

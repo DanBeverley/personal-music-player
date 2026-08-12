@@ -158,11 +158,13 @@ if ($env:SUPABASE_REDIRECT_HOST) {
   $dartDefines += "--dart-define=SUPABASE_REDIRECT_HOST=$($env:SUPABASE_REDIRECT_HOST)"
 }
 
-# Android's emulator frame-timing tag can overwhelm the useful Flutter log.
-# Raise only that tag's threshold; application warnings and errors remain.
+# Suppress the noisiest Android debug tags on the emulator itself. Do not set
+# ANDROID_LOG_TAGS: recent Windows adb builds parse it as adb's own logging
+# configuration and abort before Flutter can compile.
 $AdbCommand = Get-Command adb -ErrorAction SilentlyContinue
 if ($null -ne $AdbCommand) {
   & adb -s emulator-5554 shell setprop log.tag.EGL_emulation WARN 2>$null | Out-Null
+  & adb -s emulator-5554 shell setprop log.tag.FlutterJNI WARN 2>$null | Out-Null
 }
 
 & flutter run -d emulator-5554 @dartDefines

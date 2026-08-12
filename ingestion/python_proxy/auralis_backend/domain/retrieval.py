@@ -65,6 +65,9 @@ _SEARCH_RETRIEVAL_TOTAL_BUDGET_SECONDS = max(
     float(os.environ.get("AURALIS_SEARCH_RETRIEVAL_TOTAL_BUDGET_SECONDS", "6.5")),
 )
 _SEARCH_CANONICAL_CONFLICT_GRACE_SECONDS = 1.4
+_SEARCH_DECISIVE_CANONICAL_GRACE_SECONDS = max(
+    0.1, float(os.environ.get("AURALIS_SEARCH_DECISIVE_CANONICAL_GRACE_SECONDS", "0.75"))
+)
 _SEARCH_DISABLE_TIMEOUTS = (
     os.environ.get("AURALIS_SEARCH_DISABLE_TIMEOUTS", "0").strip().lower()
     in {"1", "true", "yes", "on"}
@@ -2408,6 +2411,56 @@ def _provider_recording_decision(
     }
 
 
+def _provider_multi_branch_corroboration(
+    decision: Dict[str, Any],
+    *,
+    artists: Iterable[Dict[str, Any]] = (),
+    albums: Iterable[Dict[str, Any]] = (),
+) -> bool:
+    """Require independent artist/album branch agreement before fast grace."""
+    track = dict(decision.get("track") or {})
+    artist_id = trim_text(decision.get("artist_id"))
+    artist_name = normalize_artist_name(decision.get("artist"))
+    if not artist_id or not _track_provider_identity(track) or not artist_name:
+        return False
+    artist_items = [item for item in artists if isinstance(item, dict)]
+    album_items = [item for item in albums if isinstance(item, dict)]
+    artist_match = any(
+        isinstance(item, dict)
+        and (
+            (item_id := trim_text(item.get("id") or item.get("artist_id") or item.get("browseId")))
+            and item_id == artist_id
+            or (
+                not item_id
+                and normalize_artist_name(item.get("name") or item.get("artist")) == artist_name
+            )
+        )
+        for item in artist_items
+    )
+    album_id = trim_text(decision.get("album_id"))
+    album_name = normalize_track_title(track.get("album") or track.get("album_name"))
+    # A selected track with an album relationship requires an actual album
+    # branch match; an absent branch is unknown, never corroboration.
+    album_match = True
+    if album_id or album_name:
+        album_match = any(
+            (
+                (item_id := trim_text(item.get("id") or item.get("album_id") or item.get("browseId")))
+                and album_id
+                and item_id == album_id
+            )
+            or (
+                not item_id
+                and album_name
+                and normalize_track_title(item.get("title") or item.get("name")) == album_name
+                and normalize_artist_name(item.get("artist") or item.get("artist_name")) == artist_name
+            )
+            for item in album_items
+        )
+    margin = float(decision.get("decision_margin") or 0.0)
+    return bool(artist_match and album_match and margin >= 0.65 and not decision.get("conflict"))
+
+
 def retrieve_search_candidates_fast(
     legacy_req,
     profile,
@@ -2554,7 +2607,7 @@ def retrieve_search_candidates_fast(
         catalog_relationship_tracks.extend(
             catalog_playable_tracks_for_artist(
                 server,
-                user_scope_id=str(profile.get("user_scope_id") or "guest"),
+                user_scope_id=str(profile.get("user_scope_id") or ""),
                 artist=artist_name,
                 limit=12,
             )
@@ -2592,6 +2645,8 @@ def retrieve_search_candidates_fast(
     timed_out_sources: List[str] = []
     provider_timings_ms: Dict[str, int] = {}
     stage_timings_ms: Dict[str, int] = {}
+    first_track_evidence_ms: int | None = None
+    acceptance_barrier_ms: int | None = None
 
     fast_track_future = executor.submit(
         search_tracks_direct,
@@ -2629,6 +2684,7 @@ def retrieve_search_candidates_fast(
         )
     canonical_evidence_future = None
     canonical_evidence_started_ms: int | None = None
+    canonical_evidence_completed_ms: int | None = None
     canonical_evidence_outcome = "not_started"
     canonical_evidence_warranted = False
     if search_mode != "taste":
@@ -2745,6 +2801,10 @@ def retrieve_search_candidates_fast(
                     (time.perf_counter() - retrieval_started_at) * 1000
                 )
                 if source_name == "tracks.fast":
+                    if resolved_values[source_name] and first_track_evidence_ms is None:
+                        first_track_evidence_ms = int(
+                            (time.perf_counter() - retrieval_started_at) * 1000
+                        )
                     # Start independent recording evidence as soon as a strong
                     # provider track exists. It remains invisible until the
                     # provider-only classifier locks the request to `track`.
@@ -2773,6 +2833,11 @@ def retrieve_search_candidates_fast(
     provider_recording_decision = _provider_recording_decision(
         query,
         fast_tracks,
+        artists=[*fast_artists, *fuzzy_artists],
+        albums=[*fast_albums, *fuzzy_albums],
+    )
+    provider_recording_decision["independent_branch_corroboration"] = _provider_multi_branch_corroboration(
+        provider_recording_decision,
         artists=[*fast_artists, *fuzzy_artists],
         albums=[*fast_albums, *fuzzy_albums],
     )
@@ -2840,6 +2905,19 @@ def retrieve_search_candidates_fast(
             _SEARCH_RETRIEVAL_TOTAL_BUDGET_SECONDS - elapsed_seconds,
             0.0,
         )
+        decisive_provider = bool(
+            provider_recording_decision.get("decisive")
+            and provider_recording_decision.get("structurally_supported")
+            and (
+                provider_recording_decision.get("authority_supported")
+                or provider_recording_decision.get("independent_branch_corroboration")
+            )
+            and not cross_entity_recording_conflict
+        )
+        if decisive_provider:
+            remaining_seconds = min(
+                remaining_seconds, _SEARCH_DECISIVE_CANONICAL_GRACE_SECONDS
+            )
         if cross_entity_recording_conflict:
             remaining_seconds += _SEARCH_CANONICAL_CONFLICT_GRACE_SECONDS
         if canonical_evidence_future.done():
@@ -2862,6 +2940,9 @@ def retrieve_search_candidates_fast(
                 completed_sources.append("canonical.musicbrainz")
                 canonical_evidence_outcome = (
                     "hit" if musicbrainz_tracks else "empty"
+                )
+                canonical_evidence_completed_ms = int(
+                    (time.perf_counter() - retrieval_started_at) * 1000
                 )
             except Exception as exc:
                 timed_out_sources.append("canonical.musicbrainz")
@@ -3092,6 +3173,9 @@ def retrieve_search_candidates_fast(
         (time.perf_counter() - target_resolution_started_at) * 1000
     )
     query_intent = str(resolved_target.get("entity_type") or "mixed")
+    acceptance_barrier_ms = int(
+        (time.perf_counter() - retrieval_started_at) * 1000
+    )
     resolved_artist = dict(resolved_target.get("lead_artist") or {})
     primary_track = (
         dict(resolved_target.get("item") or {})
@@ -3333,6 +3417,20 @@ def retrieve_search_candidates_fast(
             "completed_sources": completed_sources,
             "timed_out_sources": timed_out_sources,
             "provider_timings_ms": provider_timings_ms,
+            "time_to_first_track_evidence": first_track_evidence_ms,
+            "time_to_acceptance_barrier": acceptance_barrier_ms,
+            "branches_required": sorted(future_sources.values()),
+            "branches_skipped_from_critical_path": [],
+            "acceptance_barrier_entity_type": query_intent,
+            "canonical_overlap_ms": (
+                max(
+                    0,
+                    (canonical_evidence_completed_ms or 0)
+                    - (first_track_evidence_ms or 0),
+                )
+                if canonical_evidence_completed_ms is not None
+                else 0
+            ),
             "stage_timings_ms": stage_timings_ms,
             "local_index_ms": local_index_ms,
             "removed_untrusted_aliases": removed_untrusted_aliases,

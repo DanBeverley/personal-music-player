@@ -7,6 +7,7 @@ from concurrent.futures import (
     wait,
 )
 from copy import deepcopy
+import json
 import re
 import threading
 import time
@@ -30,6 +31,7 @@ from ..domain.retrieval import (
 )
 from ..discovery.structured_providers import LastFmClient
 from ..recommend.feature_store import request_store_runtime
+from ..recommend.store_runtime import open_recommendation_store_connection
 from ..storage.postgres import load_catalog_artist_payloads
 from .pipeline import (
     rank_album_candidates_fast_path,
@@ -55,10 +57,12 @@ from .intelligence import (
     load_catalog_artist_records,
     remember_catalog_entity,
     search_text_similarity,
+    search_query_key,
 )
 from ..storage.artist_artwork import (
     attach_cached_entity_artwork,
     attach_cached_artist_artwork,
+    attach_persisted_artist_artwork,
     entity_artwork_identity,
     register_entity_invalidation_listener,
     register_entity_metadata_listener,
@@ -68,10 +72,17 @@ from ..storage.artist_artwork import (
 )
 
 
-_SEARCH_SNAPSHOT_TTL_SECONDS = 10 * 60
 _SEARCH_SNAPSHOT_MAX_ENTRIES = 96
 _SEARCH_SNAPSHOT_LOCK = threading.RLock()
+_SEARCH_SNAPSHOT_CONDITION = threading.Condition(_SEARCH_SNAPSHOT_LOCK)
 _SEARCH_SNAPSHOTS: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+_SEARCH_SNAPSHOT_SERVERS: Dict[str, Any] = {}
+_SEARCH_SNAPSHOT_LAST_DURABLE_TOUCH: Dict[str, float] = {}
+_SEARCH_SNAPSHOT_TOUCH_INTERVAL_SECONDS = 60.0
+_SEARCH_SNAPSHOT_PERSIST_EXECUTOR = ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="auralis-search-snapshot-persist",
+)
 _SEARCH_CATALOG_WRITER = ThreadPoolExecutor(
     max_workers=1,
     thread_name_prefix="auralis-search-catalog",
@@ -95,55 +106,487 @@ _SEARCH_SURFACE_MAX_ATTEMPTS = 3
 _SEARCH_ARTWORK_MAX_ATTEMPTS = 5
 
 
-def _search_snapshot_key(user_scope_id: str, query: str, search_mode: str) -> str:
+def _normalized_search_mode(search_mode: str) -> str:
+    return str(search_mode or "exact").strip().lower() or "exact"
+
+
+def _search_snapshot_key(_user_scope_id: str, query: str, search_mode: str) -> str:
     return "||".join(
         [
-            str(user_scope_id or "guest").strip() or "guest",
-            "canonical-target-search-v3",
-            " ".join(str(query or "").strip().lower().split()),
-            str(search_mode or "exact").strip().lower() or "exact",
+            "canonical-target-search-v4",
+            search_query_key(query),
+            _normalized_search_mode(search_mode),
         ]
     )
 
 
-def _load_search_snapshot(key: str) -> Dict[str, Any] | None:
+def _canonical_target_snapshot_key(target_identity: str, search_mode: str) -> str:
+    return "||".join(
+        [
+            "canonical-target-search-v4",
+            "target:" + str(target_identity or "").strip().casefold(),
+            _normalized_search_mode(search_mode),
+        ]
+    )
+
+
+def _snapshot_json(value: Any) -> str:
+    return json.dumps(
+        value if isinstance(value, dict) else {},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
+def _snapshot_alias_key(query: str) -> str:
+    return search_query_key(query)
+
+
+def _resolve_snapshot_key(server: Any, query: str, search_mode: str) -> str:
+    base = _search_snapshot_key("", query, search_mode)
+    alias = _snapshot_alias_key(query)
+    if not alias:
+        return base
+    mode = _normalized_search_mode(search_mode)
+    connection = None
+    try:
+        connection = open_recommendation_store_connection(server)
+        row = connection.execute(
+            """
+            SELECT a.snapshot_key
+            FROM search_snapshot_aliases a
+            JOIN search_snapshots s ON s.snapshot_key = a.snapshot_key
+            WHERE a.alias_key = ? AND a.search_mode = ?
+            """,
+            [alias, mode],
+        ).fetchone()
+        if row:
+            return str(row["snapshot_key"] or base)
+        legacy = connection.execute(
+            """
+            SELECT entity_key, confidence
+            FROM search_query_aliases
+            WHERE alias_key = ?
+            ORDER BY confidence DESC, updated_at DESC
+            LIMIT 1
+            """,
+            [alias],
+        ).fetchone()
+        if legacy and float(legacy["confidence"] or 0.0) >= 0.85:
+            legacy_identity = str(legacy["entity_key"] or "").strip().casefold()
+            snapshot_rows = connection.execute(
+                "SELECT snapshot_key, payload_json FROM search_snapshots"
+            ).fetchall()
+            for candidate in snapshot_rows:
+                try:
+                    target = (
+                        json.loads(candidate["payload_json"] or "{}").get(
+                            "resolved_target"
+                        )
+                        or {}
+                    )
+                except Exception:
+                    target = {}
+                identity = _target_identity(target)
+                if identity and identity == legacy_identity:
+                    connection.execute(
+                        """
+                        INSERT OR REPLACE INTO search_snapshot_aliases(
+                            alias_key, search_mode, snapshot_key, confidence,
+                            source, updated_at
+                        ) VALUES(?, ?, ?, ?, ?, ?)
+                        """,
+                        [
+                            alias,
+                            mode,
+                            candidate["snapshot_key"],
+                            float(legacy["confidence"]),
+                            "legacy_high_confidence",
+                            time.time(),
+                        ],
+                    )
+                    connection.commit()
+                    return str(candidate["snapshot_key"])
+        return base
+    except Exception:
+        return base
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _touch_search_snapshot_access(
+    server: Any,
+    key: str,
+    accessed_at: float,
+) -> None:
+    """Best-effort LRU bookkeeping that must never delay snapshot serving."""
+    connection = None
+    try:
+        connection = open_recommendation_store_connection(server)
+        connection.execute(
+            "UPDATE search_snapshots SET last_accessed = ? WHERE snapshot_key = ?",
+            [accessed_at, key],
+        )
+        connection.commit()
+    except Exception:
+        pass
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _load_search_snapshot(key: str, server: Any | None = None) -> Dict[str, Any] | None:
+    now = time.time()
+    # The in-process snapshot is authoritative while the backend is alive.
+    # Checking SQLite first made every repeated query contend with background
+    # persistence and artwork writes, defeating the snapshot fast path.
+    with _SEARCH_SNAPSHOT_LOCK:
+        snapshot = _SEARCH_SNAPSHOTS.get(key)
+        if snapshot is not None:
+            _SEARCH_SNAPSHOTS.move_to_end(key)
+            touch_server = server or _SEARCH_SNAPSHOT_SERVERS.get(key)
+            last_touch = float(_SEARCH_SNAPSHOT_LAST_DURABLE_TOUCH.get(key) or 0.0)
+            should_touch = bool(touch_server) and (
+                now - last_touch >= _SEARCH_SNAPSHOT_TOUCH_INTERVAL_SECONDS
+            )
+            if should_touch:
+                _SEARCH_SNAPSHOT_LAST_DURABLE_TOUCH[key] = now
+            result = deepcopy(snapshot)
+        else:
+            touch_server = None
+            should_touch = False
+            result = None
+    if result is not None:
+        if should_touch:
+            _SEARCH_SNAPSHOT_PERSIST_EXECUTOR.submit(
+                _touch_search_snapshot_access,
+                touch_server,
+                key,
+                now,
+            )
+        return result
+    if server is None:
+        return None
+
+    connection = None
+    try:
+        connection = open_recommendation_store_connection(server)
+        row = connection.execute(
+            "SELECT payload_json, revision FROM search_snapshots WHERE snapshot_key = ?",
+            [key],
+        ).fetchone()
+        if not row:
+            return None
+        snapshot = json.loads(row["payload_json"] or "{}")
+        snapshot["revision"] = int(
+            row["revision"] or snapshot.get("revision") or 1
+        )
+    except Exception:
+        return None
+    finally:
+        if connection is not None:
+            connection.close()
+
+    with _SEARCH_SNAPSHOT_LOCK:
+        # Another thread may have published a newer revision while SQLite was
+        # read. Never replace that live snapshot with the older durable copy.
+        current = _SEARCH_SNAPSHOTS.get(key)
+        if current is not None and int(current.get("revision") or 1) >= int(
+            snapshot.get("revision") or 1
+        ):
+            snapshot = current
+        else:
+            _SEARCH_SNAPSHOTS[key] = deepcopy(snapshot)
+            _SEARCH_SNAPSHOT_SERVERS[key] = server
+        _SEARCH_SNAPSHOT_LAST_DURABLE_TOUCH[key] = now
+        _SEARCH_SNAPSHOTS.move_to_end(key)
+    _SEARCH_SNAPSHOT_PERSIST_EXECUTOR.submit(
+        _touch_search_snapshot_access,
+        server,
+        key,
+        now,
+    )
+    return deepcopy(snapshot)
+
+
+def _wait_for_search_snapshot_revision(
+    server: Any,
+    key: str,
+    since_revision: int,
+    timeout_ms: int,
+) -> Dict[str, Any] | None:
+    """Bounded long-poll for an existing snapshot; never starts retrieval."""
+    deadline = time.monotonic() + max(0, min(int(timeout_ms or 0), 3000)) / 1000.0
+    while True:
+        snapshot = _load_search_snapshot(key, server)
+        if snapshot is not None:
+            revision = int(snapshot.get("revision") or 1)
+            states = dict(snapshot.get("expansion_state") or {})
+            terminal = bool(states) and all(
+                str(state).casefold() in {"complete", "exhausted"}
+                for state in states.values()
+            )
+            if revision > int(since_revision or 0) or terminal:
+                return snapshot
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        with _SEARCH_SNAPSHOT_CONDITION:
+            _SEARCH_SNAPSHOT_CONDITION.wait(timeout=min(remaining, 0.25))
+
+
+def _store_search_snapshot(
+    key: str,
+    snapshot: Dict[str, Any],
+    server: Any | None = None,
+    *,
+    preserve_revision: bool = False,
+) -> None:
+    stored = deepcopy(snapshot)
     now = time.time()
     with _SEARCH_SNAPSHOT_LOCK:
-        expired = [
-            snapshot_key
-            for snapshot_key, snapshot in _SEARCH_SNAPSHOTS.items()
-            if float(snapshot.get("expires_at") or 0.0) <= now
-        ]
-        for snapshot_key in expired:
-            _SEARCH_SNAPSHOTS.pop(snapshot_key, None)
-        snapshot = _SEARCH_SNAPSHOTS.get(key)
-        if snapshot is None:
-            return None
-        _SEARCH_SNAPSHOTS.move_to_end(key)
-        return deepcopy(snapshot)
-
-
-def _store_search_snapshot(key: str, snapshot: Dict[str, Any]) -> None:
-    stored = deepcopy(snapshot)
-    stored["expires_at"] = time.time() + _SEARCH_SNAPSHOT_TTL_SECONDS
-    with _SEARCH_SNAPSHOT_LOCK:
-        previous = _SEARCH_SNAPSHOTS.get(key)
+        previous = None
+        connection = None
+        if server is not None:
+            try:
+                connection = open_recommendation_store_connection(server)
+                row = connection.execute(
+                    "SELECT payload_json, revision FROM search_snapshots "
+                    "WHERE snapshot_key = ?",
+                    [key],
+                ).fetchone()
+                if row:
+                    previous = json.loads(row["payload_json"] or "{}")
+                    previous["revision"] = int(row["revision"] or 1)
+            except Exception:
+                previous = _SEARCH_SNAPSHOTS.get(key)
+        else:
+            previous = _SEARCH_SNAPSHOTS.get(key)
         if previous is not None:
             previous_revision = int(previous.get("revision") or 1)
-            if (
-                _search_snapshot_visible_fingerprint(stored)
-                != _search_snapshot_visible_fingerprint(previous)
-            ):
+            if preserve_revision:
                 stored["revision"] = max(
-                    int(stored.get("revision") or 1),
-                    previous_revision,
-                ) + 1
+                    int(stored.get("revision") or 1), previous_revision
+                )
             else:
-                stored["revision"] = previous_revision
-        _SEARCH_SNAPSHOTS[key] = stored
+                if (
+                    _search_snapshot_visible_fingerprint(stored)
+                    != _search_snapshot_visible_fingerprint(previous)
+                ):
+                    stored["revision"] = max(
+                        int(stored.get("revision") or 1),
+                        previous_revision,
+                    ) + 1
+                else:
+                    stored["revision"] = previous_revision
+        _SEARCH_SNAPSHOTS[key] = deepcopy(stored)
+        if server is not None:
+            _SEARCH_SNAPSHOT_SERVERS[key] = server
         _SEARCH_SNAPSHOTS.move_to_end(key)
         while len(_SEARCH_SNAPSHOTS) > _SEARCH_SNAPSHOT_MAX_ENTRIES:
-            _SEARCH_SNAPSHOTS.popitem(last=False)
+            evicted_key, _ = _SEARCH_SNAPSHOTS.popitem(last=False)
+            _SEARCH_SNAPSHOT_SERVERS.pop(evicted_key, None)
+            _SEARCH_SNAPSHOT_LAST_DURABLE_TOUCH.pop(evicted_key, None)
+        _SEARCH_SNAPSHOT_CONDITION.notify_all()
+        if connection is not None:
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO search_snapshots(
+                        snapshot_key, payload_json, revision,
+                        last_accessed, updated_at
+                    ) VALUES(?, ?, ?, ?, ?)
+                    ON CONFLICT(snapshot_key) DO UPDATE SET
+                        payload_json = excluded.payload_json,
+                        revision = excluded.revision,
+                        last_accessed = excluded.last_accessed,
+                        updated_at = excluded.updated_at
+                    """,
+                    [
+                        key,
+                        _snapshot_json(stored),
+                        int(stored.get("revision") or 1),
+                        now,
+                        now,
+                    ],
+                )
+                connection.execute(
+                    """
+                    DELETE FROM search_snapshots
+                    WHERE snapshot_key IN (
+                        SELECT snapshot_key FROM search_snapshots
+                        ORDER BY last_accessed DESC, updated_at DESC
+                        LIMIT -1 OFFSET ?
+                    )
+                    """,
+                    [_SEARCH_SNAPSHOT_MAX_ENTRIES],
+                )
+                connection.execute(
+                    """
+                    DELETE FROM search_snapshot_aliases
+                    WHERE snapshot_key NOT IN (
+                        SELECT snapshot_key FROM search_snapshots
+                    )
+                    """
+                )
+                connection.commit()
+            except Exception:
+                pass
+            finally:
+                connection.close()
+
+
+def _prefer_existing_canonical_snapshot(
+    existing: Dict[str, Any],
+    incoming: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Keep established visible surfaces while filling fields that were absent."""
+    if not existing:
+        return deepcopy(incoming)
+    merged = deepcopy(existing)
+    for key, value in incoming.items():
+        if merged.get(key) in (None, "", [], {}) and value not in (None, "", [], {}):
+            merged[key] = deepcopy(value)
+    merged["revision"] = max(
+        int(existing.get("revision") or 1),
+        int(incoming.get("revision") or 1),
+    )
+    return merged
+
+
+def _learn_snapshot_alias(
+    server: Any,
+    query: str,
+    search_mode: str,
+    snapshot_key: str,
+    snapshot: Dict[str, Any],
+) -> str:
+    target = dict(snapshot.get("resolved_target") or {})
+    identity = _target_identity(target)
+    tier = str(target.get("confidence_tier") or "").casefold()
+    if not identity or tier not in {"authoritative", "corroborated"}:
+        return snapshot_key
+    canonical_key = _canonical_target_snapshot_key(identity, search_mode)
+    candidates = [_snapshot_alias_key(query)]
+    item = dict(target.get("item") or {})
+    title = str(item.get("title") or item.get("name") or "").strip()
+    artist = str(item.get("artist") or item.get("artist_name") or "").strip()
+    if title and artist:
+        candidates.extend(
+            [
+                _snapshot_alias_key(f"{title} {artist}"),
+                _snapshot_alias_key(f"{artist} {title}"),
+            ]
+        )
+    candidates = [value for value in dict.fromkeys(candidates) if value]
+    if not candidates:
+        return snapshot_key
+    connection = None
+    canonical_snapshot = deepcopy(snapshot)
+    try:
+        connection = open_recommendation_store_connection(server)
+        mode = _normalized_search_mode(search_mode)
+        confidence = float(
+            target.get("identity_confidence") or target.get("confidence") or 0.0
+        )
+        if canonical_key != snapshot_key:
+            existing = connection.execute(
+                "SELECT payload_json FROM search_snapshots WHERE snapshot_key = ?",
+                [canonical_key],
+            ).fetchone()
+            if existing:
+                try:
+                    prior = json.loads(existing["payload_json"] or "{}")
+                    canonical_snapshot = _prefer_existing_canonical_snapshot(
+                        prior,
+                        snapshot,
+                    )
+                except Exception:
+                    pass
+            connection.execute(
+                """
+                INSERT INTO search_snapshots(
+                    snapshot_key, payload_json, revision,
+                    last_accessed, updated_at
+                ) VALUES(?, ?, ?, ?, ?)
+                ON CONFLICT(snapshot_key) DO UPDATE SET
+                    payload_json = excluded.payload_json,
+                    revision = max(search_snapshots.revision, excluded.revision),
+                    last_accessed = excluded.last_accessed,
+                    updated_at = excluded.updated_at
+                """,
+                [
+                    canonical_key,
+                    _snapshot_json(canonical_snapshot),
+                    int(canonical_snapshot.get("revision") or 1),
+                    time.time(),
+                    time.time(),
+                ],
+            )
+            connection.execute(
+                "DELETE FROM search_snapshots WHERE snapshot_key = ?",
+                [snapshot_key],
+            )
+        for alias in candidates:
+            row = connection.execute(
+                """
+                SELECT snapshot_key, confidence
+                FROM search_snapshot_aliases
+                WHERE alias_key = ? AND search_mode = ?
+                """,
+                [alias, mode],
+            ).fetchone()
+            if (
+                row
+                and str(row["snapshot_key"] or "") != canonical_key
+                and float(row["confidence"] or 0.0) >= confidence
+            ):
+                continue
+            connection.execute(
+                """
+                INSERT INTO search_snapshot_aliases(
+                    alias_key, search_mode, snapshot_key,
+                    confidence, source, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?)
+                ON CONFLICT(alias_key, search_mode) DO UPDATE SET
+                    snapshot_key = excluded.snapshot_key,
+                    confidence = max(
+                        search_snapshot_aliases.confidence,
+                        excluded.confidence
+                    ),
+                    source = excluded.source,
+                    updated_at = excluded.updated_at
+                """,
+                [
+                    alias,
+                    mode,
+                    canonical_key,
+                    confidence,
+                    "authoritative_search",
+                    time.time(),
+                ],
+            )
+        connection.execute(
+            """
+            DELETE FROM search_snapshot_aliases
+            WHERE snapshot_key NOT IN (SELECT snapshot_key FROM search_snapshots)
+            """
+        )
+        connection.commit()
+        with _SEARCH_SNAPSHOT_LOCK:
+            if snapshot_key != canonical_key:
+                _SEARCH_SNAPSHOTS.pop(snapshot_key, None)
+                _SEARCH_SNAPSHOT_SERVERS.pop(snapshot_key, None)
+            _SEARCH_SNAPSHOTS[canonical_key] = deepcopy(canonical_snapshot)
+            _SEARCH_SNAPSHOT_SERVERS[canonical_key] = server
+            _SEARCH_SNAPSHOTS.move_to_end(canonical_key)
+        return canonical_key
+    except Exception:
+        return snapshot_key
+    finally:
+        if connection is not None:
+            connection.close()
 
 
 def _search_snapshot_visible_fingerprint(snapshot: Dict[str, Any]) -> tuple:
@@ -235,6 +678,59 @@ def _search_snapshot_visible_fingerprint(snapshot: Dict[str, Any]) -> tuple:
             for surface in surfaces
         ),
     )
+
+
+def _persist_listener_snapshots(changed: list[tuple[str, Dict[str, Any]]]) -> None:
+    if not changed:
+        return
+    for key, snapshot in changed:
+        with _SEARCH_SNAPSHOT_LOCK:
+            server = _SEARCH_SNAPSHOT_SERVERS.get(key)
+        if server is None:
+            continue
+        # Listener work may complete out of order. Merge into the current
+        # snapshot instead of replacing newer visible inventory with a stale
+        # payload; preserve the highest revision as well.
+        with _SEARCH_SNAPSHOT_LOCK:
+            current = deepcopy(_SEARCH_SNAPSHOTS.get(key) or {})
+        if current:
+            merged = deepcopy(current)
+            for surface in (
+                "tracks", "artists", "albums", "playlists",
+                "related_artists", "artist_tracks", "artist_albums",
+                "related_albums",
+            ):
+                incoming_items = snapshot.get(surface)
+                if not isinstance(incoming_items, list):
+                    continue
+                existing_items = list(merged.get(surface) or [])
+                by_key = {
+                    str(item.get("id") or item.get("browseId") or item.get("canonical_album_identity") or item.get("title") or "").casefold(): index
+                    for index, item in enumerate(existing_items)
+                    if isinstance(item, dict)
+                }
+                for item in incoming_items:
+                    if not isinstance(item, dict):
+                        continue
+                    item_key = str(item.get("id") or item.get("browseId") or item.get("canonical_album_identity") or item.get("title") or "").casefold()
+                    if item_key and item_key in by_key:
+                        existing_items[by_key[item_key]] = {
+                            **existing_items[by_key[item_key]],
+                            **{k: v for k, v in item.items() if v not in (None, "", [], {})},
+                        }
+                    elif item_key:
+                        by_key[item_key] = len(existing_items)
+                        existing_items.append(deepcopy(item))
+                merged[surface] = existing_items
+            for key_name, value in snapshot.items():
+                if key_name not in merged or merged.get(key_name) in (None, "", [], {}):
+                    merged[key_name] = deepcopy(value)
+            merged["revision"] = max(
+                int(current.get("revision") or 1),
+                int(snapshot.get("revision") or 1),
+            )
+            snapshot = merged
+        _store_search_snapshot(key, snapshot, server, preserve_revision=True)
 
 
 def _target_quality(
@@ -973,8 +1469,9 @@ def _artist_catalog_albums(
 def _update_search_snapshots_artist(artist: Dict[str, Any]) -> None:
     if not _artist_merge_key(artist):
         return
+    changed_snapshots = []
     with _SEARCH_SNAPSHOT_LOCK:
-        for snapshot in _SEARCH_SNAPSHOTS.values():
+        for snapshot_key, snapshot in _SEARCH_SNAPSHOTS.items():
             visible_before = _search_snapshot_visible_fingerprint(snapshot)
             changed = False
             for surface in ("artists", "related_artists"):
@@ -1048,6 +1545,8 @@ def _update_search_snapshots_artist(artist: Dict[str, Any]) -> None:
                 _search_snapshot_visible_fingerprint(snapshot) != visible_before
             ):
                 snapshot["revision"] = int(snapshot.get("revision") or 1) + 1
+                changed_snapshots.append((snapshot_key, deepcopy(snapshot)))
+    _persist_listener_snapshots(changed_snapshots)
 
 
 register_artist_metadata_listener(_update_search_snapshots_artist)
@@ -1135,8 +1634,9 @@ def _update_search_snapshots_entity(item: Dict[str, Any]) -> None:
         else ("albums", "artist_albums", "related_albums")
     )
 
+    changed_snapshots = []
     with _SEARCH_SNAPSHOT_LOCK:
-        for snapshot in _SEARCH_SNAPSHOTS.values():
+        for snapshot_key, snapshot in _SEARCH_SNAPSHOTS.items():
             visible_before = _search_snapshot_visible_fingerprint(snapshot)
             for surface in surface_names:
                 values = list(snapshot.get(surface) or [])
@@ -1299,6 +1799,8 @@ def _update_search_snapshots_entity(item: Dict[str, Any]) -> None:
             _sync_entity_artwork_expansion_state(snapshot)
             if _search_snapshot_visible_fingerprint(snapshot) != visible_before:
                 snapshot["revision"] = int(snapshot.get("revision") or 1) + 1
+                changed_snapshots.append((snapshot_key, deepcopy(snapshot)))
+    _persist_listener_snapshots(changed_snapshots)
 
 
 register_entity_metadata_listener(_update_search_snapshots_entity)
@@ -1928,6 +2430,7 @@ class SearchService:
         *,
         allow_live_lead_lookup: bool,
         schedule_background: bool = True,
+        local_only: bool = False,
     ) -> List[Dict[str, Any]]:
         hydrated: List[Dict[str, Any]] = []
         persisted_by_id = load_catalog_artist_payloads(
@@ -2013,6 +2516,7 @@ class SearchService:
                 "provider_artist_id",
                 "artist_aliases",
                 "artwork_source_url",
+                "artwork_cache_status",
                 "artwork_cache_token",
                 "artwork_cache_identity",
                 "description",
@@ -2038,7 +2542,11 @@ class SearchService:
             if persisted_id and not current_provider_id:
                 artist["id"] = persisted_id
                 artist_id = persisted_id
-            artist = attach_cached_artist_artwork(self._server, artist)
+            artist = (
+                attach_persisted_artist_artwork(self._server, artist)
+                if local_only
+                else attach_cached_artist_artwork(self._server, artist)
+            )
             if (
                 not artist.get("thumbnail")
                 and artist_id
@@ -2069,9 +2577,10 @@ class SearchService:
                             if value not in (None, "")
                         }
                     )
-                    artist = attach_cached_artist_artwork(
-                        self._server,
-                        artist,
+                    artist = (
+                        attach_persisted_artist_artwork(self._server, artist)
+                        if local_only
+                        else attach_cached_artist_artwork(self._server, artist)
                     )
             hydrated.append(artist)
         if hydrated and schedule_background:
@@ -2153,8 +2662,17 @@ class SearchService:
         )
         return refreshed
 
-    def _artist_has_usable_artwork(self, artist: Dict[str, Any]) -> bool:
-        resolved = attach_cached_artist_artwork(self._server, artist)
+    def _artist_has_usable_artwork(
+        self,
+        artist: Dict[str, Any],
+        *,
+        local_only: bool = False,
+    ) -> bool:
+        resolved = (
+            attach_persisted_artist_artwork(self._server, artist)
+            if local_only
+            else attach_cached_artist_artwork(self._server, artist)
+        )
         thumbnail = str(resolved.get("thumbnail") or "").strip()
         return thumbnail.startswith("/artist_artwork/")
 
@@ -2162,12 +2680,18 @@ class SearchService:
         self,
         artists: List[Dict[str, Any]],
         excluded_artist: Dict[str, Any] | None = None,
+        *,
+        local_only: bool = False,
     ) -> List[Dict[str, Any]]:
         output: List[Dict[str, Any]] = []
         for artist in artists:
             if not isinstance(artist, dict):
                 continue
-            resolved = attach_cached_artist_artwork(self._server, artist)
+            resolved = (
+                attach_persisted_artist_artwork(self._server, artist)
+                if local_only
+                else attach_cached_artist_artwork(self._server, artist)
+            )
             thumbnail = str(resolved.get("thumbnail") or "").strip()
             if not thumbnail.startswith("/artist_artwork/"):
                 continue
@@ -2259,7 +2783,12 @@ class SearchService:
             "exhausted": exhausted,
         }
 
-    def _missing_artist_artwork(self, snapshot: Dict[str, Any]) -> int:
+    def _missing_artist_artwork(
+        self,
+        snapshot: Dict[str, Any],
+        *,
+        local_only: bool = False,
+    ) -> int:
         lead_artist = snapshot.get("lead_artist")
         artists = list(snapshot.get("artists") or [])[:8]
         if isinstance(lead_artist, dict):
@@ -2268,7 +2797,7 @@ class SearchService:
         for artist in artists:
             if not isinstance(artist, dict):
                 continue
-            if self._artist_has_usable_artwork(artist):
+            if self._artist_has_usable_artwork(artist, local_only=local_only):
                 continue
             key = _artist_merge_key(artist)
             if key:
@@ -2285,6 +2814,7 @@ class SearchService:
         visible_related = self._visible_artists(
             related_candidates,
             lead_artist if isinstance(lead_artist, dict) else None,
+            local_only=local_only,
         )
         related_target = min(6, len(related_candidates))
         return len(unique_missing) + max(
@@ -2501,17 +3031,39 @@ class SearchService:
 
         def run() -> None:
             try:
-                snapshot = _load_search_snapshot(snapshot_key)
+                snapshot = _load_search_snapshot(snapshot_key, self._server)
                 if not snapshot:
                     return
+                # All potentially expensive local rehydration, artwork
+                # verification/scheduling, and target revalidation happen
+                # after the request has already returned its persisted view.
+                snapshot = self._rehydrate_search_snapshot(
+                    snapshot,
+                    # Keep one completion pass to one persisted visible
+                    # revision; the explicit artwork scheduler below owns
+                    # any follow-up cache writes.
+                    schedule_background=False,
+                )
+                _schedule_snapshot_entity_artwork(self._server, snapshot)
                 starting_revision = int(snapshot.get("revision") or 1)
+                expansion_state = dict(snapshot.get("expansion_state") or {})
+                pending_surfaces = [
+                    surface
+                    for surface, state in expansion_state.items()
+                    if state in {"pending", "retryable"}
+                ]
+                target_state = str(
+                    snapshot.get("target_revalidation_state") or ""
+                ).casefold()
+                revalidate_target = target_state in {"pending", "retryable"}
                 request = SimpleNamespace(
-                    user_scope_id=user_scope_id or "guest",
+                    user_scope_id=user_scope_id or "",
                     result_type="artists",
                 )
-                revalidate_target = self._snapshot_target_needs_revalidation(
-                    query,
-                    snapshot,
+                completion_surface = (
+                    "artists"
+                    if "artists" in pending_surfaces
+                    else (pending_surfaces[0] if pending_surfaces else "artists")
                 )
                 if (
                     str(
@@ -2519,30 +3071,32 @@ class SearchService:
                     ).casefold()
                     == "exhausted"
                 ):
-                    _store_search_snapshot(snapshot_key, snapshot)
+                    _store_search_snapshot(snapshot_key, snapshot, self._server)
                     return
-                try:
-                    completed = self._expand_search_snapshot_surface(
-                        req=request,
-                        query=query,
-                        search_mode=search_mode,
-                        surface="artists",
-                        snapshot=snapshot,
-                        revalidate_target=revalidate_target,
-                    )
-                except Exception as exc:
-                    completed = snapshot
-                    expansion_state = dict(
-                        completed.get("expansion_state") or {}
-                    )
-                    expansion_state["artists"] = "retryable"
-                    completed["expansion_state"] = expansion_state
-                    print(
-                        "[EBB:search][background] "
-                        f"query={query[:48]} surface=artists "
-                        f"status=failed error={str(exc)[:96]}",
-                        flush=True,
-                    )
+                completed = snapshot
+                if pending_surfaces or revalidate_target:
+                    try:
+                        completed = self._expand_search_snapshot_surface(
+                            req=request,
+                            query=query,
+                            search_mode=search_mode,
+                            surface=completion_surface,
+                            snapshot=snapshot,
+                            revalidate_target=revalidate_target,
+                        )
+                    except Exception as exc:
+                        completed = snapshot
+                        expansion_state = dict(
+                            completed.get("expansion_state") or {}
+                        )
+                        expansion_state[completion_surface] = "retryable"
+                        completed["expansion_state"] = expansion_state
+                        print(
+                            "[EBB:search][background] "
+                            f"query={query[:48]} surface={completion_surface} "
+                            f"status=failed error={str(exc)[:96]}",
+                            flush=True,
+                        )
                 with _SEARCH_SNAPSHOT_LOCK:
                     latest = deepcopy(
                         _SEARCH_SNAPSHOTS.get(snapshot_key) or {}
@@ -2630,10 +3184,7 @@ class SearchService:
                         int(latest.get("revision") or 1),
                     )
                     completed["revision"] = current_revision
-                    completed["expires_at"] = (
-                        time.time() + _SEARCH_SNAPSHOT_TTL_SECONDS
-                    )
-                    _store_search_snapshot(snapshot_key, completed)
+                    _store_search_snapshot(snapshot_key, completed, self._server)
             finally:
                 with _SEARCH_SNAPSHOT_COMPLETION_LOCK:
                     _SEARCH_SNAPSHOT_COMPLETION_PENDING.discard(snapshot_key)
@@ -3979,121 +4530,74 @@ class SearchService:
             getattr(req, "result_type", "") or ""
         ).strip().lower()
         request_offset = max(int(getattr(req, "offset", 0) or 0), 0)
-        snapshot_key = _search_snapshot_key(
-            req.user_scope_id or "guest",
-            query,
-            search_mode,
+        snapshot_key_started_at = time.perf_counter()
+        snapshot_key = _resolve_snapshot_key(self._server, query, search_mode)
+        snapshot_key_resolution_ms = int(
+            (time.perf_counter() - snapshot_key_started_at) * 1000
         )
+        snapshot_load_started_at = time.perf_counter()
         snapshot = (
             None
             if bool(getattr(req, "force_refresh", False))
-            else _load_search_snapshot(snapshot_key)
+            else _load_search_snapshot(snapshot_key, self._server)
+        )
+        snapshot_load_ms = int(
+            (time.perf_counter() - snapshot_load_started_at) * 1000
         )
         if snapshot is not None:
-            current_expansion_state = dict(
-                snapshot.get("expansion_state") or {}
-            )
-            artwork_refresh = (
-                current_expansion_state.get(requested_surface)
-                == "pending_artwork"
-            )
-            refreshed_snapshot = self._rehydrate_search_snapshot(
-                snapshot,
-                schedule_background=(
-                    requested_surface == "artists" and artwork_refresh
-                ),
-            )
-            if refreshed_snapshot != snapshot:
-                snapshot = refreshed_snapshot
-                _store_search_snapshot(snapshot_key, snapshot)
-            _schedule_snapshot_entity_artwork(self._server, snapshot)
             expansion_state = dict(snapshot.get("expansion_state") or {})
-            target_revalidation_pending = self._snapshot_target_needs_revalidation(
-                query,
-                snapshot,
-            )
-            expansion_state = dict(snapshot.get("expansion_state") or {})
-            if (
-                not target_revalidation_pending
-                and str(
-                    snapshot.get("target_revalidation_state") or ""
-                ).casefold()
-                == "exhausted"
+            background_reasons: list[str] = []
+            if any(
+                state in {"pending", "retryable"}
+                for state in expansion_state.values()
             ):
-                _store_search_snapshot(snapshot_key, snapshot)
-            if target_revalidation_pending:
-                snapshot["target_revalidation_state"] = "pending"
-                expansion_state["artists"] = "retryable"
-                snapshot["expansion_state"] = expansion_state
-                _store_search_snapshot(snapshot_key, snapshot)
-            if (
-                str(getattr(req, "context_surface", "") or "")
-                == "interactive_search"
-                and (
-                    target_revalidation_pending
-                    or expansion_state.get("artists")
-                    in {"pending", "retryable"}
-                )
+                background_reasons.append("incomplete_surface")
+            if any(
+                state == "pending_artwork"
+                for state in expansion_state.values()
             ):
-                self._schedule_search_snapshot_completion(
+                background_reasons.append("pending_artwork")
+            if any(
+                snapshot.get("_pending_entity_artwork", {}).get(surface)
+                for surface in snapshot.get("_pending_entity_artwork", {})
+            ) and "pending_artwork" not in background_reasons:
+                background_reasons.append("pending_artwork")
+            if str(snapshot.get("target_revalidation_state") or "").casefold() in {
+                "pending", "retryable"
+            }:
+                background_reasons.append("target_revalidation")
+            background_scheduled = False
+            if background_reasons:
+                background_scheduled = self._schedule_search_snapshot_completion(
                     snapshot_key=snapshot_key,
                     query=query,
                     search_mode=search_mode,
-                    user_scope_id=req.user_scope_id or "guest",
+                    user_scope_id="",
                 )
-            if artwork_refresh:
-                artwork_poll_attempts = dict(
-                    snapshot.get("artwork_poll_attempts") or {}
-                )
-                attempt = int(
-                    artwork_poll_attempts.get(requested_surface) or 0
-                ) + 1
-                artwork_poll_attempts[requested_surface] = attempt
-                snapshot["artwork_poll_attempts"] = artwork_poll_attempts
-                entity_artwork_pending = _pending_entity_artwork_count(
-                    snapshot,
-                    requested_surface,
-                )
-                artist_artwork_pending = (
-                    self._missing_artist_artwork(snapshot)
-                    if requested_surface == "artists"
-                    else 0
-                )
-                if not entity_artwork_pending and not artist_artwork_pending:
-                    expansion_state[requested_surface] = "complete"
-                    snapshot["expansion_state"] = expansion_state
-                elif attempt >= _SEARCH_ARTWORK_MAX_ATTEMPTS:
-                    expansion_state[requested_surface] = "exhausted"
-                    snapshot["expansion_state"] = expansion_state
-                _store_search_snapshot(snapshot_key, snapshot)
             surface_items = list(snapshot.get(requested_surface) or [])
             page_size = max(8, min(int(limit or 16), 24))
-            should_expand = (
-                expansion_state.get(requested_surface) in {"pending", "retryable"}
-                and request_offset >= len(surface_items)
-            )
-            if should_expand:
-                try:
-                    snapshot = self._expand_search_snapshot_surface(
-                        req=req,
+            # A persisted hit is intentionally read/build only. Expansion is
+            # performed by the deduplicated post-response completion task.
+            should_expand = False
+            if requested_surface and request_offset > 0:
+                state = dict(snapshot.get("expansion_state") or {}).get(requested_surface)
+                if state in {"pending", "retryable", "pending_artwork"}:
+                    self._schedule_search_snapshot_completion(
+                        snapshot_key=snapshot_key,
                         query=query,
                         search_mode=search_mode,
-                        surface=requested_surface,
-                        snapshot=snapshot,
+                        user_scope_id="",
                     )
-                except Exception:
-                    expansion_state = dict(
-                        snapshot.get("expansion_state") or {}
+                    waited = _wait_for_search_snapshot_revision(
+                        self._server,
+                        snapshot_key,
+                        int(snapshot.get("revision") or 1),
+                        1500,
                     )
-                    expansion_state[requested_surface] = "retryable"
-                    snapshot["expansion_state"] = expansion_state
-                _store_search_snapshot(snapshot_key, snapshot)
+                    if waited is not None:
+                        snapshot = waited
             snapshot_lead = dict(snapshot.get("lead_artist") or {})
-            response_lead = (
-                attach_cached_artist_artwork(self._server, snapshot_lead)
-                if snapshot_lead and _artist_provider_id(snapshot_lead)
-                else None
-            )
+            response_lead = snapshot_lead or None
             pages: Dict[str, Any] = {}
             paged: Dict[str, List[Dict[str, Any]]] = {}
             for surface_name in (
@@ -4105,22 +4609,43 @@ class SearchService:
             ):
                 surface_items = list(snapshot.get(surface_name) or [])
                 if surface_name == "artists":
-                    surface_items = self._visible_artists(surface_items)
+                    surface_items = [
+                        item for item in surface_items
+                        if isinstance(item, dict)
+                        and _artist_provider_id(item)
+                        and str(item.get("thumbnail") or "").startswith(
+                            "/artist_artwork/"
+                        )
+                    ]
                 elif surface_name == "related_artists":
-                    surface_items = self._visible_artists(
-                        surface_items,
-                        snapshot_lead,
-                    )
+                    surface_items = [
+                        item for item in surface_items
+                        if isinstance(item, dict)
+                        and _artist_provider_id(item)
+                        and str(item.get("thumbnail") or "").startswith(
+                            "/artist_artwork/"
+                        )
+                        and not _same_artist_identity(item, snapshot_lead)
+                    ]
                 surface_offset = (
                     0
                     if (
-                        (should_expand or artwork_refresh)
+                        should_expand
                         and requested_surface == surface_name
                     )
                     else request_offset
                     if requested_surface == surface_name
                     else 0
                 )
+                if (
+                    surface_name == requested_surface
+                    and request_offset >= len(surface_items)
+                    and dict(snapshot.get("expansion_state") or {}).get(surface_name)
+                    in {"pending", "retryable", "pending_artwork"}
+                ):
+                    # A pending expansion cannot claim a terminal empty page;
+                    # return the existing valid page with deferred/has_more.
+                    surface_offset = 0
                 paged[surface_name], pages[surface_name] = self._surface_page(
                     surface_items,
                     offset=surface_offset,
@@ -4139,6 +4664,7 @@ class SearchService:
                 ):
                     pages[surface_name]["has_more"] = True
                     pages[surface_name]["deferred_expansion"] = True
+            response_build_started_at = time.perf_counter()
             response = self._build_direct_search_response(
                 req=req,
                 trace=trace,
@@ -4163,17 +4689,41 @@ class SearchService:
                 write_resolution_memory=False,
             )
             diagnostics = dict(response.get("diagnostics") or {})
+            response_build_ms = int(
+                (time.perf_counter() - response_build_started_at) * 1000
+            )
             diagnostics.update(
                 {
                     "ranking_backend": "canonical_search_snapshot_v1",
                     "query_mode": search_mode,
                     "search_snapshot_hit": True,
+                    "snapshot_key_resolution_ms": snapshot_key_resolution_ms,
+                    "snapshot_load_ms": snapshot_load_ms,
+                    "response_build_ms": response_build_ms,
+                    "background_scheduled": background_scheduled,
+                    "background_reasons": background_reasons,
                     "profile_build_skipped": True,
                     "relevance_admission": True,
-                    **self._snapshot_progress_diagnostics(snapshot),
+                    "search_snapshot_revision": int(snapshot.get("revision") or 1),
+                    "search_pending_surfaces": sorted(
+                        surface
+                        for surface, state in expansion_state.items()
+                        if state in {"pending", "retryable", "pending_artwork"}
+                    ),
+                    "search_exhausted_surfaces": sorted(
+                        surface
+                        for surface, state in expansion_state.items()
+                        if state == "exhausted"
+                    ),
+                    "related_artist_candidate_count": len(
+                        list(snapshot.get("related_artists") or [])
+                    ),
                 }
             )
             response["diagnostics"] = diagnostics
+            diagnostics["request_ms"] = int(
+                (time.perf_counter() - direct_started_at) * 1000
+            )
             return response
 
         canonical_req = SimpleNamespace(
@@ -4201,7 +4751,9 @@ class SearchService:
         retrieval_payload = retrieve_search_candidates_fast(
             canonical_req,
             {
-                "user_scope_id": req.user_scope_id or "guest",
+                # Canonical snapshots are shared across accounts. Do not let
+                # user history/catalog partitions enter their base inventory.
+                "user_scope_id": "",
                 "recent_queries": [],
                 "last_played_tracks": [],
             },
@@ -4234,20 +4786,33 @@ class SearchService:
         request_stage_timings_ms["ranking"] = int(
             (time.perf_counter() - ranking_started_at) * 1000
         )
+        interactive_first_response = (
+            str(getattr(req, "context_surface", "") or "").casefold()
+            == "interactive_search"
+            and not requested_surface
+            and request_offset == 0
+        )
+        artist_artwork_started_at = time.perf_counter()
         artists = self._hydrate_artist_artwork(
             artists,
             allow_live_lead_lookup=False,
             schedule_background=False,
+            local_only=interactive_first_response,
         )
         artists = self._merge_snapshot_items("artists", [], artists)
         related_artists = self._hydrate_artist_artwork(
             list(retrieval_payload.get("related_artists") or []),
             allow_live_lead_lookup=False,
+            schedule_background=not interactive_first_response,
+            local_only=interactive_first_response,
         )
         related_artists = self._merge_snapshot_items(
             "related_artists",
             [],
             related_artists,
+        )
+        request_stage_timings_ms["artist_artwork_local_lookup"] = int(
+            (time.perf_counter() - artist_artwork_started_at) * 1000
         )
         playlists = list(retrieval_payload.get("playlists") or [])
         if requested_surface == "playlists":
@@ -4272,11 +4837,28 @@ class SearchService:
         containing_album = (
             dict(resolved_target.get("containing_album") or {}) or None
         )
-        if lead_artist:
+        defer_side_surfaces = bool(
+            getattr(req, "defer_side_surfaces", False)
+        )
+        # Initial interactive search owns the fast first-response contract;
+        # page/detail requests retain their explicit synchronous semantics.
+        if (
+            str(getattr(req, "context_surface", "") or "").casefold()
+            == "interactive_search"
+            and not requested_surface
+            and request_offset == 0
+        ):
+            defer_side_surfaces = True
+        if lead_artist and defer_side_surfaces:
+            # Full searches immediately pass the accepted lead through
+            # `_complete_artist_search_surfaces`, which performs the same
+            # persisted metadata merge and artwork admission. Keep this
+            # hydration only for deliberately deferred requests.
             hydrated_lead = self._hydrate_artist_artwork(
                 [lead_artist],
                 allow_live_lead_lookup=False,
                 schedule_background=False,
+                local_only=interactive_first_response,
             )
             lead_artist = hydrated_lead[0] if hydrated_lead else lead_artist
         if isinstance(lead_artist, dict):
@@ -4315,9 +4897,6 @@ class SearchService:
         live_catalog_ms = 0
         catalog_stage_timings_ms: Dict[str, int] = {}
         pending_entity_artwork: Dict[str, List[Dict[str, Any]]] = {}
-        defer_side_surfaces = bool(
-            getattr(req, "defer_side_surfaces", False)
-        )
         artist_completion_started_at = time.perf_counter()
         if isinstance(lead_artist, dict) and not defer_side_surfaces:
             completed_artist = self._complete_artist_search_surfaces(
@@ -4415,27 +4994,29 @@ class SearchService:
                 resolved_target["containing_album"] = rebound_album
 
         artwork_publication_started_at = time.perf_counter()
+        artwork_local_started_at = time.perf_counter()
+        artwork_server = None if interactive_first_response else self._server
         tracks, albums = _repair_search_artwork(
             tracks,
             albums,
-            server=self._server,
+            server=artwork_server,
         )
         artist_tracks, artist_albums = _repair_search_artwork(
             artist_tracks,
             artist_albums,
-            server=self._server,
+            server=artwork_server,
         )
         _, related_albums = _repair_search_artwork(
             [],
             related_albums,
-            server=self._server,
+            server=artwork_server,
         )
         containing_album_candidate: Dict[str, Any] | None = None
         if isinstance(containing_album, dict):
             _, repaired_containing = _repair_search_artwork(
                 tracks,
                 [containing_album],
-                server=self._server,
+                server=artwork_server,
             )
             containing_album_candidate = (
                 repaired_containing[0] if repaired_containing else None
@@ -4450,6 +5031,10 @@ class SearchService:
                 )
                 else None
             )
+        request_stage_timings_ms["artwork_local_lookup"] = int(
+            (time.perf_counter() - artwork_local_started_at) * 1000
+        )
+        artwork_remote_started_at = time.perf_counter()
         for surface, candidates in (
             (
                 "albums",
@@ -4506,14 +5091,27 @@ class SearchService:
             for album in related_albums
             if _search_album_is_publishable(album)
         ]
-        playlists = [
-            _prepare_search_entity_artwork(
-                self._server,
-                playlist,
-                entity_type="playlist",
-            )
-            for playlist in playlists
-        ]
+        if interactive_first_response:
+            # Verified persisted artwork remains immediately publishable;
+            # remote source verification is owned by the queued snapshot
+            # enrichment pass below.
+            playlists = [
+                attach_cached_entity_artwork(
+                    self._server,
+                    playlist,
+                    entity_type="playlist",
+                )
+                for playlist in playlists
+            ]
+        else:
+            playlists = [
+                _prepare_search_entity_artwork(
+                    self._server,
+                    playlist,
+                    entity_type="playlist",
+                )
+                for playlist in playlists
+            ]
         pending_entity_artwork["playlists"] = self._merge_snapshot_items(
             "playlists",
             list(pending_entity_artwork.get("playlists") or []),
@@ -4530,6 +5128,9 @@ class SearchService:
         ]
         request_stage_timings_ms["artwork_and_publication"] = int(
             (time.perf_counter() - artwork_publication_started_at) * 1000
+        )
+        request_stage_timings_ms["artwork_remote_scheduling"] = int(
+            (time.perf_counter() - artwork_remote_started_at) * 1000
         )
 
         snapshot = {
@@ -4598,7 +5199,10 @@ class SearchService:
             isinstance(lead_artist, dict)
             and (
                 not _artist_provider_id(lead_artist)
-                or self._missing_artist_artwork(snapshot)
+                or self._missing_artist_artwork(
+                    snapshot,
+                    local_only=interactive_first_response,
+                )
             )
         ):
             snapshot["expansion_state"]["artists"] = "retryable"
@@ -4614,8 +5218,33 @@ class SearchService:
             snapshot["expansion_state"]["artists"] = "retryable"
         _sync_entity_artwork_expansion_state(snapshot)
         snapshot_started_at = time.perf_counter()
+        # Publish to the in-process cache immediately. SQLite persistence is
+        # serialized off the request path so durable writes/artwork listeners
+        # cannot extend first-response latency.
         _store_search_snapshot(snapshot_key, snapshot)
-        _schedule_snapshot_entity_artwork(self._server, snapshot)
+        with _SEARCH_SNAPSHOT_LOCK:
+            _SEARCH_SNAPSHOT_SERVERS[snapshot_key] = self._server
+        artwork_persist_queue_started_at = time.perf_counter()
+        _SEARCH_SNAPSHOT_PERSIST_EXECUTOR.submit(
+            _persist_listener_snapshots,
+            [(snapshot_key, deepcopy(snapshot))],
+        )
+        _SEARCH_SNAPSHOT_PERSIST_EXECUTOR.submit(
+            _learn_snapshot_alias,
+            self._server,
+            query,
+            search_mode,
+            snapshot_key,
+            deepcopy(snapshot),
+        )
+        _SEARCH_SNAPSHOT_PERSIST_EXECUTOR.submit(
+            _schedule_snapshot_entity_artwork,
+            self._server,
+            deepcopy(snapshot),
+        )
+        request_stage_timings_ms["artwork_persistence_queue"] = int(
+            (time.perf_counter() - artwork_persist_queue_started_at) * 1000
+        )
         request_stage_timings_ms["snapshot_store"] = int(
             (time.perf_counter() - snapshot_started_at) * 1000
         )
@@ -4629,7 +5258,9 @@ class SearchService:
                 snapshot_key=snapshot_key,
                 query=query,
                 search_mode=search_mode,
-                user_scope_id=req.user_scope_id or "guest",
+                # Canonical base enrichment is shared; personalization is
+                # intentionally excluded from this background pass.
+                user_scope_id="",
             )
         offset = request_offset
         page_size = max(8, min(int(limit or 16), 24))
@@ -4638,9 +5269,16 @@ class SearchService:
             tracks, offset=offset if requested_surface == "tracks" else 0,
             limit=page_size,
         )
-        visible_artists = self._visible_artists(artists)
+        visible_artists = self._visible_artists(
+            artists,
+            local_only=interactive_first_response,
+        )
         response_lead = (
-            attach_cached_artist_artwork(self._server, lead_artist)
+            (
+                attach_persisted_artist_artwork(self._server, lead_artist)
+                if interactive_first_response
+                else attach_cached_artist_artwork(self._server, lead_artist)
+            )
             if isinstance(lead_artist, dict) and _artist_provider_id(lead_artist)
             else None
         )
@@ -4660,6 +5298,7 @@ class SearchService:
         visible_related_artists = self._visible_artists(
             related_artists,
             lead_artist,
+            local_only=interactive_first_response,
         )
         paged_related, pages["related_artists"] = self._surface_page(
             visible_related_artists,
@@ -4736,6 +5375,14 @@ class SearchService:
             "related_artist_artwork": related_artwork_ms,
         }
         diagnostics["stage_timings_ms"] = dict(request_stage_timings_ms)
+        diagnostics["first_response_contract_ms"] = direct_lookup_ms
+        diagnostics["synchronous_optional_work_ms"] = int(
+            request_stage_timings_ms.get("artist_surface_completion") or 0
+        )
+        diagnostics["snapshot_memory_publish_ms"] = int(
+            request_stage_timings_ms.get("snapshot_store") or 0
+        )
+        diagnostics["snapshot_persist_queued"] = True
         diagnostics["artist_catalog"] = {
             "status": catalog_status,
             "source": catalog_source,
@@ -4861,6 +5508,42 @@ class SearchService:
                     intent_hint=intent_hint,
                     explicit_mode=str(getattr(req, "search_mode", "") or ""),
                 )
+                # Revision wait is an existing-snapshot long poll. It returns
+                # on a visible revision advance (or terminal surfaces), and
+                # never falls through into a fresh provider retrieval.
+                wait_ms = max(0, min(int(getattr(req, "revision_wait_ms", 0) or 0), 3000))
+                since_revision = int(getattr(req, "revision", 0) or 0)
+                if wait_ms > 0 and since_revision > 0:
+                    wait_key = _resolve_snapshot_key(server, query, search_mode)
+                    waited = _wait_for_search_snapshot_revision(
+                        server, wait_key, since_revision, wait_ms
+                    )
+                    if waited is None:
+                        return {
+                            "status": "success",
+                            "request_id": trace["request_id"],
+                            "model_version": track_model_version,
+                            "query_intent": "mixed",
+                            "results": [],
+                            "tracks": [],
+                            "artists": [],
+                            "albums": [],
+                            "similar_artists": [],
+                            "similar_tracks": [],
+                            "top_result": None,
+                            "artist_tracks": [],
+                            "artist_albums": [],
+                            "related_albums": [],
+                            "playlists": [],
+                            "diagnostics": {
+                                "ranking_backend": "canonical_search_snapshot_v1",
+                                "query_mode": search_mode,
+                                "revision_wait": True,
+                                "revision_wait_timed_out": True,
+                                "search_snapshot_revision": since_revision,
+                                "request_ms": int((time.perf_counter() - request_started_at) * 1000),
+                            },
+                        }
                 return self._search_canonical_entities(
                     req=req,
                     trace=trace,
@@ -5000,7 +5683,12 @@ class SearchService:
     def suggest(self, req):
         server = self._server
         try:
-            suggestion_items = semantic_search_suggestion_items(req, server=server)
+            suggestion_timings = {}
+            suggestion_items = semantic_search_suggestion_items(
+                req,
+                server=server,
+                diagnostics_out=suggestion_timings,
+            )
             results = [
                 item.get("text") if isinstance(item, dict) else str(item)
                 for item in suggestion_items
@@ -5013,6 +5701,7 @@ class SearchService:
                 "diagnostics": {
                     "ranking_backend": "canonical_suggestions_v1",
                     "warmup_scheduled": False,
+                    "stage_timings_ms": suggestion_timings,
                 },
             }
         except Exception:

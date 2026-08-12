@@ -6,7 +6,12 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
-from .cache_runtime import lookup_search_result, store_search_result
+from .cache_runtime import (
+    lookup_search_result,
+    store_search_result,
+    lookup_persistent_suggestion_base,
+    store_persistent_suggestion_base,
+)
 from .intelligence import load_fuzzy_catalog_entity_memories
 from .server_adapter import SearchServerAdapter, adapt_search_server
 from .upstream_runtime import (
@@ -30,11 +35,13 @@ def unique_strings(values, limit: Optional[int] = None) -> List[str]:
 
 
 def _search_executor(server: Any):
-    return getattr(server, "search_executor", server.recommendation_executor)
+    executor = getattr(server, "search_executor", None)
+    return executor if executor is not None else server.recommendation_executor
 
 
 def _search_upstream_executor(server: Any):
-    return getattr(server, "search_upstream_executor", _search_executor(server))
+    executor = getattr(server, "search_upstream_executor", None)
+    return executor if executor is not None else _search_executor(server)
 
 
 def search_query_intent(query: str, *, server: Any | None = None) -> str:
@@ -460,28 +467,12 @@ def _semantic_track_suggestion_text(
 
 def _fast_suggestion_cache_key(req, *, server: Any | None = None) -> str:
     server = _resolve_server(server)
-    recent_track_ids: List[str] = []
-    for raw_track in [
-        *(getattr(req, "last_played_tracks", []) or []),
-        *(getattr(req, "recent_tracks", []) or []),
-        *(getattr(req, "recent_track_snapshots", []) or []),
-        *(getattr(req, "top_track_snapshots", []) or []),
-        *(getattr(req, "anchor_track_snapshots", []) or []),
-    ]:
-        if isinstance(raw_track, dict):
-            track_id = _suggestion_track_id(raw_track)
-            if track_id and track_id not in recent_track_ids:
-                recent_track_ids.append(track_id)
-        if len(recent_track_ids) >= 24:
-            break
+    # Canonical suggestions are shared across users.  Personal history is
+    # overlaid after this base is loaded and must never fragment the cache.
     payload = {
-        "namespace": "fast_suggestions_v2",
+        "namespace": "canonical_suggestions_v3",
         "query": server.normalize_text(req.query),
-        "user_scope_id": server.safe_scope_id(
-            getattr(req, "user_scope_id", "guest") or "guest"
-        ),
         "limit": max(int(req.limit or 0), 0),
-        "recent_track_ids": recent_track_ids,
     }
     return hashlib.sha1(
         json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -525,6 +516,27 @@ def _track_suggestion_payload(track: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+_GENERIC_PLACEHOLDERS = {"unknown", "unknown artist", "unknown title", "unknown album", "[unknown]", "n/a", "na", "none", "null", "-"}
+
+
+def _usable_suggestion_text(value: Any) -> str:
+    text = _semantic_suggestion_text(value)
+    if not text:
+        return ""
+    normalized = re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+    if normalized in _GENERIC_PLACEHOLDERS or normalized.startswith("unknown unknown"):
+        return ""
+    return text
+
+
+def _usable_suggestion_field(value: Any) -> str:
+    text = _semantic_suggestion_text(value)
+    if not text:
+        return ""
+    normalized = re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+    return "" if normalized in _GENERIC_PLACEHOLDERS else text
+
+
 def _recent_track_suggestion_items(
     req,
     query: str,
@@ -551,8 +563,8 @@ def _recent_track_suggestion_items(
             continue
         track = dict(raw_track)
         track_id = _suggestion_track_id(track)
-        title = _semantic_suggestion_text(track.get("title") or track.get("name"))
-        artist = _semantic_suggestion_text(
+        title = _usable_suggestion_field(track.get("title") or track.get("name"))
+        artist = _usable_suggestion_field(
             track.get("artist") or track.get("channel") or track.get("author")
         )
         if not title or not track_id or track_id in seen_ids:
@@ -586,29 +598,35 @@ def _recent_track_suggestion_items(
     return ranked[: max(0, int(limit or 0))]
 
 
-def semantic_search_suggestion_items(req, *, server: Any | None = None):
+def semantic_search_suggestion_items(
+    req,
+    *,
+    server: Any | None = None,
+    diagnostics_out: Dict[str, Any] | None = None,
+):
     server = _resolve_server(server)
+    started_at = time.perf_counter()
     query = server.trim_text(req.query)
     limit = max(1, min(req.limit or 5, 8))
     if not query:
         return []
 
     cache_key = _fast_suggestion_cache_key(req, server=server)
+    memory_cache_started_at = time.perf_counter()
     cached = lookup_search_result("suggestions", cache_key)
-    if cached is not None:
-        if cached and isinstance(cached[0], dict):
-            return list(cached[:limit])
-        return [
-            {
-                "text": _semantic_suggestion_text(value),
-                "source_score": 1.0,
-                "source_name": "suggestion_cache",
-                "suggestion_type": "query",
-                "direct_play": False,
-            }
-            for value in list(cached[:limit])
-            if _semantic_suggestion_text(value)
-        ]
+    memory_cache_ms = int((time.perf_counter() - memory_cache_started_at) * 1000)
+    memory_cache_hit = cached is not None
+    persistent_cache_ms = 0
+    persistent_cache_hit = False
+    if cached is None:
+        persistent_cache_started_at = time.perf_counter()
+        cached = lookup_persistent_suggestion_base(server, cache_key)
+        persistent_cache_ms = int(
+            (time.perf_counter() - persistent_cache_started_at) * 1000
+        )
+        if cached is not None:
+            store_search_result("suggestions", cache_key, cached)
+            persistent_cache_hit = True
 
     normalized_query = server.normalize_text(query)
     candidates = {}
@@ -618,18 +636,13 @@ def semantic_search_suggestion_items(req, *, server: Any | None = None):
         server=server,
         limit=min(3, limit),
     )
-    if direct_play_items and float(direct_play_items[0].get("score") or 0.0) >= 8.55:
-        fast_results = direct_play_items[:limit]
-        store_search_result("suggestions", cache_key, fast_results)
-        return list(fast_results)
-
     def add_candidate(
         raw_text: Optional[str],
         source_score: float,
         source_name: str,
         suggestion_type: str,
     ) -> None:
-        text = _semantic_suggestion_text(raw_text)
+        text = _usable_suggestion_text(raw_text)
         normalized = server.normalize_text(text)
         if not text or not normalized or normalized == normalized_query:
             return
@@ -642,6 +655,12 @@ def semantic_search_suggestion_items(req, *, server: Any | None = None):
                 "suggestion_type": suggestion_type,
             }
 
+    if isinstance(cached, list):
+        for item in cached:
+            if isinstance(item, dict):
+                add_candidate(item.get("text"), float(item.get("source_score") or 0.0), "suggestion_cache", item.get("suggestion_type") or "query")
+
+    catalog_started_at = time.perf_counter()
     for memory in load_fuzzy_catalog_entity_memories(
         server,
         query=query,
@@ -664,10 +683,14 @@ def semantic_search_suggestion_items(req, *, server: Any | None = None):
             "canonical_prefix_index",
             entity_type if entity_type in {"track", "artist", "album"} else "query",
         )
+    catalog_ms = int((time.perf_counter() - catalog_started_at) * 1000)
 
     search_started_at = time.perf_counter()
     upstream_future = None
-    if len(candidates) + len(direct_play_items) < limit:
+    # A shared cached base is already a complete typeahead response. Do not
+    # put upstream latency back on the critical path merely because a provider
+    # returned fewer than the requested cap on its first successful fetch.
+    if cached is None and hasattr(server, "ytmusic"):
         upstream_future = _search_upstream_executor(server).submit(
             server.ytmusic.get_search_suggestions,
             query,
@@ -716,6 +739,7 @@ def semantic_search_suggestion_items(req, *, server: Any | None = None):
     if not candidates and not direct_play_items:
         return []
 
+    ranking_started_at = time.perf_counter()
     ranked = []
     for item in candidates.values():
         suggestion_text = item["text"]
@@ -759,11 +783,6 @@ def semantic_search_suggestion_items(req, *, server: Any | None = None):
         "track_play": 2,
         "album": 2,
     }
-    for item in direct_play_items:
-        normalized = server.normalize_text(item.get("text"))
-        if normalized:
-            seen_texts.add(normalized)
-        results.append(item)
     for item in ranked:
         suggestion_type = item.get("suggestion_type") or "query"
         if type_counts.get(suggestion_type, 0) >= type_caps.get(suggestion_type, limit):
@@ -779,12 +798,47 @@ def semantic_search_suggestion_items(req, *, server: Any | None = None):
         if len(results) >= limit:
             break
 
-    store_search_result("suggestions", cache_key, results)
+    # Persist only the canonical base; user-specific direct-play rows are
+    # intentionally overlaid above and never cached for another account.
+    canonical_base = list(results[:limit])
+    store_search_result("suggestions", cache_key, canonical_base)
+    store_persistent_suggestion_base(server, cache_key, canonical_base)
+    output = []
+    seen_output = set()
+    for item in direct_play_items:
+        normalized = server.normalize_text(item.get("text"))
+        if normalized and normalized not in seen_output:
+            output.append(item)
+            seen_output.add(normalized)
+    for item in canonical_base:
+        normalized = server.normalize_text(item.get("text"))
+        if normalized and normalized not in seen_output:
+            output.append(item)
+            seen_output.add(normalized)
+        if len(output) >= limit:
+            break
+    source_counts: Dict[str, int] = {}
+    for item in output:
+        source_name = str(item.get("source_name") or "unknown")
+        source_counts[source_name] = source_counts.get(source_name, 0) + 1
+    diagnostics = {
+        "total": int((time.perf_counter() - started_at) * 1000),
+        "memory_cache": memory_cache_ms,
+        "persistent_cache": persistent_cache_ms,
+        "catalog": catalog_ms,
+        "upstream": int((time.perf_counter() - search_started_at) * 1000),
+        "ranking": int((time.perf_counter() - ranking_started_at) * 1000),
+        "source_counts": source_counts,
+        "memory_cache_hit": memory_cache_hit,
+        "persistent_cache_hit": persistent_cache_hit,
+    }
+    if diagnostics_out is not None:
+        diagnostics_out.update(diagnostics)
     if (time.perf_counter() - search_started_at) >= 0.75:
         print(
             "[EBB:suggest][slow] "
             f'query="{query}" '
-            f"results={len(results)} "
+            f"results={len(output)} "
             f"elapsed_ms={int((time.perf_counter() - search_started_at) * 1000)}"
         )
-    return list(results)
+    return list(output[:limit])

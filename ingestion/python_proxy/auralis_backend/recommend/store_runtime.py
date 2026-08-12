@@ -227,6 +227,51 @@ def init_recommendation_store(server: Any | None = None) -> Any:
                 )
                 connection.execute(
                     """
+                    CREATE TABLE IF NOT EXISTS search_suggestion_cache (
+                        cache_key TEXT PRIMARY KEY,
+                        payload_json TEXT NOT NULL,
+                        updated_at REAL NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_search_suggestion_cache_lru "
+                    "ON search_suggestion_cache(updated_at ASC)"
+                )
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS search_snapshots (
+                        snapshot_key TEXT PRIMARY KEY,
+                        payload_json TEXT NOT NULL,
+                        revision INTEGER NOT NULL DEFAULT 1,
+                        last_accessed REAL NOT NULL,
+                        updated_at REAL NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_search_snapshots_lru "
+                    "ON search_snapshots(last_accessed ASC, updated_at ASC)"
+                )
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS search_snapshot_aliases (
+                        alias_key TEXT NOT NULL,
+                        search_mode TEXT NOT NULL,
+                        snapshot_key TEXT NOT NULL,
+                        confidence REAL NOT NULL DEFAULT 0,
+                        source TEXT NOT NULL DEFAULT '',
+                        updated_at REAL NOT NULL,
+                        PRIMARY KEY(alias_key, search_mode)
+                    )
+                    """
+                )
+                connection.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_search_snapshot_alias_target "
+                    "ON search_snapshot_aliases(snapshot_key)"
+                )
+                connection.execute(
+                    """
                     CREATE TABLE IF NOT EXISTS search_source_identities (
                         source_provider TEXT NOT NULL,
                         source_key TEXT NOT NULL,

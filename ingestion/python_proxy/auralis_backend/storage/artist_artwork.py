@@ -616,6 +616,33 @@ def attach_cached_entity_artwork(
     return updated
 
 
+def attach_persisted_artist_artwork(
+    server: Any,
+    artist: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Attach only explicitly persisted verified artwork; never performs R2 I/O."""
+    updated = dict(artist or {})
+    status = _clean(updated.get("artwork_cache_status")).casefold()
+    token = _clean(updated.get("artwork_cache_token"))
+    identity = _clean(updated.get("artwork_cache_identity"))
+    allowed_tokens = {
+        artist_artwork_token(value)
+        for value in _artist_cache_identities(updated)
+        if artist_artwork_token(value)
+    }
+    if (
+        status == "cached"
+        and _TOKEN_RE.match(token)
+        and identity
+        and token in allowed_tokens
+        and token == artist_artwork_token(identity)
+    ):
+        updated["thumbnail"] = f"/artist_artwork/{token}"
+        return updated
+    updated.pop("thumbnail", None)
+    return updated
+
+
 def register_entity_metadata_listener(
     listener: Callable[[Dict[str, Any]], None],
 ) -> None:

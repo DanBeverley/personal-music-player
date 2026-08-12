@@ -54,6 +54,10 @@ class SearchRequest(BaseModel):
     row_id: Optional[str] = None
     row_context: Optional[str] = None
     defer_side_surfaces: bool = False
+    # Optional bounded long-poll for an existing canonical search snapshot.
+    # The backend never starts retrieval for a revision wait.
+    revision: int = 0
+    revision_wait_ms: int = 0
     recent_track_snapshots: List[Dict[str, Any]] = Field(default_factory=list)
     top_track_snapshots: List[Dict[str, Any]] = Field(default_factory=list)
     anchor_track_snapshots: List[Dict[str, Any]] = Field(default_factory=list)

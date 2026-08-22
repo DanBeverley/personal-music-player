@@ -24,7 +24,25 @@ class SearchRequest(BaseModel):
     prepare_next_session: bool = False
     prefer_fresh_rows: bool = False
     session_intent: bool = False
+    # Initial app launch may consume one durable ready-feed successor. This
+    # remains explicit so ordinary full-feed polls never rotate the queue.
+    promote_ready_on_launch: bool = False
+    launch_token: str = ""
+    feed_queue_status_only: bool = False
+    # Metadata-only queue long poll. The server waits on the per-scope
+    # condition until this revision changes, target depth is reached, or the
+    # bounded timeout (capped server-side) expires.
+    feed_queue_revision: int = 0
+    feed_queue_wait_ms: int = 0
+    last_seen_queue_revision: int = 0
+    queue_wait_ms: int = 0
     refresh_token: str = ""
+    # Bounded server-side wait for a successor during pull-to-refresh. A
+    # timeout returns the unchanged active feed with explicit diagnostics.
+    feed_refresh_wait_ms: int = 0
+    # Transitional alias for older clients; the canonical wire field is
+    # feed_refresh_wait_ms.
+    refresh_wait_ms: int = 0
     recent_track_ids: List[str] = Field(default_factory=list)
     top_track_ids: List[str] = Field(default_factory=list)
     recent_tracks: List[Dict[str, Any]] = Field(default_factory=list)

@@ -25,6 +25,7 @@ from auralis_backend.discovery.feed_state import (
     FeedState,
     invalidate_feed_state,
     load_feed_state,
+    promote_prepared_feed,
     save_feed_state,
     store_prepared_feed,
 )
@@ -573,7 +574,7 @@ def test_repeated_pull_does_not_discard_completed_prepared_feed(monkeypatch) -> 
     assert loaded.prepared_feed.session_id == prepared.session_id
 
 
-def test_more_complete_optional_rows_replace_an_older_prepared_feed() -> None:
+def test_more_complete_optional_rows_append_after_an_older_ready_feed() -> None:
     user_scope = f"prepared-optional-{int(time.time() * 1000000)}"
     active = _feed_artifact(user_scope, "optional-active", "active-track")
     older = _feed_artifact(user_scope, "optional-older", "older-track")
@@ -616,10 +617,14 @@ def test_more_complete_optional_rows_replace_an_older_prepared_feed() -> None:
 
     assert stored is not None
     assert loaded is not None and loaded.prepared_feed is not None
-    assert loaded.prepared_feed.session_id == "optional-replacement"
-    assert loaded.prepared_feed.diagnostics["prepared_replaced_for_optional_rows"] == [
-        "recommended_albums"
+    assert [entry.session_id for entry in loaded.ready_feeds] == [
+        "optional-older",
+        "optional-replacement",
     ]
+    promoted = promote_prepared_feed(None, loaded)
+    assert promoted is not None and promoted.session_id == "optional-older"
+    assert loaded.prepared_feed is not None
+    assert loaded.prepared_feed.session_id == "optional-replacement"
 
 
 def test_feed_state_persists_small_artifact_references_and_loads_both_feeds(tmp_path) -> None:

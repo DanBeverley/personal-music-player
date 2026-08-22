@@ -82,6 +82,8 @@ class RecommendationService:
             )
             if is_row_page:
                 request_mode = "row_page"
+            elif bool(getattr(req, "feed_queue_status_only", False)):
+                request_mode = "queue_status"
             elif bool(getattr(req, "prepare_next_session", False)):
                 request_mode = "background_prepare"
             else:

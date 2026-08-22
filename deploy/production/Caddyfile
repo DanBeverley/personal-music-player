@@ -1,0 +1,21 @@
+{$AURALIS_API_HOST} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	reverse_proxy api:8000 {
+		# Audio streams and progressive search/feed responses should not be
+		# accumulated by the reverse proxy before being sent to the client.
+		flush_interval -1
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}

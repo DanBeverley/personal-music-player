@@ -1,0 +1,186 @@
+name: Backend production deploy
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - develop
+    paths:
+      - ".github/workflows/backend-production-deploy.yml"
+      - "deploy/production/**"
+      - "ingestion/python_proxy/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backend-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      OCI_HOST: ${{ vars.OCI_HOST }}
+      OCI_SSH_USER: ${{ vars.OCI_SSH_USER }}
+      AURALIS_API_HOST: ${{ vars.AURALIS_API_HOST }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Validate deployment configuration
+        shell: bash
+        env:
+          OCI_SSH_PRIVATE_KEY: ${{ secrets.OCI_SSH_PRIVATE_KEY }}
+          OCI_KNOWN_HOSTS: ${{ secrets.OCI_KNOWN_HOSTS }}
+          BACKEND_ENV_B64: ${{ secrets.BACKEND_ENV_B64 }}
+        run: |
+          set -euo pipefail
+          for name in OCI_HOST OCI_SSH_USER AURALIS_API_HOST OCI_SSH_PRIVATE_KEY OCI_KNOWN_HOSTS BACKEND_ENV_B64; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "Missing GitHub Actions configuration: $name" >&2
+              exit 1
+            fi
+          done
+          [[ "$OCI_HOST" =~ ^[0-9A-Fa-f:.]+$ ]] || { echo "OCI_HOST must be an IP address" >&2; exit 1; }
+          [[ "$OCI_SSH_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || { echo "Invalid OCI_SSH_USER" >&2; exit 1; }
+          [[ "$AURALIS_API_HOST" =~ ^[A-Za-z0-9.-]+$ ]] || { echo "Invalid AURALIS_API_HOST" >&2; exit 1; }
+
+      - name: Restore protected deployment files
+        shell: bash
+        env:
+          OCI_SSH_PRIVATE_KEY: ${{ secrets.OCI_SSH_PRIVATE_KEY }}
+          OCI_KNOWN_HOSTS: ${{ secrets.OCI_KNOWN_HOSTS }}
+          BACKEND_ENV_B64: ${{ secrets.BACKEND_ENV_B64 }}
+          YTDLP_COOKIES_B64: ${{ secrets.YTDLP_COOKIES_B64 }}
+        run: |
+          set -euo pipefail
+          install -d -m 0700 "$HOME/.ssh"
+          printf '%s\n' "$OCI_SSH_PRIVATE_KEY" > "$HOME/.ssh/neatie-deploy"
+          printf '%s\n' "$OCI_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 0600 "$HOME/.ssh/neatie-deploy" "$HOME/.ssh/known_hosts"
+          printf '%s' "$BACKEND_ENV_B64" | base64 --decode > "$RUNNER_TEMP/backend.env"
+          chmod 0600 "$RUNNER_TEMP/backend.env"
+          if [[ -n "$YTDLP_COOKIES_B64" ]]; then
+            printf '%s' "$YTDLP_COOKIES_B64" | base64 --decode > "$RUNNER_TEMP/ytdlp-cookies.txt"
+            chmod 0600 "$RUNNER_TEMP/ytdlp-cookies.txt"
+            echo "YTDLP_COOKIES_FILE=$RUNNER_TEMP/ytdlp-cookies.txt" >> "$GITHUB_ENV"
+          fi
+
+      - name: Validate production environment payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          env_file="$RUNNER_TEMP/backend.env"
+          if grep -nEv '^[A-Z][A-Z0-9_]*=.*$|^[[:space:]]*(#.*)?$' "$env_file" >/dev/null; then
+            echo "BACKEND_ENV_B64 contains an invalid environment line" >&2
+            exit 1
+          fi
+          forbidden=(AURALIS_PROXY_URL AURALIS_DEVICE_PROXY_URL AURALIS_RUNTIME_DIR AURALIS_PROXY_RUNTIME_DIR AURALIS_YTDLP_COOKIES_PATH PORT)
+          for name in "${forbidden[@]}"; do
+            if grep -q "^${name}=" "$env_file"; then
+              echo "BACKEND_ENV_B64 contains host-controlled variable: $name" >&2
+              exit 1
+            fi
+          done
+          required=(
+            RECOMMENDATION_SYNC_DATABASE_DSN
+            AURALIS_STREAM_CACHE_BACKEND
+            AURALIS_STREAM_CACHE_BUCKET
+            AURALIS_R2_ACCOUNT_ID
+            AURALIS_R2_ACCESS_KEY_ID
+            AURALIS_R2_SECRET_ACCESS_KEY
+            AURALIS_R2_ENDPOINT_URL
+            YOUTUBE_DATA_API_KEY
+            LASTFM_API_KEY
+          )
+          for name in "${required[@]}"; do
+            line="$(grep "^${name}=" "$env_file" | tail -n 1 || true)"
+            value="${line#*=}"
+            value="${value//[[:space:]]/}"
+            value="${value//\"/}"
+            value="${value//\'/}"
+            if [[ -z "$line" || -z "$value" ]]; then
+              echo "BACKEND_ENV_B64 is missing required variable: $name" >&2
+              exit 1
+            fi
+          done
+          stream_backend="$(grep '^AURALIS_STREAM_CACHE_BACKEND=' "$env_file" | tail -n 1 | cut -d= -f2-)"
+          stream_backend="${stream_backend//[[:space:]]/}"
+          stream_backend="${stream_backend//\"/}"
+          stream_backend="${stream_backend//\'/}"
+          if [[ "$stream_backend" != "r2" ]]; then
+            echo "Production stream cache backend must be r2" >&2
+            exit 1
+          fi
+
+      - name: Verify SSH identity and connection
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh-keygen -F "$OCI_HOST" -f "$HOME/.ssh/known_hosts" >/dev/null || {
+            echo "OCI_KNOWN_HOSTS does not contain OCI_HOST" >&2
+            exit 1
+          }
+          ssh -i "$HOME/.ssh/neatie-deploy" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            "$OCI_SSH_USER@$OCI_HOST" \
+            'test "$(uname -s)" = Linux && sudo -n true'
+
+      - name: Package and upload release
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle="$RUNNER_TEMP/neatie-${GITHUB_SHA}.tar.gz"
+          remote_dir="/home/$OCI_SSH_USER/.neatie-upload/$GITHUB_SHA"
+          tar -czf "$bundle" deploy/production ingestion/python_proxy
+          ssh -i "$HOME/.ssh/neatie-deploy" -o BatchMode=yes -o IdentitiesOnly=yes \
+            "$OCI_SSH_USER@$OCI_HOST" \
+            "install -d -m 0700 '$remote_dir'"
+          scp -i "$HOME/.ssh/neatie-deploy" -o BatchMode=yes -o IdentitiesOnly=yes \
+            "$bundle" \
+            "$RUNNER_TEMP/backend.env" \
+            deploy/production/deploy_host.sh \
+            "$OCI_SSH_USER@$OCI_HOST:$remote_dir/"
+          if [[ -n "${YTDLP_COOKIES_FILE:-}" ]]; then
+            scp -i "$HOME/.ssh/neatie-deploy" -o BatchMode=yes -o IdentitiesOnly=yes \
+              "$YTDLP_COOKIES_FILE" \
+              "$OCI_SSH_USER@$OCI_HOST:$remote_dir/ytdlp-cookies.txt"
+          fi
+          echo "DEPLOY_BUNDLE_NAME=$(basename "$bundle")" >> "$GITHUB_ENV"
+          echo "REMOTE_UPLOAD_DIR=$remote_dir" >> "$GITHUB_ENV"
+
+      - name: Deploy and verify HTTPS
+        shell: bash
+        run: |
+          set -euo pipefail
+          remote_cookies=''
+          if [[ -n "${YTDLP_COOKIES_FILE:-}" ]]; then
+            remote_cookies="$REMOTE_UPLOAD_DIR/ytdlp-cookies.txt"
+          fi
+          ssh -i "$HOME/.ssh/neatie-deploy" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            "$OCI_SSH_USER@$OCI_HOST" \
+            "sudo bash '$REMOTE_UPLOAD_DIR/deploy_host.sh' '$GITHUB_SHA' '$AURALIS_API_HOST' '$REMOTE_UPLOAD_DIR/$DEPLOY_BUNDLE_NAME' '$REMOTE_UPLOAD_DIR/backend.env' '$remote_cookies'"
+          curl --fail --silent --show-error --max-time 15 \
+            "https://$AURALIS_API_HOST/" | grep -qi running
+
+      - name: Remove remote upload directory
+        if: always() && env.REMOTE_UPLOAD_DIR != ''
+        shell: bash
+        run: |
+          ssh -i "$HOME/.ssh/neatie-deploy" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            "$OCI_SSH_USER@$OCI_HOST" \
+            "rm -rf '$REMOTE_UPLOAD_DIR'" || true
+
+      - name: Remove local secret files
+        if: always()
+        shell: bash
+        run: |
+          rm -f "$HOME/.ssh/neatie-deploy" "$RUNNER_TEMP/backend.env" "${YTDLP_COOKIES_FILE:-}"

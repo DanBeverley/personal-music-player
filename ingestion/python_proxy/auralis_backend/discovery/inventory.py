@@ -390,6 +390,7 @@ def load_candidate_inventory(
     *,
     profile_fingerprint: str = "",
     require_fresh: bool = True,
+    allow_profile_mismatch: bool = False,
 ) -> CandidateInventory | None:
     key = _key(user_scope_id)
     payload = None
@@ -402,7 +403,11 @@ def load_candidate_inventory(
         inventory = _from_payload(_persistent_get(server, key))
     if inventory is None:
         return None
-    if profile_fingerprint and inventory.profile_fingerprint != profile_fingerprint:
+    if (
+        profile_fingerprint
+        and inventory.profile_fingerprint != profile_fingerprint
+        and not allow_profile_mismatch
+    ):
         return None
     if require_fresh and not inventory.is_fresh:
         return None

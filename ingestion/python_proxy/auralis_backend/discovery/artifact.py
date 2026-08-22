@@ -206,6 +206,12 @@ def _artifact_from_dict(payload: Dict[str, Any] | None) -> DiscoveryArtifact | N
                 has_more=bool(row.get("has_more")),
             )
         )
+    diagnostics = dict(payload.get("diagnostics") or {})
+    # Persist one authoritative lane map at the artifact top level. Older
+    # payloads may still carry the diagnostic copy; reconstruct it in memory
+    # for compatibility without writing the duplicate back to storage.
+    if "home_tab_lanes" not in diagnostics and payload.get("home_tab_lanes"):
+        diagnostics["home_tab_lanes"] = dict(payload.get("home_tab_lanes") or {})
     return DiscoveryArtifact(
         session_id=str(payload.get("session_id") or ""),
         user_scope_id=str(payload.get("user_scope_id") or "guest"),
@@ -213,7 +219,7 @@ def _artifact_from_dict(payload: Dict[str, Any] | None) -> DiscoveryArtifact | N
         generated_at=float(payload.get("generated_at") or 0.0),
         expires_at=float(payload.get("expires_at") or 0.0),
         rows=rows,
-        diagnostics=dict(payload.get("diagnostics") or {}),
+        diagnostics=diagnostics,
         candidate_pool_counts=dict(payload.get("candidate_pool_counts") or {}),
         provider_timings_ms=dict(payload.get("provider_timings_ms") or {}),
         home_tab_lanes=dict(payload.get("home_tab_lanes") or {}),
@@ -224,6 +230,8 @@ def _artifact_from_dict(payload: Dict[str, Any] | None) -> DiscoveryArtifact | N
 
 
 def artifact_to_dict(artifact: DiscoveryArtifact) -> Dict[str, Any]:
+    diagnostics = dict(artifact.diagnostics or {})
+    diagnostics.pop("home_tab_lanes", None)
     return {
         "artifact_version": ARTIFACT_VERSION,
         "session_id": artifact.session_id,
@@ -232,7 +240,7 @@ def artifact_to_dict(artifact: DiscoveryArtifact) -> Dict[str, Any]:
         "generated_at": artifact.generated_at,
         "expires_at": artifact.expires_at,
         "rows": [row_to_storage_payload(row) for row in artifact.rows],
-        "diagnostics": dict(artifact.diagnostics or {}),
+        "diagnostics": diagnostics,
         "candidate_pool_counts": dict(artifact.candidate_pool_counts or {}),
         "provider_timings_ms": dict(artifact.provider_timings_ms or {}),
         "home_tab_lanes": dict(artifact.home_tab_lanes or {}),

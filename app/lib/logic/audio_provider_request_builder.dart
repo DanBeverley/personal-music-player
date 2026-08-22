@@ -120,6 +120,9 @@ Future<Map<String, dynamic>> buildRecommendationRequestBody(
   RecommendationRequestMode requestMode = RecommendationRequestMode.launch,
   bool preferFreshRows = false,
   String refreshToken = '',
+  bool promoteReadyOnLaunch = false,
+  int feedRefreshWaitMs = 0,
+  String launchToken = '',
   List<String> extraArtistHints = const <String>[],
   List<String> extraTasteQueries = const <String>[],
   List<String> extraSessionQueries = const <String>[],
@@ -143,7 +146,7 @@ Future<Map<String, dynamic>> buildRecommendationRequestBody(
     HistoryManager.getFrequentlyPlayedTrackSnapshots(limit: 10),
     HistoryManager.getRecentSeeds(limit: 10),
     HistoryManager.getFrequentlyPlayedTrackIds(limit: 10),
-      allowNetworkCloudQueries
+    allowNetworkCloudQueries
         ? getRecentCloudSearchQueries(limit: 8)
         : Future<List<String>>.value(peekRecentCloudSearchQueries(limit: 8)),
   ]);
@@ -242,6 +245,12 @@ Future<Map<String, dynamic>> buildRecommendationRequestBody(
     'fresh_account_empty_home': !hasUserSignals,
     'force_refresh': behavior.forceRefresh,
     'prepare_next_session': behavior.prepareNextSession,
+    // Launch promotion is an explicit one-shot server contract. Ordinary
+    // later full-feed requests must not rotate the ready queue.
+    'promote_ready_on_launch': promoteReadyOnLaunch,
+    if (feedRefreshWaitMs > 0)
+      'feed_refresh_wait_ms': feedRefreshWaitMs.clamp(0, 3000),
+    if (launchToken.trim().isNotEmpty) 'launch_token': launchToken.trim(),
     'prefer_fresh_rows': behavior.preferFreshRows,
     'session_intent': extraArtistHints.isNotEmpty ||
         extraTasteQueries.isNotEmpty ||

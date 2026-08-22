@@ -32,16 +32,29 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
   int _requestVersion = 0;
   bool _startupHealthChecked = false;
   Timer? _backgroundRefreshTimer;
-  Timer? _initialFeedPollTimer;
+  Timer? _queueStatusTimer;
+  DateTime? _queueStatusDeadline;
+  bool _queueStatusRequestInFlight = false;
+  Duration _queueStatusPollDelay = Duration.zero;
+  Future<void> _feedOperationTail = Future<void>.value();
   String _backgroundRefreshKey = '';
   String _lastCompletedBackgroundRefreshKey = '';
+  final String _launchToken = 'launch-${DateTime.now().microsecondsSinceEpoch}';
   DateTime? _lastCompletedBackgroundRefreshAt;
   Future<void>? _explicitRefreshFuture;
   final List<String> _queuedSessionArtistHints = <String>[];
   final List<String> _queuedSessionQueries = <String>[];
-  String _homeReturnIntentToken = '';
   StreamSubscription<Map<String, dynamic>>? _historyTrackSubscription;
   StreamSubscription<String>? _recommendationSignalSubscription;
+
+  /// Serializes every feed lifecycle operation.  The backend owns promotion;
+  /// this guard only prevents overlapping client requests from cancelling or
+  /// overwriting one another (for example two simultaneous pull gestures).
+  Future<void> _runSerialized(Future<void> Function() operation) {
+    final next = _feedOperationTail.then((_) => operation());
+    _feedOperationTail = next.catchError((Object _) {});
+    return next;
+  }
 
   bool get isPaginating => _paginatingRows.isNotEmpty;
   bool get hasMorePages => state.rows.any((row) => row.hasMore);
@@ -96,7 +109,6 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
   void _clearQueuedSessionIntent() {
     _queuedSessionArtistHints.clear();
     _queuedSessionQueries.clear();
-    _homeReturnIntentToken = '';
   }
 
   Future<bool> _ensureProxyHealthyAtStartup() async {
@@ -157,11 +169,14 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
     if (restoredCachedFeed) {
       // The local file is offline recovery only. Always reconcile it with the
       // server-owned active version without hiding the restored rows.
-      await refreshFromSignals(forceRefresh: false);
+      await refreshFromSignals(
+        forceRefresh: false,
+        promoteReadyOnLaunch: true,
+      );
       return;
     }
 
-    await refreshFromSignals(forceRefresh: false);
+    await refreshFromSignals(forceRefresh: false, promoteReadyOnLaunch: true);
   }
 
   String _cacheScopeId() {
@@ -180,12 +195,17 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
     );
   }
 
-  Future<void> refreshFromSignals({bool forceRefresh = false}) {
+  Future<void> refreshFromSignals({
+    bool forceRefresh = false,
+    bool promoteReadyOnLaunch = false,
+  }) {
+    // Public lifecycle entrypoint: enqueue once, then call private request
+    // routines that never enqueue themselves.
     if (forceRefresh) {
       final running = _explicitRefreshFuture;
       if (running != null) return running;
       late final Future<void> operation;
-      operation = _refreshUntilFeedChanges().whenComplete(() {
+      operation = _runSerialized(_refreshUntilFeedChanges).whenComplete(() {
         if (identical(_explicitRefreshFuture, operation)) {
           _explicitRefreshFuture = null;
         }
@@ -193,12 +213,16 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
       _explicitRefreshFuture = operation;
       return operation;
     }
-    return _refreshFromCurrentSignals(forceRefresh: false);
+    return _runSerialized(() => _refreshFromCurrentSignals(
+          forceRefresh: false,
+          promoteReadyOnLaunch: promoteReadyOnLaunch,
+        ));
   }
 
   Future<void> _refreshFromCurrentSignals({
     required bool forceRefresh,
     String refreshToken = '',
+    bool promoteReadyOnLaunch = false,
   }) async {
     final seed = await HistoryManager.getRecommendationSeed();
     if (!mounted) return;
@@ -209,69 +233,143 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
           : RecommendationRequestMode.launch,
       allowNetworkCloudQueries: false,
       refreshToken: refreshToken,
+      promoteReadyOnLaunch: promoteReadyOnLaunch,
+      feedRefreshWaitMs: forceRefresh ? 3000 : 0,
     );
   }
 
   Future<void> _refreshUntilFeedChanges() async {
-    _initialFeedPollTimer?.cancel();
     final startingVersion = state.feedVersion;
     final refreshToken =
         'pull-${DateTime.now().microsecondsSinceEpoch.toString()}';
 
-    while (mounted) {
-      await _refreshFromCurrentSignals(
-        forceRefresh: true,
-        refreshToken: refreshToken,
+    await _refreshFromCurrentSignals(
+      forceRefresh: true,
+      refreshToken: refreshToken,
+    );
+    if (!mounted || state.feedVersion > startingVersion) return;
+    final readyDepth =
+        (state.diagnostics['ready_feed_depth'] as num?)?.toInt() ??
+            (state.diagnostics['ready_feed_count'] as num?)?.toInt() ??
+            0;
+    final readyTarget =
+        (state.diagnostics['ready_feed_target_depth'] as num?)?.toInt() ?? 2;
+    final preparing = readyDepth < readyTarget &&
+        (state.preparationState == 'preparing' ||
+            state.diagnostics['preparation_state'] == 'preparing' ||
+            readyDepth == 0);
+    if (preparing && state.hasRows) {
+      state = state.copyWith(
+        requestState: 'complete',
+        errorMessage: 'Fresh recommendations are still being prepared.',
       );
-      if (!mounted || state.feedVersion > startingVersion) return;
-
-      final failed =
-          state.requestState == 'failed' || state.feedAction == 'build_failed';
-      final exhausted =
-          state.diagnostics['rotation_inventory_exhausted'] == true;
-      if (failed || exhausted) {
-        if (exhausted) {
-          state = state.copyWith(
-            requestState: 'complete',
-            errorMessage: 'No new recommendation rotation is available yet.',
-          );
-        }
-        return;
-      }
-      await Future<void>.delayed(const Duration(milliseconds: 1200));
     }
+    debugProxyLog(
+      'recommend',
+      'pull outcome=unchanged waitMs=${state.diagnostics['refresh_wait_ms'] ?? 3000} queueDepth=${state.diagnostics['ready_feed_depth'] ?? state.diagnostics['ready_feed_count'] ?? 0} phase=${state.preparationState}',
+    );
   }
 
-  Future<void> applyPreparedFeedOnHomeReturn() async {
-    if (isLoading) return;
-    _initialFeedPollTimer?.cancel();
-    final startingVersion = state.feedVersion;
-    if (_hasQueuedSessionIntent && _homeReturnIntentToken.isEmpty) {
-      _homeReturnIntentToken =
-          'search-return-${DateTime.now().microsecondsSinceEpoch}';
-    }
-    final seed = await HistoryManager.getRecommendationSeed();
-    if (!mounted) return;
-    await loadRecommendations(
-      seed,
-      requestMode: _hasQueuedSessionIntent
-          ? RecommendationRequestMode.pullToRefresh
-          : RecommendationRequestMode.launch,
-      allowNetworkCloudQueries: false,
-      refreshToken: _homeReturnIntentToken,
-    );
-    if (!mounted ||
-        !_hasQueuedSessionIntent ||
-        state.feedVersion > startingVersion ||
-        state.requestState == 'failed' ||
-        state.feedAction == 'build_failed' ||
-        state.diagnostics['rotation_inventory_exhausted'] == true) {
+  void _scheduleQueueStatusMonitor(Map<String, dynamic> diagnostics) {
+    final ready = (diagnostics['ready_feed_count'] as num?)?.toInt() ??
+        (diagnostics['ready_feed_depth'] as num?)?.toInt() ??
+        0;
+    final target = (diagnostics['ready_feed_target_depth'] as num?)?.toInt() ??
+        (diagnostics['target_ready_feed_depth'] as num?)?.toInt() ??
+        2;
+    final phase = diagnostics['queue_phase']?.toString() ?? '';
+    final inflight = diagnostics['queue_build_inflight'] == true;
+    final active = ready < target &&
+        (inflight ||
+            phase == 'scheduled' ||
+            phase == 'building' ||
+            phase == 'inventory_building' ||
+            phase == 'prepared' ||
+            phase == 'delayed' ||
+            phase == 'retry' ||
+            (diagnostics['retry_at'] as num?) != null);
+    if (!active) {
+      _queueStatusTimer?.cancel();
+      _queueStatusTimer = null;
+      _queueStatusDeadline = null;
+      _queueStatusPollDelay = Duration.zero;
       return;
     }
-    _initialFeedPollTimer = Timer(
-      const Duration(milliseconds: 1200),
-      () => unawaited(applyPreparedFeedOnHomeReturn()),
-    );
+    // Keep observing delayed/retry states until the backend reaches terminal
+    // state; the active feed remains visible while this monitor is armed.
+    _queueStatusDeadline = null;
+    if (_queueStatusTimer != null) return;
+    _queueStatusTimer = Timer(_queueStatusPollDelay, () {
+      _queueStatusTimer = null;
+      if (mounted) unawaited(_runQueueStatusRequest());
+    });
+  }
+
+  Future<void> _runQueueStatusRequest() async {
+    if (!mounted || _queueStatusRequestInFlight) return;
+    _queueStatusRequestInFlight = true;
+    try {
+      // Queue status is a passive long-poll and must not occupy the general
+      // feed-operation serialization tail used by refresh/promotion.
+      await (() async {
+        final scope = _cacheScopeId();
+        try {
+          final res = await postRecommendation({
+            'query': '',
+            'limit': 0,
+            'offset': 0,
+            'user_scope_id': scope,
+            'feed_queue_status_only': true,
+            'feed_queue_revision':
+                (state.diagnostics['queue_revision'] as num?)?.toInt() ?? 0,
+            'feed_queue_wait_ms': 9000,
+          });
+          if (!mounted || res.statusCode != 200) return;
+          final payload = jsonDecode(res.body) as Map<String, dynamic>;
+          final raw = payload['diagnostics'];
+          if (raw is! Map) return;
+          final diagnostics = Map<String, dynamic>.from(raw);
+          final incomingRevision =
+              (diagnostics['queue_revision'] as num?)?.toInt() ?? 0;
+          final currentRevision =
+              (state.diagnostics['queue_revision'] as num?)?.toInt() ?? 0;
+          if (incomingRevision < currentRevision) return;
+          final responseScope = diagnostics['user_scope_id']?.toString().trim();
+          if (responseScope != null &&
+              responseScope.isNotEmpty &&
+              responseScope != _cacheScopeId()) {
+            return;
+          }
+          final ready = (diagnostics['ready_feed_count'] as num?)?.toInt() ??
+              (diagnostics['ready_feed_depth'] as num?)?.toInt() ??
+              0;
+          final target =
+              (diagnostics['ready_feed_target_depth'] as num?)?.toInt() ?? 2;
+          state = state.copyWith(
+            preparationState: diagnostics['preparation_state']?.toString() ??
+                state.preparationState,
+            feedAction: 'queue_status',
+            diagnostics: {...state.diagnostics, ...diagnostics},
+            clearError: ready >= target,
+          );
+          // A successful bounded wait either observed a revision or reached
+          // its timeout. Re-arm immediately so there is no client-side gap
+          // between Feed A and Feed B becoming ready.
+          _queueStatusPollDelay = Duration.zero;
+          _scheduleQueueStatusMonitor({...state.diagnostics, ...diagnostics});
+        } catch (_) {
+          // Status is advisory; retain the active feed on transient failure.
+          _queueStatusPollDelay = const Duration(seconds: 1);
+          _scheduleQueueStatusMonitor({
+            ...state.diagnostics,
+            'queue_build_inflight': true,
+            'preparation_state': state.preparationState,
+          });
+        }
+      })();
+    } finally {
+      _queueStatusRequestInFlight = false;
+    }
   }
 
   void _scheduleSignalDrivenBackgroundRefresh() {
@@ -280,18 +378,6 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
       if (!mounted) return;
       unawaited(_scheduleBackgroundRecommendationsRefresh(seed));
     }());
-  }
-
-  bool _shouldPrepareNextSession(Map<String, dynamic> payload) {
-    final diagnosticsRaw = payload['diagnostics'];
-    if (diagnosticsRaw is! Map) return false;
-    final diagnostics = Map<String, dynamic>.from(diagnosticsRaw);
-    final action =
-        (payload['feed_action'] ?? diagnostics['feed_action'] ?? '').toString();
-    return action == 'served_active' &&
-        diagnostics['prepared_candidate_available'] != true &&
-        diagnostics['rotation_inventory_exhausted'] != true &&
-        diagnostics['preparation_state'] != 'preparing';
   }
 
   Future<void> _scheduleBackgroundRecommendationsRefresh(
@@ -325,27 +411,32 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
         '$refreshFingerprint::${explicitRefresh ? 'explicit:${DateTime.now().microsecondsSinceEpoch}' : 'automatic'}';
     _backgroundRefreshKey = refreshKey;
     _backgroundRefreshTimer?.cancel();
+    _queueStatusTimer?.cancel();
     if (explicitRefresh) {
-      return _refreshRecommendationsInBackground(
-        seedId,
-        expectedKey: refreshKey,
-        refreshFingerprint: refreshFingerprint,
-        explicitRefresh: true,
-        extraArtistHints: extraArtistHints,
-        extraTasteQueries: extraTasteQueries,
-        extraSessionQueries: extraSessionQueries,
+      return _runSerialized(
+        () => _refreshRecommendationsInBackground(
+          seedId,
+          expectedKey: refreshKey,
+          refreshFingerprint: refreshFingerprint,
+          explicitRefresh: true,
+          extraArtistHints: extraArtistHints,
+          extraTasteQueries: extraTasteQueries,
+          extraSessionQueries: extraSessionQueries,
+        ),
       );
     }
     _backgroundRefreshTimer = Timer(const Duration(milliseconds: 750), () {
       unawaited(
-        _refreshRecommendationsInBackground(
-          seedId,
-          expectedKey: refreshKey,
-          refreshFingerprint: refreshFingerprint,
-          explicitRefresh: explicitRefresh,
-          extraArtistHints: extraArtistHints,
-          extraTasteQueries: extraTasteQueries,
-          extraSessionQueries: extraSessionQueries,
+        _runSerialized(
+          () => _refreshRecommendationsInBackground(
+            seedId,
+            expectedKey: refreshKey,
+            refreshFingerprint: refreshFingerprint,
+            explicitRefresh: explicitRefresh,
+            extraArtistHints: extraArtistHints,
+            extraTasteQueries: extraTasteQueries,
+            extraSessionQueries: extraSessionQueries,
+          ),
         ),
       );
     });
@@ -384,6 +475,7 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
         extraTasteQueries: extraTasteQueries,
         extraSessionQueries: extraSessionQueries,
         allowNetworkCloudQueries: false,
+        promoteReadyOnLaunch: false,
       );
       if (!mounted || _backgroundRefreshKey != expectedKey) {
         return;
@@ -409,11 +501,19 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
         return;
       }
       _logRecommendationDiagnostics('background', payload);
+      final diagnostics = payload['diagnostics'] is Map
+          ? Map<String, dynamic>.from(payload['diagnostics'] as Map)
+          : const <String, dynamic>{};
       debugProxyLog(
         'recommend',
-        'background prepare scheduled=${payload['prepared'] == true} diagnostics=${compactDiagnosticValue(payload['diagnostics'])}',
+        'background action=${payload['feed_action'] ?? diagnostics['feed_action'] ?? ''} phase=${diagnostics['queue_phase'] ?? diagnostics['preparation_state'] ?? ''} inflight=${diagnostics['queue_build_inflight'] ?? false} ready=${diagnostics['ready_feed_count'] ?? diagnostics['ready_feed_depth'] ?? 0}/${diagnostics['ready_feed_target_depth'] ?? diagnostics['target_ready_feed_depth'] ?? 2} reason=${diagnostics['queue_last_rejection_or_shortage'] ?? ''}',
       );
       final nextState = _feedStateFromPayload(payload);
+      if (payload['diagnostics'] is Map) {
+        _scheduleQueueStatusMonitor(
+          Map<String, dynamic>.from(payload['diagnostics'] as Map),
+        );
+      }
       if (explicitRefresh &&
           nextState.hasRows &&
           nextState.feedVersion > state.feedVersion &&
@@ -439,7 +539,7 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
   void dispose() {
     _requestVersion++;
     _backgroundRefreshTimer?.cancel();
-    _initialFeedPollTimer?.cancel();
+    _queueStatusTimer?.cancel();
     unawaited(_historyTrackSubscription?.cancel());
     unawaited(_recommendationSignalSubscription?.cancel());
     super.dispose();
@@ -568,6 +668,8 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
     List<String> extraSessionQueries = const <String>[],
     bool allowNetworkCloudQueries = true,
     String refreshToken = '',
+    bool promoteReadyOnLaunch = false,
+    int feedRefreshWaitMs = 0,
   }) async {
     final requestVersion = ++_requestVersion;
     final previousState = state;
@@ -614,6 +716,9 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
         extraTasteQueries: extraTasteQueries,
         extraSessionQueries: mergedSessionQueries,
         allowNetworkCloudQueries: allowNetworkCloudQueries,
+        promoteReadyOnLaunch: promoteReadyOnLaunch,
+        launchToken: promoteReadyOnLaunch ? _launchToken : '',
+        feedRefreshWaitMs: feedRefreshWaitMs,
       );
       if (!_isRequestCurrent(requestVersion)) return;
       debugProxyLog(
@@ -623,55 +728,70 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
       final res = await postRecommendation(body);
       if (!_isRequestCurrent(requestVersion)) return;
       if (res.statusCode == 200) {
-        final payload = filterActiveHomeFeedPayload(
-          jsonDecode(res.body) as Map<String, dynamic>,
-        );
+        final rawPayload = jsonDecode(res.body) as Map<String, dynamic>;
+        final responseScope = (rawPayload['user_scope_id'] ??
+                (rawPayload['diagnostics'] is Map
+                    ? (rawPayload['diagnostics'] as Map)['user_scope_id']
+                    : null))
+            ?.toString()
+            .trim();
+        if (responseScope != null &&
+            responseScope.isNotEmpty &&
+            responseScope != _cacheScopeId()) {
+          debugProxyLog('recommend', 'ignored response scope=$responseScope');
+          return;
+        }
+        // A valid scoped response acknowledges the queued weak search signal.
+        // Promotion/version changes are independent and are not used as proof
+        // that the intent was consumed.
+        if (usedQueuedSessionIntent) {
+          _clearQueuedSessionIntent();
+        }
+        final payload = filterActiveHomeFeedPayload(rawPayload);
         _logRecommendationDiagnostics('main', payload);
+        if (payload['diagnostics'] is Map) {
+          _scheduleQueueStatusMonitor(
+            Map<String, dynamic>.from(payload['diagnostics'] as Map),
+          );
+        }
         final nextState = _feedStateFromPayload(payload);
         debugProxyLog(
           'recommend',
           'response rows=${nextState.rows.length} hasRows=${nextState.hasRows} firstRow=${nextState.rows.isEmpty ? '' : nextState.rows.first.id} diagnostics=${compactDiagnosticValue(payload['diagnostics'])}',
         );
         if (nextState.hasRows) {
+          final refreshTimedOut =
+              forceRefresh && nextState.feedAction == 'unchanged_no_rotation';
+          final responseDiagnostics = <String, dynamic>{
+            ...state.diagnostics,
+            ...nextState.diagnostics,
+            if (refreshTimedOut) 'refresh_wait_timed_out': true,
+            if (forceRefresh) 'refresh_wait_ms': feedRefreshWaitMs,
+          };
           if (state.hasRows && nextState.feedVersion <= state.feedVersion) {
             if (nextState.feedVersion == state.feedVersion && forceRefresh) {
               state = state.copyWith(
                 requestState: 'complete',
                 feedAction: nextState.feedAction,
                 preparationState: nextState.preparationState,
-                diagnostics: nextState.diagnostics,
-                clearError: true,
+                diagnostics: responseDiagnostics,
+                errorMessage: refreshTimedOut
+                    ? 'Fresh recommendations are still being prepared.'
+                    : null,
+                clearError: !refreshTimedOut,
               );
             }
             return;
           }
-          _initialFeedPollTimer?.cancel();
           state = nextState.copyWith(
             requestState: 'complete',
-            errorMessage:
-                forceRefresh && nextState.feedAction == 'unchanged_no_rotation'
-                    ? 'Fresh recommendations are still being prepared.'
-                    : null,
-            clearError: !(forceRefresh &&
-                nextState.feedAction == 'unchanged_no_rotation'),
+            errorMessage: refreshTimedOut
+                ? 'Fresh recommendations are still being prepared.'
+                : null,
+            diagnostics: responseDiagnostics,
+            clearError: !refreshTimedOut,
           );
-          if (usedQueuedSessionIntent &&
-              (nextState.feedAction == 'promoted_prepared' ||
-                  nextState.feedAction == 'built_and_promoted')) {
-            _clearQueuedSessionIntent();
-          }
           unawaited(_storeCachedHomeFeed(state));
-          if (requestMode == RecommendationRequestMode.launch &&
-              _shouldPrepareNextSession(payload)) {
-            unawaited(
-              _scheduleBackgroundRecommendationsRefresh(
-                seedId,
-                extraArtistHints: mergedArtistHints,
-                extraTasteQueries: extraTasteQueries,
-                extraSessionQueries: mergedSessionQueries,
-              ),
-            );
-          }
           return;
         }
         debugProxyLog(
@@ -683,28 +803,26 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
           final diagnostics = payloadDiagnostics is Map
               ? Map<String, dynamic>.from(payloadDiagnostics)
               : const <String, dynamic>{};
-          if (nextState.feedAction == 'preparing_initial') {
-            state = previousState.hasRows
-                ? previousState.copyWith(
-                    requestState: 'complete',
-                    preparationState: 'preparing',
-                    clearError: true,
-                    diagnostics: {
-                      ...previousState.diagnostics,
-                      ...diagnostics,
-                      'client_preserved_active_during_preparation': true,
-                    },
-                  )
-                : nextState.copyWith(
-                    requestState: 'loading',
-                    clearError: true,
-                  );
-            if (!forceRefresh) {
-              _initialFeedPollTimer?.cancel();
-              _initialFeedPollTimer = Timer(const Duration(seconds: 2), () {
-                unawaited(refreshFromSignals(forceRefresh: false));
-              });
-            }
+          final backendPreparing =
+              nextState.feedAction == 'preparing_initial' ||
+                  nextState.feedAction == 'unchanged_no_rotation' ||
+                  nextState.preparationState == 'preparing' ||
+                  diagnostics['preparation_state'] == 'preparing' ||
+                  diagnostics['ready_feed_count'] == 0 ||
+                  diagnostics['ready_feed_depth'] == 0;
+          if (backendPreparing && previousState.hasRows) {
+            state = previousState.copyWith(
+              requestState: 'complete',
+              preparationState: 'preparing',
+              clearError: true,
+              diagnostics: {
+                ...previousState.diagnostics,
+                ...diagnostics,
+                'client_preserved_active_during_preparation': true,
+              },
+            );
+            // Keep a valid active feed visible while the backend prepares the
+            // next ready head. Do not poll indefinitely or synthesize rows.
           } else if (diagnostics['fresh_account_empty_home'] == true ||
               diagnostics['client_signal_tier'] == 'cold_start') {
             state = RecommendationFeedState(

@@ -12,6 +12,10 @@ ENGINE_MODEL_VERSION = "discovery-engine:home_orchestrator"
 # artifact implementation; changing this value would make the accepted feed
 # from the previous build unreadable before its replacement is prepared.
 ARTIFACT_VERSION = "discovery_home_artifact_v7"
+# Contract for promotion, independent from the storage serialization version.
+# A persisted artifact can deserialize successfully while still being unsafe
+# to promote after a row-contract change.
+FEED_PROMOTION_CONTRACT_VERSION = "feed-promotion-v2-radio-verified"
 ARTIFACT_TTL_SECONDS = 60 * 60 * 24
 
 TRACK_POOL_QUOTAS: Dict[str, int] = {
@@ -133,10 +137,10 @@ ROW_RECIPES: Dict[str, RowRecipe] = {
         title="Popular Radio",
         item_type="radio",
         launch_required=False,
-        min_items=8,
-        target_items=12,
-        max_items=12,
-        page_size=12,
+        min_items=12,
+        target_items=16,
+        max_items=20,
+        page_size=20,
         can_page=True,
         candidate_sources=("profile_spine", "artist_graph", "similarity", "collaborative", "popularity"),
         ranking_intent="artist_radio",

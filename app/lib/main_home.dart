@@ -399,8 +399,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       sessionQueries: query.isEmpty ? const <String>[] : <String>[query],
     );
     await _pendingSearchIntentWrite;
-    if (!mounted) return;
-    await notifier.applyPreparedFeedOnHomeReturn();
+    // Search intent is a weak signal for the next backend-owned preparation;
+    // returning Home must not promote, poll, or rebuild the active feed.
   }
 
   Future<void> _performSearch(WidgetRef ref, [String? query]) async {
@@ -531,9 +531,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     }
     await _pendingSearchIntentWrite;
     if (!mounted) return;
-    unawaited(ref
-        .read(recommendationProvider.notifier)
-        .applyPreparedFeedOnHomeReturn());
     _syncControllerCanHandleBack();
   }
 
@@ -545,12 +542,22 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     await ref
         .read(recommendationProvider.notifier)
         .refreshFromSignals(forceRefresh: true);
-    await Future.wait([
-      ref.read(lastPlayedProvider.notifier).loadTracks(forceRefresh: true),
-      ref
-          .read(frequentlyPlayedProvider.notifier)
-          .loadTracks(forceRefresh: true),
-    ]);
+    // These rows are secondary signals. They must never extend the pull
+    // spinner after the feed promotion/wait contract has completed.
+    unawaited(_refreshSecondaryHomeRows());
+  }
+
+  Future<void> _refreshSecondaryHomeRows() async {
+    try {
+      await Future.wait([
+        ref.read(lastPlayedProvider.notifier).loadTracks(forceRefresh: true),
+        ref
+            .read(frequentlyPlayedProvider.notifier)
+            .loadTracks(forceRefresh: true),
+      ]);
+    } catch (error) {
+      debugProxyLog('recommend', 'secondary rows refresh failed=$error');
+    }
   }
 
   bool handleSystemBack() {
@@ -1342,6 +1349,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
             onSearch: widget.onOpenSearchTab ?? focusSearch,
             onProfile: widget.onOpenProfileTab ?? _openAssistant,
           ),
+          if (recState.hasRows && _feedPreparationIsActive(recState))
+            _buildFeedPreparationStatus(recState),
           NeatieFeaturedAlbumHero(
             albums: heroAlbums,
             onOpen: (album) => unawaited(_openAlbum(album)),
@@ -1526,6 +1535,65 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         ],
       ),
     );
+  }
+
+  Widget _buildFeedPreparationStatus(RecommendationFeedState feed) {
+    final diagnostics = feed.diagnostics;
+    final ready =
+        diagnostics['ready_feed_count'] ?? diagnostics['ready_feed_depth'] ?? 0;
+    final target = diagnostics['ready_feed_target_depth'] ??
+        diagnostics['target_ready_feed_depth'] ??
+        2;
+    final depthText = '$ready/$target';
+    return Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: Semantics(
+        label: 'Feed preparation depth $depthText',
+        liveRegion: true,
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const SizedBox(
+              width: 12,
+              height: 12,
+              child: CircularProgressIndicator(strokeWidth: 1.5),
+            ),
+            const SizedBox(width: 8),
+            Flexible(
+              child: Text(
+                depthText,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  bool _feedPreparationIsActive(RecommendationFeedState feed) {
+    final diagnostics = feed.diagnostics;
+    final ready = (diagnostics['ready_feed_count'] as num?)?.toInt() ??
+        (diagnostics['ready_feed_depth'] as num?)?.toInt() ??
+        0;
+    final target = (diagnostics['ready_feed_target_depth'] as num?)?.toInt() ??
+        (diagnostics['target_ready_feed_depth'] as num?)?.toInt() ??
+        2;
+    if (ready >= target) return false;
+    final phase = (diagnostics['queue_phase'] ?? '').toString();
+    final backendState =
+        (diagnostics['preparation_state'] ?? feed.preparationState).toString();
+    final retryAt = diagnostics['retry_at'];
+    return diagnostics['queue_build_inflight'] == true ||
+        phase == 'building' ||
+        phase == 'scheduled' ||
+        phase == 'inventory_building' ||
+        phase == 'delayed' ||
+        phase == 'retry' ||
+        (retryAt is num && retryAt > 0) ||
+        backendState == 'preparing' && phase.isNotEmpty;
   }
 
   Future<void> _openTrackDetails(

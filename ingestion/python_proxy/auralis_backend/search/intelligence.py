@@ -791,6 +791,47 @@ def load_catalog_artist_records(
     )
     if not artist_keys:
         return {}
+    # Bounded hygiene for legacy query/backfill aliases. Name aliases are
+    # useful only when they agree with the payload's intrinsic name/aliases;
+    # stable identity aliases and authoritative sources are retained.
+    try:
+        connection = open_recommendation_store_connection(server)
+        rows = connection.execute(
+            """SELECT a.entity_key, a.alias_key, a.source, e.payload_json
+               FROM catalog_entity_aliases a
+               JOIN catalog_entities e ON e.entity_type=a.entity_type AND e.entity_key=a.entity_key
+               WHERE a.entity_type='artist' AND (
+                 lower(coalesce(a.source,'')) IN
+                   ('query','search','backfill','catalog_backfill','musicbrainz_query_backfill','catalog_backfill_search_event')
+                 OR lower(coalesce(a.source,'')) LIKE '%query_backfill%'
+                 OR lower(coalesce(a.source,'')) LIKE '%search_backfill%'
+               )
+               LIMIT 256"""
+        ).fetchall()
+        stale = []
+        for row in rows:
+            payload = _json_loads(row["payload_json"])
+            intrinsic = {
+                normalize_artist_name(payload.get("name")),
+                *(normalize_artist_name(v) for v in (payload.get("artist_aliases") or []) if normalize_artist_name(v)),
+                *(normalize_artist_name(v) for v in (payload.get("aliases") or []) if normalize_artist_name(v)),
+            }
+            alias_key = normalize_artist_name(row["alias_key"])
+            if alias_key and alias_key not in intrinsic:
+                stale.append((row["entity_key"], row["alias_key"]))
+        for entity_key, alias_key in stale:
+            connection.execute(
+                "DELETE FROM catalog_entity_aliases WHERE entity_type='artist' AND entity_key=? AND alias_key=?",
+                [entity_key, alias_key],
+            )
+        if stale:
+            connection.commit()
+        connection.close()
+    except Exception:
+        try:
+            connection.close()
+        except Exception:
+            pass
     placeholders = ",".join("?" for _ in artist_keys)
     try:
         connection = open_recommendation_store_connection(server)

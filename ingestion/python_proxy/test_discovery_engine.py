@@ -2148,7 +2148,7 @@ def test_feed_state_v2_rejects_stale_prepared_version() -> None:
     assert loaded.generation_status == "stale_prepared_discarded"
 
 
-def test_prepared_feed_accepts_popular_radio_artwork_improvement() -> None:
+def test_ready_queue_appends_popular_radio_artwork_improvement() -> None:
     user_scope = f"feed-v2-radio-art-{int(time.time() * 1000000)}"
     active = _contract_ready_artifact("radio-active")
     active.user_scope_id = user_scope
@@ -2189,15 +2189,17 @@ def test_prepared_feed_accepts_popular_radio_artwork_improvement() -> None:
     assert stored is not None
     assert loaded is not None
     assert loaded.prepared_feed is not None
+    assert [entry.session_id for entry in loaded.ready_feeds] == [
+        prepared.session_id,
+        "session-radio-art-repaired",
+    ]
+    promoted = promote_prepared_feed(None, loaded)
+    assert promoted is not None and promoted.session_id == prepared.session_id
+    assert loaded.prepared_feed is not None
     assert loaded.prepared_feed.session_id == "session-radio-art-repaired"
-    reasons = list(
-        loaded.prepared_feed.diagnostics.get("prepared_replacement_reasons")
-        or []
-    )
-    assert "optional_quality_improved" in reasons
 
 
-def test_prepared_feed_accepts_changed_radio_from_new_inventory() -> None:
+def test_ready_queue_appends_changed_radio_from_new_inventory() -> None:
     user_scope = f"feed-v2-radio-rotation-{int(time.time() * 1000000)}"
     active = _contract_ready_artifact("radio-active")
     active.user_scope_id = user_scope
@@ -2232,12 +2234,14 @@ def test_prepared_feed_accepts_changed_radio_from_new_inventory() -> None:
     assert stored is not None
     assert loaded is not None
     assert loaded.prepared_feed is not None
+    assert [entry.session_id for entry in loaded.ready_feeds] == [
+        prepared.session_id,
+        replacement.session_id,
+    ]
+    promoted = promote_prepared_feed(None, loaded)
+    assert promoted is not None and promoted.session_id == prepared.session_id
+    assert loaded.prepared_feed is not None
     assert loaded.prepared_feed.session_id == replacement.session_id
-    reasons = list(
-        loaded.prepared_feed.diagnostics.get("prepared_replacement_reasons")
-        or []
-    )
-    assert "new_inventory_optional_content_changed" in reasons
 
 
 def test_feed_state_v2_stale_writer_uses_latest_persisted_version() -> None:

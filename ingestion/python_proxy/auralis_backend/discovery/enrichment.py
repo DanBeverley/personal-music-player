@@ -313,6 +313,7 @@ def complete_inventory_release_metadata(
     inventory: Any,
     *,
     max_new_lookups: int = RELEASE_METADATA_BATCH_SIZE,
+    allow_remote_lookup: bool = True,
 ) -> Any:
     """Fill and persist release years for canonical inventory recordings.
 
@@ -377,10 +378,10 @@ def complete_inventory_release_metadata(
         if not _release_year(known_by_recording.get(recording_id) or {})
         and float((cached.get(recording_id) or {}).get("retry_after") or 0.0) <= now
     ][: max(int(max_new_lookups or 0), 0)]
-    lookup_values, lookup_failed = _lookup_release_metadata(
-        server,
-        missing_ids,
-        now=now,
+    lookup_values, lookup_failed = (
+        _lookup_release_metadata(server, missing_ids, now=now)
+        if allow_remote_lookup and max_new_lookups > 0
+        else ({}, False)
     )
     discovered.update(lookup_values)
     for recording_id, metadata in lookup_values.items():
@@ -525,6 +526,8 @@ def complete_inventory_release_metadata(
 def hydrate_artifact_release_metadata(
     server: Any,
     artifact: DiscoveryArtifact,
+    *,
+    allow_remote_lookup: bool = True,
 ) -> tuple[DiscoveryArtifact, int]:
     """Apply persisted release metadata to every track stored in an artifact.
 
@@ -592,10 +595,10 @@ def hydrate_artifact_release_metadata(
         for recording_id in dict.fromkeys(recording_ids)
         if recording_id not in cached
     ][:RELEASE_METADATA_BATCH_SIZE]
-    discovered, _lookup_failed = _lookup_release_metadata(
-        server,
-        missing_ids,
-        now=now,
+    discovered, _lookup_failed = (
+        _lookup_release_metadata(server, missing_ids, now=now)
+        if allow_remote_lookup
+        else ({}, False)
     )
     _store_release_metadata(server, discovered)
     cached = {**cached, **discovered}
@@ -1129,6 +1132,9 @@ def build_enrichment_plan(
     taste: TasteProfile,
     *,
     acquisition_ledger: Dict[str, Any] | None = None,
+    allowed_pools: set[str] | None = None,
+    radio_discovery_artist_seeds: List[Dict[str, Any]] | None = None,
+    radio_discovery_deficit: int = 0,
 ) -> CandidateEnrichmentPlan:
     ledger = dict(acquisition_ledger or {})
     request_progress = {
@@ -1153,22 +1159,64 @@ def build_enrichment_plan(
         *all_anchor_artists[:artist_cursor],
     ]
     anchor_artists = rotated_artists[:8]
+    if allowed_pools == {"radio_artist_catalog"}:
+        # Radio replenishment is a bounded local shortage repair. Prefer
+        # direct seeds closest to the 12-track minimum and cap one pass.
+        seed_counts = {
+            str(key).casefold(): int(value or 0)
+            for key, value in dict(ledger.get("radio_seed_counts") or {}).items()
+        }
+        incomplete_artists = [
+            artist
+            for artist in anchor_artists
+            if seed_counts.get(str(artist).casefold(), 0) < 12
+        ]
+        direct_repairs = sorted(
+            incomplete_artists,
+            key=lambda artist: max(12 - seed_counts.get(str(artist).casefold(), 0), 0),
+        )[:3]
+        # Discovery seeds come from persisted, profile-compatible artist
+        # evidence. They must take precedence over repairing familiar seeds
+        # while the radio discovery reserve is deficient.
+        discovery = []
+        for seed in radio_discovery_artist_seeds or []:
+            name = _text(seed.get("name") if isinstance(seed, dict) else seed)
+            if name and name.casefold() not in {a.casefold() for a in all_anchor_artists}:
+                discovery.append(name)
+        anchor_artists = [*discovery[:4], *direct_repairs]
+        anchor_artists = _unique(anchor_artists, limit=4 if int(radio_discovery_deficit or 0) > 0 else 3)
     artist_cursor_next = (
         (artist_cursor + max(len(anchor_artists), 1)) % len(all_anchor_artists)
         if all_anchor_artists
         else 0
     )
+    if allowed_pools == {"radio_artist_catalog"} and radio_discovery_artist_seeds:
+        discovery_cursor = max(int(ledger.get("radio_discovery_cursor") or 0), 0)
+        artist_cursor_next = (
+            discovery_cursor + len(anchor_artists)
+        ) % max(len(radio_discovery_artist_seeds), 1)
     artist_ids = {
         str(key): str(value)
         for key, value in dict(ledger.get("canonical_artist_ids") or {}).items()
         if _text(key) and _text(value)
     }
     artist_ids.update(_artist_musicbrainz_ids(taste))
+    for seed in radio_discovery_artist_seeds or []:
+        if isinstance(seed, dict):
+            name = _text(seed.get("name"))
+            identity = _text(seed.get("musicbrainz_artist_id"))
+            if name and identity:
+                artist_ids[name.casefold()] = identity
     optional_row_counts = {
         str(key): int(value or 0)
         for key, value in dict(ledger.get("optional_row_counts") or {}).items()
     }
-    radio_work_needed = int(optional_row_counts.get("popular_radio") or 0) < 8
+    radio_work_needed = (
+        int(optional_row_counts.get("popular_radio") or 0) < 8
+        or (allowed_pools == {"radio_artist_catalog"} and (
+            int(radio_discovery_deficit or 0) > 0 or bool(radio_discovery_artist_seeds)
+        ))
+    )
     requests: List[EnrichmentRequest] = []
     if taste.is_cold_start or not anchor_artists:
         sitewide_offset = max(
@@ -1215,7 +1263,21 @@ def build_enrichment_plan(
         artist_mbid = _text(artist_ids.get(artist.casefold()))
         metadata = {
             "profile_seed_artist": artist,
+            "radio_seed_key": next(
+                (_text(seed.get("key")) for seed in (radio_discovery_artist_seeds or [])
+                 if isinstance(seed, dict) and _text(seed.get("name")).casefold() == artist.casefold()),
+                "",
+            ),
             "musicbrainz_artist_id": artist_mbid,
+            "provider_artist_id": next(
+                (
+                    _text(seed.get("provider_artist_id"))
+                    for seed in (radio_discovery_artist_seeds or [])
+                    if isinstance(seed, dict)
+                    and _text(seed.get("name")).casefold() == artist.casefold()
+                ),
+                "",
+            ),
             "user_scope_id": taste.user_scope_id,
         }
         requests.extend(
@@ -1417,6 +1479,8 @@ def build_enrichment_plan(
     deduped: List[EnrichmentRequest] = []
     seen: set[str] = set()
     for request in requests:
+        if allowed_pools is not None and request.pool not in allowed_pools:
+            continue
         signature = _request_signature(request)
         progress = request_progress.get(signature) or {}
         if signature in seen or progress.get("exhausted") is True or not targets_shortage(request):

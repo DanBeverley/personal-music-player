@@ -630,13 +630,27 @@ def attach_persisted_artist_artwork(
         for value in _artist_cache_identities(updated)
         if artist_artwork_token(value)
     }
+    current_token = _artwork_token_from_path(_clean(updated.get("thumbnail")))
+    # Legacy verified records predate artwork_cache_status but persisted both
+    # an identity-bound token and the local proxy path after a successful R2
+    # HEAD. Migrate only that cryptographically consistent form; arbitrary
+    # URLs, bare tokens and homonymous name identities remain untrusted.
+    legacy_verified = bool(
+        not status
+        and _TOKEN_RE.match(token)
+        and identity
+        and current_token == token
+        and token in allowed_tokens
+        and token == artist_artwork_token(identity)
+    )
     if (
-        status == "cached"
+        (status == "cached" or legacy_verified)
         and _TOKEN_RE.match(token)
         and identity
         and token in allowed_tokens
         and token == artist_artwork_token(identity)
     ):
+        updated["artwork_cache_status"] = "cached"
         updated["thumbnail"] = f"/artist_artwork/{token}"
         return updated
     updated.pop("thumbnail", None)

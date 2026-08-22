@@ -12,6 +12,9 @@ app/.packages
 app/.flutter-plugins
 app/.flutter-plugins-dependencies
 app/android.keystore
+*.jks
+*.keystore
+keystore.txt
 
 # Python / FastAPI
 ingestion/python_proxy/venv/
@@ -23,6 +26,9 @@ ingestion/python_proxy/.pytest_cache/
 *.pyc
 *.pyo
 .env
+deploy/production/.env
+deploy/production/backend.env
+deploy/production/*.tar.gz
 
 # Local Codex worker/checkpoint artifacts
 .codex/

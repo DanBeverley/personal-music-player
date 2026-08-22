@@ -28,7 +28,7 @@ class _LibraryUpdatePanelState extends ConsumerState<LibraryUpdatePanel> {
       if (!mounted) return;
       final state = ref.read(appUpdateProvider);
       if (state.phase == AppUpdatePhase.idle) {
-        ref.read(appUpdateProvider.notifier).checkForUpdate();
+        ref.read(appUpdateProvider.notifier).checkForUpdate(automatic: true);
       }
     });
   }

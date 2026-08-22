@@ -7,9 +7,11 @@ import 'package:google_fonts/google_fonts.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import 'logic/audio_provider.dart';
+import 'logic/app_update_provider.dart';
 import 'logic/auth_provider.dart';
 import 'main_shell.dart';
 import 'ui/app_theme_tokens.dart';
+import 'widgets/app_update_banner.dart';
 
 const _accentGrey = neatieActive;
 const _surfaceGrey = neatieRaised;
@@ -41,6 +43,12 @@ class _AuralisAppState extends ConsumerState<AuralisApp>
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     unawaited(_requestNotificationPermissionIfNeeded());
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      unawaited(
+        ref.read(appUpdateProvider.notifier).checkForUpdate(automatic: true),
+      );
+    });
     _introFadeTimer = Timer(const Duration(milliseconds: 950), () {
       if (mounted) {
         setState(() => _introFading = true);
@@ -81,6 +89,13 @@ class _AuralisAppState extends ConsumerState<AuralisApp>
         state == AppLifecycleState.paused ||
         state == AppLifecycleState.detached) {
       audioNotifier.refreshMediaSession();
+    }
+    if (state == AppLifecycleState.resumed &&
+        ref.read(appUpdateProvider).phase ==
+            AppUpdatePhase.permissionRequired) {
+      unawaited(
+        ref.read(appUpdateProvider.notifier).resumeInstallAfterPermission(),
+      );
     }
   }
 
@@ -146,6 +161,13 @@ class _AuralisAppState extends ConsumerState<AuralisApp>
       home: Stack(
         children: [
           home,
+          if (!_showIntro)
+            const Positioned(
+              top: 0,
+              left: 0,
+              right: 0,
+              child: AppUpdateBanner(),
+            ),
           if (_showIntro)
             Positioned.fill(
               child: IgnorePointer(

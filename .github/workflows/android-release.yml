@@ -1,0 +1,146 @@
+name: Android release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to publish (for example v1.0.1)
+        required: true
+        type: string
+      release_notes:
+        description: Short notes embedded in update.json
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      AURALIS_PROXY_URL: ${{ vars.AURALIS_PROXY_URL }}
+      SUPABASE_URL: ${{ vars.SUPABASE_URL }}
+      SUPABASE_ANON_KEY: ${{ vars.SUPABASE_ANON_KEY }}
+      SUPABASE_REDIRECT_SCHEME: ${{ vars.SUPABASE_REDIRECT_SCHEME }}
+      SUPABASE_REDIRECT_HOST: ${{ vars.SUPABASE_REDIRECT_HOST }}
+
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+
+      - name: Validate release configuration
+        shell: bash
+        env:
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          required=(
+            AURALIS_PROXY_URL
+            SUPABASE_URL
+            SUPABASE_ANON_KEY
+            SUPABASE_REDIRECT_SCHEME
+            SUPABASE_REDIRECT_HOST
+            ANDROID_KEY_ALIAS
+            ANDROID_STORE_PASSWORD
+            ANDROID_KEY_PASSWORD
+            ANDROID_KEYSTORE_BASE64
+          )
+          for name in "${required[@]}"; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "Missing GitHub Actions configuration: $name" >&2
+              exit 1
+            fi
+          done
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Restore release keystore
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          keystore_path="$RUNNER_TEMP/neatie-release.p12"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$keystore_path"
+          chmod 600 "$keystore_path"
+          echo "ANDROID_KEYSTORE_PATH=$keystore_path" >> "$GITHUB_ENV"
+
+      - name: Resolve release notes
+        shell: bash
+        env:
+          INPUT_RELEASE_NOTES: ${{ inputs.release_notes }}
+        run: |
+          set -euo pipefail
+          notes="$INPUT_RELEASE_NOTES"
+          if [[ -z "$notes" ]]; then
+            notes="$(git for-each-ref "refs/tags/$RELEASE_TAG" --format='%(contents)' | sed '/^[[:space:]]*$/d')"
+          fi
+          if [[ -z "$notes" ]]; then
+            notes="See the GitHub release for changes in this version."
+          fi
+          {
+            echo 'RELEASE_NOTES<<NEATIE_RELEASE_NOTES'
+            echo "$notes"
+            echo 'NEATIE_RELEASE_NOTES'
+          } >> "$GITHUB_ENV"
+
+      - name: Install Flutter dependencies
+        working-directory: app
+        run: flutter pub get
+
+      - name: Run updater contract tests
+        working-directory: app
+        run: flutter test test/app_update_provider_test.dart
+
+      - name: Build, verify, and generate update manifest
+        shell: pwsh
+        env:
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: >-
+          ./tools/build_android_release.ps1
+          -Tag $env:RELEASE_TAG
+          -ReleaseNotes $env:RELEASE_NOTES
+
+      - name: Publish GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          output='app/build/app/outputs/flutter-apk'
+          gh release create "$RELEASE_TAG" \
+            "$output/app-arm64-v8a-release.apk" \
+            "$output/app-armeabi-v7a-release.apk" \
+            "$output/app-x86_64-release.apk" \
+            "$output/update.json" \
+            --verify-tag \
+            --title "Neatie $RELEASE_TAG" \
+            --generate-notes \
+            --latest

@@ -5,6 +5,27 @@ plugins {
     id("dev.flutter.flutter-gradle-plugin")
 }
 
+val releaseKeystorePath = System.getenv("ANDROID_KEYSTORE_PATH")?.trim().orEmpty()
+val releaseKeyAlias = System.getenv("ANDROID_KEY_ALIAS")?.trim().orEmpty()
+val releaseStorePassword = System.getenv("ANDROID_STORE_PASSWORD").orEmpty()
+val releaseKeyPassword = System.getenv("ANDROID_KEY_PASSWORD").orEmpty()
+val releaseSigningConfigured = listOf(
+    releaseKeystorePath,
+    releaseKeyAlias,
+    releaseStorePassword,
+    releaseKeyPassword,
+).all { it.isNotEmpty() }
+val releaseTaskRequested = gradle.startParameter.taskNames.any {
+    it.contains("release", ignoreCase = true)
+}
+
+if (releaseTaskRequested && !releaseSigningConfigured) {
+    throw GradleException(
+        "Release signing is not configured. Set ANDROID_KEYSTORE_PATH, " +
+            "ANDROID_KEY_ALIAS, ANDROID_STORE_PASSWORD, and ANDROID_KEY_PASSWORD.",
+    )
+}
+
 android {
     namespace = "com.danbeverley.ebb"
     compileSdk = flutter.compileSdkVersion
@@ -28,15 +49,40 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+
+        externalNativeBuild {
+            cmake {
+                arguments += listOf("-DANDROID_STL=c++_shared")
+            }
+        }
+    }
+
+    signingConfigs {
+        create("release") {
+            if (releaseSigningConfigured) {
+                storeFile = file(releaseKeystorePath)
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
+        }
     }
 
     buildTypes {
         release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the debug keys for now, so `flutter run --release` works.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("release")
             isMinifyEnabled = true
             isShrinkResources = true
+        }
+    }
+
+    // Build the native engine from source on every machine. The old ignored
+    // jniLibs directory was machine-local and could not produce reproducible CI releases.
+    sourceSets.getByName("main").jniLibs.srcDirs("src/main/managedJniLibs")
+    externalNativeBuild {
+        cmake {
+            path = file("../../../core_native/CMakeLists.txt")
+            version = "3.22.1"
         }
     }
 }

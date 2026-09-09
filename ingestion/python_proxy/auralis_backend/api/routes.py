@@ -13,6 +13,8 @@ from .stream_runtime import (
     stream_audio as stream_audio_runtime,
 )
 from ..recognition.service import RecognitionService
+from ..charts import ChartsService, get_charts_service
+from ..releases import NewReleasesService, get_new_releases_service
 from ..recommend.service import RecommendationService
 from ..search.catalog_pipeline import (
     catalog_import_coverage_report,
@@ -34,6 +36,7 @@ from ..contracts import (
     SearchRequest,
     PlaybackResolveRequest,
     PrepareSessionRequest,
+    RelatedTracksRequest,
 )
 
 router = APIRouter()
@@ -44,6 +47,8 @@ _recommendation_service = None
 _assistant_service = None
 _media_service = None
 _recognition_service = None
+_charts_service = None
+_new_releases_service = None
 
 
 def configure_router(server) -> None:
@@ -53,12 +58,16 @@ def configure_router(server) -> None:
     global _assistant_service
     global _media_service
     global _recognition_service
+    global _charts_service
+    global _new_releases_service
     _server = server
     _search_service = SearchService(server)
     _recommendation_service = RecommendationService(server)
     _assistant_service = AssistantService(server)
     _media_service = MediaService(server)
     _recognition_service = RecognitionService(server)
+    _charts_service = get_charts_service(server)
+    _new_releases_service = get_new_releases_service(server)
 
 
 def _require_server():
@@ -97,6 +106,18 @@ def _require_recognition_service() -> RecognitionService:
     return _recognition_service
 
 
+def _require_charts_service() -> ChartsService:
+    if _charts_service is None:
+        raise RuntimeError("Charts service has not been configured")
+    return _charts_service
+
+
+def _require_new_releases_service() -> NewReleasesService:
+    if _new_releases_service is None:
+        raise RuntimeError("New releases service has not been configured")
+    return _new_releases_service
+
+
 @router.get("/")
 def health_check():
     return _require_media_service().health_check()
@@ -126,12 +147,29 @@ def get_track_details(req: DownloadRequest):
     return _require_media_service().get_track_details(req)
 
 
-@router.get("/lyrics/{video_id}")
-def get_track_lyrics(video_id: str, title: str = "", artist: str = ""):
+@router.post("/related_tracks")
+def get_related_tracks(req: RelatedTracksRequest):
+    return _require_media_service().get_related_tracks(req)
+
+
+@router.get("/lyrics/{track_key}")
+def get_track_lyrics(
+    track_key: str,
+    title: str = "",
+    artist: str = "",
+    album: str = "",
+    duration: int | None = None,
+    source_id: str = "",
+    force_refresh: bool = False,
+):
     return _require_media_service().get_track_lyrics(
-        video_id,
+        track_key,
         title=title,
         artist=artist,
+        album=album,
+        duration=duration,
+        source_id=source_id,
+        force_refresh=force_refresh,
     )
 
 
@@ -178,6 +216,26 @@ def recommended_artists(req: SearchRequest):
 @router.post("/suggest")
 def get_suggestions(req: SearchRequest):
     return _require_search_service().suggest(req)
+
+
+@router.get("/charts")
+def charts(
+    country: str = "GLOBAL",
+    range: str = "week",
+    source: str = "all",
+    limit: int = 60,
+):
+    return _require_charts_service().get(
+        country=country,
+        range_key=range,
+        source=source,
+        limit=limit,
+    )
+
+
+@router.get("/new_releases")
+def new_releases(limit: int = 30, refresh: bool = False):
+    return _require_new_releases_service().get(limit=limit, force=refresh, background=True)
 
 
 @router.post("/recommend")
@@ -386,7 +444,16 @@ def stream_audio(video_id: str):
 
 @router.post("/playback/resolve")
 def playback_resolve(req: PlaybackResolveRequest):
-    return playback_resolve_runtime(_require_server(), req.track_key)
+    return playback_resolve_runtime(
+        _require_server(),
+        req.track_key,
+        title=req.title,
+        artist=req.artist,
+        album=req.album,
+        duration=req.duration,
+        source_id=req.source_id,
+        source_provider=req.source_provider,
+    )
 
 
 @router.get("/playback/stream/{track_key}")

@@ -215,12 +215,28 @@ class _FakeMediaService:
         self.last_track_details_request = req
         return {"status": "success", "video_id": req.video_id}
 
-    def get_track_lyrics(self, video_id: str, *, title: str = "", artist: str = ""):
+    def get_track_lyrics(
+        self,
+        track_key: str,
+        *,
+        title: str = "",
+        artist: str = "",
+        album: str = "",
+        duration: int | None = None,
+        source_id: str = "",
+        force_refresh: bool = False,
+    ):
         return {
             "status": "success",
-            "video_id": video_id,
+            "video_id": source_id or track_key,
+            "track_key": track_key,
             "title": title,
             "artist": artist,
+            "album": album,
+            "duration": duration,
+            "source_id": source_id,
+            "force_refresh": force_refresh,
+            "lyrics_status": "not_found",
             "has_lyrics": False,
             "has_timestamps": False,
             "source": None,
@@ -614,6 +630,30 @@ class ApiContractTests(unittest.TestCase):
             self.fake_media_service.last_prepare_request.track_keys,
         )
         self.assertEqual("track_1", captured["download_req"].video_id)
+
+    def test_lyrics_endpoint_accepts_canonical_identity_and_match_context(self) -> None:
+        response = self.client.get(
+            "/lyrics/recording:980a426e-623e-4ea5-98c7-008d037a0508",
+            params={
+                "title": "No Surprises",
+                "artist": "Radiohead",
+                "album": "OK Computer",
+                "duration": 229,
+                "source_id": "7374CZQoS2Y",
+                "force_refresh": True,
+            },
+        )
+
+        self.assertEqual(200, response.status_code)
+        payload = response.json()
+        self.assertEqual(
+            "recording:980a426e-623e-4ea5-98c7-008d037a0508",
+            payload["track_key"],
+        )
+        self.assertEqual("7374CZQoS2Y", payload["source_id"])
+        self.assertEqual("OK Computer", payload["album"])
+        self.assertEqual(229, payload["duration"])
+        self.assertIs(True, payload["force_refresh"])
 
 
 if __name__ == "__main__":

@@ -132,6 +132,26 @@ class PrepareSessionRequest(BaseModel):
 
 class PlaybackResolveRequest(BaseModel):
     track_key: str
+    title: str = ""
+    artist: str = ""
+    album: str = ""
+    duration: int = 0
+    source_id: str = ""
+    source_provider: str = "youtube"
+
+
+class RelatedTracksRequest(BaseModel):
+    track_key: str
+    title: str = ""
+    artist: str = ""
+    album: str = ""
+    duration: int = 0
+    source_id: str = ""
+    source_provider: str = "youtube"
+    user_scope_id: str = "guest"
+    avoid_ids: List[str] = Field(default_factory=list)
+    offset: int = 0
+    limit: int = 18
 
 
 class LyricsMeaningRequest(BaseModel):

@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 from types import SimpleNamespace
 import pathlib
+import requests
 import sys
 import time
 import unittest
@@ -25,6 +26,16 @@ from auralis_backend.api import (
 
 
 def _fake_server() -> SimpleNamespace:
+    response = MagicMock()
+    response.status_code = 206
+    response.headers = {
+        "content-type": "audio/mp4",
+        "content-range": "bytes 0-0/1024",
+    }
+    response.iter_content.return_value = [b"x"]
+    response.raise_for_status.return_value = None
+    upstream_http = MagicMock()
+    upstream_http.get.return_value = response
     return SimpleNamespace(
         STREAM_CHUNK_TTL_SECONDS=1800,
         STREAM_INFO_TTL_SECONDS=21600,
@@ -38,7 +49,10 @@ def _fake_server() -> SimpleNamespace:
         stream_failure_lock=Lock(),
         STREAM_FAILURE_COOLDOWN_SECONDS=900,
         AURALIS_YTDLP_COOKIES_PATH="",
-        AURALIS_YTDLP_PO_TOKEN="",
+        AURALIS_YTDLP_JS_RUNTIME="node",
+        AURALIS_YTDLP_JS_RUNTIME_PATH="",
+        AURALIS_YTDLP_PO_PROVIDER_URL="",
+        upstream_http=upstream_http,
         stream_chunk_cache={},
         stream_chunk_lock=Lock(),
         stream_chunk_inflight={},
@@ -50,6 +64,55 @@ def _fake_server() -> SimpleNamespace:
 
 
 class StreamPrepareLatencyTests(unittest.TestCase):
+    def test_only_one_overlapping_full_response_spools_to_r2(self) -> None:
+        cache = MagicMock()
+        cache.enabled = True
+        cache.backend_name = "r2"
+        cache.put_file.return_value = True
+        server = SimpleNamespace(
+            AURALIS_STREAM_CACHE_MIN_BYTES=1,
+            AURALIS_STREAM_CACHE_MAX_BYTES=1024,
+            AURALIS_STREAM_CACHE_TMP_DIR="",
+        )
+
+        with patch.object(stream_cache, "get_stream_cache", return_value=cache):
+            leader = stream_cache.iter_and_store_full_stream(
+                server,
+                "shared-track",
+                iter([b"first", b"second"]),
+                content_type="audio/webm",
+            )
+            self.assertEqual(next(leader), b"first")
+            follower = list(
+                stream_cache.iter_and_store_full_stream(
+                    server,
+                    "shared-track",
+                    iter([b"follower"]),
+                    content_type="audio/webm",
+                )
+            )
+            self.assertEqual(follower, [b"follower"])
+            self.assertEqual(list(leader), [b"second"])
+
+        cache.put_file.assert_called_once()
+
+    def test_ytdlp_uses_supported_runtime_and_automatic_token_provider(self) -> None:
+        server = _fake_server()
+        server.AURALIS_YTDLP_PO_PROVIDER_URL = "http://pot-provider:4416/"
+
+        with patch.object(stream_core_runtime.shutil, "which", return_value="C:/node.exe"):
+            options = stream_core_runtime._ytdlp_opts(server)
+
+        self.assertEqual(
+            options["js_runtimes"],
+            {"node": {"path": "C:/node.exe"}},
+        )
+        self.assertEqual(
+            options["extractor_args"]["youtubepot-bgutilhttp"]["base_url"],
+            ["http://pot-provider:4416"],
+        )
+        self.assertNotIn("po_token", options["extractor_args"]["youtube"])
+
     def test_format_selection_falls_back_to_a_real_audio_format(self) -> None:
         server = _fake_server()
         server.AURALIS_YTDLP_COOKIES_PATH = "C:/test/cookies.txt"
@@ -238,6 +301,115 @@ class StreamPrepareLatencyTests(unittest.TestCase):
         self.assertFalse(prepared["next_track"]["chunk_deferred"])
         self.assertGreater(prepared["next_track"]["cached_prefix_bytes"], 0)
 
+    def test_three_track_resolve_cycle_returns_only_backend_proxy_urls(self) -> None:
+        server = _fake_server()
+
+        def sources(_server, track_key: str):
+            suffix = track_key.rsplit(":", 1)[-1]
+            return [{"provider": "youtube", "source_id": f"video-{suffix}"}]
+
+        try:
+            with patch.object(
+                stream_runtime,
+                "playback_source_candidates",
+                side_effect=sources,
+            ), patch.object(
+                stream_runtime,
+                "get_stream_info",
+                return_value={
+                    "url": "https://googlevideo.example/signed",
+                    "headers": {"User-Agent": "test"},
+                    "mime_type": "audio/webm",
+                    "duration": 180,
+                    "expires_at": time.time() + 3600,
+                },
+            ):
+                resolved = [
+                    stream_runtime.playback_resolve(server, f"recording:{index}")
+                    for index in range(3)
+                ]
+        finally:
+            server.stream_warm_executor.shutdown(wait=True)
+
+        self.assertEqual(
+            [item["url"] for item in resolved],
+            [
+                "/playback/stream/recording%3A0",
+                "/playback/stream/recording%3A1",
+                "/playback/stream/recording%3A2",
+            ],
+        )
+        self.assertTrue(all(item["source_kind"] == "youtube_proxy" for item in resolved))
+        self.assertTrue(all(item["headers"] == {} for item in resolved))
+
+    def test_proxy_rejection_is_reported_before_streaming_response_starts(self) -> None:
+        server = _fake_server()
+        cache = MagicMock()
+        cache.head.return_value = None
+        cache.enabled = False
+        request = SimpleNamespace(headers={}, query_params={})
+        rejected = requests.HTTPError(
+            "403 Client Error",
+            response=SimpleNamespace(status_code=403),
+        )
+
+        try:
+            with patch.object(stream_runtime, "get_stream_cache", return_value=cache), patch.object(
+                stream_runtime,
+                "get_stream_info",
+                return_value={
+                    "url": "https://googlevideo.example/rejected",
+                    "headers": {},
+                    "mime_type": "audio/mp4",
+                },
+            ), patch.object(
+                stream_runtime,
+                "open_upstream_stream",
+                side_effect=rejected,
+            ):
+                with self.assertRaises(HTTPException) as raised:
+                    stream_runtime.proxy_stream(server, "rejected-video", request)
+        finally:
+            server.stream_warm_executor.shutdown(wait=True)
+
+        self.assertEqual(raised.exception.status_code, 502)
+        self.assertEqual(raised.exception.detail["code"], "source_blocked")
+
+    def test_playback_stream_falls_back_before_returning_a_response(self) -> None:
+        request = SimpleNamespace(headers={}, query_params={})
+        expected = object()
+        sources = [
+            {"provider": "youtube", "source_id": "rejected"},
+            {"provider": "youtube", "source_id": "working"},
+        ]
+
+        with patch.object(
+            stream_runtime,
+            "playback_source_candidates",
+            return_value=sources,
+        ), patch.object(
+            stream_runtime,
+            "proxy_stream",
+            side_effect=[
+                HTTPException(
+                    status_code=502,
+                    detail={"code": "source_blocked"},
+                ),
+                expected,
+            ],
+        ) as proxy:
+            result = stream_runtime.playback_stream(
+                SimpleNamespace(),
+                "recording:test",
+                request,
+            )
+
+        self.assertIs(result, expected)
+        self.assertEqual(
+            [call.args[1] for call in proxy.call_args_list],
+            ["rejected", "working"],
+        )
+
     def test_small_prefix_target_is_not_expanded_to_legacy_global_size(self) -> None:
         server = _fake_server()
         observed_ranges: list[str] = []
@@ -351,6 +523,51 @@ class StreamPrepareLatencyTests(unittest.TestCase):
         extract.assert_not_called()
         self.assertEqual(result["url"], payload["url"])
         self.assertIn("persisted-track", server.stream_info_cache)
+
+    def test_unreachable_persisted_url_is_replaced_before_reuse(self) -> None:
+        server = _fake_server()
+        expires_at = time.time() + 1800
+        stale = {
+            "url": "https://example.test/stale",
+            "headers": {},
+            "mime_type": "audio/mp4",
+            "duration": 180,
+            "expires_at": expires_at,
+        }
+        replacement = {
+            "url": "https://example.test/fresh",
+            "headers": {},
+            "mime_type": "audio/mp4",
+            "duration": 180,
+        }
+        stale_response = MagicMock()
+        stale_response.raise_for_status.side_effect = requests.HTTPError(
+            "403 Client Error",
+            response=SimpleNamespace(status_code=403),
+        )
+        fresh_response = MagicMock()
+        fresh_response.headers = {"content-type": "audio/mp4"}
+        fresh_response.iter_content.return_value = [b"x"]
+        fresh_response.raise_for_status.return_value = None
+        server.upstream_http.get.side_effect = [stale_response, fresh_response]
+
+        with patch.object(
+            stream_core_runtime,
+            "_load_persisted_stream_info",
+            return_value=(stale, expires_at),
+        ), patch.object(
+            stream_core_runtime,
+            "_delete_persisted_stream_info",
+        ) as deleted, patch.object(
+            stream_core_runtime,
+            "extract_stream_info",
+            return_value=replacement,
+        ):
+            result = stream_core_runtime.get_stream_info(server, "replaced-track")
+
+        deleted.assert_called_once_with(server, "replaced-track")
+        self.assertEqual(result["url"], replacement["url"])
+        self.assertGreater(result["validated_at"], 0)
 
     def test_refresh_removes_persisted_resolution_before_extracting_again(self) -> None:
         server = _fake_server()

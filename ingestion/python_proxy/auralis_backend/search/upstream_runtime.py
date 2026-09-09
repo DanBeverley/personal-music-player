@@ -2,7 +2,33 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+from ytmusicapi import YTMusic
+
 from .server_adapter import adapt_search_server
+
+
+class CompatibleYTMusic(YTMusic):
+    """Normalize unavailable optional watch tabs before ytmusicapi parses them."""
+
+    def _send_request(self, endpoint, *args, **kwargs):
+        payload = super()._send_request(endpoint, *args, **kwargs)
+        if endpoint != "next":
+            return payload
+        renderer = payload
+        for key in ("contents", "singleColumnMusicWatchNextResultsRenderer",
+                    "tabbedRenderer", "watchNextTabbedResultsRenderer"):
+            renderer = renderer.get(key, {}) if isinstance(renderer, dict) else {}
+        tabs = renderer.get("tabs")
+        if not isinstance(tabs, list) or not tabs:
+            return payload
+        while len(tabs) < 3:
+            tabs.append({"tabRenderer": {"unselectable": True}})
+        for tab in tabs[1:3]:
+            optional = tab.setdefault("tabRenderer", {})
+            browse_id = ((optional.get("endpoint") or {}).get("browseEndpoint") or {}).get("browseId")
+            if not browse_id:
+                optional["unselectable"] = True
+        return payload
 
 
 class _QuietSearchLogger:

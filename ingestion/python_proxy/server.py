@@ -28,7 +28,7 @@ import uuid
 
 import requests
 import yt_dlp
-from ytmusicapi import YTMusic
+from auralis_backend.search.upstream_runtime import CompatibleYTMusic as YTMusic
 
 from auralis_backend.contracts import (
     RecommendationInteractionEventRequest,
@@ -1533,7 +1533,12 @@ ytmusic = YTMusic()
 STREAM_INFO_TTL_SECONDS = 21600
 STREAM_FAILURE_COOLDOWN_SECONDS = int(os.environ.get("STREAM_FAILURE_COOLDOWN_SECONDS", "900"))
 AURALIS_YTDLP_COOKIES_PATH = os.environ.get("AURALIS_YTDLP_COOKIES_PATH", "").strip()
-AURALIS_YTDLP_PO_TOKEN = os.environ.get("AURALIS_YTDLP_PO_TOKEN", "").strip()
+AURALIS_YTDLP_JS_RUNTIME = os.environ.get("AURALIS_YTDLP_JS_RUNTIME", "node").strip()
+AURALIS_YTDLP_JS_RUNTIME_PATH = os.environ.get("AURALIS_YTDLP_JS_RUNTIME_PATH", "").strip()
+AURALIS_YTDLP_PO_PROVIDER_URL = os.environ.get(
+    "AURALIS_YTDLP_PO_PROVIDER_URL",
+    "",
+).strip()
 AURALIS_STREAM_CACHE_BACKEND = os.environ.get("AURALIS_STREAM_CACHE_BACKEND", "none").strip().lower()
 AURALIS_STREAM_CACHE_BUCKET = os.environ.get("AURALIS_STREAM_CACHE_BUCKET", "").strip()
 AURALIS_STREAM_CACHE_PREFIX = os.environ.get("AURALIS_STREAM_CACHE_PREFIX", "streams").strip()

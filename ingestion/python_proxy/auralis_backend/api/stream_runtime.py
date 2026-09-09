@@ -20,9 +20,11 @@ from .stream_cache import (
 from .stream_core_runtime import (
     _ytdlp_opts,
     classify_stream_failure,
+    extract_total_length,
     get_cached_stream_chunk,
     get_stream_info,
     iter_upstream_stream,
+    open_upstream_stream,
     parse_byte_range,
     prepare_streams_with_failures,
 )
@@ -119,6 +121,10 @@ def playback_source_candidates_batch(
             payload = {}
         state = str(payload.get("verification_state") or "")
         if state != "verified":
+            continue
+        from ..discovery.source_registry import playback_source_semantically_compatible
+
+        if not playback_source_semantically_compatible(payload):
             continue
         provider = str(row["source_provider"] or "").strip().lower()
         source_id = str(row["source_key"] or "").strip()
@@ -259,6 +265,7 @@ def prepare_playback_tracks(
                     "playback_url": _playback_path(track_key),
                     "provider": "youtube",
                     "source_id": source_id,
+                    "source_kind": "youtube_proxy",
                     "headers": {},
                 }
                 break
@@ -422,19 +429,28 @@ def proxy_stream(server: Any, video_id: str, request: Request):
                     requested_end = end if end is not None else cached_end
                     slice_end = min(cached_end, requested_end)
                     cached_slice = cached_bytes[start:slice_end + 1]
+                    upstream_start = max(len(cached_bytes), start)
+                    needs_upstream = not (
+                        (end is not None and upstream_start > end)
+                        or (
+                            total_length is not None
+                            and upstream_start >= total_length
+                        )
+                    )
+                    upstream_response = None
+                    if needs_upstream:
+                        upstream_response, stream_info = open_upstream_stream(
+                            server,
+                            video_id,
+                            stream_info,
+                            start=upstream_start,
+                            end=end,
+                        )
 
                     def generate_cached_then_upstream():
                         if cached_slice:
                             yield cached_slice
-
-                        upstream_start = len(cached_bytes)
-                        if upstream_start <= start:
-                            upstream_start = start
-
-                        if end is not None and upstream_start > end:
-                            return
-
-                        if total_length is not None and upstream_start >= total_length:
+                        if upstream_response is None:
                             return
 
                         yield from iter_upstream_stream(
@@ -443,6 +459,7 @@ def proxy_stream(server: Any, video_id: str, request: Request):
                             stream_info,
                             start=upstream_start,
                             end=end,
+                            initial_response=upstream_response,
                         )
 
                     resp_headers = {"Accept-Ranges": "bytes"}
@@ -479,8 +496,21 @@ def proxy_stream(server: Any, video_id: str, request: Request):
 
         total_length = cached_chunk.get("total_length") if cached_chunk else None
         parsed_range = parse_byte_range(range_header, total_length)
+        if range_header and parsed_range is None:
+            raise HTTPException(
+                status_code=416,
+                detail={"code": "invalid_range", "video_id": video_id},
+            )
         start = parsed_range[0] if parsed_range else 0
         end = parsed_range[1] if parsed_range else None
+        upstream_response, stream_info = open_upstream_stream(
+            server,
+            video_id,
+            stream_info,
+            start=start,
+            end=end,
+        )
+        total_length = extract_total_length(upstream_response.headers) or total_length
 
         def generate_upstream():
             chunks = iter_upstream_stream(
@@ -489,6 +519,7 @@ def proxy_stream(server: Any, video_id: str, request: Request):
                 stream_info,
                 start=start,
                 end=end,
+                initial_response=upstream_response,
             )
             if should_cache_full_response(start, end, total_length):
                 yield from iter_and_store_full_stream(
@@ -501,19 +532,19 @@ def proxy_stream(server: Any, video_id: str, request: Request):
             yield from chunks
 
         resp_headers = {"Accept-Ranges": "bytes"}
-        status_code = 206 if range_header and parsed_range is not None else 200
-        if total_length is not None:
-            response_end = end if end is not None else total_length - 1
-            if status_code == 206:
-                resp_headers["Content-Range"] = f"bytes {start}-{response_end}/{total_length}"
-                resp_headers["Content-Length"] = str(max(response_end - start + 1, 0))
-            elif start == 0:
-                resp_headers["Content-Length"] = str(total_length)
+        status_code = int(upstream_response.status_code or 200)
+        for header in ("content-length", "content-range"):
+            value = upstream_response.headers.get(header)
+            if value:
+                resp_headers["-".join(part.capitalize() for part in header.split("-"))] = value
         return StreamingResponse(
             generate_upstream(),
             status_code=status_code,
             headers=resp_headers,
-            media_type=stream_info.get("mime_type", "audio/mp4"),
+            media_type=(
+                upstream_response.headers.get("content-type")
+                or stream_info.get("mime_type", "audio/mp4")
+            ),
         )
     except HTTPException:
         raise
@@ -529,33 +560,50 @@ def proxy_stream(server: Any, video_id: str, request: Request):
         )
 
 
-def direct_stream_url(server: Any, video_id: str):
-    try:
-        stream_info = get_stream_info(server, video_id)
-        return {
-            "status": "success",
-            "url": stream_info["url"],
-            "headers": stream_info["headers"],
-            "mime_type": stream_info["mime_type"],
-            "duration": stream_info["duration"],
-            "expires_at": stream_info.get("expires_at"),
-        }
-    except HTTPException:
-        raise
-    except Exception as exc:
-        classified = classify_stream_failure(exc)
-        raise HTTPException(
-            status_code=classified["status_code"],
-            detail={
-                "code": classified["code"],
-                "message": classified["message"],
-                "video_id": video_id,
-            },
-        )
-
-
-def playback_resolve(server: Any, track_key: str):
+def playback_resolve(
+    server: Any,
+    track_key: str,
+    *,
+    title: str = "",
+    artist: str = "",
+    album: str = "",
+    duration: int = 0,
+    source_id: str = "",
+    source_provider: str = "youtube",
+):
     sources = playback_source_candidates(server, track_key)
+    if not sources and str(track_key or "").startswith(
+        ("recording:", "musicbrainz:recording:")
+    ):
+        from ..discovery.source_registry import (
+            resolve_user_requested_playback_source,
+        )
+
+        try:
+            resolved = resolve_user_requested_playback_source(
+                server,
+                track_key=track_key,
+                title=title,
+                artist=artist,
+                album=album,
+                duration=duration,
+                source_id=source_id,
+                source_provider=source_provider,
+            )
+        except Exception as exc:
+            print(
+                "[EBB:playback-source] "
+                f"track={track_key} outcome=resolver_error "
+                f"error={type(exc).__name__}"
+            )
+            resolved = None
+        if resolved is not None:
+            sources = [{
+                "provider": str(resolved.get("provider") or "youtube"),
+                "source_id": str(resolved.get("source_id") or ""),
+                "authority": str(resolved.get("authority") or "trusted_match"),
+                "verification_state": "verified",
+            }]
     if not sources:
         raise HTTPException(
             status_code=404,
@@ -576,16 +624,24 @@ def playback_resolve(server: Any, track_key: str):
                 "source_kind": "audius_proxy",
             }
         try:
-            resolved = direct_stream_url(server, source_id)
+            stream_info = get_stream_info(server, source_id)
             return {
-                **resolved,
+                "status": "success",
                 "track_key": track_key,
                 "provider": provider,
                 "source_id": source_id,
-                "source_kind": "youtube_direct",
+                "url": _playback_path(track_key),
+                "headers": {},
+                "mime_type": stream_info.get("mime_type") or "audio/mp4",
+                "duration": stream_info.get("duration") or 0,
+                "expires_at": min(
+                    float(stream_info.get("expires_at") or (time.time() + 1200)),
+                    time.time() + 1200,
+                ),
+                "source_kind": "youtube_proxy",
             }
-        except HTTPException as exc:
-            failures.append(str(exc.detail))
+        except Exception as exc:
+            failures.append(str(classify_stream_failure(exc)))
     raise HTTPException(
         status_code=502,
         detail={

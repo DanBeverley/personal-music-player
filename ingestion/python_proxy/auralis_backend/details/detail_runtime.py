@@ -355,6 +355,7 @@ def build_album_details_payload(server: Any, album_id: str) -> Dict[str, Any]:
             "album_title": album.get("title"),
             "album_id": album_id,
             "year": album.get("year") or "",
+            "views": entry.get("views"),
         })
 
     payload = {
@@ -365,6 +366,7 @@ def build_album_details_payload(server: Any, album_id: str) -> Dict[str, Any]:
         "thumbnail": album_thumbnail,
         "year": album.get("year") or "",
         "track_count": len(tracks),
+        "views": album.get("views"),
         "tracks": tracks,
     }
     return _persist_album_details(server, cache_key, payload)

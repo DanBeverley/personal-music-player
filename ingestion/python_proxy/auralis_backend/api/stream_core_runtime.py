@@ -1,18 +1,26 @@
 from __future__ import annotations
 
 import json
+import shutil
 import time
 import urllib.parse
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, List, Optional
 
 import yt_dlp
+import yt_dlp.plugins
 
 from .stream_cache import get_stream_cache
 
 _STREAM_RESOLUTION_NAMESPACE = "playback_stream_resolution"
 _STREAM_RESOLUTION_MODEL = "youtube"
 _STREAM_RESOLUTION_EXPIRY_MARGIN_SECONDS = 90
+
+# yt-dlp discovers plugin modules lazily. Recommendation verification uses
+# several worker threads, and concurrent first-use discovery can register the
+# same PO-token provider twice. Import-time initialization runs under Python's
+# module lock and makes every later YoutubeDL construction read-only here.
+yt_dlp.plugins.load_all_plugins()
 
 
 def _resolved_stream_expiry(server: Any, payload: dict) -> tuple[float, bool]:
@@ -211,12 +219,32 @@ def _ytdlp_opts(server: Any) -> dict:
         "no_warnings": True,
         "logger": _QuietYtDlpLogger(),
     }
+    js_runtime = str(
+        getattr(server, "AURALIS_YTDLP_JS_RUNTIME", "node") or "node"
+    ).strip().lower()
+    js_runtime_path = str(
+        getattr(server, "AURALIS_YTDLP_JS_RUNTIME_PATH", "") or ""
+    ).strip()
+    resolved_runtime = js_runtime_path or shutil.which(js_runtime)
+    if js_runtime and resolved_runtime:
+        opts["js_runtimes"] = {
+            js_runtime: {"path": resolved_runtime},
+        }
     cookies_path = str(getattr(server, "AURALIS_YTDLP_COOKIES_PATH", "") or "").strip()
     if cookies_path:
         opts["cookiefile"] = cookies_path
-    po_token = str(getattr(server, "AURALIS_YTDLP_PO_TOKEN", "") or "").strip()
-    if po_token:
-        opts.setdefault("extractor_args", {}).setdefault("youtube", {})["po_token"] = [po_token]
+    provider_url = str(
+        getattr(server, "AURALIS_YTDLP_PO_PROVIDER_URL", "") or ""
+    ).strip().rstrip("/")
+    if provider_url:
+        extractor_args = opts.setdefault("extractor_args", {})
+        extractor_args.setdefault("youtube", {})["player_client"] = [
+            "mweb",
+            "web_safari",
+        ]
+        extractor_args["youtubepot-bgutilhttp"] = {
+            "base_url": [provider_url],
+        }
     return opts
 
 
@@ -284,6 +312,35 @@ def extract_stream_info(server: Any, video_id: str):
         "mime_type": selected.get("ext") or selected.get("acodec") or "audio/mp4",
         "duration": selected.get("duration") or (info or {}).get("duration") or 0,
     }
+
+
+def validate_stream_info(server: Any, video_id: str, stream_info: dict) -> dict:
+    """Prove that an extracted URL yields media before it can be cached."""
+    headers = dict(stream_info.get("headers") or {})
+    headers["range"] = "bytes=0-0"
+    response = server.upstream_http.get(
+        stream_info["url"],
+        headers=headers,
+        stream=True,
+        timeout=(5, 20),
+    )
+    try:
+        response.raise_for_status()
+        first_chunk = next(
+            (chunk for chunk in response.iter_content(chunk_size=1) if chunk),
+            b"",
+        )
+        if not first_chunk:
+            raise RuntimeError("stream_preflight_empty")
+        content_type = str(response.headers.get("content-type") or "").casefold()
+        if content_type.startswith(("text/", "application/json")):
+            raise RuntimeError(f"stream_preflight_invalid_content_type:{content_type}")
+        validated = dict(stream_info)
+        validated["validated_at"] = time.time()
+        validated["validation_video_id"] = video_id
+        return validated
+    finally:
+        response.close()
 
 
 def is_stream_info_cached(server: Any, video_id: str):
@@ -670,6 +727,8 @@ def prepare_stream_track_safely(server: Any, video_id: str, target_chunk_bytes: 
 def classify_stream_failure(exc: Exception):
     message = str(exc or "").strip()
     lowered = message.lower()
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
     if "video unavailable" in lowered or "this video is not available" in lowered:
         return {
             "code": "video_unavailable",
@@ -682,7 +741,12 @@ def classify_stream_failure(exc: Exception):
             "message": message or "Requested format is not available",
             "status_code": 410,
         }
-    if "sign in to confirm" in lowered or "not a bot" in lowered or "source_blocked" in lowered:
+    if (
+        status_code in {401, 403, 429}
+        or "sign in to confirm" in lowered
+        or "not a bot" in lowered
+        or "source_blocked" in lowered
+    ):
         return {
             "code": "source_blocked",
             "message": message or "Upstream source requires verification",
@@ -790,8 +854,25 @@ def get_stream_info(server: Any, video_id: str):
         persisted = _load_persisted_stream_info(server, video_id)
         if persisted is not None:
             payload, expires_at = persisted
+            try:
+                payload = validate_stream_info(server, video_id, payload)
+            except Exception:
+                _delete_persisted_stream_info(server, video_id)
+                payload = validate_stream_info(
+                    server,
+                    video_id,
+                    extract_stream_info(server, video_id),
+                )
+                expires_at, should_persist = _resolved_stream_expiry(server, payload)
+                payload["expires_at"] = expires_at
+                if should_persist:
+                    _persist_stream_info(server, video_id, payload, expires_at)
         else:
-            payload = extract_stream_info(server, video_id)
+            payload = validate_stream_info(
+                server,
+                video_id,
+                extract_stream_info(server, video_id),
+            )
             expires_at, should_persist = _resolved_stream_expiry(server, payload)
             payload = dict(payload)
             payload["expires_at"] = expires_at
@@ -828,46 +909,84 @@ def should_refresh_stream_info(exc: Exception):
     return status_code in {401, 403, 404, 410, 416}
 
 
-def iter_upstream_stream(
+def open_upstream_stream(
     server: Any,
     video_id: str,
     stream_info: dict,
     start: int = 0,
     end: Optional[int] = None,
 ):
+    """Open and validate upstream before FastAPI commits response headers."""
+    current_stream_info = stream_info
+    refreshed = False
+    while True:
+        headers = dict(current_stream_info.get("headers") or {})
+        if start > 0 or end is not None:
+            headers["range"] = (
+                f"bytes={start}-" if end is None else f"bytes={start}-{end}"
+            )
+        response = server.upstream_http.get(
+            current_stream_info["url"],
+            headers=headers,
+            stream=True,
+            timeout=(8, 90),
+        )
+        try:
+            response.raise_for_status()
+            return response, current_stream_info
+        except Exception as exc:
+            response.close()
+            if refreshed or not should_refresh_stream_info(exc):
+                raise
+            refreshed = True
+            current_stream_info = refresh_stream_info(server, video_id)
+
+
+def iter_upstream_stream(
+    server: Any,
+    video_id: str,
+    stream_info: dict,
+    start: int = 0,
+    end: Optional[int] = None,
+    initial_response: Any = None,
+):
     current_start = max(start, 0)
     current_stream_info = stream_info
     attempts = 0
     refreshed = False
+    emitted_bytes = 0
 
     while True:
-        req = None
+        req = initial_response
+        initial_response = None
         try:
-            headers = dict(current_stream_info["headers"])
-            if current_start > 0 or end is not None:
-                if end is None:
-                    headers["range"] = f"bytes={current_start}-"
-                else:
-                    headers["range"] = f"bytes={current_start}-{end}"
-
-            req = server.upstream_http.get(
-                current_stream_info["url"],
-                headers=headers,
-                stream=True,
-                timeout=(8, 90),
-            )
-            req.raise_for_status()
+            if req is None:
+                req, current_stream_info = open_upstream_stream(
+                    server,
+                    video_id,
+                    current_stream_info,
+                    start=current_start,
+                    end=end,
+                )
 
             for chunk in req.iter_content(chunk_size=1024 * 64):
                 if not chunk:
                     continue
                 yield chunk
                 current_start += len(chunk)
+                emitted_bytes += len(chunk)
                 if end is not None and current_start > end:
                     return
             return
         except Exception as exc:
             if attempts >= 2:
+                if emitted_bytes:
+                    print(
+                        "[EBB:stream] "
+                        f"video={video_id} event=upstream_ended_after_start "
+                        f"bytes={emitted_bytes} error={exc.__class__.__name__}"
+                    )
+                    return
                 raise
             attempts += 1
             if should_refresh_stream_info(exc) and not refreshed:

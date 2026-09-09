@@ -19,6 +19,8 @@ except Exception:  # pragma: no cover - optional production dependency
 
 
 _STREAM_CACHE_CLIENTS: Dict[int, "StreamCacheBackend"] = {}
+_STREAM_UPLOAD_LEASES: set[tuple[int, str]] = set()
+_STREAM_UPLOAD_LEASES_LOCK = Lock()
 
 
 def _clean(value: Any) -> str:
@@ -302,6 +304,20 @@ def iter_and_store_full_stream(
         yield from chunks
         return
 
+    raw_server = getattr(server, "raw", server)
+    upload_key = (id(raw_server), _safe_video_id(video_id))
+    with _STREAM_UPLOAD_LEASES_LOCK:
+        owns_upload = upload_key not in _STREAM_UPLOAD_LEASES
+        if owns_upload:
+            _STREAM_UPLOAD_LEASES.add(upload_key)
+    if not owns_upload:
+        # Multiple ExoPlayer probes/range retries may overlap before the first
+        # full response reaches R2. They still receive their upstream bytes,
+        # but only one response may spool and upload the object.
+        _log("upload_coalesced", video_id, backend=cache.backend_name)
+        yield from chunks
+        return
+
     min_bytes = int(getattr(server, "AURALIS_STREAM_CACHE_MIN_BYTES", 65536) or 65536)
     max_bytes = int(getattr(server, "AURALIS_STREAM_CACHE_MAX_BYTES", 80 * 1024 * 1024) or 80 * 1024 * 1024)
     temp_dir = _clean(getattr(server, "AURALIS_STREAM_CACHE_TMP_DIR", "")) or tempfile.gettempdir()
@@ -370,6 +386,8 @@ def iter_and_store_full_stream(
         )
         raise
     finally:
+        with _STREAM_UPLOAD_LEASES_LOCK:
+            _STREAM_UPLOAD_LEASES.discard(upload_key)
         if temp_path:
             try:
                 os.remove(temp_path)

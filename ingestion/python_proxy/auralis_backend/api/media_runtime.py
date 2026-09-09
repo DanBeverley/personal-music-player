@@ -16,7 +16,7 @@ from ..details.detail_runtime import (
     build_artist_details_payload,
     build_track_details_payload,
 )
-from ..domain.catalog import normalize_artist_name, normalize_track_title
+from ..lyrics import LyricsService
 
 
 class MediaService:
@@ -35,8 +35,30 @@ class MediaService:
     def get_track_details(self, req: Any):
         return get_track_details(self._server, req)
 
-    def get_track_lyrics(self, video_id: str, *, title: str = "", artist: str = ""):
-        return get_track_lyrics(self._server, video_id, title=title, artist=artist)
+    def get_related_tracks(self, req: Any):
+        return get_related_tracks(self._server, req)
+
+    def get_track_lyrics(
+        self,
+        track_key: str,
+        *,
+        title: str = "",
+        artist: str = "",
+        album: str = "",
+        duration: int | None = None,
+        source_id: str = "",
+        force_refresh: bool = False,
+    ):
+        return get_track_lyrics(
+            self._server,
+            track_key,
+            title=title,
+            artist=artist,
+            album=album,
+            duration=duration,
+            source_id=source_id,
+            force_refresh=force_refresh,
+        )
 
     def get_track_lyrics_meaning(self, video_id: str, req: Any):
         return get_track_lyrics_meaning(self._server, video_id, req)
@@ -118,137 +140,170 @@ def get_track_details(server: Any, req: Any):
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-def _lyrics_response(
-    *,
-    video_id: str,
-    lines: list[dict[str, Any]] | None = None,
-    has_timestamps: bool = False,
-    source: Any = None,
-    resolved_from: str = "video",
-):
+def get_related_tracks(server: Any, req: Any):
+    """Resolve a canonical seed once, then page its provider radio results."""
+
+    from .stream_runtime import playback_source_candidates
+
+    track_key = str(req.track_key or "").strip()
+    sources = playback_source_candidates(server, track_key)
+    if not sources and track_key.startswith(
+        ("recording:", "musicbrainz:recording:")
+    ):
+        from ..discovery.source_registry import (
+            resolve_user_requested_playback_source,
+        )
+
+        try:
+            resolved = resolve_user_requested_playback_source(
+                server,
+                track_key=track_key,
+                title=str(getattr(req, "title", "") or ""),
+                artist=str(getattr(req, "artist", "") or ""),
+                album=str(getattr(req, "album", "") or ""),
+                duration=int(getattr(req, "duration", 0) or 0),
+                source_id=str(getattr(req, "source_id", "") or ""),
+                source_provider=str(
+                    getattr(req, "source_provider", "youtube") or "youtube"
+                ),
+            )
+        except Exception as exc:
+            print(
+                "[EBB:related-tracks] "
+                f"track={track_key} outcome=source_resolution_failed "
+                f"error={type(exc).__name__}"
+            )
+            resolved = None
+        if resolved is not None:
+            sources = [resolved]
+    source_id = next(
+        (
+            str(source.get("source_id") or "").strip()
+            for source in sources
+            if source.get("provider") == "youtube" and source.get("source_id")
+        ),
+        "",
+    )
+    if not source_id and len(track_key) == 11 and ":" not in track_key:
+        source_id = track_key
+    if not source_id:
+        return {
+            "status": "temporarily_unavailable",
+            "tracks": [],
+            "next_cursor": str(max(int(req.offset), 0)),
+            "has_more": True,
+        }
+    try:
+        # Fetch beyond tracks the client already owns; the provider defaults to
+        # a short first page, which makes repeated retries return only duplicates.
+        watch = server.ytmusic.get_watch_playlist(
+            videoId=source_id,
+            radio=True,
+            limit=min(300, max(50, len(req.avoid_ids) + int(req.offset) + int(req.limit) + 1)),
+        ) or {}
+    except Exception as exc:
+        print(f"[EBB:related-tracks] source={source_id} provider_error={type(exc).__name__}")
+        return {
+            "status": "temporarily_unavailable",
+            "tracks": [],
+            "next_cursor": str(max(int(req.offset), 0)),
+            "has_more": True,
+        }
+    avoid = {str(value or "").strip() for value in req.avoid_ids if str(value or "").strip()}
+    avoid.update({track_key, source_id})
+    candidates = []
+    seen = set(avoid)
+    for entry in watch.get("tracks") or []:
+        if not isinstance(entry, dict):
+            continue
+        video_id = str(entry.get("videoId") or entry.get("id") or "").strip()
+        if not video_id or video_id in seen:
+            continue
+        title = str(entry.get("title") or "").strip()
+        artist = server.extract_artist(entry)
+        if not title or not artist:
+            continue
+        seen.add(video_id)
+        album = server.extract_album_info(entry) or {}
+        candidates.append({
+            "id": video_id,
+            "track_key": video_id,
+            "videoId": video_id,
+            "title": title,
+            "channel": artist,
+            "artist": artist,
+            "duration": server.parse_duration_seconds(
+                entry.get("length") or entry.get("duration_seconds") or entry.get("duration")
+            ),
+            "thumbnail": server.extract_thumbnail(entry),
+            "album": album.get("title") or album.get("name") or "",
+            "album_id": album.get("id") or album.get("browseId") or "",
+            "playback": {
+                "provider": "youtube",
+                "source_id": video_id,
+                "authority": "ytmusic_radio",
+            },
+        })
+    offset = max(int(req.offset), 0)
+    limit = min(max(int(req.limit), 1), 30)
+    page = candidates[offset : offset + limit]
+    next_offset = offset + len(page)
     return {
-        "status": "success",
-        "video_id": video_id,
-        "has_lyrics": bool(lines),
-        "has_timestamps": bool(has_timestamps),
-        "source": source,
-        "resolved_from": resolved_from,
-        "lines": list(lines or []),
+        "status": "ready" if page else "exhausted",
+        "tracks": page,
+        "next_cursor": str(next_offset),
+        "has_more": next_offset < len(candidates),
+        "source_id": source_id,
     }
 
 
-def _lyrics_lines(lyrics_payload: dict[str, Any] | None) -> list[dict[str, Any]]:
-    if not lyrics_payload:
-        return []
-    lines = []
-    if lyrics_payload.get("hasTimestamps"):
-        for index, line in enumerate(lyrics_payload.get("lyrics", [])):
-            text = getattr(line, "text", "").strip()
-            if not text:
-                continue
-            lines.append({
-                "index": index,
-                "text": text,
-                "start_time_ms": getattr(line, "start_time", None),
-                "end_time_ms": getattr(line, "end_time", None),
-            })
-        return lines
-    raw_text = (lyrics_payload.get("lyrics") or "").splitlines()
-    for index, line in enumerate(raw_text):
-        text = line.strip()
-        if not text:
-            continue
-        lines.append({
-            "index": index,
-            "text": text,
-            "start_time_ms": None,
-            "end_time_ms": None,
-        })
-    return lines
+def _lyrics_service(server: Any) -> LyricsService:
+    service = getattr(server, "lyrics_service", None)
+    if isinstance(service, LyricsService):
+        return service
+    service = LyricsService(server)
+    setattr(server, "lyrics_service", service)
+    return service
 
 
-def _lyrics_for_video(server: Any, video_id: str, *, resolved_from: str = "video"):
-    watch = server.ytmusic.get_watch_playlist(videoId=video_id)
-    lyrics_browse_id = watch.get("lyrics")
-    if not lyrics_browse_id:
-        return _lyrics_response(video_id=video_id, resolved_from=resolved_from)
-    lyrics_payload = server.ytmusic.get_lyrics(lyrics_browse_id, timestamps=True)
-    lines = _lyrics_lines(lyrics_payload)
-    return _lyrics_response(
-        video_id=video_id,
-        lines=lines,
-        has_timestamps=bool((lyrics_payload or {}).get("hasTimestamps")),
-        source=(lyrics_payload or {}).get("source"),
-        resolved_from=resolved_from,
+def get_track_lyrics(
+    server: Any,
+    track_key: str,
+    *,
+    title: str = "",
+    artist: str = "",
+    album: str = "",
+    duration: int | None = None,
+    source_id: str = "",
+    force_refresh: bool = False,
+):
+    started = time.perf_counter()
+    result = _lyrics_service(server).get(
+        track_key,
+        title=title,
+        artist=artist,
+        album=album,
+        duration=duration,
+        source_id=source_id,
+        force_refresh=force_refresh,
     )
-
-
-def _fallback_lyrics_video_ids(server: Any, *, title: str, artist: str, current_video_id: str) -> list[str]:
-    cleaned_title = normalize_track_title(title)
-    cleaned_artist = normalize_artist_name(artist)
-    if not cleaned_title:
-        return []
-    base_query = " ".join(part for part in (cleaned_artist, cleaned_title) if part).strip()
-    if not base_query:
-        return []
-    queries = [
-        base_query,
-        f"{base_query} lyrics",
-        " ".join(part for part in (cleaned_title, cleaned_artist, "lyrics") if part).strip(),
-    ]
-    results: list[dict[str, Any]] = []
-    for query in dict.fromkeys(q for q in queries if q):
-        for search_filter in ("songs", "videos"):
-            try:
-                raw_results = server.ytmusic.search(query, filter=search_filter, limit=6) or []
-            except Exception:
-                raw_results = []
-            results.extend(item for item in raw_results if isinstance(item, dict))
-    output: list[str] = []
-    for item in results:
-        if not isinstance(item, dict):
-            continue
-        candidate_id = str(item.get("videoId") or item.get("id") or "").strip()
-        if not candidate_id or candidate_id == current_video_id or candidate_id in output:
-            continue
-        candidate_title = normalize_track_title(item.get("title") or "")
-        artists = item.get("artists") or []
-        first_artist = artists[0].get("name") if artists and isinstance(artists[0], dict) else ""
-        candidate_artist = normalize_artist_name(item.get("artist") or first_artist)
-        if not (
-            candidate_title == cleaned_title
-            or cleaned_title in candidate_title
-            or candidate_title in cleaned_title
-        ):
-            continue
-        if cleaned_artist and candidate_artist and cleaned_artist not in candidate_artist and candidate_artist not in cleaned_artist:
-            continue
-        output.append(candidate_id)
-    return output[:3]
-
-
-def get_track_lyrics(server: Any, video_id: str, *, title: str = "", artist: str = ""):
-    try:
-        primary = _lyrics_for_video(server, video_id)
-        if primary.get("has_lyrics"):
-            return primary
-        for candidate_id in _fallback_lyrics_video_ids(
-            server,
-            title=title,
-            artist=artist,
-            current_video_id=video_id,
-        ):
-            fallback = _lyrics_for_video(
-                server,
-                candidate_id,
-                resolved_from="title_artist_fallback",
-            )
-            if fallback.get("has_lyrics"):
-                fallback["requested_video_id"] = video_id
-                return fallback
-        return primary
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+    attempts = ",".join(
+        f"{item.get('provider')}:{item.get('outcome')}"
+        for item in result.get("provider_attempts") or []
+        if isinstance(item, dict)
+    )
+    identity_kind = "canonical" if ":" in str(track_key or "") else "source"
+    print(
+        "[EBB:lyrics] "
+        f"identity={identity_kind} status={result.get('lyrics_status')} "
+        f"source={result.get('source') or '-'} "
+        f"resolved={bool(result.get('resolved_source_id'))} "
+        f"lines={len(result.get('lines') or [])} "
+        f"cache={bool(result.get('cache_hit'))} "
+        f"attempts={attempts or '-'} "
+        f"elapsed_ms={int((time.perf_counter() - started) * 1000)}"
+    )
+    return result
 
 
 def _lyrics_meaning_cache(server: Any) -> dict[str, dict[str, Any]]:
@@ -382,7 +437,13 @@ def get_track_lyrics_meaning(server: Any, video_id: str, req: Any):
 
     if not lines:
         try:
-            lyrics_payload = get_track_lyrics(server, requested_id, title=title, artist=artist)
+            lyrics_payload = get_track_lyrics(
+                server,
+                requested_id,
+                title=title,
+                artist=artist,
+                album=album,
+            )
             lines = list(lyrics_payload.get("lines") or [])
             source = source or _trim_text(lyrics_payload.get("source"), 120)
         except Exception:
@@ -501,44 +562,48 @@ def get_track_lyrics_meaning(server: Any, video_id: str, req: Any):
 def get_album_details(server: Any, album_id: str):
     try:
         normalized_id = str(album_id or "").strip()
-        prefix = "musicbrainz:release-group:"
-        if normalized_id.startswith(prefix):
-            from ..recommend.store_runtime import open_recommendation_store_connection
+        from ..recommend.store_runtime import open_recommendation_store_connection
 
-            release_group_id = normalized_id[len(prefix):]
-            connection = open_recommendation_store_connection(server)
-            try:
-                row = connection.execute(
-                    """
-                    SELECT payload_json
-                    FROM catalog_entities
-                    WHERE entity_type = 'album' AND entity_key = ?
-                    LIMIT 1
-                    """,
-                    [f"musicbrainz:release:{release_group_id}"],
-                ).fetchone()
-            finally:
-                connection.close()
-            if row is None:
-                raise HTTPException(status_code=404, detail="Canonical album is not prepared")
+        aliases = {normalized_id}
+        if normalized_id.startswith("ytmusic:album:"):
+            aliases.add(normalized_id.removeprefix("ytmusic:album:"))
+        if normalized_id.startswith("musicbrainz:release-group:"):
+            token = normalized_id.removeprefix("musicbrainz:release-group:")
+            aliases.update({f"musicbrainz:release:{token}", token})
+        connection = open_recommendation_store_connection(server)
+        try:
+            placeholders = ",".join("?" for _ in aliases)
+            rows = connection.execute(
+                f"""
+                SELECT payload_json
+                FROM catalog_entities
+                WHERE entity_type = 'album' AND entity_key IN ({placeholders})
+                ORDER BY updated_at DESC
+                """,
+                list(aliases),
+            ).fetchall()
+        finally:
+            connection.close()
+        for row in rows:
             payload = json.loads(str(row[0] or "{}"))
+            raw_tracks = payload.get("tracks") or payload.get("canonical_tracks") or []
             tracks = [
                 dict(item)
-                for item in payload.get("tracks") or []
-                if isinstance(item, dict)
-                and item.get("track_key")
-                and item.get("playable") is not False
+                for item in raw_tracks
+                if isinstance(item, dict) and item.get("playable") is not False
             ]
-            if not tracks:
-                raise HTTPException(status_code=404, detail="Canonical album has no playable tracklist")
-            return {
-                **payload,
-                "status": "success",
-                "id": normalized_id,
-                "track_count": len(tracks),
-                "tracks": tracks,
-            }
-        return build_album_details_payload(server, album_id)
+            if tracks:
+                return {
+                    **payload,
+                    "status": "success",
+                    "id": normalized_id,
+                    "track_count": len(tracks),
+                    "tracks": tracks,
+                }
+        provider_id = normalized_id.removeprefix("ytmusic:album:")
+        if normalized_id.startswith("musicbrainz:"):
+            raise HTTPException(status_code=404, detail="Canonical album is not prepared")
+        return build_album_details_payload(server, provider_id)
     except HTTPException:
         raise
     except Exception as exc:

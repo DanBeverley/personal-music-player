@@ -2,6 +2,35 @@ import 'package:flutter/material.dart';
 
 import '../../logic/audio_provider.dart';
 
+String _lyricsEmptyTitle(TrackLyricsState state) {
+  switch (state.availability) {
+    case 'instrumental':
+      return 'This recording is instrumental.';
+    case 'identity_unresolved':
+      return 'This track could not be matched safely.';
+    case 'provider_error':
+      return 'Lyrics providers are temporarily unavailable.';
+    default:
+      return 'No lyrics provider has this recording yet.';
+  }
+}
+
+String _lyricsEmptyDescription(TrackLyricsState state) {
+  if (state.error != null && state.error!.trim().isNotEmpty) {
+    return state.error!;
+  }
+  switch (state.availability) {
+    case 'instrumental':
+      return 'There are no vocal lyrics to display.';
+    case 'identity_unresolved':
+      return 'The title, artist, or playable source needs better metadata.';
+    case 'provider_error':
+      return 'Try again shortly without changing the track.';
+    default:
+      return 'YouTube Music and LRCLIB returned no verified match.';
+  }
+}
+
 class PlayerLyricsPanel extends StatelessWidget {
   final PlayerState playerState;
   final TrackLyricsState lyricsState;
@@ -13,6 +42,7 @@ class PlayerLyricsPanel extends StatelessWidget {
   final Color accentColor;
   final VoidCallback onOpenMeaning;
   final VoidCallback onCloseMeaning;
+  final VoidCallback onRetryLyrics;
   final VoidCallback onAskNeatie;
 
   const PlayerLyricsPanel({
@@ -27,6 +57,7 @@ class PlayerLyricsPanel extends StatelessWidget {
     required this.accentColor,
     required this.onOpenMeaning,
     required this.onCloseMeaning,
+    required this.onRetryLyrics,
     required this.onAskNeatie,
   });
 
@@ -55,172 +86,188 @@ class PlayerLyricsPanel extends StatelessWidget {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                Row(
-                  children: [
-                    Icon(
-                      Icons.lyrics_rounded,
-                      color: Colors.white.withValues(alpha: 0.72),
-                      size: 18,
+                    Wrap(
+                      spacing: 10,
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      children: [
+                        Icon(
+                          Icons.lyrics_rounded,
+                          color: Colors.white.withValues(alpha: 0.72),
+                          size: 18,
+                        ),
+                        const SizedBox(width: 10),
+                        Text(
+                          'Lyrics',
+                          style: TextStyle(
+                            color: Colors.white.withValues(alpha: 0.92),
+                            fontSize: 16,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                        TextButton.icon(
+                          onPressed: onOpenMeaning,
+                          style: TextButton.styleFrom(
+                            foregroundColor:
+                                Colors.white.withValues(alpha: 0.9),
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 10,
+                              vertical: 8,
+                            ),
+                          ),
+                          icon:
+                              const Icon(Icons.auto_awesome_rounded, size: 16),
+                          label: Text(
+                            lyricsState.hasLyrics
+                                ? 'Behind the Lyrics'
+                                : 'Explore meaning',
+                            style: const TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        if (lyricsState.source != null &&
+                            lyricsState.source!.isNotEmpty)
+                          Text(
+                            lyricsState.source!,
+                            style: TextStyle(
+                              color: Colors.white.withValues(alpha: 0.34),
+                              fontSize: 11,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                      ],
                     ),
-                    const SizedBox(width: 10),
+                    const SizedBox(height: 16),
                     Text(
-                      'Lyrics',
+                      playerState.currentTrackName,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
                       style: TextStyle(
-                        color: Colors.white.withValues(alpha: 0.92),
-                        fontSize: 16,
+                        color: Colors.white.withValues(alpha: 0.95),
+                        fontSize: 22,
                         fontWeight: FontWeight.w700,
                       ),
                     ),
-                    const Spacer(),
-                    TextButton.icon(
-                      onPressed: onOpenMeaning,
-                      style: TextButton.styleFrom(
-                        foregroundColor: Colors.white.withValues(alpha: 0.9),
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 10,
-                          vertical: 8,
-                        ),
-                      ),
-                      icon: const Icon(Icons.auto_awesome_rounded, size: 16),
-                      label: Text(
-                        lyricsState.hasLyrics
-                            ? 'Behind the Lyrics'
-                            : 'Explore meaning',
-                        style: const TextStyle(
-                          fontSize: 12,
-                          fontWeight: FontWeight.w700,
-                        ),
+                    const SizedBox(height: 6),
+                    Text(
+                      playerState.artist ?? 'Artist Unknown',
+                      style: TextStyle(
+                        color: Colors.white.withValues(alpha: 0.52),
+                        fontSize: 14,
+                        fontWeight: FontWeight.w500,
                       ),
                     ),
-                    const SizedBox(width: 6),
-                    if (lyricsState.source != null &&
-                        lyricsState.source!.isNotEmpty)
-                      Text(
-                        lyricsState.source!,
-                        style: TextStyle(
-                          color: Colors.white.withValues(alpha: 0.34),
-                          fontSize: 11,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                  ],
-                ),
-                const SizedBox(height: 16),
-                Text(
-                  playerState.currentTrackName,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    color: Colors.white.withValues(alpha: 0.95),
-                    fontSize: 22,
-                    fontWeight: FontWeight.w700,
-                  ),
-                ),
-                const SizedBox(height: 6),
-                Text(
-                  playerState.artist ?? 'Artist Unknown',
-                  style: TextStyle(
-                    color: Colors.white.withValues(alpha: 0.52),
-                    fontSize: 14,
-                    fontWeight: FontWeight.w500,
-                  ),
-                ),
-                const SizedBox(height: 24),
-                Expanded(
-                  child: AnimatedSwitcher(
-                    duration: const Duration(milliseconds: 240),
-                    switchInCurve: Curves.easeOutCubic,
-                    switchOutCurve: Curves.easeInCubic,
-                    child: () {
-                      if (lyricsState.isLoading) {
-                        return Center(
-                          key: const ValueKey('lyrics-loading'),
-                          child: CircularProgressIndicator(color: accentColor),
-                        );
-                      }
-                      if (!lyricsState.hasLyrics) {
-                        return Center(
-                          key: const ValueKey('lyrics-empty'),
-                          child: Padding(
-                            padding: const EdgeInsets.symmetric(horizontal: 16),
-                            child: Column(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                Icon(
-                                  Icons.lyrics_outlined,
-                                  color: Colors.white.withValues(alpha: 0.38),
-                                  size: 42,
+                    const SizedBox(height: 24),
+                    Expanded(
+                      child: AnimatedSwitcher(
+                        duration: const Duration(milliseconds: 240),
+                        switchInCurve: Curves.easeOutCubic,
+                        switchOutCurve: Curves.easeInCubic,
+                        child: () {
+                          if (lyricsState.isLoading) {
+                            return Center(
+                              key: const ValueKey('lyrics-loading'),
+                              child:
+                                  CircularProgressIndicator(color: accentColor),
+                            );
+                          }
+                          if (!lyricsState.hasLyrics) {
+                            return Center(
+                              key: const ValueKey('lyrics-empty'),
+                              child: Padding(
+                                padding:
+                                    const EdgeInsets.symmetric(horizontal: 16),
+                                child: Column(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Icon(
+                                      Icons.lyrics_outlined,
+                                      color:
+                                          Colors.white.withValues(alpha: 0.38),
+                                      size: 42,
+                                    ),
+                                    const SizedBox(height: 18),
+                                    Text(
+                                      _lyricsEmptyTitle(lyricsState),
+                                      textAlign: TextAlign.center,
+                                      style: const TextStyle(
+                                        color: Colors.white70,
+                                        fontSize: 18,
+                                        fontWeight: FontWeight.w600,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 10),
+                                    Text(
+                                      _lyricsEmptyDescription(lyricsState),
+                                      textAlign: TextAlign.center,
+                                      style: const TextStyle(
+                                        color: Colors.white54,
+                                        fontSize: 13,
+                                        height: 1.35,
+                                      ),
+                                    ),
+                                    if (lyricsState.availability ==
+                                        'provider_error') ...[
+                                      const SizedBox(height: 14),
+                                      TextButton.icon(
+                                        onPressed: onRetryLyrics,
+                                        icon: const Icon(Icons.refresh_rounded),
+                                        label: const Text('Try again'),
+                                      ),
+                                    ],
+                                  ],
                                 ),
-                                const SizedBox(height: 18),
-                                const Text(
-                                  'Lyrics are not available for this track yet.',
-                                  textAlign: TextAlign.center,
-                                  style: TextStyle(
-                                    color: Colors.white70,
-                                    fontSize: 18,
-                                    fontWeight: FontWeight.w600,
-                                  ),
-                                ),
-                                const SizedBox(height: 10),
-                                Text(
-                                  lyricsState.error ??
-                                      'Swipe right or tap Player to return.',
-                                  textAlign: TextAlign.center,
-                                  style: const TextStyle(
-                                    color: Colors.white54,
-                                    fontSize: 13,
-                                    height: 1.35,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                        );
-                      }
+                              ),
+                            );
+                          }
 
-                      return ListView.builder(
-                        key: ValueKey('lyrics-${lyricsState.videoId}'),
-                        physics: const BouncingScrollPhysics(
-                          parent: AlwaysScrollableScrollPhysics(),
-                        ),
-                        padding: const EdgeInsets.only(bottom: 140),
-                        itemCount: lyricsState.lines.length,
-                        itemBuilder: (context, index) {
-                          final line = lyricsState.lines[index];
-                          final isActive = index == activeIndex;
-                          return Padding(
-                            key: lyricKeyFor(index),
-                            padding: const EdgeInsets.symmetric(vertical: 8),
-                            child: AnimatedContainer(
-                              duration: const Duration(milliseconds: 260),
-                              curve: Curves.easeOutCubic,
-                              transform: Matrix4.translationValues(
-                                isActive ? 0.0 : 8.0,
-                                0.0,
-                                0.0,
-                              ),
-                              child: AnimatedDefaultTextStyle(
-                                duration: const Duration(milliseconds: 260),
-                                curve: Curves.easeOutCubic,
-                                style: TextStyle(
-                                  color: isActive
-                                      ? Colors.white
-                                      : Colors.white.withValues(alpha: 0.34),
-                                  fontSize: isActive ? 30 : 24,
-                                  fontWeight: isActive
-                                      ? FontWeight.w700
-                                      : FontWeight.w500,
-                                  height: 1.16,
-                                ),
-                                child: Text(line.text),
-                              ),
+                          return ListView.builder(
+                            key: ValueKey('lyrics-${lyricsState.videoId}'),
+                            physics: const BouncingScrollPhysics(
+                              parent: AlwaysScrollableScrollPhysics(),
                             ),
+                            padding: const EdgeInsets.only(bottom: 140),
+                            itemCount: lyricsState.lines.length,
+                            itemBuilder: (context, index) {
+                              final line = lyricsState.lines[index];
+                              final isActive = index == activeIndex;
+                              return Padding(
+                                key: lyricKeyFor(index),
+                                padding:
+                                    const EdgeInsets.symmetric(vertical: 8),
+                                child: AnimatedContainer(
+                                  duration: const Duration(milliseconds: 260),
+                                  curve: Curves.easeOutCubic,
+                                  transform: Matrix4.translationValues(
+                                    isActive ? 0.0 : 8.0,
+                                    0.0,
+                                    0.0,
+                                  ),
+                                  child: AnimatedDefaultTextStyle(
+                                    duration: const Duration(milliseconds: 260),
+                                    curve: Curves.easeOutCubic,
+                                    style: TextStyle(
+                                      color: isActive
+                                          ? Colors.white
+                                          : Colors.white
+                                              .withValues(alpha: 0.34),
+                                      fontSize: isActive ? 30 : 24,
+                                      fontWeight: isActive
+                                          ? FontWeight.w700
+                                          : FontWeight.w500,
+                                      height: 1.16,
+                                    ),
+                                    child: Text(line.text),
+                                  ),
+                                ),
+                              );
+                            },
                           );
-                        },
-                      );
-                    }(),
-                  ),
-                ),
+                        }(),
+                      ),
+                    ),
                   ],
                 ),
               ),
@@ -293,7 +340,8 @@ class _LyricsMeaningDrawer extends StatelessWidget {
             children: [
               Row(
                 children: [
-                  Icon(Icons.auto_awesome_rounded, color: accentColor, size: 19),
+                  Icon(Icons.auto_awesome_rounded,
+                      color: accentColor, size: 19),
                   const SizedBox(width: 9),
                   const Expanded(
                     child: Text(
@@ -440,7 +488,8 @@ class _MeaningInsightView extends StatelessWidget {
         if (insight.emotionalTone.trim().isNotEmpty)
           _MeaningSection(title: 'Emotional tone', body: insight.emotionalTone),
         if (insight.contextNotes.isNotEmpty)
-          _MeaningListSection(title: 'Context notes', values: insight.contextNotes),
+          _MeaningListSection(
+              title: 'Context notes', values: insight.contextNotes),
         if (insight.notableImagery.isNotEmpty)
           _MeaningListSection(
             title: 'Imagery',
@@ -527,7 +576,8 @@ class _MeaningChipSection extends StatelessWidget {
                       fontSize: 12,
                       fontWeight: FontWeight.w700,
                     ),
-                    side: BorderSide(color: Colors.white.withValues(alpha: 0.08)),
+                    side:
+                        BorderSide(color: Colors.white.withValues(alpha: 0.08)),
                   ),
                 )
                 .toList(growable: false),

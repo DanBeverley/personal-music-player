@@ -386,31 +386,12 @@ class NeatieSearchLanding extends StatelessWidget {
         icon: Icons.trending_up_rounded,
         colors: [Color(0xFF6140A0), Color(0xFFB04D70)]
       ),
-      (
-        title: 'Mood',
-        icon: Icons.favorite_border_rounded,
-        colors: [Color(0xFF527E7D), Color(0xFF273F43)]
-      ),
-      (
-        title: 'Genres',
-        icon: Icons.grid_view_rounded,
-        colors: [Color(0xFF493C86), Color(0xFF7B4FB5)]
-      ),
     ];
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         songMatchLauncher,
         const SizedBox(height: 22),
-        const Text(
-          'Browse all',
-          style: TextStyle(
-            color: Colors.white,
-            fontSize: 16,
-            fontWeight: FontWeight.w800,
-          ),
-        ),
-        const SizedBox(height: 12),
         GridView.builder(
           shrinkWrap: true,
           physics: const NeverScrollableScrollPhysics(),
@@ -487,7 +468,7 @@ List<Map<String, dynamic>> _matchingRecentTracks(
   return matches;
 }
 
-class NeatieSearchResultsSection extends StatelessWidget {
+class NeatieSearchResultsSection extends StatefulWidget {
   const NeatieSearchResultsSection({
     super.key,
     required this.query,
@@ -543,8 +524,146 @@ class NeatieSearchResultsSection extends StatelessWidget {
   final ValueChanged<Map<String, dynamic>> onOpenAlbum;
   final ValueChanged<Map<String, dynamic>> onOpenPlaylist;
 
+
+  @override
+  State<NeatieSearchResultsSection> createState() => _NeatieSearchResultsSectionState();
+}
+
+class _NeatieSearchResultsSectionState extends State<NeatieSearchResultsSection> {
+  NeatieSearchResultsSection? _initial;
+  final Set<String> _seen = {};
+  final List<({String kind, List<String> keys})> _continuations = [];
+
+  String get query => widget.query;
+  String get queryIntent => widget.queryIntent;
+  String get selectedTab => widget.selectedTab;
+  bool get isLoading => widget.isLoading;
+  Set<String> get loadingSurfaces => widget.loadingSurfaces;
+  Set<String> get appendedItemKeys => widget.appendedItemKeys;
+  String? get errorMessage => widget.errorMessage;
+  ValueChanged<Map<String, dynamic>> get onPlayTrack => widget.onPlayTrack;
+  ValueChanged<Map<String, dynamic>> get onPrimeTrack => widget.onPrimeTrack;
+  ValueChanged<Map<String, dynamic>> get onOpenTrack => widget.onOpenTrack;
+  ValueChanged<Map<String, dynamic>> get onOpenArtist => widget.onOpenArtist;
+  ValueChanged<Map<String, dynamic>> get onOpenAlbum => widget.onOpenAlbum;
+  ValueChanged<Map<String, dynamic>> get onOpenPlaylist => widget.onOpenPlaylist;
+  List<Map<String, dynamic>> get tracks => _initialItems('track', widget.tracks, _initial?.tracks);
+  List<Map<String, dynamic>> get artists => _initialItems('artist', widget.artists, _initial?.artists);
+  List<Map<String, dynamic>> get albums => _initialItems('album', widget.albums, _initial?.albums);
+  List<Map<String, dynamic>> get recentlyPlayedTracks => _initialItems('track', widget.recentlyPlayedTracks, _initial?.recentlyPlayedTracks);
+  List<Map<String, dynamic>> get similarArtists => _initialItems('artist', widget.similarArtists, _initial?.similarArtists);
+  List<Map<String, dynamic>> get artistTracks => _initialItems('track', widget.artistTracks, _initial?.artistTracks);
+  List<Map<String, dynamic>> get artistAlbums => _initialItems('album', widget.artistAlbums, _initial?.artistAlbums);
+  List<Map<String, dynamic>> get similarTracks => _initialItems('track', widget.similarTracks, _initial?.similarTracks);
+  List<Map<String, dynamic>> get playlists => _initialItems('playlist', widget.playlists, _initial?.playlists);
+  Map<String, dynamic>? get topResult =>
+      _initial?.topResult == null && _initial != null ? null : widget.topResult;
+  Map<String, dynamic>? get leadArtist =>
+      _initial?.leadArtist == null && _initial != null ? null : widget.leadArtist;
+  Map<String, dynamic>? get containingAlbum =>
+      _initial?.containingAlbum == null && _initial != null ? null : widget.containingAlbum;
+
+  String _key(String kind, Map<String, dynamic> item) {
+    final identity = switch (kind) {
+      'track' => extractTrackId(item) ?? '',
+      'artist' => _searchArtistIdentityKey(item),
+      'album' => _searchAlbumIdentityKey(item),
+      _ => (item['id'] ?? item['name'] ?? '').toString(),
+    };
+    return '$kind:$identity';
+  }
+
+  bool _displayable(String kind, Map<String, dynamic> item) =>
+      !const {'album', 'playlist'}.contains(kind) ||
+      preferredArtworkUrl(item['thumbnail']?.toString()).isNotEmpty;
+
+  List<Map<String, dynamic>> _initialItems(String kind,
+      List<Map<String, dynamic>> current, List<Map<String, dynamic>>? initial) {
+    if (selectedTab.toLowerCase() != 'top' || initial == null) return current;
+    final latest = {for (final item in current) _key(kind, item): item};
+    return [for (final item in initial)
+      if (_displayable(kind, item) && latest.containsKey(_key(kind, item))) latest[_key(kind, item)]!];
+  }
+
+  Map<String, List<Map<String, dynamic>>> _items(NeatieSearchResultsSection value) => {
+    'track': [...value.tracks, ...value.artistTracks, ...value.similarTracks,
+      if (value.topResult?['entity_type'] == 'track' && value.topResult?['item'] is Map)
+        Map<String, dynamic>.from(value.topResult!['item'] as Map)],
+    'artist': [...value.artists, ...value.similarArtists,
+      if (value.leadArtist != null) value.leadArtist!,
+      if (value.topResult?['entity_type'] == 'artist' && value.topResult?['item'] is Map)
+        Map<String, dynamic>.from(value.topResult!['item'] as Map)],
+    'album': [...value.albums, ...value.artistAlbums,
+      if (value.containingAlbum != null) value.containingAlbum!,
+      if (value.topResult?['entity_type'] == 'album' && value.topResult?['item'] is Map)
+        Map<String, dynamic>.from(value.topResult!['item'] as Map)],
+    'playlist': value.playlists,
+  }.map((kind, items) => MapEntry(kind,
+      items.where((item) => _displayable(kind, item)).toList(growable: false)));
+
+  @override
+  void didUpdateWidget(covariant NeatieSearchResultsSection oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.query != widget.query || oldWidget.selectedTab != widget.selectedTab ||
+        (widget.isLoading && !oldWidget.isLoading)) {
+      _initial = null;
+      _seen.clear();
+      _continuations.clear();
+    }
+  }
+
+  void _captureArrivalOrder() {
+    if (selectedTab.toLowerCase() != 'top' || widget.isLoading) return;
+    final current = _items(widget);
+    if (_initial == null) {
+      if (current.values.every((items) => items.isEmpty) && widget.topResult == null) return;
+      _initial = widget;
+      for (final group in current.entries) {
+        _seen.addAll(group.value.map((item) => _key(group.key, item)));
+      }
+      if (widget.containingAlbum != null) _seen.add(_key('album', widget.containingAlbum!));
+      if (widget.leadArtist != null) _seen.add(_key('artist', widget.leadArtist!));
+      final top = widget.topResult;
+      if (top?['item'] is Map) {
+        _seen.add(_key(top!['entity_type'].toString(),
+            Map<String, dynamic>.from(top['item'] as Map)));
+      }
+      return;
+    }
+    for (final group in current.entries) {
+      final keys = <String>[];
+      for (final item in group.value) {
+        final key = _key(group.key, item);
+        if (_seen.add(key)) keys.add(key);
+      }
+      if (keys.isNotEmpty) _continuations.add((kind: group.key, keys: keys));
+    }
+  }
+
+  List<Widget> _continuationSections() {
+    final current = _items(widget);
+    final sections = <Widget>[];
+    for (final batch in _continuations) {
+      final latest = {for (final item in current[batch.kind]!) _key(batch.kind, item): item};
+      final items = [for (final key in batch.keys) if (latest[key] != null) latest[key]!];
+      if (items.isEmpty) continue;
+      sections.add(switch (batch.kind) {
+        'track' => _SearchTrackSection(title: 'More songs', tracks: items,
+            onPlay: onPlayTrack, onPrime: onPrimeTrack, onOpen: onOpenTrack),
+        'artist' => _SearchArtistSection(title: 'More related artists', artists: items,
+            horizontalShelf: true, onOpen: onOpenArtist),
+        'album' => _SearchAlbumSection(title: 'More albums', albums: items,
+            horizontalShelf: true, onOpen: onOpenAlbum),
+        _ => _SearchPlaylistSection(playlists: items, horizontalShelf: true,
+            onOpen: onOpenPlaylist),
+      });
+    }
+    return sections;
+  }
+
   @override
   Widget build(BuildContext context) {
+    _captureArrivalOrder();
     final normalizedTab = selectedTab.toLowerCase();
     final leadArtistName =
         (leadArtist?['name'] ?? leadArtist?['artist'] ?? '').toString().trim();
@@ -779,6 +898,8 @@ class NeatieSearchResultsSection extends StatelessWidget {
             onOpen: onOpenPlaylist));
       }
     }
+
+    if (normalizedTab == 'top') sections.addAll(_continuationSections());
 
     if (isLoading && sections.isEmpty) {
       return const Padding(

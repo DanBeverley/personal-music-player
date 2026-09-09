@@ -104,8 +104,10 @@ class _LibraryScreenState extends ConsumerState<LibraryScreen> {
         final existing = artists[key];
         artists[key] = {
           ...?existing,
-          'id':
-              existing?['id'] ?? track['artist_id'] ?? track['channel_id'] ?? key,
+          'id': existing?['id'] ??
+              track['artist_id'] ??
+              track['channel_id'] ??
+              key,
           'name': name,
           'thumbnail': existing?['thumbnail'] ?? track['thumbnail'],
           'track_count': ((existing?['track_count'] as num?)?.toInt() ?? 0) + 1,
@@ -124,7 +126,7 @@ class _LibraryScreenState extends ConsumerState<LibraryScreen> {
   }
 
   Future<void> _openAlbum(Map<String, dynamic> album) async {
-    final albumId = album['id']?.toString().trim() ?? '';
+    final albumId = resolveAlbumDetailId(album) ?? '';
     if (albumId.isEmpty) return;
     unawaited(ref.read(albumDetailsProvider.notifier).fetchAlbum(albumId));
     await Navigator.of(context).push(
@@ -284,7 +286,8 @@ class _LibraryScreenState extends ConsumerState<LibraryScreen> {
                 SavedTracksSection(
                   libraryAsync: libraryAsync.whenData(
                     (tracks) => tracks
-                        .where((track) => track['is_downloaded_locally'] == true)
+                        .where(
+                            (track) => track['is_downloaded_locally'] == true)
                         .toList(growable: false),
                   ),
                   missingOfflineTracks: const [],

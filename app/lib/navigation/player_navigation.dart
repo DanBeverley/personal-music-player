@@ -11,9 +11,15 @@ Future<void> openFullPlayer(BuildContext context) async {
   final currentRoute = ModalRoute.of(context);
   if (currentRoute?.settings.name == fullPlayerRouteName) return;
 
+  await openFullPlayerWithNavigator(Navigator.of(context));
+}
+
+Future<void> openFullPlayerWithNavigator(NavigatorState? navigator) async {
+  if (_isOpeningFullPlayer || navigator == null) return;
+
   _isOpeningFullPlayer = true;
   try {
-    await Navigator.of(context).push(
+    await navigator.push(
       MaterialPageRoute<void>(
         settings: const RouteSettings(name: fullPlayerRouteName),
         builder: (_) => const FullPlayerScreen(),

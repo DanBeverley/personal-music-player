@@ -10,8 +10,10 @@ import 'logic/audio_provider.dart';
 import 'logic/app_update_provider.dart';
 import 'logic/auth_provider.dart';
 import 'main_shell.dart';
+import 'navigation/player_navigation.dart';
 import 'ui/app_theme_tokens.dart';
 import 'widgets/app_update_banner.dart';
+import 'widgets/player/mini_player.dart';
 
 const _accentGrey = neatieActive;
 const _surfaceGrey = neatieRaised;
@@ -33,6 +35,8 @@ class AuralisApp extends ConsumerStatefulWidget {
 
 class _AuralisAppState extends ConsumerState<AuralisApp>
     with WidgetsBindingObserver {
+  final _navigatorKey = GlobalKey<NavigatorState>();
+  final _routeTracker = _AppRouteTracker();
   Timer? _introFadeTimer;
   Timer? _introDismissTimer;
   bool _showIntro = true;
@@ -78,6 +82,7 @@ class _AuralisAppState extends ConsumerState<AuralisApp>
     _introFadeTimer?.cancel();
     _introDismissTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
+    _routeTracker.dispose();
     super.dispose();
   }
 
@@ -102,6 +107,11 @@ class _AuralisAppState extends ConsumerState<AuralisApp>
   @override
   Widget build(BuildContext context) {
     final authState = ref.watch(authProvider);
+    final hasActiveTrack = ref.watch(
+      audioPlayerProvider.select(
+        (state) => state.currentTrackName != 'No track loaded',
+      ),
+    );
     final Widget home;
     if (authState.canUseApp) {
       home = const MainLayout();
@@ -122,6 +132,48 @@ class _AuralisAppState extends ConsumerState<AuralisApp>
     return MaterialApp(
       key: appShellKey,
       title: 'Neatie',
+      navigatorKey: _navigatorKey,
+      navigatorObservers: <NavigatorObserver>[_routeTracker],
+      builder: (context, child) => AnimatedBuilder(
+        animation: _routeTracker,
+        builder: (context, _) {
+          final showMiniPlayer = authState.canUseApp &&
+              hasActiveTrack &&
+              !_showIntro &&
+              !_routeTracker.isFullPlayer;
+          final bottomInset = MediaQuery.viewPaddingOf(context).bottom;
+          return Stack(
+            children: <Widget>[
+              if (child != null) child,
+              Positioned(
+                left: 18,
+                right: 18,
+                bottom:
+                    _routeTracker.isRoot ? bottomInset + 66 : bottomInset + 8,
+                child: IgnorePointer(
+                  ignoring: !showMiniPlayer,
+                  child: AnimatedSlide(
+                    offset: showMiniPlayer ? Offset.zero : const Offset(0, 0.3),
+                    duration: const Duration(milliseconds: 240),
+                    curve: Curves.easeOutCubic,
+                    child: AnimatedOpacity(
+                      opacity: showMiniPlayer ? 1 : 0,
+                      duration: const Duration(milliseconds: 200),
+                      child: MiniPlayer(
+                        onOpenPlayer: () => unawaited(
+                          openFullPlayerWithNavigator(
+                            _navigatorKey.currentState,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          );
+        },
+      ),
       onGenerateRoute: (settings) {
         final routeName = settings.name ?? '';
         if (routeName.startsWith('/?code=') ||
@@ -197,6 +249,45 @@ class _AuralisAppState extends ConsumerState<AuralisApp>
         ],
       ),
     );
+  }
+}
+
+class _AppRouteTracker extends NavigatorObserver with ChangeNotifier {
+  final List<Route<dynamic>> _routes = <Route<dynamic>>[];
+
+  bool get isRoot => _routes.length <= 1;
+  bool get isFullPlayer =>
+      _routes.isNotEmpty && _routes.last.settings.name == fullPlayerRouteName;
+
+  void _changed() => notifyListeners();
+
+  @override
+  void didPush(Route<dynamic> route, Route<dynamic>? previousRoute) {
+    _routes.add(route);
+    _changed();
+  }
+
+  @override
+  void didPop(Route<dynamic> route, Route<dynamic>? previousRoute) {
+    _routes.remove(route);
+    _changed();
+  }
+
+  @override
+  void didRemove(Route<dynamic> route, Route<dynamic>? previousRoute) {
+    _routes.remove(route);
+    _changed();
+  }
+
+  @override
+  void didReplace({Route<dynamic>? newRoute, Route<dynamic>? oldRoute}) {
+    final index = oldRoute == null ? -1 : _routes.indexOf(oldRoute);
+    if (index >= 0 && newRoute != null) {
+      _routes[index] = newRoute;
+    } else if (newRoute != null) {
+      _routes.add(newRoute);
+    }
+    _changed();
   }
 }
 

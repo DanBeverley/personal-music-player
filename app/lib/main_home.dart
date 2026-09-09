@@ -20,6 +20,8 @@ import 'main_details.dart';
 import 'main_player.dart';
 import 'navigation/player_navigation.dart';
 import 'screens/assistant_screen.dart';
+import 'screens/charts_screen.dart';
+import 'screens/new_releases_screen.dart';
 import 'screens/personal_mix_detail_screen.dart';
 import 'screens/playlist_detail_screen.dart';
 import 'screens/radio_detail_screen.dart';
@@ -463,7 +465,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
 
   void focusSearch() {
     if (!mounted) return;
-    if (_homeScrollController.hasClients) {
+    if (!_hasSubmittedSearch && _homeScrollController.hasClients) {
       _homeScrollController.animateTo(
         0,
         duration: const Duration(milliseconds: 240),
@@ -521,7 +523,9 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
           );
     }
     _refreshRecommendationsOnSearchExit = false;
-    _clearSearch(refreshRecommendations: false);
+    // Home and Search are retained tabs sharing the backend result provider.
+    // Returning Home must not erase the other tab's submitted snapshot.
+    _setSearchMode(false);
     if (_homeScrollController.hasClients) {
       _homeScrollController.animateTo(
         0,
@@ -1045,13 +1049,18 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     );
   }
 
-  Future<void> _playSearchDiscoveryTrack(Map<String, dynamic> track) async {
-    _queueSearchSelectionWrite(
-      eventType: 'play_start',
-      entityType: 'track',
-      item: track,
-      confidence: 0.94,
-    );
+  Future<void> _playSearchDiscoveryTrack(
+    Map<String, dynamic> track, {
+    bool recordSelection = true,
+  }) async {
+    if (recordSelection) {
+      _queueSearchSelectionWrite(
+        eventType: 'play_start',
+        entityType: 'track',
+        item: track,
+        confidence: 0.94,
+      );
+    }
     final trackId = extractTrackId(track);
     if (trackId != null && trackId.isNotEmpty) {
       _warmTrack(trackId);
@@ -1078,13 +1087,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       item: track,
       confidence: 0.9,
     );
-    final trackId = extractTrackId(track) ?? suggestion.text;
-    await _playTrackFromCollection(
-      tracks: [track],
-      track: track,
-      playlistId: 'neatie:search_suggestion:$trackId',
-      playlistName: 'Recently played suggestion',
-    );
+    await _playSearchDiscoveryTrack(track, recordSelection: false);
   }
 
   Future<void> _recordSearchSelection({
@@ -1644,7 +1647,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   }
 
   Future<void> _openAlbum(Map<String, dynamic> album) async {
-    final albumId = album['id']?.toString();
+    final albumId = resolveAlbumDetailId(album);
     if (albumId == null || albumId.isEmpty) return;
     unawaited(ref.read(albumDetailsProvider.notifier).fetchAlbum(albumId));
     await Navigator.of(context).push(
@@ -1729,9 +1732,23 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   }
 
   void _openBrowseSurface(WidgetRef ref, String surface) {
+    if (surface == 'Charts') {
+      unawaited(
+        Navigator.of(context).push(
+          MaterialPageRoute<void>(builder: (_) => const ChartsScreen()),
+        ),
+      );
+      return;
+    }
+    if (surface == 'New releases') {
+      unawaited(
+        Navigator.of(context).push(
+          MaterialPageRoute<void>(builder: (_) => const NewReleasesScreen()),
+        ),
+      );
+      return;
+    }
     final query = switch (surface) {
-      'New releases' => 'new releases',
-      'Charts' => 'popular music',
       'Mood' => 'mood music',
       'Genres' => 'music genres',
       _ => surface,
@@ -1883,18 +1900,13 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       onSelectQuery: (query) => _performSearch(ref, query),
       onPlayPick: (pick) => unawaited(
         () async {
-          await recordRecentSearchPick(pick.query, pick.track);
+          unawaited(recordRecentSearchPick(pick.query, pick.track));
           if (mounted) {
             setState(() {
               _recentSearchPicks = peekRecentSearchPicks(limit: 8);
             });
           }
-          await _playTrackFromCollection(
-            tracks: [pick.track],
-            track: pick.track,
-            playlistId: 'neatie:recent_search:${pick.key}',
-            playlistName: pick.query,
-          );
+          await _playSearchDiscoveryTrack(pick.track);
         }(),
       ),
       onRemovePick: (pick) => unawaited(_removeRecentSearchPick(pick)),

@@ -53,26 +53,21 @@ class PlayerQueueSheet extends ConsumerWidget {
     final resolvedCurrentIndex = playerResolvedQueueIndex(queueState);
     final currentTrack = playerCurrentQueueTrack(queueState);
     final earlierQueue = resolvedCurrentIndex > 0
-        ? queueState.queue
-            .take(resolvedCurrentIndex)
-            .where((track) {
-              final trackId = extractTrackId(track);
-              if (trackId == null || trackId == queueState.currentTrackId) {
-                return false;
-              }
-              return !queueState.playedTrackIds.contains(trackId);
-            })
-            .toList(growable: false)
+        ? queueState.queue.take(resolvedCurrentIndex).where((track) {
+            final trackId = extractTrackId(track);
+            if (trackId == null || trackId == queueState.currentTrackId) {
+              return false;
+            }
+            return !queueState.playedTrackIds.contains(trackId);
+          }).toList(growable: false)
         : const <Map<String, dynamic>>[];
-    final playedQueue = queueState.queue
-        .where((track) {
-          final trackId = extractTrackId(track);
-          if (trackId == null || trackId == queueState.currentTrackId) {
-            return false;
-          }
-          return queueState.playedTrackIds.contains(trackId);
-        })
-        .toList(growable: false);
+    final playedQueue = queueState.queue.where((track) {
+      final trackId = extractTrackId(track);
+      if (trackId == null || trackId == queueState.currentTrackId) {
+        return false;
+      }
+      return queueState.playedTrackIds.contains(trackId);
+    }).toList(growable: false);
     final upcomingQueue = resolvedCurrentIndex >= 0 &&
             resolvedCurrentIndex + 1 < queueState.queue.length
         ? queueState.queue.sublist(resolvedCurrentIndex + 1)
@@ -197,7 +192,9 @@ class PlayerQueueSheet extends ConsumerWidget {
                               if (queueState.mode ==
                                       PlaybackQueueMode.playlist &&
                                   queueState.playlistId != null) {
-                                ref.read(playlistProvider.notifier).setTrackHidden(
+                                ref
+                                    .read(playlistProvider.notifier)
+                                    .setTrackHidden(
                                       queueState.playlistId!,
                                       videoId,
                                       !isHidden,
@@ -286,7 +283,8 @@ class PlayerQueueSheet extends ConsumerWidget {
       );
     }
 
-    if (queueState.mode == PlaybackQueueMode.radio && queueState.isLoadingQueue) {
+    if (queueState.mode == PlaybackQueueMode.radio &&
+        queueState.isLoadingQueue) {
       queueChildren.add(
         Padding(
           padding: const EdgeInsets.symmetric(vertical: 18),
@@ -353,16 +351,18 @@ class PlayerQueueSheet extends ConsumerWidget {
       }
     }
     if (queueState.mode == PlaybackQueueMode.playlist &&
-        !queueState.hasMoreRecommendations &&
+        queueState.recommendations.isEmpty &&
+        queueState.hasMoreRecommendations &&
         !queueState.isLoadingRecommendations) {
       queueChildren.add(
         Padding(
           padding: const EdgeInsets.fromLTRB(6, 18, 6, 8),
-          child: Text(
-            'No more related songs are available for this session.',
-            style: TextStyle(
-              color: Colors.white.withValues(alpha: 0.46),
-              fontSize: 12.5,
+          child: TextButton.icon(
+            onPressed: () => unawaited(queueNotifier.retryRelatedSongs()),
+            icon: const Icon(Icons.refresh_rounded),
+            label: const Text('Retry related songs'),
+            style: TextButton.styleFrom(
+              foregroundColor: Colors.white.withValues(alpha: 0.68),
             ),
           ),
         ),
@@ -422,10 +422,12 @@ class PlayerQueueSheet extends ConsumerWidget {
                         16,
                         8,
                         16,
-                        math.max(
-                          140,
-                          MediaQuery.of(context).padding.bottom + 120,
-                        ).toDouble(),
+                        math
+                            .max(
+                              140,
+                              MediaQuery.of(context).padding.bottom + 120,
+                            )
+                            .toDouble(),
                       ),
                       children: queueChildren,
                     ),
@@ -457,7 +459,8 @@ class _QueueSheetHeader extends StatelessWidget {
         padding: const EdgeInsets.fromLTRB(22, 14, 22, 14),
         decoration: BoxDecoration(
           color: Colors.black.withValues(alpha: 0.96),
-          borderRadius: BorderRadius.vertical(top: Radius.circular(radiusLarge)),
+          borderRadius:
+              BorderRadius.vertical(top: Radius.circular(radiusLarge)),
           border: Border(
             bottom: BorderSide(color: Colors.white.withValues(alpha: 0.06)),
           ),

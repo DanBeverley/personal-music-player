@@ -1,4 +1,4 @@
-﻿import 'dart:async';
+import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -77,7 +77,7 @@ class _ArtistDetailsScreenState extends ConsumerState<ArtistDetailsScreen> {
   }
 
   Future<void> _openAlbum(Map<String, dynamic> album) async {
-    final albumId = album['id']?.toString();
+    final albumId = resolveAlbumDetailId(album);
     if (albumId == null || albumId.isEmpty) return;
     unawaited(ref.read(albumDetailsProvider.notifier).fetchAlbum(albumId));
     await Navigator.of(context).push(
@@ -125,8 +125,7 @@ class _ArtistDetailsScreenState extends ConsumerState<ArtistDetailsScreen> {
             .map((entry) => Map<String, dynamic>.from(entry))
             .toList(growable: false);
     final description = (artist['description'] ?? '').toString().trim();
-    final isFollowing =
-        ref.watch(followedArtistsProvider.select((artists) {
+    final isFollowing = ref.watch(followedArtistsProvider.select((artists) {
       final id = (artist['id'] ?? artist['browseId'] ?? artist['artist_id'])
               ?.toString()
               .trim() ??
@@ -137,8 +136,7 @@ class _ArtistDetailsScreenState extends ConsumerState<ArtistDetailsScreen> {
                 ?.toString()
                 .trim() ??
             '';
-        final entryName =
-            entry['name']?.toString().trim().toLowerCase() ?? '';
+        final entryName = entry['name']?.toString().trim().toLowerCase() ?? '';
         return (id.isNotEmpty && entryId == id) ||
             (name.isNotEmpty && entryName == name);
       });
@@ -221,8 +219,7 @@ class _ArtistDetailsScreenState extends ConsumerState<ArtistDetailsScreen> {
                   title: 'Top songs',
                   tracks: topSongs,
                   isLoading: artistState.isLoading,
-                  emptyMessage:
-                      artistState.error ??
+                  emptyMessage: artistState.error ??
                       'No top-song data available for this artist.',
                   fallbackSubtitle:
                       artist['name']?.toString() ?? 'Unknown Artist',
@@ -257,6 +254,7 @@ class _ArtistDetailsScreenState extends ConsumerState<ArtistDetailsScreen> {
     );
   }
 }
+
 class AlbumDetailsScreen extends ConsumerStatefulWidget {
   final String albumId;
   final Map<String, dynamic> fallbackAlbum;
@@ -328,7 +326,11 @@ class _AlbumDetailsScreenState extends ConsumerState<AlbumDetailsScreen> {
         loadedAlbum != null && loadedAlbum['id']?.toString() == widget.albumId
             ? loadedAlbum
             : widget.fallbackAlbum;
-    final tracks = (loadedAlbum?['tracks'] as List<dynamic>?) ?? const [];
+    final loadedTracks = (loadedAlbum?['tracks'] as List<dynamic>?) ?? const [];
+    final fallbackTracks = (widget.fallbackAlbum['tracks'] as List<dynamic>?) ??
+        (widget.fallbackAlbum['canonical_tracks'] as List<dynamic>?) ??
+        const [];
+    final tracks = loadedTracks.isNotEmpty ? loadedTracks : fallbackTracks;
     final likeKey = 'album:${widget.albumId}';
     final isLiked = ref.watch(collectionLikesProvider).contains(likeKey);
 
@@ -371,8 +373,8 @@ class _AlbumDetailsScreenState extends ConsumerState<AlbumDetailsScreen> {
                   title: 'Tracks',
                   tracks: tracks,
                   isLoading: albumState.isLoading,
-                  emptyMessage:
-                      albumState.error ?? 'No track data available for this album.',
+                  emptyMessage: albumState.error ??
+                      'No track data available for this album.',
                   fallbackSubtitle: album['artist']?.toString() ?? '',
                   fallbackThumbnail: album['thumbnail']?.toString(),
                   onPrimeTrack: (track) => _primeDetailsTrack(ref, track),

@@ -10,7 +10,9 @@ import '../../ui/neatie_components.dart';
 import '../app_artwork.dart';
 
 class MiniPlayer extends ConsumerWidget {
-  const MiniPlayer({super.key});
+  const MiniPlayer({super.key, this.onOpenPlayer});
+
+  final VoidCallback? onOpenPlayer;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -23,7 +25,12 @@ class MiniPlayer extends ConsumerWidget {
         : 0.0;
 
     void openPlayer() {
-      unawaited(openFullPlayer(context));
+      final callback = onOpenPlayer;
+      if (callback != null) {
+        callback();
+      } else {
+        unawaited(openFullPlayer(context));
+      }
     }
 
     return GestureDetector(
@@ -82,7 +89,7 @@ class MiniPlayer extends ConsumerWidget {
                               width: 22,
                               height: 22,
                               child: CircularProgressIndicator(
-                        strokeWidth: 2.2,
+                                strokeWidth: 2.2,
                                 color: Colors.white,
                               ),
                             )

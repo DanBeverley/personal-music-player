@@ -17,7 +17,6 @@ import 'ui/app_theme_tokens.dart';
 import 'ui/neatie_components.dart';
 import 'widgets/app_bottom_nav_bar.dart';
 import 'widgets/download_hud.dart';
-import 'widgets/player/mini_player.dart';
 
 const _voidBlack = neatieInk;
 
@@ -131,300 +130,316 @@ class _AuthGateScreenState extends ConsumerState<AuthGateScreen> {
                         child: Column(
                           mainAxisAlignment: MainAxisAlignment.center,
                           children: [
-                          Image.asset(
-                            'assets/branding/neatie_3rd.png',
-                            width: 88,
-                            height: 58,
-                            fit: BoxFit.contain,
-                          ),
-                          const SizedBox(height: 48),
-                          AnimatedSize(
-                            duration: const Duration(milliseconds: 420),
-                            curve: Curves.easeInOutCubic,
-                            child: AnimatedSwitcher(
+                            Image.asset(
+                              'assets/branding/neatie_3rd.png',
+                              width: 88,
+                              height: 58,
+                              fit: BoxFit.contain,
+                            ),
+                            const SizedBox(height: 48),
+                            AnimatedSize(
                               duration: const Duration(milliseconds: 420),
-                              switchInCurve: Curves.easeOutCubic,
-                              switchOutCurve: Curves.easeInCubic,
-                              transitionBuilder: (child, animation) {
-                                final curved = CurvedAnimation(
-                                  parent: animation,
-                                  curve: Curves.easeOutCubic,
-                                );
-                                final slide = Tween<Offset>(
-                                  begin: Offset(
-                                      _isSignUp ? 0.035 : -0.035, 0.015),
-                                  end: Offset.zero,
-                                ).animate(curved);
-                                final scale = Tween<double>(
-                                  begin: 0.97,
-                                  end: 1,
-                                ).animate(curved);
-                                return FadeTransition(
-                                  opacity: curved,
-                                  child: SlideTransition(
-                                    position: slide,
-                                    child: ScaleTransition(
-                                      scale: scale,
-                                      child: child,
-                                    ),
-                                  ),
-                                );
-                              },
-                              child: NeatieSurface(
-                              key: ValueKey<bool>(_isSignUp),
-                            width: double.infinity,
-                            padding: const EdgeInsets.fromLTRB(28, 28, 28, 28),
-                            radius: 28,
-                            color: Colors.black.withValues(alpha: 0.34),
-                            blur: true,
-                            bordered: true,
-                            elevated: false,
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.stretch,
-                              children: [
-                                if (_isSignUp) ...[
-                                  _AuthTextField(
-                                    controller: _fullNameController,
-                                    enabled: !authControlsLocked,
-                                    icon: Icons.person_outline_rounded,
-                                    hintText: 'Username',
-                                    keyboardType: TextInputType.name,
-                                  ),
-                                  const SizedBox(height: 18),
-                                ],
-                                _AuthTextField(
-                                  controller: _emailController,
-                                  enabled: !authControlsLocked,
-                                  icon: Icons.mail_outline_rounded,
-                                  hintText: 'you@domain.com',
-                                  keyboardType: TextInputType.emailAddress,
-                                ),
-                                const SizedBox(height: 18),
-                                _AuthTextField(
-                                  controller: _passwordController,
-                                  enabled: !authControlsLocked,
-                                  icon: Icons.lock_outline_rounded,
-                                  hintText: 'Password',
-                                  obscureText: _obscurePassword,
-                                  keyboardType: TextInputType.visiblePassword,
-                                  suffixIcon: IconButton(
-                                    onPressed: authControlsLocked
-                                        ? null
-                                        : () => setState(
-                                              () => _obscurePassword =
-                                                  !_obscurePassword,
-                                            ),
-                                    icon: Icon(
-                                      _obscurePassword
-                                          ? Icons.visibility_off_outlined
-                                          : Icons.visibility_outlined,
-                                    ),
-                                    color: Colors.white.withValues(alpha: 0.58),
-                                    tooltip: _obscurePassword
-                                        ? 'Show password'
-                                        : 'Hide password',
-                                  ),
-                                ),
-                                if (_isSignUp) ...[
-                                  const SizedBox(height: 18),
-                                  _AuthTextField(
-                                    controller: _confirmPasswordController,
-                                    enabled: !authControlsLocked,
-                                    icon: Icons.lock_outline_rounded,
-                                    hintText: 'Confirm Password',
-                                    obscureText: _obscurePassword,
-                                    keyboardType: TextInputType.visiblePassword,
-                                    suffixIcon: IconButton(
-                                      onPressed: authControlsLocked
-                                          ? null
-                                          : () => setState(
-                                                () => _obscurePassword =
-                                                    !_obscurePassword,
-                                              ),
-                                      icon: Icon(
-                                        _obscurePassword
-                                            ? Icons.visibility_off_outlined
-                                            : Icons.visibility_outlined,
+                              curve: Curves.easeInOutCubic,
+                              child: AnimatedSwitcher(
+                                duration: const Duration(milliseconds: 420),
+                                switchInCurve: Curves.easeOutCubic,
+                                switchOutCurve: Curves.easeInCubic,
+                                transitionBuilder: (child, animation) {
+                                  final curved = CurvedAnimation(
+                                    parent: animation,
+                                    curve: Curves.easeOutCubic,
+                                  );
+                                  final slide = Tween<Offset>(
+                                    begin: Offset(
+                                        _isSignUp ? 0.035 : -0.035, 0.015),
+                                    end: Offset.zero,
+                                  ).animate(curved);
+                                  final scale = Tween<double>(
+                                    begin: 0.97,
+                                    end: 1,
+                                  ).animate(curved);
+                                  return FadeTransition(
+                                    opacity: curved,
+                                    child: SlideTransition(
+                                      position: slide,
+                                      child: ScaleTransition(
+                                        scale: scale,
+                                        child: child,
                                       ),
-                                      color: Colors.white.withValues(alpha: 0.58),
-                                      tooltip: _obscurePassword
-                                          ? 'Show password'
-                                          : 'Hide password',
                                     ),
-                                  ),
-                                ],
-                                const SizedBox(height: 28),
-                                SizedBox(
+                                  );
+                                },
+                                child: NeatieSurface(
+                                  key: ValueKey<bool>(_isSignUp),
                                   width: double.infinity,
-                                  height: 62,
-                                  child: FilledButton(
-                                    onPressed: authControlsLocked
-                                        ? null
-                                        : () => _submit(authNotifier),
-                                    style: FilledButton.styleFrom(
-                                      backgroundColor: Colors.white,
-                                      disabledBackgroundColor:
-                                          Colors.white.withValues(alpha: 0.2),
-                                      foregroundColor: Colors.black,
-                                      disabledForegroundColor:
-                                          Colors.white.withValues(alpha: 0.38),
-                                      shape: RoundedRectangleBorder(
-                                        borderRadius: BorderRadius.circular(15),
+                                  padding:
+                                      const EdgeInsets.fromLTRB(28, 28, 28, 28),
+                                  radius: 28,
+                                  color: Colors.black.withValues(alpha: 0.34),
+                                  blur: true,
+                                  bordered: true,
+                                  elevated: false,
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.stretch,
+                                    children: [
+                                      if (_isSignUp) ...[
+                                        _AuthTextField(
+                                          controller: _fullNameController,
+                                          enabled: !authControlsLocked,
+                                          icon: Icons.person_outline_rounded,
+                                          hintText: 'Username',
+                                          keyboardType: TextInputType.name,
+                                        ),
+                                        const SizedBox(height: 18),
+                                      ],
+                                      _AuthTextField(
+                                        controller: _emailController,
+                                        enabled: !authControlsLocked,
+                                        icon: Icons.mail_outline_rounded,
+                                        hintText: 'you@domain.com',
+                                        keyboardType:
+                                            TextInputType.emailAddress,
                                       ),
-                                    ),
-                                    child: Text(
-                                      _isSignUp
-                                          ? 'Create account'
-                                          : 'Continue',
-                                      style: const TextStyle(
-                                        fontSize: 17,
-                                        fontWeight: FontWeight.w800,
-                                      ),
-                                    ),
-                                  ),
-                                ),
-                                if (!_isSignUp) ...[
-                                  const SizedBox(height: 18),
-                                  TextButton.icon(
-                                    onPressed: authControlsLocked
-                                        ? null
-                                        : () => authNotifier.sendMagicLink(
-                                              _emailController.text,
-                                            ),
-                                    style: TextButton.styleFrom(
-                                      foregroundColor: Colors.white,
-                                      disabledForegroundColor:
-                                          Colors.white.withValues(alpha: 0.36),
-                                    ),
-                                    icon: const Icon(Icons.send_outlined,
-                                        size: 22),
-                                    label: const Text(
-                                      'Send magic link',
-                                      style: TextStyle(
-                                        fontSize: 15,
-                                        fontWeight: FontWeight.w700,
-                                      ),
-                                    ),
-                                  ),
-                                ],
-                                const SizedBox(height: 24),
-                                Row(
-                                  children: [
-                                    Expanded(
-                                      child: Divider(
-                                        color: Colors.white
-                                            .withValues(alpha: 0.18),
-                                      ),
-                                    ),
-                                    Padding(
-                                      padding: const EdgeInsets.symmetric(
-                                          horizontal: 20),
-                                      child: Text(
-                                        'or',
-                                        style: TextStyle(
+                                      const SizedBox(height: 18),
+                                      _AuthTextField(
+                                        controller: _passwordController,
+                                        enabled: !authControlsLocked,
+                                        icon: Icons.lock_outline_rounded,
+                                        hintText: 'Password',
+                                        obscureText: _obscurePassword,
+                                        keyboardType:
+                                            TextInputType.visiblePassword,
+                                        suffixIcon: IconButton(
+                                          onPressed: authControlsLocked
+                                              ? null
+                                              : () => setState(
+                                                    () => _obscurePassword =
+                                                        !_obscurePassword,
+                                                  ),
+                                          icon: Icon(
+                                            _obscurePassword
+                                                ? Icons.visibility_off_outlined
+                                                : Icons.visibility_outlined,
+                                          ),
                                           color: Colors.white
                                               .withValues(alpha: 0.58),
-                                          fontSize: 15,
+                                          tooltip: _obscurePassword
+                                              ? 'Show password'
+                                              : 'Hide password',
                                         ),
                                       ),
-                                    ),
-                                    Expanded(
-                                      child: Divider(
-                                        color: Colors.white
-                                            .withValues(alpha: 0.18),
+                                      if (_isSignUp) ...[
+                                        const SizedBox(height: 18),
+                                        _AuthTextField(
+                                          controller:
+                                              _confirmPasswordController,
+                                          enabled: !authControlsLocked,
+                                          icon: Icons.lock_outline_rounded,
+                                          hintText: 'Confirm Password',
+                                          obscureText: _obscurePassword,
+                                          keyboardType:
+                                              TextInputType.visiblePassword,
+                                          suffixIcon: IconButton(
+                                            onPressed: authControlsLocked
+                                                ? null
+                                                : () => setState(
+                                                      () => _obscurePassword =
+                                                          !_obscurePassword,
+                                                    ),
+                                            icon: Icon(
+                                              _obscurePassword
+                                                  ? Icons
+                                                      .visibility_off_outlined
+                                                  : Icons.visibility_outlined,
+                                            ),
+                                            color: Colors.white
+                                                .withValues(alpha: 0.58),
+                                            tooltip: _obscurePassword
+                                                ? 'Show password'
+                                                : 'Hide password',
+                                          ),
+                                        ),
+                                      ],
+                                      const SizedBox(height: 28),
+                                      SizedBox(
+                                        width: double.infinity,
+                                        height: 62,
+                                        child: FilledButton(
+                                          onPressed: authControlsLocked
+                                              ? null
+                                              : () => _submit(authNotifier),
+                                          style: FilledButton.styleFrom(
+                                            backgroundColor: Colors.white,
+                                            disabledBackgroundColor: Colors
+                                                .white
+                                                .withValues(alpha: 0.2),
+                                            foregroundColor: Colors.black,
+                                            disabledForegroundColor: Colors
+                                                .white
+                                                .withValues(alpha: 0.38),
+                                            shape: RoundedRectangleBorder(
+                                              borderRadius:
+                                                  BorderRadius.circular(15),
+                                            ),
+                                          ),
+                                          child: Text(
+                                            _isSignUp
+                                                ? 'Create account'
+                                                : 'Continue',
+                                            style: const TextStyle(
+                                              fontSize: 17,
+                                              fontWeight: FontWeight.w800,
+                                            ),
+                                          ),
+                                        ),
                                       ),
-                                    ),
-                                  ],
+                                      if (!_isSignUp) ...[
+                                        const SizedBox(height: 18),
+                                        TextButton.icon(
+                                          onPressed: authControlsLocked
+                                              ? null
+                                              : () =>
+                                                  authNotifier.sendMagicLink(
+                                                    _emailController.text,
+                                                  ),
+                                          style: TextButton.styleFrom(
+                                            foregroundColor: Colors.white,
+                                            disabledForegroundColor: Colors
+                                                .white
+                                                .withValues(alpha: 0.36),
+                                          ),
+                                          icon: const Icon(Icons.send_outlined,
+                                              size: 22),
+                                          label: const Text(
+                                            'Send magic link',
+                                            style: TextStyle(
+                                              fontSize: 15,
+                                              fontWeight: FontWeight.w700,
+                                            ),
+                                          ),
+                                        ),
+                                      ],
+                                      const SizedBox(height: 24),
+                                      Row(
+                                        children: [
+                                          Expanded(
+                                            child: Divider(
+                                              color: Colors.white
+                                                  .withValues(alpha: 0.18),
+                                            ),
+                                          ),
+                                          Padding(
+                                            padding: const EdgeInsets.symmetric(
+                                                horizontal: 20),
+                                            child: Text(
+                                              'or',
+                                              style: TextStyle(
+                                                color: Colors.white
+                                                    .withValues(alpha: 0.58),
+                                                fontSize: 15,
+                                              ),
+                                            ),
+                                          ),
+                                          Expanded(
+                                            child: Divider(
+                                              color: Colors.white
+                                                  .withValues(alpha: 0.18),
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                      const SizedBox(height: 24),
+                                      _OAuthButton(
+                                        enabled: !authControlsLocked,
+                                        isGoogle: true,
+                                        label: _isSignUp
+                                            ? 'Sign up with Google'
+                                            : 'Continue with Google',
+                                        onPressed: () =>
+                                            authNotifier.signInWithGoogle(),
+                                      ),
+                                      const SizedBox(height: 18),
+                                      _OAuthButton(
+                                        enabled: !authControlsLocked,
+                                        label: _isSignUp
+                                            ? 'Sign up with GitHub'
+                                            : 'Continue with GitHub',
+                                        onPressed: () =>
+                                            authNotifier.signInWithGitHub(),
+                                      ),
+                                    ],
+                                  ),
                                 ),
-                                const SizedBox(height: 24),
-                                _OAuthButton(
-                                  enabled: !authControlsLocked,
-                                  isGoogle: true,
-                                  label: _isSignUp
-                                      ? 'Sign up with Google'
-                                      : 'Continue with Google',
-                                  onPressed: () =>
-                                      authNotifier.signInWithGoogle(),
-                                ),
-                                const SizedBox(height: 18),
-                                _OAuthButton(
-                                  enabled: !authControlsLocked,
-                                  label: _isSignUp
-                                      ? 'Sign up with GitHub'
-                                      : 'Continue with GitHub',
-                                  onPressed: () =>
-                                      authNotifier.signInWithGitHub(),
-                                ),
-                              ],
                               ),
                             ),
-                          ),
-                          ),
-                          if (statusText.isNotEmpty) ...[
-                            const SizedBox(height: 16),
-                            _AuthStatusPill(text: statusText),
-                          ],
-                          if (authState.error != null &&
-                              authState.error!.isNotEmpty) ...[
-                            const SizedBox(height: 14),
-                            Text(
-                              authState.error!,
-                              textAlign: TextAlign.center,
-                              style: TextStyle(
-                                color: Colors.white.withValues(alpha: 0.72),
-                                fontSize: 13,
-                                height: 1.35,
-                              ),
-                            ),
-                          ],
-                          const SizedBox(height: 30),
-                          Row(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
+                            if (statusText.isNotEmpty) ...[
+                              const SizedBox(height: 16),
+                              _AuthStatusPill(text: statusText),
+                            ],
+                            if (authState.error != null &&
+                                authState.error!.isNotEmpty) ...[
+                              const SizedBox(height: 14),
                               Text(
-                                _isSignUp
-                                    ? 'Already had an account ?'
-                                    : 'New here?',
+                                authState.error!,
+                                textAlign: TextAlign.center,
                                 style: TextStyle(
-                                  color: Colors.white.withValues(alpha: 0.58),
-                                  fontSize: 16,
-                                ),
-                              ),
-                              TextButton(
-                                onPressed: authControlsLocked
-                                    ? null
-                                    : () => _setAuthMode(!_isSignUp),
-                                style: TextButton.styleFrom(
-                                  foregroundColor: Colors.white,
-                                  padding: const EdgeInsets.only(left: 6),
-                                  minimumSize: Size.zero,
-                                  tapTargetSize:
-                                      MaterialTapTargetSize.shrinkWrap,
-                                ),
-                                child: Row(
-                                  mainAxisSize: MainAxisSize.min,
-                                  children: [
-                                    Text(
-                                      _isSignUp ? 'Sign in' : 'Create account',
-                                      style: const TextStyle(
-                                        fontSize: 16,
-                                        fontWeight: FontWeight.w800,
-                                      ),
-                                    ),
-                                    const SizedBox(width: 2),
-                                    const Icon(Icons.chevron_right_rounded,
-                                        size: 22),
-                                  ],
+                                  color: Colors.white.withValues(alpha: 0.72),
+                                  fontSize: 13,
+                                  height: 1.35,
                                 ),
                               ),
                             ],
-                          ),
-                        ],
+                            const SizedBox(height: 30),
+                            Row(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                Text(
+                                  _isSignUp
+                                      ? 'Already had an account ?'
+                                      : 'New here?',
+                                  style: TextStyle(
+                                    color: Colors.white.withValues(alpha: 0.58),
+                                    fontSize: 16,
+                                  ),
+                                ),
+                                TextButton(
+                                  onPressed: authControlsLocked
+                                      ? null
+                                      : () => _setAuthMode(!_isSignUp),
+                                  style: TextButton.styleFrom(
+                                    foregroundColor: Colors.white,
+                                    padding: const EdgeInsets.only(left: 6),
+                                    minimumSize: Size.zero,
+                                    tapTargetSize:
+                                        MaterialTapTargetSize.shrinkWrap,
+                                  ),
+                                  child: Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Text(
+                                        _isSignUp
+                                            ? 'Sign in'
+                                            : 'Create account',
+                                        style: const TextStyle(
+                                          fontSize: 16,
+                                          fontWeight: FontWeight.w800,
+                                        ),
+                                      ),
+                                      const SizedBox(width: 2),
+                                      const Icon(Icons.chevron_right_rounded,
+                                          size: 22),
+                                    ],
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ],
+                        ),
                       ),
                     ),
                   ),
-                ),
-              );
+                );
               },
             ),
           ),
@@ -498,35 +513,35 @@ class _AuthTextField extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-          height: 68,
-          decoration: BoxDecoration(
-            color: Colors.black.withValues(alpha: 0.24),
-            borderRadius: BorderRadius.circular(18),
-            border: Border.all(color: Colors.white.withValues(alpha: 0.24)),
+      height: 68,
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.24),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.24)),
+      ),
+      child: TextField(
+        controller: controller,
+        enabled: enabled,
+        obscureText: obscureText,
+        keyboardType: keyboardType,
+        style: const TextStyle(color: Colors.white, fontSize: 17),
+        decoration: InputDecoration(
+          border: InputBorder.none,
+          prefixIcon: Icon(
+            icon,
+            color: Colors.white.withValues(alpha: 0.7),
+            size: 25,
           ),
-          child: TextField(
-            controller: controller,
-            enabled: enabled,
-            obscureText: obscureText,
-            keyboardType: keyboardType,
-            style: const TextStyle(color: Colors.white, fontSize: 17),
-            decoration: InputDecoration(
-              border: InputBorder.none,
-              prefixIcon: Icon(
-                icon,
-                color: Colors.white.withValues(alpha: 0.7),
-                size: 25,
-              ),
-              suffixIcon: suffixIcon,
-              hintText: hintText,
-              hintStyle: TextStyle(
-                color: Colors.white.withValues(alpha: 0.42),
-                fontSize: 17,
-              ),
-              contentPadding: const EdgeInsets.symmetric(vertical: 22),
-            ),
+          suffixIcon: suffixIcon,
+          hintText: hintText,
+          hintStyle: TextStyle(
+            color: Colors.white.withValues(alpha: 0.42),
+            fontSize: 17,
           ),
-        );
+          contentPadding: const EdgeInsets.symmetric(vertical: 22),
+        ),
+      ),
+    );
   }
 }
 
@@ -550,7 +565,7 @@ class _OAuthButton extends StatelessWidget {
       height: 58,
       child: OutlinedButton.icon(
         onPressed: enabled ? onPressed : null,
-      style: OutlinedButton.styleFrom(
+        style: OutlinedButton.styleFrom(
           backgroundColor: Colors.black.withValues(alpha: 0.18),
           disabledBackgroundColor: Colors.white.withValues(alpha: 0.06),
           foregroundColor: Colors.white,
@@ -727,40 +742,13 @@ class _MainLayoutState extends ConsumerState<MainLayout> {
   }
 
   Widget _buildBottomArea(bool hasActiveTrack) {
-    final viewBottomInset = MediaQuery.of(context).viewPadding.bottom;
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
-        AnimatedSwitcher(
+        AnimatedContainer(
           duration: const Duration(milliseconds: 240),
-          switchInCurve: Curves.easeOutCubic,
-          switchOutCurve: Curves.easeInCubic,
-          transitionBuilder: (child, animation) {
-            return FadeTransition(
-              opacity: animation,
-              child: SlideTransition(
-                position: animation.drive(
-                  Tween<Offset>(
-                    begin: const Offset(0, 0.18),
-                    end: Offset.zero,
-                  ),
-                ),
-                child: child,
-              ),
-            );
-          },
-          child: hasActiveTrack
-              ? Padding(
-                  key: const ValueKey('mini-player'),
-                  padding: EdgeInsets.fromLTRB(
-                    18,
-                    0,
-                    18,
-                    viewBottomInset > 0 ? 8 : 6,
-                  ),
-                  child: const MiniPlayer(),
-                )
-              : const SizedBox.shrink(key: ValueKey('mini-player-hidden')),
+          curve: Curves.easeOutCubic,
+          height: hasActiveTrack ? 70 : 0,
         ),
         AppBottomNavBar(
           currentIndex: _currentIndex,
@@ -802,7 +790,7 @@ class _MainLayoutState extends ConsumerState<MainLayout> {
 
     return PopScope(
       canPop: false,
-      onPopInvokedWithResult: (didPop, result) {
+      onPopInvokedWithResult: (didPop, result) async {
         if (didPop) return;
         final handledByCurrentTab = _handleBackForCurrentTab();
         if (handledByCurrentTab) {
@@ -816,8 +804,11 @@ class _MainLayoutState extends ConsumerState<MainLayout> {
           });
           return;
         }
-        unawaited(ref.read(audioPlayerProvider.notifier).stopPlayback());
-        ref.read(playbackQueueProvider.notifier).clearSession();
+        final queue = ref.read(playbackQueueProvider.notifier);
+        await queue.restored;
+        if (!mounted) return;
+        await queue.saveSession();
+        await ref.read(audioPlayerProvider.notifier).stopPlayback(resetState: false);
         SystemNavigator.pop();
       },
       child: Scaffold(
@@ -834,9 +825,8 @@ class _MainLayoutState extends ConsumerState<MainLayout> {
             ),
             Positioned(
               right: 24,
-              bottom: hasActiveTrack
-                  ? viewBottomInset + 148
-                  : viewBottomInset + 24,
+              bottom:
+                  hasActiveTrack ? viewBottomInset + 148 : viewBottomInset + 24,
               child: const DownloadHud(),
             ),
           ],

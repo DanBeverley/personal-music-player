@@ -1342,7 +1342,9 @@ class NeatiePopularRadioRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     if (radios.isEmpty) return const SizedBox.shrink();
-    final visible = radios.take(16).toList(growable: false);
+    // The backend publishes a bounded 16–20-card rotation. Keep the client
+    // from silently discarding qualified discovery cards above the old cap.
+    final visible = radios.take(20).toList(growable: false);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [

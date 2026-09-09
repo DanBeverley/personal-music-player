@@ -8,16 +8,38 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'audio_provider.dart' show audioPlayerProvider;
 import 'audio_provider_history.dart';
-import 'audio_provider_request_builder.dart';
+import 'audio_queue_runtime.dart';
 import 'audio_service_bridge.dart';
-import 'history_manager.dart';
+import 'auth_provider.dart';
 import 'interaction_events.dart';
 import 'playlist_provider.dart';
 import 'proxy_runtime.dart';
-import 'recommendation_api_client.dart';
 import 'track_metadata.dart';
 
 enum PlaybackQueueMode { none, radio, playlist }
+
+List<Map<String, dynamic>> matchQueueTracks(
+    Iterable<Map<String, dynamic>> queue, String query) {
+  final words = query.trim().toLowerCase().split(RegExp(r'\s+'));
+  if (query.trim().isEmpty) return const [];
+  return queue.where((track) {
+    final text = ['title', 'artist', 'author', 'channel']
+        .map((key) => track[key] ?? '').join(' ').toLowerCase();
+    return words.every(text.contains);
+  }).toList(growable: false);
+}
+
+class _RelatedTracksPage {
+  final List<Map<String, dynamic>> tracks;
+  final bool hasMore;
+  final bool temporarilyUnavailable;
+
+  const _RelatedTracksPage({
+    required this.tracks,
+    required this.hasMore,
+    this.temporarilyUnavailable = false,
+  });
+}
 
 class PlaybackQueueState {
   final PlaybackQueueMode mode;
@@ -45,6 +67,32 @@ class PlaybackQueueState {
     this.isLoadingRecommendations = false,
     this.hasMoreRecommendations = true,
   });
+
+  Map<String, dynamic> toSnapshot() => {
+    'version': 1, 'mode': mode.name, 'queue': queue,
+    'current_track_id': currentTrackId, 'played_track_ids': playedTrackIds,
+    'playlist_id': playlistId, 'playlist_name': playlistName,
+    'recommendations': recommendations,
+    'has_more': hasMoreRecommendations,
+  };
+
+  static PlaybackQueueState? fromSnapshot(dynamic raw) {
+    if (raw is! Map || raw['version'] != 1 || raw['queue'] is! List) return null;
+    final mode = PlaybackQueueMode.values.where((v) => v.name == raw['mode']).firstOrNull;
+    if (mode == null || mode == PlaybackQueueMode.none) return null;
+    final queue = (raw['queue'] as List).whereType<Map>()
+        .map((v) => Map<String, dynamic>.from(v)).toList();
+    if (queue.isEmpty || queue.any((v) => extractTrackId(v) == null)) return null;
+    final index = queue.indexWhere((v) => extractTrackId(v) == raw['current_track_id']);
+    if (index < 0) return null;
+    return PlaybackQueueState(mode: mode, queue: queue, currentIndex: index,
+      currentTrackId: extractTrackId(queue[index]),
+      playedTrackIds: (raw['played_track_ids'] as List? ?? []).whereType<String>().toList(),
+      playlistId: raw['playlist_id'] as String?, playlistName: raw['playlist_name'] as String?,
+      recommendations: (raw['recommendations'] as List? ?? []).whereType<Map>()
+          .map((v) => Map<String, dynamic>.from(v)).toList(),
+      hasMoreRecommendations: raw['has_more'] != false);
+  }
 
   PlaybackQueueState copyWith({
     PlaybackQueueMode? mode,
@@ -86,8 +134,67 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
   final Random _random = Random();
   static const int _playedTrackMinSeconds = 12;
   static const double _playedTrackMinRatio = 0.35;
+  DateTime? _recommendationRetryAfter;
+  int _recommendationSessionRevision = 0;
 
-  PlaybackQueueNotifier(this.ref) : super(const PlaybackQueueState());
+  final String storageScopeId;
+  late final Future<void> restored;
+  Future<void> _pendingSave = Future.value();
+  bool _restoring = false;
+  int _stateRevision = 0;
+
+  PlaybackQueueNotifier(this.ref, this.storageScopeId) : super(const PlaybackQueueState()) {
+    restored = _restoreSession();
+  }
+
+  @override
+  set state(PlaybackQueueState value) {
+    _stateRevision++;
+    super.state = value;
+    if (!_restoring) unawaited(saveSession());
+  }
+
+  Future<void> saveSession() {
+    final payload = jsonEncode(state.toSnapshot());
+    // Serialize writes and capture the account before any await.
+    _pendingSave = _pendingSave.then((_) async {
+      final file = await getScopedDataFile('playback_session.json', storageScopeId);
+      final temporary = File('${file.path}.tmp');
+      await temporary.writeAsString(payload, flush: true);
+      await temporary.rename(file.path);
+    }).catchError((Object error) {
+      debugPrint('Playback session save failed: $error');
+    });
+    return _pendingSave;
+  }
+
+  Future<void> _restoreSession() async {
+    final revision = _stateRevision;
+    try {
+      final file = await getScopedDataFile('playback_session.json', storageScopeId);
+      if (!await file.exists()) return;
+      final saved = PlaybackQueueState.fromSnapshot(jsonDecode(await file.readAsString()));
+      final audio = ref.read(audioPlayerProvider.notifier);
+      await audio.rememberedTrackRestored;
+      if (!mounted || revision != _stateRevision || saved == null ||
+          ref.read(authProvider).storageScopeId != storageScopeId) return;
+      _restoring = true;
+      state = saved;
+      audio.restoreTrackPreview(saved.queue[saved.currentIndex]);
+    } catch (error) {
+      debugPrint('Playback session restore failed: $error');
+    } finally {
+      _restoring = false;
+    }
+  }
+
+  Future<bool> resumeSavedQueue() async {
+    await restored;
+    if (!mounted || state.queue.isEmpty || state.mode == PlaybackQueueMode.none) return false;
+    await ref.read(audioPlayerProvider.notifier).configureManagedQueue(
+      state.queue, initialIndex: state.currentIndex);
+    return true;
+  }
 
   void _primeTracks(
     Iterable<dynamic> tracks, {
@@ -127,12 +234,12 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
     if (state.queue.isEmpty) return 0;
 
     final audioNotifier = ref.read(audioPlayerProvider.notifier);
-    final managedIndex = audioNotifier.currentManagedQueueIndex;
+    final managedTrackId = audioNotifier.currentManagedQueueTrackId;
     if (audioNotifier.hasManagedQueue &&
-        managedIndex != null &&
-        managedIndex >= 0 &&
-        managedIndex < state.queue.length) {
-      return managedIndex;
+        managedTrackId != null &&
+        managedTrackId.isNotEmpty) {
+      final logicalIndex = trackIndexByIdentity(state.queue, managedTrackId);
+      if (logicalIndex >= 0) return logicalIndex;
     }
 
     final activeTrackId = state.currentTrackId;
@@ -244,56 +351,56 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
     );
   }
 
-  Future<List<Map<String, dynamic>>> _fetchRecommendations(
+  Future<_RelatedTracksPage> _fetchRelatedTracks(
     String seedId, {
-    int limit = 12,
+    int limit = 18,
+    int offset = 0,
+    Set<String> avoidIds = const {},
   }) async {
-    final body = await buildRecommendationRequestBody(
-      ref,
-      seedId,
-      limit: limit,
-      avoidIds: state.queue
-          .map((track) => extractTrackId(track))
-          .whereType<String>()
-          .toSet(),
-    );
-    final res = await postRecommendation(body);
-
-    if (res.statusCode != 200) {
-      throw Exception('Recommendation lookup failed: ${res.statusCode}');
-    }
-
-    final payload = jsonDecode(res.body) as Map<String, dynamic>;
-    final rawTracks =
-        payload['recommendations'] as List<dynamic>? ?? const <dynamic>[];
-    return _uniqueTracks(rawTracks, excludedIds: {seedId});
-  }
-
-  Future<List<Map<String, dynamic>>> _fetchSimilarTracks(
-    String seedId, {
-    int limit = 12,
-  }) async {
+    final seed = state.queue.cast<Map<String, dynamic>?>().firstWhere(
+          (track) => extractTrackId(track) == seedId,
+          orElse: () => null,
+        );
     final res = await appHttpClient
         .post(
-          buildProxyUri('/track_details'),
+          buildProxyUri('/related_tracks'),
           headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({'video_id': seedId}),
+          body: jsonEncode({
+            'track_key': extractPlaybackRoutingKey(seed) ?? seedId,
+            'title': seed?['title']?.toString() ?? '',
+            'artist': seed?['channel']?.toString() ??
+                seed?['artist']?.toString() ??
+                '',
+            'album': seed?['album']?.toString() ?? '',
+            'duration': seed?['duration'] ?? 0,
+            'source_id': extractPlaybackSourceId(seed) ?? '',
+            'source_provider': extractPlaybackProvider(seed),
+            'user_scope_id': ref.read(authProvider).storageScopeId,
+            'avoid_ids': avoidIds.toList(growable: false),
+            'offset': offset,
+            'limit': limit,
+          }),
         )
-        .timeout(const Duration(seconds: 12));
+        .timeout(const Duration(seconds: 30));
 
     if (res.statusCode != 200) {
-      throw Exception('Track detail lookup failed: ${res.statusCode}');
+      throw Exception('Related-track lookup failed: ${res.statusCode}');
     }
 
     final payload = jsonDecode(res.body) as Map<String, dynamic>;
-    final rawTracks =
-        payload['similar_tracks'] as List<dynamic>? ?? const <dynamic>[];
-    return _uniqueTracks(rawTracks, excludedIds: {seedId})
-        .take(limit)
-        .toList(growable: false);
+    final rawTracks = payload['tracks'] as List<dynamic>? ?? const <dynamic>[];
+    debugPrint('[EBB:related-tracks] seed=$seedId status=${payload['status']} '
+        'received=${rawTracks.length} excluded=${avoidIds.length}');
+    return _RelatedTracksPage(
+      tracks: _uniqueTracks(rawTracks, excludedIds: {...avoidIds, seedId}),
+      hasMore: payload['has_more'] == true,
+      temporarilyUnavailable:
+          payload['status']?.toString() == 'temporarily_unavailable',
+    );
   }
 
   Future<void> startRadioSession(dynamic track) async {
+    _recommendationSessionRevision++;
     final normalizedTrack = normalizeTrack(track);
     final videoId = extractTrackId(normalizedTrack);
     if (videoId == null) return;
@@ -318,42 +425,23 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
   Future<void> startDiscoverySession(
     dynamic track, {
     String? sessionName,
+    Iterable<dynamic> initialCandidates = const [],
   }) async {
     final normalizedTrack = normalizeTrack(track);
     final videoId = extractTrackId(normalizedTrack);
     if (videoId == null || videoId.isEmpty) return;
 
-    final frequentSnapshots =
-        await HistoryManager.getFrequentlyPlayedTrackSnapshots(
-      limit: 2,
-    );
-    List<Map<String, dynamic>> similarTracks = const [];
-    List<Map<String, dynamic>> fillerTracks = const [];
-    try {
-      similarTracks = await _fetchSimilarTracks(videoId, limit: 10);
-    } catch (_) {
-      similarTracks = const [];
-    }
-    if (similarTracks.length < 6) {
-      try {
-        fillerTracks = await _fetchRecommendations(
-          videoId,
-          limit: 8 - similarTracks.length,
-        );
-      } catch (_) {
-        fillerTracks = const [];
-      }
-    }
-
-    final queue = _uniqueTracks(
-      [
-        normalizedTrack,
-        ...similarTracks,
-        if (similarTracks.isNotEmpty) ...frequentSnapshots,
-        ...fillerTracks,
-      ],
-      excludedIds: const {},
-    );
+    // Search already has query-related and similar tracks. Use those persisted
+    // results immediately instead of blocking playback on another network
+    // round-trip. startPlaylistSession schedules background replenishment.
+    final contextualTracks = _uniqueTracks(
+      initialCandidates,
+      excludedIds: {videoId},
+    ).take(18).toList(growable: false);
+    final queue = <Map<String, dynamic>>[
+      normalizedTrack,
+      ...contextualTracks,
+    ];
 
     await startPlaylistSession(
       playlistId: 'discovery:$videoId',
@@ -368,6 +456,7 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
     required dynamic track,
     required String path,
   }) async {
+    _recommendationSessionRevision++;
     final normalizedTrack = normalizeTrack(track);
     final localTrack = {
       ...normalizedTrack,
@@ -416,6 +505,13 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
     required dynamic currentTrack,
     bool shuffle = false,
   }) async {
+    final existingIndex = trackIndexByIdentity(state.queue, extractTrackId(currentTrack));
+    if (!shuffle && state.mode == PlaybackQueueMode.playlist &&
+        state.playlistId == playlistId && existingIndex >= 0) {
+      await playQueueIndex(existingIndex);
+      return;
+    }
+    final sessionRevision = ++_recommendationSessionRevision;
     final normalizedQueue = _uniqueTracks(tracks);
     final currentTrackMap = normalizeTrack(currentTrack);
     final currentTrackId = extractTrackId(currentTrackMap);
@@ -441,17 +537,20 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
       playlistId: playlistId,
       playlistName: playlistName,
     );
+    _recommendationRetryAfter = null;
 
     await ref.read(audioPlayerProvider.notifier).configureManagedQueue(
           normalizedQueue,
           initialIndex: currentIndex,
         );
+    if (!mounted || sessionRevision != _recommendationSessionRevision) return;
     _refreshHistorySignalConsumers();
     _primeUpcomingQueue();
     unawaited(_refreshPlaylistRecommendations(currentTrackId));
   }
 
   void clearSession() {
+    _recommendationSessionRevision++;
     state = const PlaybackQueueState();
   }
 
@@ -486,6 +585,7 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
   }
 
   Future<void> handleTrackChanged(String? videoId) async {
+    if (_restoring) return;
     if (videoId == null || videoId.isEmpty) return;
     if (state.mode == PlaybackQueueMode.none) return;
 
@@ -524,25 +624,6 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
 
   Future<void> playNext({bool logCurrentSkip = true}) async {
     if (state.mode == PlaybackQueueMode.none) return;
-
-    final audioNotifier = ref.read(audioPlayerProvider.notifier);
-
-    if (audioNotifier.hasManagedQueue) {
-      final resolvedCurrentIndex = _resolvedCurrentIndex();
-      final nextIndex = _nextPlayableIndex(resolvedCurrentIndex);
-      if (nextIndex >= 0) {
-        if (logCurrentSkip) {
-          unawaited(_recordCurrentQueueInteraction('skip'));
-        }
-        if (nextIndex == resolvedCurrentIndex + 1 &&
-            !isTrackHidden(state.queue[nextIndex])) {
-          await audioNotifier.skipManagedQueueNext();
-        } else {
-          await audioNotifier.playManagedQueueIndex(nextIndex);
-        }
-        return;
-      }
-    }
 
     final resolvedCurrentIndex = _resolvedCurrentIndex();
     if (resolvedCurrentIndex != state.currentIndex) {
@@ -585,15 +666,6 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
 
   Future<void> playPrevious({bool logCurrentSkip = true}) async {
     if (state.mode == PlaybackQueueMode.none) return;
-    final audioNotifier = ref.read(audioPlayerProvider.notifier);
-    if (audioNotifier.hasManagedQueue) {
-      if (logCurrentSkip && _resolvedCurrentIndex() > 0) {
-        unawaited(_recordCurrentQueueInteraction('skip'));
-      }
-      await audioNotifier.skipManagedQueuePrevious();
-      return;
-    }
-
     final resolvedCurrentIndex = _resolvedCurrentIndex();
     final previousIndex = max(0, resolvedCurrentIndex - 1);
     if (logCurrentSkip && previousIndex != resolvedCurrentIndex) {
@@ -611,7 +683,17 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
     final previousTrackId = state.currentTrackId;
     final audioNotifier = ref.read(audioPlayerProvider.notifier);
     if (audioNotifier.hasManagedQueue) {
-      await audioNotifier.playManagedQueueIndex(index);
+      final managedIndex = audioNotifier.managedQueueIndexForTrackId(videoId);
+      if (managedIndex != null) {
+        final played = await audioNotifier.playManagedQueueTrack(videoId);
+        if (!played) return;
+      } else {
+        final configured = await audioNotifier.configureManagedQueue(
+          state.queue,
+          initialIndex: index,
+        );
+        if (!configured) return;
+      }
     } else {
       final localPath = track['local_path']?.toString();
       if (localPath != null &&
@@ -621,7 +703,11 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
         if (!loaded) return;
         await audioNotifier.play();
       } else {
-        await audioNotifier.streamYoutube(videoId, track);
+        final configured = await audioNotifier.configureManagedQueue(
+          state.queue,
+          initialIndex: index,
+        );
+        if (!configured) return;
       }
     }
     state = state.copyWith(
@@ -658,7 +744,7 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
         playedTrackIds:
             state.playedTrackIds.where((id) => id != videoId).toList(),
       );
-      unawaited(audioNotifier.removeManagedQueueItem(index));
+      unawaited(audioNotifier.removeManagedQueueTrack(videoId));
       unawaited(playQueueIndex(replacementIndex));
       return;
     }
@@ -673,7 +759,7 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
       playedTrackIds:
           state.playedTrackIds.where((id) => id != videoId).toList(),
     );
-    unawaited(audioNotifier.removeManagedQueueItem(index));
+    unawaited(audioNotifier.removeManagedQueueTrack(videoId));
     _primeUpcomingQueue();
   }
 
@@ -714,7 +800,7 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
       playedTrackIds:
           state.playedTrackIds.where((id) => id != trackId).toList(),
     );
-    unawaited(audioNotifier.removeManagedQueueItem(index));
+    unawaited(audioNotifier.removeManagedQueueTrack(trackId));
     _primeUpcomingQueue();
   }
 
@@ -809,11 +895,23 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
     }
     if (state.mode == PlaybackQueueMode.playlist) {
       if (!state.hasMoreRecommendations) return;
+      final retryAfter = _recommendationRetryAfter;
+      if (retryAfter != null && DateTime.now().isBefore(retryAfter)) return;
       await _refreshPlaylistRecommendations(
         state.currentTrackId,
         append: true,
       );
     }
+  }
+
+  Future<void> retryRelatedSongs() async {
+    if (state.mode != PlaybackQueueMode.playlist) return;
+    _recommendationRetryAfter = null;
+    state = state.copyWith(hasMoreRecommendations: true);
+    await _refreshPlaylistRecommendations(
+      state.currentTrackId,
+      append: state.recommendations.isNotEmpty,
+    );
   }
 
   Future<void> _appendRadioRecommendations({String? seedId}) async {
@@ -829,8 +927,11 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
     try {
       final existingIds =
           state.queue.map(extractTrackId).whereType<String>().toSet();
-      final fetchedTracks = await _fetchRecommendations(effectiveSeedId);
-      final newTracks = fetchedTracks
+      final page = await _fetchRelatedTracks(
+        effectiveSeedId,
+        avoidIds: existingIds,
+      );
+      final newTracks = page.tracks
           .where((track) => !existingIds.contains(extractTrackId(track)))
           .toList(growable: false);
       if (newTracks.isNotEmpty) {
@@ -860,6 +961,7 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
     if (state.isLoadingRecommendations) return;
     if (append && !state.hasMoreRecommendations) return;
 
+    final sessionRevision = _recommendationSessionRevision;
     final existingRecommendations = state.recommendations;
     state = state.copyWith(
       isLoadingRecommendations: true,
@@ -870,38 +972,29 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
         if (append)
           ...state.recommendations.map(extractTrackId).whereType<String>(),
       };
-      final targetCount = append ? 16 : 18;
-
-      List<Map<String, dynamic>> similarTracks = const [];
-      try {
-        similarTracks = await _fetchSimilarTracks(seedId, limit: targetCount);
-      } catch (_) {
-        similarTracks = const [];
-      }
-
-      List<Map<String, dynamic>> fallbackTracks = const [];
-      if (similarTracks.length < targetCount) {
-        try {
-          fallbackTracks = await _fetchRecommendations(
-            seedId,
-            limit: targetCount - similarTracks.length,
-          );
-        } catch (_) {
-          fallbackTracks = const [];
-        }
-      }
-
-      final fetchedTracks = _uniqueTracks(
-        [
-          ...similarTracks,
-          ...fallbackTracks,
-        ],
-        excludedIds: excludedIds,
+      final page = await _fetchRelatedTracks(
+        seedId,
+        limit: append ? 16 : 18,
+        avoidIds: excludedIds,
       );
+      if (!mounted || sessionRevision != _recommendationSessionRevision) {
+        return;
+      }
+      final fetchedTracks = page.tracks;
       final nextRecommendations = fetchedTracks
           .where((track) => !excludedIds.contains(extractTrackId(track)))
           .toList(growable: false);
-      if (!append && nextRecommendations.isEmpty) {
+      if (nextRecommendations.isEmpty && page.temporarilyUnavailable) {
+        _recommendationRetryAfter = DateTime.now().add(
+          const Duration(seconds: 8),
+        );
+        state = state.copyWith(
+          recommendations: existingRecommendations,
+          hasMoreRecommendations: true,
+        );
+        return;
+      }
+      if (nextRecommendations.isEmpty) {
         state = state.copyWith(
           recommendations: existingRecommendations,
           hasMoreRecommendations: false,
@@ -914,7 +1007,7 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
         state = state.copyWith(
           queue: [...state.queue, ...nextRecommendations],
           recommendations: const [],
-          hasMoreRecommendations: true,
+          hasMoreRecommendations: page.hasMore,
         );
         unawaited(
           ref.read(audioPlayerProvider.notifier).appendManagedQueueTracks(
@@ -926,14 +1019,25 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
           recommendations: append
               ? [...state.recommendations, ...nextRecommendations]
               : nextRecommendations,
-          hasMoreRecommendations: nextRecommendations.isNotEmpty,
+          hasMoreRecommendations: page.hasMore,
         );
       }
+      if (nextRecommendations.isNotEmpty) {
+        _recommendationRetryAfter = null;
+      }
       _primeTracks(nextRecommendations);
-    } catch (_) {
-      // Recommendation shelf loading stays silent.
-    } finally {
+    } catch (error) {
+      if (!mounted || sessionRevision != _recommendationSessionRevision) return;
+      debugPrint('[EBB:related-tracks] request failed: ${error.runtimeType}');
+      _recommendationRetryAfter = DateTime.now().add(
+        const Duration(seconds: 8),
+      );
       if (state.mode == PlaybackQueueMode.playlist) {
+        state = state.copyWith(hasMoreRecommendations: true);
+      }
+    } finally {
+      if (mounted && sessionRevision == _recommendationSessionRevision &&
+          state.mode == PlaybackQueueMode.playlist) {
         state = state.copyWith(isLoadingRecommendations: false);
       }
     }
@@ -942,7 +1046,8 @@ class PlaybackQueueNotifier extends StateNotifier<PlaybackQueueState> {
 
 final playbackQueueProvider =
     StateNotifierProvider<PlaybackQueueNotifier, PlaybackQueueState>((ref) {
-  final notifier = PlaybackQueueNotifier(ref);
+  final scope = ref.watch(authProvider.select((value) => value.storageScopeId));
+  final notifier = PlaybackQueueNotifier(ref, scope);
   final audioNotifier = ref.read(audioPlayerProvider.notifier);
 
   Future<void> handleTrackCompleted() async {
@@ -956,6 +1061,7 @@ final playbackQueueProvider =
 
   audioNotifier.onTrackCompleted = handleTrackCompleted;
   audioNotifier.onTrackChanged = handleTrackChanged;
+  audioNotifier.onResumeSavedQueue = notifier.resumeSavedQueue;
   if (globalAudioHandler is AuralisAudioHandler) {
     final handler = globalAudioHandler as AuralisAudioHandler;
     handler.onSkipToNext = notifier.playNext;
@@ -963,6 +1069,9 @@ final playbackQueueProvider =
   }
 
   ref.onDispose(() {
+    if (audioNotifier.onResumeSavedQueue == notifier.resumeSavedQueue) {
+      audioNotifier.onResumeSavedQueue = null;
+    }
     if (identical(audioNotifier.onTrackCompleted, handleTrackCompleted)) {
       audioNotifier.onTrackCompleted = null;
     }

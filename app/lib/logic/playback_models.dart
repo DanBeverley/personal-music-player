@@ -67,6 +67,7 @@ class TrackLyricsState {
   final bool hasTimestamps;
   final String? videoId;
   final String? source;
+  final String availability;
   final String? error;
   final List<TrackLyricsLine> lines;
 
@@ -76,6 +77,7 @@ class TrackLyricsState {
     this.hasTimestamps = false,
     this.videoId,
     this.source,
+    this.availability = 'unknown',
     this.error,
     this.lines = const [],
   });
@@ -171,7 +173,9 @@ class PlayerState {
   final int currentPosition;
   final int currentPositionMs;
   final String? artist;
+  final String? album;
   final String? videoId;
+  final String? playbackSourceId;
   final int sleepTimerRemainingSeconds;
 
   PlayerState({
@@ -185,7 +189,9 @@ class PlayerState {
     this.currentPosition = 0,
     this.currentPositionMs = 0,
     this.artist,
+    this.album,
     this.videoId,
+    this.playbackSourceId,
     this.sleepTimerRemainingSeconds = 0,
   });
 
@@ -200,11 +206,15 @@ class PlayerState {
     int? currentPosition,
     int? currentPositionMs,
     String? artist,
+    String? album,
     String? videoId,
+    String? playbackSourceId,
     int? sleepTimerRemainingSeconds,
     bool clearThumbnail = false,
     bool clearArtist = false,
+    bool clearAlbum = false,
     bool clearVideoId = false,
+    bool clearPlaybackSourceId = false,
   }) {
     final nextCurrentPosition = currentPosition ?? this.currentPosition;
     return PlayerState(
@@ -221,7 +231,11 @@ class PlayerState {
               ? currentPosition * 1000
               : this.currentPositionMs),
       artist: clearArtist ? null : (artist ?? this.artist),
+      album: clearAlbum ? null : (album ?? this.album),
       videoId: clearVideoId ? null : (videoId ?? this.videoId),
+      playbackSourceId: clearPlaybackSourceId
+          ? null
+          : (playbackSourceId ?? this.playbackSourceId),
       sleepTimerRemainingSeconds:
           sleepTimerRemainingSeconds ?? this.sleepTimerRemainingSeconds,
     );

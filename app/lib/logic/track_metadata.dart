@@ -140,6 +140,31 @@ String? extractPlaybackSourceId(dynamic track) {
   return null;
 }
 
+/// Returns the physical source key used by the backend playback proxy.
+///
+/// `track_key` remains the stable catalog identity for history and queue
+/// state. Playback must prefer the provider source carried by that catalog
+/// item; a title/artist fallback identity is not itself a playable source.
+String? extractPlaybackRoutingKey(dynamic track) {
+  if (track is! Map) return null;
+  final trackKey = extractTrackId(track);
+  if (trackKey != null &&
+      (trackKey.startsWith('recording:') ||
+          trackKey.startsWith('musicbrainz:recording:'))) {
+    // Canonical tracks must be resolved by the backend registry. Embedded
+    // physical IDs can outlive a corrected source match and play the wrong
+    // edition (for example a live performance for a studio recording).
+    return trackKey;
+  }
+  final sourceId = extractPlaybackSourceId(track);
+  if (sourceId == null || sourceId.isEmpty) {
+    return trackKey;
+  }
+  return extractPlaybackProvider(track) == 'audius'
+      ? 'audius:$sourceId'
+      : sourceId;
+}
+
 List<String> extractTrackArtists(dynamic rawTrack) {
   if (rawTrack is! Map) return const <String>[];
   final results = <String>[];

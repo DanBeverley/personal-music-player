@@ -16,6 +16,17 @@ import 'search_semantics.dart';
 import 'search_payload_runtime.dart';
 import 'track_metadata.dart';
 
+String? resolveAlbumDetailId(Map<String, dynamic> album) {
+  for (final raw in [album['browseId'], album['album_id'], album['id']]) {
+    var value = raw?.toString().trim() ?? '';
+    if (value.startsWith('ytmusic:album:')) {
+      value = value.substring('ytmusic:album:'.length);
+    }
+    if (value.isNotEmpty) return value;
+  }
+  return null;
+}
+
 Future<Map<String, dynamic>?> resolveArtistReference(
   ProviderReader read,
   Map<String, dynamic> artist,
@@ -38,17 +49,17 @@ Future<Map<String, dynamic>?> resolveArtistReference(
   try {
     final response = await runSearchRequest(
       appHttpClient.post(
-          buildProxyUri('/resolve_artist'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({
-            'query': artistName,
-            'anchor_artist_id': directId,
-            'limit': 4,
-            'user_scope_id': read(authProvider).storageScopeId,
-            'search_mode': 'entity',
-            'defer_side_surfaces': true,
-          }),
-        ),
+        buildProxyUri('/resolve_artist'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'query': artistName,
+          'anchor_artist_id': directId,
+          'limit': 4,
+          'user_scope_id': read(authProvider).storageScopeId,
+          'search_mode': 'entity',
+          'defer_side_surfaces': true,
+        }),
+      ),
       const Duration(seconds: 12),
     );
     if (response.statusCode == 200) {
@@ -71,7 +82,9 @@ Future<Map<String, dynamic>?> resolveArtistReference(
       .map((entry) => Map<String, dynamic>.from(entry))
       .toList(growable: false);
   if (candidates.isEmpty) {
-    return isCanonicalBrowseId ? <String, dynamic>{...artist, 'id': directId} : null;
+    return isCanonicalBrowseId
+        ? <String, dynamic>{...artist, 'id': directId}
+        : null;
   }
   final normalizedName = artistName.toLowerCase();
   final resolved = candidates.firstWhere(
@@ -81,7 +94,9 @@ Future<Map<String, dynamic>?> resolveArtistReference(
   );
   final resolvedId =
       (resolved['id'] ?? resolved['browseId'])?.toString().trim() ?? '';
-  return resolvedId.isEmpty ? null : <String, dynamic>{...resolved, 'id': resolvedId};
+  return resolvedId.isEmpty
+      ? null
+      : <String, dynamic>{...resolved, 'id': resolvedId};
 }
 
 class TrackDetailsNotifier extends StateNotifier<Map<String, dynamic>?> {
@@ -640,37 +655,47 @@ class LyricsNotifier extends StateNotifier<TrackLyricsState> {
   LyricsNotifier() : super(const TrackLyricsState());
 
   Future<void> fetchLyrics(
-    String? videoId, {
+    String? trackKey, {
     String? title,
     String? artist,
+    String? album,
+    int? duration,
+    String? sourceId,
+    bool forceRefresh = false,
   }) async {
-    if (videoId == null || videoId.isEmpty) {
+    if (trackKey == null || trackKey.isEmpty) {
       clear();
       return;
     }
-    if (state.videoId == videoId) {
+    if (state.videoId == trackKey &&
+        !forceRefresh &&
+        (state.isLoading || state.hasLyrics)) {
       return;
     }
 
     final requestVersion = ++_requestVersion;
-    state = TrackLyricsState(isLoading: true, videoId: videoId);
+    state = TrackLyricsState(isLoading: true, videoId: trackKey);
     try {
       final query = <String, String>{
         if (title != null && title.trim().isNotEmpty) 'title': title.trim(),
-        if (artist != null && artist.trim().isNotEmpty)
-          'artist': artist.trim(),
+        if (artist != null && artist.trim().isNotEmpty) 'artist': artist.trim(),
+        if (album != null && album.trim().isNotEmpty) 'album': album.trim(),
+        if (duration != null && duration > 0) 'duration': '$duration',
+        if (sourceId != null && sourceId.trim().isNotEmpty)
+          'source_id': sourceId.trim(),
+        if (forceRefresh) 'force_refresh': 'true',
       };
-      final uri = buildProxyUri('/lyrics/$videoId').replace(
+      final uri = buildProxyUri('/lyrics/$trackKey').replace(
         queryParameters: query.isEmpty ? null : query,
       );
-      final res = await appHttpClient
-          .get(uri)
-          .timeout(const Duration(seconds: 12));
+      final res =
+          await appHttpClient.get(uri).timeout(const Duration(seconds: 12));
       if (requestVersion != _requestVersion) return;
 
       if (res.statusCode != 200) {
         state = TrackLyricsState(
-          videoId: videoId,
+          videoId: trackKey,
+          availability: 'provider_error',
           error: 'Lyrics unavailable right now.',
         );
         return;
@@ -685,16 +710,18 @@ class LyricsNotifier extends StateNotifier<TrackLyricsState> {
           .toList(growable: false);
 
       state = TrackLyricsState(
-        videoId: videoId,
+        videoId: trackKey,
         hasLyrics: payload['has_lyrics'] == true && lines.isNotEmpty,
         hasTimestamps: payload['has_timestamps'] == true,
         source: payload['source']?.toString(),
+        availability: payload['lyrics_status']?.toString() ?? 'not_found',
         lines: lines,
       );
     } catch (_) {
       if (requestVersion != _requestVersion) return;
       state = TrackLyricsState(
-        videoId: videoId,
+        videoId: trackKey,
+        availability: 'provider_error',
         error: 'Lyrics unavailable right now.',
       );
     }

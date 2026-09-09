@@ -12,6 +12,12 @@ import 'playback_models.dart';
 import 'proxy_runtime.dart';
 import 'track_metadata.dart';
 
+bool isTerminalPlaybackPreparationFailure(dynamic failure) {
+  if (failure is! Map) return false;
+  final code = failure['code']?.toString().trim();
+  return code == 'playback_source_missing' || code == 'video_unavailable';
+}
+
 class AudioStreamRuntime {
   final Map<String, ResolvedStreamSource> _streamCache = {};
   final Map<String, Future<ResolvedStreamSource>> _pendingStreamLookups = {};
@@ -152,8 +158,12 @@ class AudioStreamRuntime {
         File(localPath).existsSync()) {
       return false;
     }
-    final videoId = extractTrackId(track);
-    return videoId != null && _unavailableStreamTrackIds.contains(videoId);
+    final catalogId = extractTrackId(track);
+    final routingKey = extractPlaybackRoutingKey(track);
+    return (catalogId != null &&
+            _unavailableStreamTrackIds.contains(catalogId)) ||
+        (routingKey != null &&
+            _unavailableStreamTrackIds.contains(routingKey));
   }
 
   String _sanitizeCacheKey(String value) {
@@ -341,6 +351,7 @@ class AudioStreamRuntime {
       final failed = data['failed'];
       if (failed is Map) {
         failed.forEach((key, dynamic value) {
+          if (!isTerminalPlaybackPreparationFailure(value)) return;
           final failureReason = value is Map
               ? value['message']?.toString() ?? value['code']?.toString()
               : value?.toString();
@@ -417,7 +428,9 @@ class AudioStreamRuntime {
       final failureReason = failure is Map
           ? failure['message']?.toString() ?? failure['code']?.toString()
           : failure?.toString();
-      registerUnavailableTrack(videoId, failureReason);
+      if (isTerminalPlaybackPreparationFailure(failure)) {
+        registerUnavailableTrack(videoId, failureReason);
+      }
       throw Exception(failureReason ?? 'Track unavailable for streaming');
     }
     if (prepared is! Map || !prepared.containsKey(videoId)) {
@@ -474,6 +487,49 @@ class AudioStreamRuntime {
     );
     _streamCache[videoId] = source;
     return source;
+  }
+
+  Future<ResolvedStreamSource> ensurePlaybackTrack(
+    Map<String, dynamic> track,
+  ) async {
+    final routingKey = extractPlaybackRoutingKey(track);
+    if (routingKey == null || routingKey.isEmpty) {
+      throw StateError('playback_source_missing');
+    }
+    final isCanonical = routingKey.startsWith('recording:') ||
+        routingKey.startsWith('musicbrainz:recording:');
+    if (!isCanonical) {
+      return freshStreamSource(routingKey) ?? buildProxyStreamSource(routingKey);
+    }
+
+    final response = await appHttpClient
+        .post(
+          _proxyUri('/playback/resolve'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({
+            'track_key': routingKey,
+            'title': track['title']?.toString() ?? '',
+            'artist': (track['channel'] ??
+                        track['artist'] ??
+                        track['author'])
+                    ?.toString() ??
+                '',
+            'album': (track['album'] ?? track['album_title'])?.toString() ?? '',
+            'duration': trackDurationSeconds(track),
+            'source_id': extractPlaybackSourceId(track) ?? '',
+            'source_provider': extractPlaybackProvider(track),
+          }),
+        )
+        .timeout(const Duration(seconds: 18));
+    if (response.statusCode != 200) {
+      throw StateError('playback_identity_unavailable:${response.statusCode}');
+    }
+    final payload = jsonDecode(response.body) as Map<String, dynamic>;
+    final resolvedUrl = payload['url']?.toString().trim() ?? '';
+    if (resolvedUrl.isEmpty) {
+      throw StateError('playback_identity_unavailable');
+    }
+    return markPreparedStream(routingKey, payload: payload);
   }
 
   Future<ResolvedStreamSource> resolveStreamSource(String videoId) {

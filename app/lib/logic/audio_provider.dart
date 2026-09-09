@@ -51,6 +51,8 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
   Map<String, dynamic>? _restorableTrackMeta;
   Future<void> Function()? onTrackCompleted;
   Future<void> Function(String? videoId)? onTrackChanged;
+  Future<bool> Function()? onResumeSavedQueue;
+  late final Future<void> rememberedTrackRestored;
   Timer? _playbackTimer;
   final streamPlayer = AudioPlayer(useLazyPreparation: false);
   final RememberedTrackStore _rememberedTrackStore =
@@ -105,7 +107,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       handler.onSkipToNext = skipManagedQueueNext;
       handler.onSkipToPrevious = skipManagedQueuePrevious;
     }
-    unawaited(_restoreRememberedTrack());
+    rememberedTrackRestored = _restoreRememberedTrack();
   }
 
   @override
@@ -206,6 +208,11 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
 
   Future<void> _restoreRememberedTrack() async {
     final snapshot = await _rememberedTrackStore.restoreSnapshot();
+    if (!mounted || _restorableTrackMeta != null) return;
+    restoreTrackPreview(snapshot);
+  }
+
+  void restoreTrackPreview(Map<String, dynamic>? snapshot) {
     final trackId = extractTrackId(snapshot);
     if (snapshot == null || trackId == null || trackId.isEmpty) return;
     _restorableTrackMeta = snapshot;
@@ -217,7 +224,11 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       thumbnail: snapshot['thumbnail']?.toString(),
       artist: (snapshot['author'] ?? snapshot['artist'] ?? snapshot['channel'])
           ?.toString(),
+      album: (snapshot['album'] ?? snapshot['album_title'])?.toString(),
+      clearAlbum: snapshot['album'] == null && snapshot['album_title'] == null,
       videoId: trackId,
+      playbackSourceId: extractPlaybackSourceId(snapshot),
+      clearPlaybackSourceId: extractPlaybackSourceId(snapshot) == null,
       duration: _parseInt(snapshot['duration']),
       currentPosition: 0,
       currentPositionMs: 0,
@@ -520,8 +531,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
 
   void _ensurePlaybackHealthMonitor() {
     _lastStreamProgressAt ??= DateTime.now();
-    _playbackHealthTimer ??=
-        Timer.periodic(const Duration(seconds: 2), (_) {
+    _playbackHealthTimer ??= Timer.periodic(const Duration(seconds: 2), (_) {
       unawaited(_checkPlaybackHealth());
     });
   }
@@ -540,12 +550,30 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         _streamFailureRecoveryInProgress) {
       return;
     }
-    final lastProgressAt = _lastStreamProgressAt;
-    if (lastProgressAt == null ||
-        DateTime.now().difference(lastProgressAt) <
-            const Duration(seconds: 7)) {
+    final sampledPositionMs = streamPlayer.position.inMilliseconds;
+    if (sampledPositionMs > _lastStreamProgressMs) {
+      _lastStreamProgressMs = sampledPositionMs;
+      _lastStreamProgressAt = DateTime.now();
+      _playbackStallRecoveryAttempts = 0;
       return;
     }
+    final lastProgressAt = _lastStreamProgressAt;
+    if (lastProgressAt == null) {
+      return;
+    }
+    final stalledFor = DateTime.now().difference(lastProgressAt);
+    final processingState = streamPlayer.processingState;
+    final bufferedAhead = streamPlayer.bufferedPosition - streamPlayer.position;
+    final waitingForNetwork = processingState == ProcessingState.buffering ||
+        processingState == ProcessingState.loading ||
+        bufferedAhead < const Duration(milliseconds: 750);
+    final recoveryAction = playbackStallRecoveryAction(
+      stalledFor: stalledFor,
+      waitingForNetwork: waitingForNetwork,
+      priorRecoveryAttempts: _playbackStallRecoveryAttempts,
+    );
+    if (recoveryAction == PlaybackStallRecoveryAction.wait) return;
+
     final trackId = state.videoId?.trim();
     if (trackId == null || trackId.isEmpty) return;
     _lastStreamProgressAt = DateTime.now();
@@ -554,12 +582,36 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       'playback-stall',
       '$trackId attempt=$_playbackStallRecoveryAttempts '
           'positionMs=${state.currentPositionMs} '
-          'processing=${streamPlayer.processingState.name}',
+          'bufferedAheadMs=${max(0, bufferedAhead.inMilliseconds)} '
+          'processing=${processingState.name} '
+          'action=${recoveryAction.name}',
     );
-    if (_playbackStallRecoveryAttempts > 1) {
-      await _handleStreamFailure(StateError('playback_stalled'));
+
+    // A no-progress timer is not proof that the source is unavailable. The
+    // emulator, decoder, or network may recover, so never poison/remove a
+    // queue entry from this path. First nudge the existing decoder without
+    // recreating ExoPlayer; only refresh the source after a repeated or
+    // network-starved stall.
+    if (recoveryAction == PlaybackStallRecoveryAction.softSeek) {
+      _streamFailureRecoveryInProgress = true;
+      try {
+        final resumeAt = Duration(
+          milliseconds: max(0, state.currentPositionMs),
+        );
+        await _runStreamCommand(() async {
+          if (!_activeStream) return;
+          await streamPlayer.seek(resumeAt);
+        });
+        await _resumeStreamPlayback(allowCompletedRecovery: false);
+      } catch (_) {
+        // A failed soft recovery is not an unavailable-track signal. Further
+        // automatic recovery is suppressed until real position progress.
+      } finally {
+        _streamFailureRecoveryInProgress = false;
+      }
       return;
     }
+
     _streamFailureRecoveryInProgress = true;
     try {
       _streamRuntime.invalidateStreamSource(trackId);
@@ -571,10 +623,28 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         lookahead: 1,
       );
       if (_managedQueueActive && _managedQueueTracks.isNotEmpty) {
-        await _restoreManagedQueueAfterSeekFailure(
-          boundedSeconds: max(0, state.currentPositionMs ~/ 1000),
-          shouldResume: true,
+        final index = streamPlayer.currentIndex ?? 0;
+        if (index < 0 || index >= _managedQueueTracks.length) {
+          throw StateError('managed_queue_index_missing');
+        }
+        final activeTrack = _managedQueueTracks[index];
+        await _streamRuntime.ensurePlaybackTrack(activeTrack);
+        final replacement = await _buildManagedAudioSource(activeTrack);
+        final resumeAt = Duration(
+          milliseconds: max(0, state.currentPositionMs),
         );
+        _streamTransitionInProgress = true;
+        try {
+          await _runStreamCommand(() async {
+            await streamPlayer.pause();
+            await streamPlayer.removeAudioSourceAt(index);
+            await streamPlayer.insertAudioSource(index, replacement);
+            await streamPlayer.seek(resumeAt, index: index);
+          });
+          await _resumeStreamPlayback(allowCompletedRecovery: false);
+        } finally {
+          _streamTransitionInProgress = false;
+        }
       } else {
         final source = _freshStreamSource(trackId);
         if (source == null) throw StateError('stream_refresh_failed');
@@ -589,8 +659,16 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         await _resumeStreamPlayback(allowCompletedRecovery: false);
       }
     } catch (error) {
-      _streamFailureRecoveryInProgress = false;
-      await _handleStreamFailure(error);
+      if (_activeStream) {
+        state = state.copyWith(
+          isPlaying: false,
+          isDownloading: false,
+        );
+        debugProxyLog(
+          'playback-stall',
+          '$trackId recovery_failed=${error.runtimeType} retained=true',
+        );
+      }
     } finally {
       _streamFailureRecoveryInProgress = false;
     }
@@ -946,10 +1024,6 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     _streamRuntime.registerUnavailableTrack(videoId, reason);
   }
 
-  bool _isKnownUnavailableRemoteTrack(Map<String, dynamic> track) {
-    return _streamRuntime.isKnownUnavailableRemoteTrack(track);
-  }
-
   Future<Map<String, dynamic>> _resolveManagedQueueSources(
     List<Map<String, dynamic>> tracks, {
     required int preferredInitialIndex,
@@ -957,7 +1031,6 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     final resolution = await resolveManagedQueueSources(
       tracks: tracks,
       preferredInitialIndex: preferredInitialIndex,
-      isKnownUnavailableRemoteTrack: _isKnownUnavailableRemoteTrack,
       buildManagedAudioSource: _buildManagedAudioSource,
       registerUnavailableTrack: _registerUnavailableTrack,
     );
@@ -1013,33 +1086,22 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
 
       final failedTrack = _managedQueueTracks[failedIndex];
       final failedVideoId = extractTrackId(failedTrack) ?? state.videoId;
-      _registerUnavailableTrack(failedVideoId, error.toString());
-
-      final remainingTracks = _managedQueueTracks
-          .where((track) => !_isKnownUnavailableRemoteTrack(track))
-          .toList(growable: false);
-
-      if (remainingTracks.isEmpty) {
-        await stopPlayback(resetState: false);
-        state = state.copyWith(
-          isPlaying: false,
-          isDownloading: false,
-          currentTrackName: 'Track unavailable right now',
-          videoId: failedVideoId,
-        );
-        _managedQueueActive = false;
-        _managedQueueTracks = const [];
-        _broadcastManagedQueue();
-        return;
-      }
-
-      final nextIndex =
-          failedIndex.clamp(0, remainingTracks.length - 1).toInt();
-      await configureManagedQueue(
-        remainingTracks,
-        initialIndex: nextIndex,
-        autoplay: _desiredStreamPlaying,
+      // A failed source must not silently change the requested recording.
+      // The previous implementation removed this item and rebuilt the queue
+      // at the same numeric index, which could start a different search result
+      // such as a live edition. Keep the logical queue intact; retrying or
+      // skipping is then an explicit user action.
+      _desiredStreamPlaying = false;
+      await _runStreamCommand(() => streamPlayer.stop());
+      _managedQueueActive = false;
+      _managedQueueTracks = const [];
+      state = state.copyWith(
+        isPlaying: false,
+        isDownloading: false,
+        currentTrackName: 'Track unavailable right now',
+        videoId: failedVideoId,
       );
+      _broadcastManagedQueue();
     } catch (recoveryError) {
       if (!_activeStream) return;
       _markStreamFailed(recoveryError);
@@ -1088,7 +1150,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     );
   }
 
-  Future<void> _refreshManagedQueueWarmup({int lookahead = 3}) async {
+  Future<void> _refreshManagedQueueWarmup({int lookahead = 2}) async {
     if (!_managedQueueActive || _managedQueueTracks.isEmpty) return;
     final currentIndex = currentManagedQueueIndex ?? 0;
     if (currentIndex < 0 || currentIndex >= _managedQueueTracks.length) return;
@@ -1101,15 +1163,18 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       }
     }
     final ids = <String?>[];
-    for (var i = currentIndex; i < _managedQueueTracks.length; i++) {
+    final firstWarmIndex = state.isLooping ? currentIndex : currentIndex + 1;
+    for (var i = firstWarmIndex; i < _managedQueueTracks.length; i++) {
       final track = _managedQueueTracks[i];
-      if (i != currentIndex && isTrackHidden(track)) continue;
-      ids.add(extractTrackId(track));
+      if (isTrackHidden(track)) continue;
+      ids.add(extractPlaybackRoutingKey(track));
       if (ids.length >= lookahead) break;
     }
+    if (ids.isEmpty) return;
     await _prepareQueueSession(
       ids,
-      currentVideoId: extractTrackId(_managedQueueTracks[currentIndex]),
+      currentVideoId:
+          extractPlaybackRoutingKey(_managedQueueTracks[currentIndex]),
       activeQueue: true,
       lookahead: lookahead,
     );
@@ -1122,12 +1187,17 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     if (index < 0 || index >= _managedQueueTracks.length) return;
     final track = _managedQueueTracks[index];
     final videoId = extractTrackId(track);
+    final playbackSourceId = extractPlaybackSourceId(track);
     final hintedDuration = _parseInt(track['duration']);
     state = state.copyWith(
       currentTrackName: track['title']?.toString() ?? state.currentTrackName,
       thumbnail: track['thumbnail']?.toString() ?? state.thumbnail,
       artist: _trackArtist(track) ?? state.artist,
+      album: (track['album'] ?? track['album_title'])?.toString(),
+      clearAlbum: track['album'] == null && track['album_title'] == null,
       videoId: videoId,
+      playbackSourceId: playbackSourceId,
+      clearPlaybackSourceId: playbackSourceId == null,
       duration: hintedDuration > 0 ? hintedDuration : state.duration,
       currentPosition: resetPosition ? 0 : state.currentPosition,
       currentPositionMs: resetPosition ? 0 : state.currentPositionMs,
@@ -1146,45 +1216,45 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       return AudioSource.file(localPath, tag: track);
     }
 
-    final videoId = extractTrackId(track);
-    if (videoId == null || videoId.isEmpty) {
-      throw Exception('Missing track id for managed queue source');
+    final routingKey = extractPlaybackRoutingKey(track);
+    if (routingKey == null || routingKey.isEmpty) {
+      throw Exception('Missing playback source for managed queue track');
     }
-    if (_streamRuntime.isUnavailableTrackId(videoId)) {
-      final reason = _streamRuntime.unavailableReason(videoId);
+    if (_streamRuntime.isUnavailableTrackId(routingKey)) {
+      final reason = _streamRuntime.unavailableReason(routingKey);
       throw Exception(reason == null || reason.isEmpty
           ? 'Track unavailable for streaming'
           : reason);
     }
-
+    // Keep the physical player queue aligned even when a previous warmup
+    // failed. The stable proxy route may recover through another verified
+    // source; an actual playback error is handled by queue failure recovery.
     return _buildPlaybackSourceForVideoId(
-      videoId,
+      routingKey,
       tag: track,
-      requirePrepared: true,
     );
   }
 
-  Future<void> configureManagedQueue(
+  Future<bool> configureManagedQueue(
     List<Map<String, dynamic>> tracks, {
     required int initialIndex,
     bool autoplay = true,
   }) async {
     if (tracks.isEmpty || initialIndex < 0 || initialIndex >= tracks.length) {
-      return;
+      return false;
     }
 
     final sourceTracks =
         tracks.map((track) => normalizeTrack(track)).toList(growable: false);
     final currentTrack = sourceTracks[initialIndex];
-    final normalizedTracks = <Map<String, dynamic>>[
-      currentTrack,
-      ...sourceTracks.skip(initialIndex + 1),
-      ...sourceTracks.take(initialIndex),
-    ];
+    // The logical queue and just_audio queue must retain the same order. The
+    // previous rotation put the selected track at player index zero while the
+    // PlaybackQueueNotifier kept the original indexes, so later skips could
+    // address a different (or absent) player item.
+    final normalizedTracks = sourceTracks;
     final currentTrackId = extractTrackId(currentTrack);
+    final currentRoutingKey = extractPlaybackRoutingKey(currentTrack);
     _beginPlaybackLatencyProbe(currentTrackId);
-    final remainingTracks =
-        normalizedTracks.skip(1).where((track) => !isTrackHidden(track)).toList();
 
     final loadVersion = ++_streamLoadVersion;
     _desiredStreamPlaying = autoplay;
@@ -1203,54 +1273,52 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
           currentTrack['title']?.toString() ?? 'Connecting Queue...',
       thumbnail: currentTrack['thumbnail']?.toString(),
       artist: _trackArtist(currentTrack),
+      album: (currentTrack['album'] ?? currentTrack['album_title'])?.toString(),
       clearVideoId: true,
+      clearPlaybackSourceId: true,
       duration: 0,
       currentPosition: 0,
       currentPositionMs: 0,
     );
 
-    final bootstrapTracks = <Map<String, dynamic>>[currentTrack];
-    final bootstrapIds = bootstrapTracks.map(extractTrackId).toList();
+    try {
+      await _streamRuntime.ensurePlaybackTrack(currentTrack);
+    } catch (_) {
+      _streamTransitionInProgress = false;
+      _desiredStreamPlaying = false;
+      _managedQueueActive = false;
+      _managedQueueTracks = const [];
+      state = state.copyWith(
+        isPlaying: false,
+        isDownloading: false,
+        currentTrackName: 'Track unavailable right now',
+        videoId: currentTrackId,
+        playbackSourceId: extractPlaybackSourceId(currentTrack),
+      );
+      _broadcastManagedQueue();
+      return false;
+    }
+
+    // Preparing the current item improves startup latency, but it is not an
+    // admission contract. Every queue item receives its stable backend proxy
+    // source below, so a missed warmup cannot remove it from the player queue.
     await _prepareQueueSession(
-      bootstrapIds,
-      currentVideoId: currentTrackId,
+      [currentRoutingKey],
+      currentVideoId: currentRoutingKey,
       activeQueue: true,
       background: false,
-      lookahead: bootstrapTracks.length,
+      lookahead: 1,
     );
-    if (loadVersion != _streamLoadVersion) return;
+    if (loadVersion != _streamLoadVersion) return false;
 
-    var resolvedQueue = await _resolveManagedQueueSources(
-      bootstrapTracks,
-      preferredInitialIndex: 0,
+    final resolvedQueue = await _resolveManagedQueueSources(
+      normalizedTracks,
+      preferredInitialIndex: initialIndex,
     );
     final playableTracks =
         List<Map<String, dynamic>>.from(resolvedQueue['tracks'] as List);
-    var sources = List<AudioSource>.from(resolvedQueue['sources'] as List);
-    var resolvedInitialIndex = (resolvedQueue['initialIndex'] as int?) ?? 0;
-    if ((playableTracks.isEmpty || sources.isEmpty) &&
-        remainingTracks.isNotEmpty) {
-      final recoveryTracks =
-          remainingTracks.take(4).toList(growable: false);
-      await _prepareQueueSession(
-        recoveryTracks.map(extractTrackId),
-        currentVideoId: extractTrackId(recoveryTracks.first),
-        activeQueue: true,
-        background: false,
-        lookahead: recoveryTracks.length,
-      );
-      resolvedQueue = await _resolveManagedQueueSources(
-        recoveryTracks,
-        preferredInitialIndex: 0,
-      );
-      playableTracks
-        ..clear()
-        ..addAll(List<Map<String, dynamic>>.from(
-          resolvedQueue['tracks'] as List,
-        ));
-      sources = List<AudioSource>.from(resolvedQueue['sources'] as List);
-      resolvedInitialIndex = (resolvedQueue['initialIndex'] as int?) ?? 0;
-    }
+    final sources = List<AudioSource>.from(resolvedQueue['sources'] as List);
+    final resolvedInitialIndex = (resolvedQueue['initialIndex'] as int?) ?? 0;
     if (playableTracks.isEmpty || sources.isEmpty) {
       _streamTransitionInProgress = false;
       _managedQueueActive = false;
@@ -1262,17 +1330,12 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
         clearVideoId: true,
       );
       _broadcastManagedQueue();
-      return;
+      return false;
     }
-    if (loadVersion != _streamLoadVersion) return;
+    if (loadVersion != _streamLoadVersion) return false;
 
     _cachedStreamVideoId = extractTrackId(playableTracks[resolvedInitialIndex]);
     _managedQueueTracks = playableTracks;
-    final resolvedBootstrapIds = playableTracks
-        .map(extractTrackId)
-        .whereType<String>()
-        .where((id) => id.isNotEmpty)
-        .toSet();
 
     await _runStreamCommand(() async {
       if (loadVersion != _streamLoadVersion) return;
@@ -1284,7 +1347,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
       );
       await streamPlayer.setLoopMode(_streamLoopMode);
     });
-    if (loadVersion != _streamLoadVersion) return;
+    if (loadVersion != _streamLoadVersion) return false;
 
     _streamTransitionInProgress = false;
     _applyManagedTrackMetadata(resolvedInitialIndex, resetPosition: true);
@@ -1296,21 +1359,7 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     if (_desiredStreamPlaying) {
       await _resumeStreamPlayback(allowCompletedRecovery: false);
     }
-    final deferredRemainingTracks = remainingTracks
-        .where((track) {
-          final id = extractTrackId(track);
-          return id == null || !resolvedBootstrapIds.contains(id);
-        })
-        .toList(growable: false);
-    if (deferredRemainingTracks.isNotEmpty &&
-        loadVersion == _streamLoadVersion) {
-      unawaited(
-        appendManagedQueueTracks(
-          deferredRemainingTracks,
-          expectedLoadVersion: loadVersion,
-        ),
-      );
-    }
+    return true;
   }
 
   Future<void> appendManagedQueueTracks(
@@ -1325,36 +1374,15 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     }
     final normalizedTracks =
         tracks.map((track) => normalizeTrack(track)).toList(growable: false);
-    final batch = normalizedTracks.take(4).toList(growable: false);
-    await _prepareQueueSession(
-      batch.map(extractTrackId),
-      currentVideoId: extractTrackId(batch.first),
-      activeQueue: true,
-      background: false,
-      lookahead: batch.length,
-    );
-    if (!_managedQueueActive || loadVersion != _streamLoadVersion) return;
     final resolvedQueue = await _resolveManagedQueueSources(
-      batch,
+      normalizedTracks,
       preferredInitialIndex: 0,
     );
     if (!_managedQueueActive || loadVersion != _streamLoadVersion) return;
     final playableTracks =
         List<Map<String, dynamic>>.from(resolvedQueue['tracks'] as List);
     final sources = List<AudioSource>.from(resolvedQueue['sources'] as List);
-    final remaining =
-        normalizedTracks.skip(batch.length).toList(growable: false);
     if (playableTracks.isEmpty || sources.isEmpty) {
-      if (remaining.isNotEmpty &&
-          _managedQueueActive &&
-          loadVersion == _streamLoadVersion) {
-        unawaited(
-          appendManagedQueueTracks(
-            remaining,
-            expectedLoadVersion: loadVersion,
-          ),
-        );
-      }
       return;
     }
     await _runStreamCommand(() async {
@@ -1365,16 +1393,6 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     _managedQueueTracks = [..._managedQueueTracks, ...playableTracks];
     _broadcastManagedQueue();
     unawaited(_refreshManagedQueueWarmup());
-    if (remaining.isNotEmpty &&
-        _managedQueueActive &&
-        loadVersion == _streamLoadVersion) {
-      unawaited(
-        appendManagedQueueTracks(
-          remaining,
-          expectedLoadVersion: loadVersion,
-        ),
-      );
-    }
   }
 
   Future<void> insertManagedQueueTracks(
@@ -1385,13 +1403,6 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     final normalizedTracks =
         tracks.map((track) => normalizeTrack(track)).toList(growable: false);
     final insertIndex = index.clamp(0, _managedQueueTracks.length).toInt();
-    await _prepareQueueSession(
-      normalizedTracks.map(extractTrackId),
-      currentVideoId: extractTrackId(normalizedTracks.first),
-      activeQueue: true,
-      background: false,
-      lookahead: normalizedTracks.length,
-    );
     final resolvedQueue = await _resolveManagedQueueSources(
       normalizedTracks,
       preferredInitialIndex: 0,
@@ -1471,11 +1482,45 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
     await _resumeStreamPlayback();
   }
 
+  int? managedQueueIndexForTrackId(String? trackId) {
+    final normalizedId = trackId?.trim();
+    if (!_managedQueueActive || normalizedId == null || normalizedId.isEmpty) {
+      return null;
+    }
+    final index = trackIndexByIdentity(_managedQueueTracks, normalizedId);
+    return index < 0 ? null : index;
+  }
+
+  String? get currentManagedQueueTrackId {
+    final index = currentManagedQueueIndex;
+    return trackIdentityAt(_managedQueueTracks, index);
+  }
+
+  Future<bool> playManagedQueueTrack(String? trackId) async {
+    final index = managedQueueIndexForTrackId(trackId);
+    if (index == null) return false;
+    try {
+      await _streamRuntime.ensurePlaybackTrack(_managedQueueTracks[index]);
+      await playManagedQueueIndex(index);
+    } catch (_) {
+      return false;
+    }
+    return currentManagedQueueIndex == index;
+  }
+
+  Future<bool> removeManagedQueueTrack(String? trackId) async {
+    final index = managedQueueIndexForTrackId(trackId);
+    if (index == null) return false;
+    await removeManagedQueueItem(index);
+    return true;
+  }
+
   Future<void> skipManagedQueueNext() async {
     if (!_managedQueueActive || !streamPlayer.hasNext) return;
     final nextIndex = (streamPlayer.currentIndex ?? -1) + 1;
     if (nextIndex >= 0 && nextIndex < _managedQueueTracks.length) {
-      _beginPlaybackLatencyProbe(extractTrackId(_managedQueueTracks[nextIndex]));
+      _beginPlaybackLatencyProbe(
+          extractTrackId(_managedQueueTracks[nextIndex]));
     }
     _streamTransitionInProgress = true;
     await _runStreamCommand(() async {
@@ -1911,6 +1956,8 @@ class AudioPlayerNotifier extends StateNotifier<PlayerState> {
   }
 
   Future<void> play() async {
+    if (!_activeStream &&
+        await (onResumeSavedQueue?.call() ?? Future.value(false))) return;
     if (!_activeStream &&
         streamPlayer.audioSource == null &&
         _restorableTrackMeta != null) {

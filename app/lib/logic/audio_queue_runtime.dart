@@ -4,6 +4,43 @@ import 'package:just_audio/just_audio.dart';
 
 import 'track_metadata.dart';
 
+enum PlaybackStallRecoveryAction { wait, softSeek, refreshSource }
+
+PlaybackStallRecoveryAction playbackStallRecoveryAction({
+  required Duration stalledFor,
+  required bool waitingForNetwork,
+  required int priorRecoveryAttempts,
+}) {
+  final threshold = waitingForNetwork
+      ? const Duration(seconds: 18)
+      : const Duration(seconds: 10);
+  if (stalledFor < threshold) return PlaybackStallRecoveryAction.wait;
+  if (priorRecoveryAttempts > 0) {
+    return PlaybackStallRecoveryAction.wait;
+  }
+  if (!waitingForNetwork) {
+    return PlaybackStallRecoveryAction.softSeek;
+  }
+  return PlaybackStallRecoveryAction.refreshSource;
+}
+
+int trackIndexByIdentity(
+  List<Map<String, dynamic>> tracks,
+  String? trackId,
+) {
+  final normalizedId = trackId?.trim();
+  if (normalizedId == null || normalizedId.isEmpty) return -1;
+  return tracks.indexWhere((track) => extractTrackId(track) == normalizedId);
+}
+
+String? trackIdentityAt(
+  List<Map<String, dynamic>> tracks,
+  int? index,
+) {
+  if (index == null || index < 0 || index >= tracks.length) return null;
+  return extractTrackId(tracks[index]);
+}
+
 class ManagedQueueResolution {
   final List<Map<String, dynamic>> tracks;
   final List<AudioSource> sources;
@@ -19,10 +56,10 @@ class ManagedQueueResolution {
 Future<ManagedQueueResolution> resolveManagedQueueSources({
   required List<Map<String, dynamic>> tracks,
   required int preferredInitialIndex,
-  required bool Function(Map<String, dynamic> track) isKnownUnavailableRemoteTrack,
   required Future<AudioSource> Function(Map<String, dynamic> track)
       buildManagedAudioSource,
-  required void Function(String? videoId, [String? reason]) registerUnavailableTrack,
+  required void Function(String? videoId, [String? reason])
+      registerUnavailableTrack,
 }) async {
   final playableTracks = <Map<String, dynamic>>[];
   final sources = <AudioSource>[];
@@ -31,21 +68,13 @@ Future<ManagedQueueResolution> resolveManagedQueueSources({
   for (var i = 0; i < tracks.length; i++) {
     final track = tracks[i];
     final videoId = extractTrackId(track);
-    if (isKnownUnavailableRemoteTrack(track)) {
-      if (i < resolvedInitialIndex) {
-        resolvedInitialIndex -= 1;
-      }
-      continue;
-    }
     try {
       final source = await buildManagedAudioSource(track);
       playableTracks.add(track);
       sources.add(source);
     } catch (error) {
       final reason = error.toString();
-      if (!reason.contains('managed_source_not_prepared')) {
-        registerUnavailableTrack(videoId, reason);
-      }
+      registerUnavailableTrack(videoId, reason);
       if (i < resolvedInitialIndex) {
         resolvedInitialIndex -= 1;
       }

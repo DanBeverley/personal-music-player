@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List
 import json
 import time
@@ -16,18 +16,63 @@ from .schema import DiscoveryCandidate, TasteProfile
 
 
 RADIO_INVENTORY_NAMESPACE = "discovery_artist_radio_inventory"
-RADIO_INVENTORY_VERSION = "artist-radio-inventory-v3"
+RADIO_INVENTORY_VERSION = "artist-radio-inventory-v5"
 RADIO_INVENTORY_TTL_SECONDS = 60 * 60 * 24
 RADIO_CATALOG_INDEX_NAMESPACE = "discovery_radio_catalog_index"
 RADIO_CATALOG_INDEX_VERSION = "radio-catalog-index-v1"
 RADIO_CATALOG_INDEX_MAX_TRACKS = 96
-# Keep at least 24 cards available; normal background replenishment aims for
-# a deeper 36-card reservoir so rotation can retain familiar supply.
+# Storage ceiling only. Readiness and replenishment are driven by the visible
+# row plus missing unexposed/discovery supply, not by filling all 36 slots.
 RADIO_RESERVOIR_TARGET_CARDS = 36
 RADIO_RESERVOIR_MAX_CARDS = 36
+RADIO_WORKING_RESERVOIR_TARGET_CARDS = 15
 RADIO_DISCOVERY_RESERVE_TARGET_CARDS = 12
 RADIO_VISIBLE_DISCOVERY_MINIMUM = 4
+# A feed slice aims for six genuinely related/exploratory seeds. Four truly
+# unexposed identities remain the minimum freshness admission threshold.
+RADIO_VISIBLE_DISCOVERY_TARGET = 6
+RADIO_UNEXPOSED_TARGET_CARDS = RADIO_VISIBLE_DISCOVERY_TARGET * 2
+RADIO_EXPOSURE_LEDGER_MAX_ENTRIES = 128  # five 20-card feeds, plus bounded margin
 ACQUISITION_JOB_NAMESPACE = "discovery_acquisition_job"
+
+_RADIO_PERSONAL_FIELDS = {
+    "user_scope_id", "user_id", "account_id", "profile_key", "profile_fingerprint",
+    "history", "history_ids", "play_count", "play_counts", "completed",
+    "completion_count", "completed_at", "is_favorite", "favorite", "liked",
+    "likes", "saved", "in_library", "last_played_at", "played_at", "seen_at",
+    "negative_feedback_state", "negative_feedback", "feedback", "avoid_ids",
+    "request_metadata", "canonical_query", "query", "session_id", "score",
+    "personal_score", "taste_score", "interaction_score", "updated_at",
+    "user", "profile", "session", "taste", "ranking", "rank", "timestamp",
+    "timestamps", "completion", "completions",
+}
+
+
+def _sanitize_global_catalog_item(value: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove account/profile/ranking state before writing shared catalog rows."""
+    def clean(node: Any) -> Any:
+        if isinstance(node, dict):
+            output: Dict[str, Any] = {}
+            for key, item in node.items():
+                normalized = str(key or "").strip().casefold()
+                if (
+                    normalized in _RADIO_PERSONAL_FIELDS
+                    or normalized.startswith(
+                        (
+                            "user_", "profile_", "history_", "personal_", "feedback_",
+                            "score_", "interaction_", "engagement_", "taste_",
+                        )
+                    )
+                    or normalized.endswith(("_score", "_at", "_timestamp"))
+                ):
+                    continue
+                output[key] = clean(item)
+            return output
+        if isinstance(node, list):
+            return [clean(item) for item in node]
+        return node
+
+    return clean(dict(value or {}))
 
 
 @dataclass
@@ -49,20 +94,25 @@ class ArtistRadioInventory:
 
     @property
     def is_ready(self) -> bool:
-        if len(self.cards) < 12:
+        if len(self.cards) < 10:
             return False
         # Visible radio cards must have a usable seed thumbnail and at least
         # one verified collage image; a track catalog alone is not publishable.
-        return all(
+        qualified = all(
             str(card.get("thumbnail") or "").strip().startswith("/artist_artwork/")
             and str(card.get("seed_artist_identity") or "").strip()
-            and str(card.get("artwork_owner_token") or "").strip()
-            and str(card.get("artwork_owner_token") or "").strip()
-            == str(card.get("seed_artist_identity_token") or "").strip()
-            and str(card.get("seed_artist_identity_token") or "").strip()
-            == artist_artwork_token(card.get("seed_artist_identity"))
-            and str(card.get("artwork_owner_identity") or "").strip()
-            == str(card.get("seed_artist_identity") or "").strip()
+            and (
+                str(card.get("radio_mode") or "").strip() == "multi_artist_mix"
+                or (
+                    str(card.get("artwork_owner_token") or "").strip()
+                    and str(card.get("artwork_owner_token") or "").strip()
+                    == str(card.get("seed_artist_identity_token") or "").strip()
+                    and str(card.get("seed_artist_identity_token") or "").strip()
+                    == artist_artwork_token(card.get("seed_artist_identity"))
+                    and str(card.get("artwork_owner_identity") or "").strip()
+                    == str(card.get("seed_artist_identity") or "").strip()
+                )
+            )
             and bool(
                 [
                     str(value or "").strip()
@@ -74,6 +124,11 @@ class ArtistRadioInventory:
             >= POPULAR_RADIO_CARD_MIN_TRACKS
             for card in self.cards
         )
+        if not qualified:
+            return False
+        discovery = sum(str(card.get("seed_affinity") or "").casefold() in {"related", "exploratory"} for card in self.cards)
+        mixes = sum(str(card.get("radio_mode") or "").casefold() == "multi_artist_mix" for card in self.cards)
+        return discovery >= 3 and mixes >= 2
 
 
 def _key(user_scope_id: str) -> str:
@@ -109,6 +164,36 @@ def _radio_seed_keys(item: Dict[str, Any], fallback: str = "") -> List[str]:
     return list(dict.fromkeys(_artist_key(value) for value in values if _artist_key(value)))
 
 
+def _radio_card_identity(card: Dict[str, Any]) -> str:
+    return _artist_key(
+        card.get("seed_artist_identity")
+        or card.get("seed_artist_key")
+        or card.get("artist_name")
+        or card.get("id")
+    )
+
+
+def _radio_card_artist_aliases(card: Dict[str, Any]) -> set[str]:
+    aliases: set[str] = set()
+    for value in (
+        card.get("seed_artist_identity"),
+        card.get("seed_artist_key"),
+        card.get("artist_name"),
+        *(card.get("seed_artist_identities") or []),
+    ):
+        normalized = _artist_key(value)
+        if not normalized:
+            continue
+        aliases.add(normalized)
+        if normalized.startswith("artist:"):
+            aliases.add(normalized.removeprefix("artist:"))
+        elif not normalized.startswith(
+            ("provider:artist:", "musicbrainz:artist:", "mix:")
+        ):
+            aliases.add(f"artist:{normalized}")
+    return aliases
+
+
 def _artist_identity(record: Dict[str, Any]) -> str:
     cached = str(record.get("artwork_cache_identity") or "").strip()
     if cached.startswith(("provider:artist:", "musicbrainz:artist:")):
@@ -142,8 +227,46 @@ def _record_matches_requested_artist(record: Dict[str, Any], item: Dict[str, Any
     return not requested_ids or not record_ids or bool(requested_ids & record_ids)
 
 
-def _radio_catalog_index_key(user_scope_id: str, seed_key: str) -> str:
-    return f"{str(user_scope_id or 'guest').strip() or 'guest'}:{seed_key}"
+def _canonical_artist_cache_identity(
+    seed_key: str,
+    items: List[Dict[str, Any]] | None = None,
+) -> str:
+    normalized_seed = _artist_key(seed_key)
+    if normalized_seed.startswith(("provider:artist:", "musicbrainz:artist:")):
+        return normalized_seed
+    for item in items or []:
+        if _artist_key(artist_name(item)) != normalized_seed:
+            continue
+        mbid = str(item.get("musicbrainz_artist_id") or "").strip()
+        if mbid:
+            return f"musicbrainz:artist:{mbid.casefold()}"
+        canonical = str(item.get("canonical_artist_id") or "").strip()
+        if canonical.startswith(("provider:artist:", "musicbrainz:artist:")):
+            return canonical.casefold()
+        provider = str(
+            item.get("provider_artist_id")
+            or item.get("artist_id")
+            or item.get("artistId")
+            or ""
+        ).strip()
+        if provider:
+            return f"provider:artist:{provider.casefold()}"
+    return ""
+
+
+def _radio_catalog_index_key(
+    user_scope_id: str,
+    seed_key: str,
+    *,
+    items: List[Dict[str, Any]] | None = None,
+) -> str:
+    identity = _canonical_artist_cache_identity(seed_key, items)
+    if identity:
+        return f"global:{identity}"
+    # Name-only rows remain account-scoped until canonical artist evidence is
+    # available; they must not contaminate the global cache.
+    scope = str(user_scope_id or "guest").strip() or "guest"
+    return f"{scope}:{_artist_key(seed_key)}"
 
 
 def _load_radio_catalog_index(
@@ -168,28 +291,59 @@ def _load_radio_catalog_index(
     except Exception:
         return merged
     try:
-        scope_prefix = (
-            f"{str(user_scope_id or 'guest').strip() or 'guest'}:%"
-        )
-        rows = connection.execute(
-            "SELECT entity_id, payload_json FROM recommendation_feature_store "
-            "WHERE namespace = ? AND entity_id LIKE ?",
-            [RADIO_CATALOG_INDEX_NAMESPACE, scope_prefix],
-        ).fetchall()
+        scope = str(user_scope_id or "guest").strip() or "guest"
+        lookup_ids: set[str] = set()
+        for seed_key, values in merged.items():
+            lookup_ids.add(_radio_catalog_index_key(scope, seed_key, items=values))
+            # Read the scoped name fallback during canonical migration.
+            lookup_ids.add(f"{scope}:{_artist_key(seed_key)}")
+        if lookup_ids:
+            rows = []
+            ordered_lookup_ids = sorted(lookup_ids)
+            for offset in range(0, len(ordered_lookup_ids), 400):
+                batch = ordered_lookup_ids[offset : offset + 400]
+                placeholders = ",".join("?" for _ in batch)
+                rows.extend(
+                    connection.execute(
+                        "SELECT entity_id, payload_json FROM recommendation_feature_store "
+                        f"WHERE namespace = ? AND entity_id IN ({placeholders}) "
+                        "ORDER BY updated_at DESC LIMIT 512",
+                        [RADIO_CATALOG_INDEX_NAMESPACE, *batch],
+                    ).fetchall()
+                )
+        else:
+            rows = []
         indexed_by_seed: Dict[str, List[Dict[str, Any]]] = {}
+        global_rows_needing_rewrite: set[str] = set()
         for row in rows:
             try:
                 payload = json.loads(row["payload_json"] or "{}")
             except Exception:
                 continue
+            if payload.get("version") not in (None, RADIO_CATALOG_INDEX_VERSION):
+                continue
+            cache_identity = _artist_key(payload.get("cache_identity"))
+            if (
+                str(row["entity_id"] or "").startswith("global:")
+                and (
+                    not cache_identity
+                    or str(row["entity_id"]) != f"global:{cache_identity}"
+                )
+            ):
+                continue
             seed_key = _artist_key(payload.get("seed_key"))
             if not seed_key:
                 continue
-            indexed_by_seed[seed_key] = [
-                dict(item)
-                for item in payload.get("tracks") or []
-                if isinstance(item, dict)
-            ]
+            is_global = str(row["entity_id"] or "").startswith("global:")
+            indexed_items: List[Dict[str, Any]] = []
+            for item in payload.get("tracks") or []:
+                if not isinstance(item, dict):
+                    continue
+                cleaned = _sanitize_global_catalog_item(item) if is_global else dict(item)
+                if is_global and cleaned != item:
+                    global_rows_needing_rewrite.add(seed_key)
+                indexed_items.append(cleaned)
+            indexed_by_seed.setdefault(seed_key, []).extend(indexed_items)
 
         changed: Dict[str, List[Dict[str, Any]]] = {}
         for seed_key in set(indexed_by_seed) | set(merged):
@@ -217,11 +371,19 @@ def _load_radio_catalog_index(
                 _track_key(item) for item in indexed_by_seed.get(seed_key, [])
             ]
             after = [_track_key(item) for item in combined]
-            if before != after:
+            if before != after or seed_key in global_rows_needing_rewrite:
                 changed[seed_key] = combined
 
         now = time.time()
         for seed_key, tracks in changed.items():
+            cache_key = _radio_catalog_index_key(
+                user_scope_id, seed_key, items=tracks
+            )
+            persisted_tracks = (
+                [_sanitize_global_catalog_item(item) for item in tracks]
+                if cache_key.startswith("global:")
+                else tracks
+            )
             connection.execute(
                 """INSERT INTO recommendation_feature_store(
                     namespace, entity_id, model_id, payload_json, updated_at
@@ -232,13 +394,16 @@ def _load_radio_catalog_index(
                     updated_at=excluded.updated_at""",
                 [
                     RADIO_CATALOG_INDEX_NAMESPACE,
-                    _radio_catalog_index_key(user_scope_id, seed_key),
+                    cache_key,
                     RADIO_CATALOG_INDEX_VERSION,
                     json.dumps(
                         {
                             "version": RADIO_CATALOG_INDEX_VERSION,
                             "seed_key": seed_key,
-                            "tracks": tracks,
+                            "cache_identity": _canonical_artist_cache_identity(
+                                seed_key, tracks
+                            ),
+                            "tracks": persisted_tracks,
                             "updated_at": now,
                         },
                         ensure_ascii=False,
@@ -262,6 +427,7 @@ def _merge_radio_catalog_index(
     server: Any,
     user_scope_id: str,
     current: Dict[str, List[Dict[str, Any]]],
+    allowed_seed_keys: set[str] | None = None,
 ) -> Dict[str, List[Dict[str, Any]]]:
     """Merge current candidate radio supply with persisted acquisition results.
 
@@ -333,7 +499,7 @@ def _merge_radio_catalog_index(
                 continue
             if not isinstance(payload, dict) or payload.get("pool") != "radio_artist_catalog":
                 continue
-            if payload.get("kind") not in {"canonical_artist_radio_catalog", "artist_radio_catalog"}:
+            if payload.get("kind") != "artist_catalog":
                 continue
             fallback = str(payload.get("key") or "").strip()
             results = payload.get("results")
@@ -348,19 +514,46 @@ def _merge_radio_catalog_index(
                 if raw is None:
                     continue
                 for seed_key in _radio_seed_keys(raw, fallback):
+                    if allowed_seed_keys is not None and seed_key not in allowed_seed_keys:
+                        continue
                     touched.setdefault(seed_key, []).append(dict(raw))
         # Include already-indexed rows even if their source acquisition rows age out.
         seed_keys = set(merged) | set(touched)
         for seed_key in seed_keys:
+            seed_items = [
+                *merged.get(seed_key, []),
+                *touched.get(seed_key, []),
+            ]
+            cache_key = _radio_catalog_index_key(
+                user_scope_id, seed_key, items=seed_items
+            )
             existing_row = connection.execute(
                 "SELECT payload_json FROM recommendation_feature_store WHERE namespace = ? AND entity_id = ?",
-                [RADIO_CATALOG_INDEX_NAMESPACE, _radio_catalog_index_key(user_scope_id, seed_key)],
+                [RADIO_CATALOG_INDEX_NAMESPACE, cache_key],
             ).fetchone()
             indexed: List[Dict[str, Any]] = []
             if existing_row:
                 try:
                     value = json.loads(existing_row["payload_json"] or "{}")
-                    indexed = [dict(item) for item in value.get("tracks") or [] if isinstance(item, dict)]
+                    expected_identity = _canonical_artist_cache_identity(
+                        seed_key, seed_items
+                    )
+                    payload_identity = _artist_key(value.get("cache_identity"))
+                    if (
+                        value.get("version") not in (None, RADIO_CATALOG_INDEX_VERSION)
+                        or cache_key.startswith("global:")
+                        and payload_identity != expected_identity
+                    ):
+                        value = {}
+                    indexed = [
+                        (
+                            _sanitize_global_catalog_item(item)
+                            if cache_key.startswith("global:")
+                            else dict(item)
+                        )
+                        for item in value.get("tracks") or []
+                        if isinstance(item, dict)
+                    ]
                 except Exception:
                     indexed = []
             seen: set[str] = set()
@@ -373,14 +566,18 @@ def _merge_radio_catalog_index(
                 combined.append(dict(item))
                 if len(combined) >= RADIO_CATALOG_INDEX_MAX_TRACKS:
                     break
+            if cache_key.startswith("global:"):
+                combined = [
+                    _sanitize_global_catalog_item(item) for item in combined
+                ]
             if combined:
                 merged[seed_key] = combined
                 connection.execute(
                     """INSERT INTO recommendation_feature_store(namespace, entity_id, model_id, payload_json, updated_at)
                     VALUES (?, ?, ?, ?, ?) ON CONFLICT(namespace, entity_id) DO UPDATE SET
                     model_id=excluded.model_id, payload_json=excluded.payload_json, updated_at=excluded.updated_at""",
-                    [RADIO_CATALOG_INDEX_NAMESPACE, _radio_catalog_index_key(user_scope_id, seed_key),
-                     RADIO_CATALOG_INDEX_VERSION, json.dumps({"version": RADIO_CATALOG_INDEX_VERSION, "seed_key": seed_key, "tracks": combined, "updated_at": time.time()}, ensure_ascii=False), time.time()],
+                    [RADIO_CATALOG_INDEX_NAMESPACE, cache_key,
+                     RADIO_CATALOG_INDEX_VERSION, json.dumps({"version": RADIO_CATALOG_INDEX_VERSION, "seed_key": seed_key, "cache_identity": _canonical_artist_cache_identity(seed_key, combined), "tracks": combined, "updated_at": time.time()}, ensure_ascii=False), time.time()],
                 )
         connection.commit()
     except Exception:
@@ -427,6 +624,14 @@ def _payload(inventory: ArtistRadioInventory) -> Dict[str, Any]:
     }
 
 
+def artist_radio_inventory_to_payload(
+    inventory: ArtistRadioInventory,
+) -> Dict[str, Any]:
+    """Serialize the independent radio reservoir for durable Home storage."""
+
+    return _payload(inventory)
+
+
 def _from_payload(payload: Dict[str, Any] | None) -> ArtistRadioInventory | None:
     if not isinstance(payload, dict):
         return None
@@ -444,11 +649,21 @@ def _from_payload(payload: Dict[str, Any] | None) -> ArtistRadioInventory | None
     )
 
 
+def artist_radio_inventory_from_payload(
+    payload: Dict[str, Any] | None,
+) -> ArtistRadioInventory | None:
+    """Deserialize one radio reservoir from durable Home storage."""
+
+    return _from_payload(payload)
+
+
 def load_artist_radio_inventory(
     server: Any,
     user_scope_id: str,
     *,
     profile_fingerprint: str = "",
+    allow_profile_mismatch: bool = False,
+    allow_expired: bool = False,
 ) -> ArtistRadioInventory | None:
     try:
         connection = open_recommendation_store_connection(server)
@@ -469,9 +684,13 @@ def load_artist_radio_inventory(
         inventory = _from_payload(json.loads(row["payload_json"] or "{}"))
     except Exception:
         return None
-    if inventory is None or (profile_fingerprint and inventory.profile_fingerprint != profile_fingerprint):
+    if inventory is None or (
+        profile_fingerprint
+        and inventory.profile_fingerprint != profile_fingerprint
+        and not allow_profile_mismatch
+    ):
         return None
-    if inventory.expires_at <= time.time():
+    if inventory.expires_at <= time.time() and not allow_expired:
         return None
     return inventory
 
@@ -507,19 +726,96 @@ def store_artist_radio_inventory(server: Any, inventory: ArtistRadioInventory) -
             pass
 
 
+def merge_radio_exposure(
+    server: Any,
+    user_scope_id: str,
+    identities: List[str],
+    *,
+    max_entries: int = RADIO_EXPOSURE_LEDGER_MAX_ENTRIES,
+) -> bool:
+    """Merge promotion exposure without clobbering concurrent expansion state."""
+    values = [str(value or "").strip().casefold() for value in identities]
+    values = list(dict.fromkeys(value for value in values if value))
+    if not values:
+        return False
+    connection = None
+    try:
+        connection = open_recommendation_store_connection(server)
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            "SELECT payload_json FROM recommendation_feature_store "
+            "WHERE namespace = ? AND entity_id = ?",
+            [RADIO_INVENTORY_NAMESPACE, _key(user_scope_id)],
+        ).fetchone()
+        if row is None:
+            connection.rollback()
+            return False
+        inventory = _from_payload(json.loads(row["payload_json"] or "{}"))
+        if inventory is None:
+            connection.rollback()
+            return False
+        diagnostics = dict(inventory.diagnostics or {})
+        prior = [
+            str(value or "").strip().casefold()
+            for value in diagnostics.get("popular_radio_exposure_ledger") or []
+            if str(value or "").strip()
+        ]
+        merged = list(dict.fromkeys([*values, *prior]))[:max(int(max_entries or 0), 1)]
+        diagnostics["popular_radio_exposure_ledger"] = merged
+        diagnostics["popular_radio_last_exposure_at"] = time.time()
+        updated = replace(inventory, diagnostics=diagnostics)
+        connection.execute(
+            """UPDATE recommendation_feature_store
+               SET model_id = ?, payload_json = ?, updated_at = ?
+               WHERE namespace = ? AND entity_id = ?""",
+            [
+                RADIO_INVENTORY_VERSION,
+                json.dumps(_payload(updated), ensure_ascii=False),
+                time.time(),
+                RADIO_INVENTORY_NAMESPACE,
+                _key(user_scope_id),
+            ],
+        )
+        connection.commit()
+        return True
+    except Exception:
+        try:
+            connection.rollback()
+        except Exception:
+            pass
+        return False
+    finally:
+        try:
+            connection.close()
+        except Exception:
+            pass
+
+
 def merge_store_artist_radio_inventory(
     server: Any,
     incoming: ArtistRadioInventory,
 ) -> bool:
     """Atomically merge qualified reservoir supply without clobbering state.
 
-    Expansion workers may finish after a successor rotation has selected a
-    newer visible slice.  The transaction reads that slice under ``BEGIN
-    IMMEDIATE``, preserves it, and only appends/improves qualified reservoir
-    cards.  Profile and expiry mismatches are treated as a no-op.
+    Expansion workers may finish after another reservoir update. The
+    transaction merges qualified cards under ``BEGIN IMMEDIATE`` and derives a
+    complete visible rotation from that immutable reservoir before commit.
+    Profile and expiry mismatches are treated as a no-op.
     """
     connection = None
     try:
+        merge_now = time.time()
+
+        def stamped_card(card: Dict[str, Any], fallback: float) -> Dict[str, Any]:
+            value = dict(card)
+            first_verified_at = float(value.get("first_verified_at") or fallback or merge_now)
+            last_verified_at = float(
+                value.get("last_verified_at") or first_verified_at
+            )
+            value["first_verified_at"] = first_verified_at
+            value["last_verified_at"] = max(last_verified_at, first_verified_at)
+            return value
+
         connection = open_recommendation_store_connection(server)
         connection.execute("BEGIN IMMEDIATE")
         row = connection.execute(
@@ -533,20 +829,43 @@ def merge_store_artist_radio_inventory(
                 current = _from_payload(json.loads(row["payload_json"] or "{}"))
             except Exception:
                 current = None
-        if current is not None:
-            if (
-                current.profile_fingerprint != incoming.profile_fingerprint
-                or current.expires_at <= time.time()
-            ):
+        if current is not None and current.profile_fingerprint != incoming.profile_fingerprint:
+            # Profile fingerprints describe ranking context, not ownership of
+            # the durable radio supply. Keep the reservoir/cursors across
+            # profile snapshots; the next selection applies the current taste
+            # filter. Only reject a genuinely older completion.
+            if float(incoming.generated_at or 0.0) < float(current.generated_at or 0.0):
                 connection.rollback()
                 return False
         if current is None:
-            merged = incoming
+            incoming_fallback = float(incoming.generated_at or merge_now)
+            merged = replace(
+                incoming,
+                generated_at=max(float(incoming.generated_at or 0), merge_now),
+                expires_at=max(
+                    float(incoming.expires_at or 0),
+                    merge_now + RADIO_INVENTORY_TTL_SECONDS,
+                ),
+                cards=[
+                    stamped_card(card, incoming_fallback)
+                    for card in incoming.cards or []
+                ],
+                reservoir_cards=[
+                    stamped_card(card, incoming_fallback)
+                    for card in incoming.reservoir_cards or incoming.cards or []
+                ],
+            )
         else:
             by_id: Dict[str, Dict[str, Any]] = {}
             order: List[str] = []
-            current_reservoir = list(current.reservoir_cards or current.cards or [])
-            incoming_reservoir = list(incoming.reservoir_cards or incoming.cards or [])
+            current_reservoir = [
+                stamped_card(card, float(current.generated_at or 0.0))
+                for card in current.reservoir_cards or current.cards or []
+            ]
+            incoming_reservoir = [
+                stamped_card(card, float(incoming.generated_at or merge_now))
+                for card in incoming.reservoir_cards or incoming.cards or []
+            ]
             current_selected_ids = {
                 str(card.get("id") or "").strip()
                 for card in current.cards or []
@@ -559,6 +878,9 @@ def merge_store_artist_radio_inventory(
                     "exploratory",
                 }
 
+            def is_mix(card: Dict[str, Any]) -> bool:
+                return str(card.get("radio_mode") or "").strip() == "multi_artist_mix"
+
             # Fresh discovery supply gets first claim on bounded reserve slots;
             # the currently selected slice is then pinned before older excess
             # familiar cards. This cannot mutate active feed artifacts, but it
@@ -566,6 +888,8 @@ def merge_store_artist_radio_inventory(
             ordered_candidates = [
                 *[card for card in incoming_reservoir if is_discovery(card)],
                 *[card for card in current_reservoir if is_discovery(card)],
+                *[card for card in incoming_reservoir if is_mix(card)],
+                *[card for card in current_reservoir if is_mix(card)],
                 *[
                     card
                     for card in current_reservoir
@@ -596,8 +920,23 @@ def merge_store_artist_radio_inventory(
                 if card_id not in by_id:
                     order.append(card_id)
                     by_id[card_id] = candidate
-                elif len(tracks) > len(by_id[card_id].get("tracks") or []):
-                    by_id[card_id] = candidate
+                else:
+                    previous = by_id[card_id]
+                    first_verified_at = min(
+                        float(previous.get("first_verified_at") or merge_now),
+                        float(candidate.get("first_verified_at") or merge_now),
+                    )
+                    last_verified_at = max(
+                        float(previous.get("last_verified_at") or 0.0),
+                        float(candidate.get("last_verified_at") or 0.0),
+                    )
+                    if len(tracks) > len(previous.get("tracks") or []):
+                        by_id[card_id] = candidate
+                    by_id[card_id]["first_verified_at"] = first_verified_at
+                    by_id[card_id]["last_verified_at"] = max(
+                        last_verified_at,
+                        first_verified_at,
+                    )
             reservoir = [by_id[card_id] for card_id in order[:RADIO_RESERVOIR_MAX_CARDS]]
             progress = dict((incoming.diagnostics or {}).get("radio_expansion_progress") or {})
             prior_progress = dict((current.diagnostics or {}).get("radio_expansion_progress") or {})
@@ -618,16 +957,54 @@ def merge_store_artist_radio_inventory(
                 # Keep the durable revision and all cursor/request fields
                 # from the newer completion; discard stale worker progress.
                 prior_progress["progress_revision"] = current_revision
+            current_own_counts = {
+                str(key).strip().casefold(): int(value or 0)
+                for key, value in dict(
+                    (current.diagnostics or {}).get("own_track_count_by_seed")
+                    or {}
+                ).items()
+                if str(key).strip()
+            }
+            incoming_own_counts = {
+                str(key).strip().casefold(): int(value or 0)
+                for key, value in dict(
+                    (incoming.diagnostics or {}).get("own_track_count_by_seed")
+                    or {}
+                ).items()
+                if str(key).strip()
+            }
+            merged_own_counts = {
+                key: max(
+                    int(current_own_counts.get(key) or 0),
+                    int(incoming_own_counts.get(key) or 0),
+                )
+                for key in set(current_own_counts) | set(incoming_own_counts)
+            }
             merged = ArtistRadioInventory(
                 user_scope_id=current.user_scope_id,
-                profile_fingerprint=current.profile_fingerprint,
-                generated_at=current.generated_at,
-                expires_at=current.expires_at,
-                generation_id=current.generation_id,
-                cards=list(current.cards or []),
+                profile_fingerprint=incoming.profile_fingerprint or current.profile_fingerprint,
+                generated_at=max(current.generated_at, incoming.generated_at),
+                expires_at=max(time.time() + RADIO_INVENTORY_TTL_SECONDS, incoming.expires_at),
+                generation_id=current.generation_id or incoming.generation_id,
+                # ``cards`` is the publishable visible rotation, while
+                # ``reservoir_cards`` is only its larger source pool. Keeping
+                # an old empty selection here permanently trapped an otherwise
+                # qualified reservoir in ``is_ready == False``.
+                cards=[
+                    stamped_card(
+                        card,
+                        float(incoming.generated_at or current.generated_at or merge_now),
+                    )
+                    for card in incoming.cards or current.cards or []
+                ],
                 reservoir_cards=reservoir,
                 diagnostics={
                     **dict(current.diagnostics or {}),
+                    "radio_supply_funnel": dict(
+                        (incoming.diagnostics or {}).get("radio_supply_funnel")
+                        or (current.diagnostics or {}).get("radio_supply_funnel")
+                        or {}
+                    ),
                     "reservoir_size": len(reservoir),
                     "reservoir_merged_size": len(reservoir),
                     "reservoir_expansion_applied": True,
@@ -645,9 +1022,27 @@ def merge_store_artist_radio_inventory(
                         ),
                         0,
                     ),
+                    "exposure_deficit": int(
+                        (incoming.diagnostics or {}).get("exposure_deficit") or 0
+                    ),
+                    "own_track_count_by_seed": merged_own_counts,
                     "radio_expansion_progress": prior_progress,
                 },
             )
+        # Always materialize the visible 10-15 card rotation from the merged
+        # reservoir before publication. This is local/deterministic and never
+        # opens provider or artwork work. It also repairs older persisted
+        # inventories whose reservoir was populated while ``cards`` remained
+        # empty.
+        selected = select_radio_rotation(
+            merged,
+            epoch=max(
+                int((merged.diagnostics or {}).get("rotation_epoch") or 0),
+                0,
+            ),
+        )
+        if selected is not None and selected.is_ready:
+            merged = selected
         connection.execute(
             """INSERT INTO recommendation_feature_store(namespace, entity_id, model_id, payload_json, updated_at)
             VALUES (?, ?, ?, ?, ?)
@@ -703,15 +1098,17 @@ def build_artist_radio_inventory(
 
     for track in taste.full_history_tracks:
         name = artist_name(track)
+        # A single historical play is not strong evidence of familiarity.
+        # Keep it available as discovery supply, while repeated/completed or
+        # explicitly saved/favourite tracks remain familiar anchors.
+        play_count = float(track.get("play_count") or 0)
         engagement = (
             (2.5 if track.get("is_favorite") is True else 0.0)
             + (1.5 if track.get("in_library") is True or track.get("saved") is True else 0.0)
             + (1.0 if track.get("completed") is True else 0.0)
         )
-        add_seed(
-            name,
-            2.0 + engagement + min(float(track.get("play_count") or 0), 20.0) * 0.35,
-        )
+        if engagement > 0.0 or play_count >= 2.0:
+            add_seed(name, 2.0 + engagement + min(play_count, 20.0) * 0.35)
     for name in taste.top_artists:
         add_seed(name, 5.0)
     for name in taste.artist_hints:
@@ -870,6 +1267,23 @@ def build_artist_radio_inventory(
                 or ""
             ).strip(),
         }
+        for provenance_key in (
+            "radio_discovery_provenance",
+            "relationship_provenance",
+            "radio_catalog_role",
+        ):
+            if item.get(provenance_key):
+                artwork_record[provenance_key] = item.get(provenance_key)
+        provenance_value = str(
+            item.get("radio_discovery_provenance")
+            or item.get("relationship_provenance")
+            or item.get("radio_catalog_role")
+            or ""
+        ).casefold()
+        if provenance_value in {"artist_graph", "related", "relationship", "neighbor", "neighbor_artist"}:
+            artwork_record["seed_affinity"] = "related"
+        elif provenance_value in {"popularity", "discovery_universe", "exploratory"}:
+            artwork_record["seed_affinity"] = "exploratory"
         candidate_thumbnail = str(item.get("artist_thumbnail") or "").strip()
         if candidate_thumbnail.startswith(("http://", "https://")):
             artwork_record.setdefault("artwork_source_url", candidate_thumbnail)
@@ -904,14 +1318,48 @@ def build_artist_radio_inventory(
     ]
     rotation_epoch = max(int(getattr(taste, "rotation_epoch", 0) or 0), 0)
     direct_seeds = _rotated(direct_seeds, rotation_epoch * 3)
-    enforce_direct_ratio = len(direct_seeds) >= 5
     seeds = [(key, "direct") for key in direct_seeds if key in catalog_by_seed]
     catalog_seeds = [key for key in catalog_by_seed if key not in direct_scores]
+
+    def catalog_seed_affinity(seed_key: str) -> str:
+        values = catalog_by_seed.get(seed_key, [])
+        provenance = {
+            str(
+                item.get("radio_discovery_provenance")
+                or item.get("discovery_origin")
+                or ""
+            ).strip().casefold()
+            for item in values
+        }
+        if provenance & {
+            "popularity",
+            "collaborative",
+            "genre_mood",
+            "ytmusic_home",
+            "exploratory",
+            "broad_global",
+        } or any(value.startswith("lane_") for value in provenance):
+            return "exploratory"
+        if provenance & {
+            "artist_graph",
+            "related",
+            "relationship",
+            "neighbor",
+            "neighbor_artist",
+            "similarity",
+        }:
+            return "related"
+        if any(
+            _artist_key(item.get("related_to_artist"))
+            or item.get("artist_graph")
+            or item.get("source") == "artist_graph"
+            for item in values
+        ):
+            return "related"
+        return "exploratory"
+
     seeds.extend(
-        (key, "related" if any(
-            _artist_key(item.get("related_to_artist")) or item.get("artist_graph") or item.get("source") == "artist_graph"
-            for item in catalog_by_seed.get(key, [])
-        ) else "exploratory")
+        (key, catalog_seed_affinity(key))
         for key in _rotated(catalog_seeds, rotation_epoch * 2)
     )
     qualified_independent_seed_keys = {
@@ -926,6 +1374,7 @@ def build_artist_radio_inventory(
         )
         >= POPULAR_RADIO_CARD_MIN_TRACKS
     }
+    now = time.time()
     cards: List[Dict[str, Any]] = []
     visible_used: set[str] = set()
     prior_full_sets: List[set[str]] = []
@@ -934,10 +1383,11 @@ def build_artist_radio_inventory(
     similar_cards = 0
     rejected: Dict[str, int] = {}
 
+    seen_seed_identities: set[str] = set()
     for seed_key, affinity in seeds:
         # Keep a bounded multi-rotation reservoir.  A later successor selects
         # from this durable supply while excluding active/queued identities.
-        if len(cards) >= RADIO_RESERVOIR_MAX_CARDS:
+        if len(cards) >= RADIO_RESERVOIR_MAX_CARDS - 2:
             break
         catalog = catalog_by_seed.get(seed_key, [])
         own = sorted(
@@ -980,7 +1430,18 @@ def build_artist_radio_inventory(
             rejected[reason] = rejected.get(reason, 0) + 1
             continue
         full_set = {_track_key(item) for item in selected if _track_key(item)}
-        card_id = f"radio:artist_inventory:{seed_key}"
+        seed_identity = artist_identity_by_key.get(seed_key, "")
+        if not seed_identity:
+            for candidate_item in selected:
+                if _artist_key(artist_name(candidate_item)) == seed_key:
+                    seed_identity = _artist_identity(candidate_item)
+                    if seed_identity:
+                        break
+        canonical_seed_key = seed_identity or seed_key
+        if canonical_seed_key in seen_seed_identities:
+            rejected["canonical_artist_alias"] = rejected.get("canonical_artist_alias", 0) + 1
+            continue
+        card_id = f"radio:artist_inventory:{canonical_seed_key}"
         if excluded_card_ids and card_id in excluded_card_ids:
             continue
         if excluded_track_ids and full_set & excluded_track_ids:
@@ -1042,6 +1503,8 @@ def build_artist_radio_inventory(
                 "artwork_owner_token": thumbnail_token,
                 "seed_affinity": affinity,
                 "radio_mode": "artist_inventory",
+                "first_verified_at": now,
+                "last_verified_at": now,
                 "tracks": selected,
                 "items": selected,
                 "track_count": len(selected),
@@ -1055,6 +1518,7 @@ def build_artist_radio_inventory(
                 ],
             }
         )
+        seen_seed_identities.add(canonical_seed_key)
         if affinity == "direct":
             direct_cards += 1
         elif affinity == "related":
@@ -1062,23 +1526,57 @@ def build_artist_radio_inventory(
         else:
             similar_cards += 1
 
-    if enforce_direct_ratio and cards and direct_cards / len(cards) < 0.60:
-        direct_only = [card for card in cards if card.get("seed_affinity") == "direct"]
-        non_direct = [card for card in cards if card.get("seed_affinity") != "direct"]
-        max_total = min(
-            int(len(direct_only) / 0.60),
-            RADIO_RESERVOIR_MAX_CARDS,
-        )
-        cards = [*direct_only, *non_direct[: max(max_total - len(direct_only), 0)]]
-        direct_cards = len(direct_only)
-        backbone_cards = sum(card.get("seed_affinity") == "related" for card in cards)
-        similar_cards = sum(card.get("seed_affinity") == "exploratory" for card in cards)
-    now = time.time()
+    # Familiar artists naturally lead the row through scoring/order, but do
+    # not discard qualified related/exploratory cards to satisfy an arbitrary
+    # ratio. Discovery supply is the contract that prevents stale reshuffles.
     discovery_cards = sum(
         card.get("seed_affinity") in {"related", "exploratory"}
         for card in cards
     )
-    discovery_deficit = max(RADIO_DISCOVERY_RESERVE_TARGET_CARDS - discovery_cards, 0)
+    # Add a small, deterministic pair of multi-artist mixes from already
+    # qualified cards.  These are synthetic queue identities (never artist
+    # identities) and retain the source cards' verified artwork/playability.
+    mix_sources = [
+        card for card in cards
+        if str(card.get("seed_artist_identity") or "").strip()
+        and str(card.get("thumbnail") or "").startswith("/artist_artwork/")
+        and len(card.get("tracks") or []) >= POPULAR_RADIO_CARD_MIN_TRACKS
+    ]
+    for offset in (0, 2):
+        if len(mix_sources) < offset + 2 or len(cards) >= RADIO_RESERVOIR_MAX_CARDS:
+            break
+        left, right = mix_sources[offset], mix_sources[offset + 1]
+        source_ids = [
+            str(left["seed_artist_identity"]), str(right["seed_artist_identity"])
+        ]
+        mix_id = "mix:" + "+".join(sorted(source_ids)).casefold()
+        if any(str(card.get("seed_artist_identity") or "").casefold() == mix_id for card in cards):
+            continue
+        tracks = list((left.get("tracks") or [])[:6]) + list((right.get("tracks") or [])[:6])
+        mix_discovery = left.get("seed_affinity") in {"related", "exploratory"} or right.get("seed_affinity") in {"related", "exploratory"}
+        cards.append({
+            "id": "radio:multi_artist_mix:" + mix_id,
+            "title": f"{left.get('artist_name') or 'Artist'} + {right.get('artist_name') or 'Artist'} Mix",
+            "radio_title": f"{left.get('artist_name') or 'Artist'} + {right.get('artist_name') or 'Artist'} Mix",
+            "artist_name": " + ".join((left.get("artist_name") or "Artist", right.get("artist_name") or "Artist")),
+            "seed_artist_identity": mix_id,
+            "seed_artist_identities": source_ids,
+            "seed_affinity": "exploratory" if mix_discovery else "direct",
+            "radio_mode": "multi_artist_mix",
+            "first_verified_at": now,
+            "last_verified_at": now,
+            "tracks": tracks,
+            "items": tracks,
+            "track_count": len(tracks),
+            "thumbnail": left.get("thumbnail"),
+            "collage_images": [left.get("thumbnail"), right.get("thumbnail")],
+            "collage_artists": [left.get("artist_name"), right.get("artist_name")],
+            "artwork_owner_identity": source_ids[0],
+            "artwork_owner_token": left.get("seed_artist_identity_token", ""),
+            "seed_artist_identity_token": "",
+        })
+        discovery_cards += int(mix_discovery)
+    discovery_deficit = max(RADIO_VISIBLE_DISCOVERY_TARGET - discovery_cards, 0)
     return ArtistRadioInventory(
         user_scope_id=taste.user_scope_id,
         profile_fingerprint=taste.profile_key,
@@ -1087,20 +1585,20 @@ def build_artist_radio_inventory(
         generation_id=str(uuid.uuid4()),
         cards=cards,
         reservoir_cards=list(cards),
-        artwork_repair_records=list(artwork_repair_records.values())[:16],
+        artwork_repair_records=list(artwork_repair_records.values())[:36],
         diagnostics={
             "card_count": len(cards),
             "reservoir_size": len(cards),
-            "reservoir_target_size": RADIO_RESERVOIR_TARGET_CARDS,
+            "reservoir_target_size": RADIO_WORKING_RESERVOIR_TARGET_CARDS,
             "reservoir_replenishment_needed": (
-                len(cards) < RADIO_RESERVOIR_TARGET_CARDS
+                len(cards) < RADIO_WORKING_RESERVOIR_TARGET_CARDS
                 or discovery_deficit > 0
             ),
             "direct_card_count": direct_cards,
             "related_card_count": sum(card.get("seed_affinity") == "related" for card in cards),
             "exploratory_card_count": sum(card.get("seed_affinity") == "exploratory" for card in cards),
             "discovery_card_count": discovery_cards,
-            "discovery_target_count": RADIO_DISCOVERY_RESERVE_TARGET_CARDS,
+            "discovery_target_count": RADIO_VISIBLE_DISCOVERY_TARGET,
             "discovery_deficit": discovery_deficit,
             "backbone_card_count": backbone_cards,
             "similar_card_count": similar_cards,
@@ -1117,7 +1615,7 @@ def build_artist_radio_inventory(
             ),
             "artwork_repair_scheduled_count": len(artwork_repair_records),
             "artwork_repair_pending_count": len(artwork_repair_records),
-            "artwork_contract_ready": len(cards) >= 12
+            "artwork_contract_ready": len(cards) >= 10
             and all(
                 str(card.get("thumbnail") or "").startswith(
                     "/artist_artwork/"
@@ -1142,6 +1640,13 @@ def build_artist_radio_inventory(
                 if len({_track_key(item) for item in values if _track_key(item)})
                 < POPULAR_RADIO_CARD_MIN_TRACKS
             },
+            "own_track_count_by_seed": {
+                seed: len({
+                    _track_key(item) for item in values
+                    if _track_key(item) and _artist_key(artist_name(item)) == seed
+                })
+                for seed, values in catalog_seed_items.items()
+            },
         },
     )
 
@@ -1151,10 +1656,29 @@ def radio_card_candidates(inventory: ArtistRadioInventory | None) -> List[Discov
         return []
     # The durable inventory may contain several rotations; the home row keeps
     # the product contract of a bounded 8-12 card slice.
-    visible_cards = list(inventory.cards or [])[:20]
+    visible_cards = list(inventory.cards or [])[:15]
+    diag = dict(inventory.diagnostics or {})
     return [
         DiscoveryCandidate(
-            item=dict(card),
+            item={
+                **dict(card),
+                "radio_supply_generation_id": inventory.generation_id,
+                "radio_discovery_cursor_next": int(
+                    (diag.get("radio_expansion_progress") or {}).get(
+                        "radio_discovery_cursor_next", 0
+                    )
+                ),
+                "fresh_rotation": bool(diag.get("fresh_rotation")),
+                "radio_novel_identity_count": int(diag.get("novel_identity_count") or 0),
+                "radio_selected_discovery_count": int(
+                    diag.get("selected_discovery_card_count")
+                    or diag.get("selected_discovery_count")
+                    or 0
+                ),
+                "rotation_pending": bool(
+                    diag.get("rotation_pending") or diag.get("radio_rotation_pending")
+                ),
+            },
             source="artist_radio_inventory",
             score=10.0,
             reasons=["independent_artist_radio_inventory"],
@@ -1169,6 +1693,8 @@ def select_radio_rotation(
     *,
     excluded_card_ids: set[str] | None = None,
     excluded_track_ids: set[str] | None = None,
+    comparison_card_ids: set[str] | None = None,
+    known_artist_identities: set[str] | None = None,
     epoch: int = 0,
 ) -> ArtistRadioInventory | None:
     """Derive a deterministic visible slice from the persisted reservoir.
@@ -1185,6 +1711,44 @@ def select_radio_rotation(
     reservoir = list(inventory.reservoir_cards or inventory.cards or [])
     excluded_card_ids = excluded_card_ids or set()
     excluded_track_ids = excluded_track_ids or set()
+    exposure_ledger = {
+        _artist_key(value)
+        for value in (inventory.diagnostics or {}).get(
+            "popular_radio_exposure_ledger"
+        ) or []
+        if _artist_key(value)
+    }
+    known_artist_keys = set(exposure_ledger)
+    for value in known_artist_identities or set():
+        normalized = _artist_key(value)
+        if not normalized:
+            continue
+        known_artist_keys.add(normalized)
+        if normalized.startswith("artist:"):
+            known_artist_keys.add(normalized.removeprefix("artist:"))
+        elif not normalized.startswith(
+            ("provider:artist:", "musicbrainz:artist:", "mix:")
+        ):
+            known_artist_keys.add(f"artist:{normalized}")
+
+    def is_genuine_discovery(candidate: tuple[Any, ...]) -> bool:
+        card = candidate[0]
+        mode = str(card.get("radio_mode") or "").strip().casefold()
+        if mode in {"multi_artist_mix", "mix", "artist_mix"}:
+            return False
+        affinity = str(card.get("seed_affinity") or "").strip().casefold()
+        return bool(
+            affinity in {"related", "exploratory", "similar"}
+            and not (_radio_card_artist_aliases(card) & known_artist_keys)
+        )
+
+    def first_verified_at(candidate: tuple[Any, ...]) -> float:
+        card = candidate[0]
+        return float(
+            card.get("first_verified_at")
+            or card.get("last_verified_at")
+            or 0.0
+        )
     novel = []
     fallback = []
     for card in reservoir:
@@ -1198,16 +1762,18 @@ def select_radio_rotation(
             continue
         # Do not weaken the card contract while selecting.  Invalid cards are
         # never admitted as a fallback or counted as novelty.
+        is_mix = str(card.get("radio_mode") or "").strip().casefold() in {"multi_artist_mix", "mix", "artist_mix"}
+        mix_sources = [str(value).strip() for value in (card.get("seed_artist_identities") or []) if str(value).strip()]
+        valid_mix = is_mix and len(set(mix_sources)) >= 2 and sum(
+            str(value or "").startswith("/artist_artwork/") for value in (card.get("collage_images") or [])
+        ) >= 2
         if (
             not str(card.get("thumbnail") or "").startswith("/artist_artwork/")
             or not str(card.get("seed_artist_identity") or "").strip()
-            or not str(card.get("artwork_owner_token") or "").strip()
-            or str(card.get("artwork_owner_token") or "").strip()
-            != str(card.get("seed_artist_identity_token") or "").strip()
-            or str(card.get("seed_artist_identity_token") or "").strip()
-            != artist_artwork_token(card.get("seed_artist_identity"))
-            or str(card.get("artwork_owner_identity") or "").strip()
-            != str(card.get("seed_artist_identity") or "").strip()
+            or (not valid_mix and (not str(card.get("artwork_owner_token") or "").strip()
+            or str(card.get("artwork_owner_token") or "").strip() != str(card.get("seed_artist_identity_token") or "").strip()
+            or str(card.get("seed_artist_identity_token") or "").strip() != artist_artwork_token(card.get("seed_artist_identity"))
+            or str(card.get("artwork_owner_identity") or "").strip() != str(card.get("seed_artist_identity") or "").strip()))
             or not any(
                 str(value or "").startswith("/artist_artwork/")
                 for value in card.get("collage_images") or []
@@ -1216,11 +1782,19 @@ def select_radio_rotation(
         ):
             continue
         track_ids = {_track_key(track) for track in tracks}
-        card_overlap = cid in excluded_card_ids
+        card_identity = _radio_card_identity(card)
+        active_overlap = cid in excluded_card_ids
+        historical_overlap = card_identity in exposure_ledger
         track_overlap = track_ids & excluded_track_ids
-        overlap_score = int(card_overlap) + len(track_overlap)
-        candidate = (dict(card), tracks, track_overlap, card_overlap)
-        if not card_overlap and not track_overlap:
+        overlap_score = (1000 * int(active_overlap)) + len(track_overlap)
+        candidate = (
+            dict(card),
+            tracks,
+            track_overlap,
+            active_overlap,
+            historical_overlap,
+        )
+        if not active_overlap and not track_overlap:
             novel.append(candidate)
         else:
             fallback.append((overlap_score, candidate))
@@ -1229,38 +1803,87 @@ def select_radio_rotation(
     # consumed before controlled fallbacks; fallback score minimizes repeated
     # card/track identities instead of failing the entire feed.
     epoch_value = max(int(epoch or 0), 0)
-    novel.sort(key=lambda value: str(value[0].get("id") or ""))
-    if novel:
-        offset = epoch_value % len(novel)
-        novel = novel[offset:] + novel[:offset]
-    fallback.sort(key=lambda value: (value[0], str(value[1][0].get("id") or "")))
+    exposure_rank = {
+        _artist_key(value): index
+        for index, value in enumerate(
+            (inventory.diagnostics or {}).get("popular_radio_exposure_ledger") or []
+        )
+        if _artist_key(value)
+    }
+    novel.sort(
+        key=lambda value: (
+            int(value[4]),
+            -first_verified_at(value),
+            -int(exposure_rank.get(_radio_card_identity(value[0]), -1)),
+            str(value[0].get("id") or ""),
+        )
+    )
+    fallback.sort(
+        key=lambda value: (
+            value[0],
+            int(value[1][4]),
+            -first_verified_at(value[1]),
+            -int(exposure_rank.get(_radio_card_identity(value[1][0]), -1)),
+            str(value[1][0].get("id") or ""),
+        )
+    )
     fallback_candidates = [candidate for _score, candidate in fallback]
 
-    target_limit = min(20, 16 + (max(int(epoch or 0), 0) % 5))
+    target_limit = min(15, 12 + (max(int(epoch or 0), 0) % 4))
     discovery_novel = [
         candidate for candidate in novel
-        if str(candidate[0].get("seed_affinity") or "") in {"related", "exploratory"}
+        if is_genuine_discovery(candidate)
     ]
     familiar_novel = [candidate for candidate in novel if candidate not in discovery_novel]
     discovery_fallback = [
         candidate for candidate in fallback_candidates
-        if str(candidate[0].get("seed_affinity") or "") in {"related", "exploratory"}
+        if is_genuine_discovery(candidate)
     ]
     selected_candidates = [
-        *familiar_novel[: max(target_limit - RADIO_VISIBLE_DISCOVERY_MINIMUM, 0)],
-        *[ *discovery_novel, *discovery_fallback ][:RADIO_VISIBLE_DISCOVERY_MINIMUM],
+        *familiar_novel[: max(target_limit - RADIO_VISIBLE_DISCOVERY_TARGET, 0)],
+        *[ *discovery_novel, *discovery_fallback ][:RADIO_VISIBLE_DISCOVERY_TARGET],
     ]
     selected_candidates.extend(
         candidate for candidate in [*familiar_novel, *discovery_novel, *fallback_candidates]
         if candidate not in selected_candidates
     )
     selected_candidates = selected_candidates[:target_limit]
+    mixes = [candidate for candidate in [*novel, *fallback_candidates] if str(candidate[0].get("radio_mode") or "").strip().casefold() == "multi_artist_mix"]
+    # Reservoir generations retain old mixes. Selecting all of them can repeat
+    # source artists across mixes and fail the publication identity contract.
+    # Reserve two disjoint pairs, then fill with the already ranked artist cards.
+    mix_pair = next((
+        [left, right]
+        for index, left in enumerate(mixes)
+        for right in mixes[index + 1:]
+        if set(left[0].get("seed_artist_identities") or []).isdisjoint(
+            right[0].get("seed_artist_identities") or []
+        )
+    ), [])
+    artist_candidates = [
+        candidate for candidate in [*selected_candidates, *novel, *fallback_candidates]
+        if candidate not in mixes
+    ]
+    selected_candidates = list(mix_pair)
+    for candidate in artist_candidates:
+        if candidate not in selected_candidates:
+            selected_candidates.append(candidate)
+        if len(selected_candidates) >= target_limit:
+            break
+    selected_candidates.sort(
+        key=lambda value: (
+            -first_verified_at(value),
+            int(value[4]),
+            str(value[0].get("id") or ""),
+        )
+    )
     selected = []
     selected_novel_count = 0
     selected_fallback_count = 0
     selected_track_overlap_count = 0
     selected_card_overlap_count = 0
-    for card, tracks, track_overlap, card_overlap in selected_candidates:
+    selected_historical_exposure_count = 0
+    for card, tracks, track_overlap, active_overlap, historical_overlap in selected_candidates:
         # Rotate toward tracks not used by the active/queued feeds.  If the
         # card has fewer than the full target after filtering, retain its
         # verified tracks as a controlled, quality-preserving fallback.
@@ -1276,10 +1899,11 @@ def select_radio_rotation(
         card_copy["tracks"] = ordered
         card_copy["items"] = ordered
         selected.append(card_copy)
-        if card_overlap or track_overlap:
+        selected_historical_exposure_count += int(historical_overlap)
+        if active_overlap or track_overlap:
             selected_fallback_count += 1
             selected_track_overlap_count += len(track_overlap)
-            selected_card_overlap_count += int(card_overlap)
+            selected_card_overlap_count += int(active_overlap)
         else:
             selected_novel_count += 1
 
@@ -1287,25 +1911,65 @@ def select_radio_rotation(
     valid_count = len(novel) + len(fallback_candidates)
     diagnostics = dict(inventory.diagnostics or {})
     reservoir_discovery_count = sum(
-        str(card.get("seed_affinity") or "").strip()
-        in {"related", "exploratory"}
-        for card in reservoir
+        is_genuine_discovery((card,)) for card in reservoir
     )
     selected_discovery_count = sum(
-        str(card.get("seed_affinity") or "").strip()
-        in {"related", "exploratory"}
+        is_genuine_discovery((card,)) for card in selected
+    )
+    selected_affinity_discovery_count = sum(
+        str(card.get("seed_affinity") or "").strip().casefold()
+        in {"related", "exploratory", "similar"}
+        and str(card.get("radio_mode") or "").strip().casefold()
+        not in {"multi_artist_mix", "mix", "artist_mix"}
+        for card in selected
+    )
+    discovery_novel_ids = {
+        _radio_card_identity(candidate[0]) for candidate in discovery_novel
+    }
+    selected_discovery_novel_count = sum(
+        _radio_card_identity(card) in discovery_novel_ids
         for card in selected
     )
     discovery_deficit = max(
-        RADIO_DISCOVERY_RESERVE_TARGET_CARDS - reservoir_discovery_count,
+        RADIO_VISIBLE_DISCOVERY_TARGET - reservoir_discovery_count,
         0,
     )
+    reservoir_unexposed_count = sum(
+        _radio_card_identity(card) not in exposure_ledger
+        for card in reservoir
+        if isinstance(card, dict) and _radio_card_identity(card)
+    )
+    unexposed_deficit = max(
+        RADIO_UNEXPOSED_TARGET_CARDS - reservoir_unexposed_count,
+        0,
+    )
+    selected_ids = {
+        str(card.get("id") or "").strip() for card in selected if str(card.get("id") or "").strip()
+    }
+    selected_identity_ids = {
+        _radio_card_identity(card) for card in selected if _radio_card_identity(card)
+    }
+    comparison_ids = {
+        str(value).strip() for value in (comparison_card_ids if comparison_card_ids is not None else excluded_card_ids)
+        if str(value).strip()
+    }
+    comparison_identity_ids: set[str] = set()
+    for card in reservoir:
+        identity = _radio_card_identity(card)
+        if (
+            str(card.get("id") or "").strip() in comparison_ids
+            or identity in comparison_ids
+        ):
+            if identity:
+                comparison_identity_ids.add(identity)
+    novel_identity_count = len(selected_identity_ids - comparison_identity_ids)
     diagnostics.update({
         "reservoir_size": len(reservoir),
-        "reservoir_target_size": RADIO_RESERVOIR_TARGET_CARDS,
+        "reservoir_target_size": RADIO_WORKING_RESERVOIR_TARGET_CARDS,
         "reservoir_replenishment_needed": (
-            len(reservoir) < RADIO_RESERVOIR_TARGET_CARDS
+            len(reservoir) < RADIO_WORKING_RESERVOIR_TARGET_CARDS
             or discovery_deficit > 0
+            or unexposed_deficit > 0
         ),
         "available_valid_card_count": valid_count,
         "available_novel_card_count": len(novel),
@@ -1317,6 +1981,7 @@ def select_radio_rotation(
         "fallback_card_ratio": (selected_fallback_count / max(len(selected), 1)),
         "fallback_track_overlap_count": selected_track_overlap_count,
         "fallback_card_overlap_count": selected_card_overlap_count,
+        "historical_exposure_selected_count": selected_historical_exposure_count,
         "rotation_epoch": epoch_value,
         # Repairs are inputs to background enrichment, never a property of
         # the selected valid slice. Do not carry stale universe-wide counts
@@ -1327,15 +1992,35 @@ def select_radio_rotation(
         "reservoir_overlap_ratio": (
             overlap_count / max(len(reservoir), 1)
         ),
-        "visible_target_count": 16,
+        "visible_target_count": 12,
         "visible_selected_limit": target_limit,
-        "visible_minimum_count": 12,
-        "visible_maximum_count": 20,
+        "visible_minimum_count": 10,
+        "visible_maximum_count": 15,
         "reservoir_discovery_card_count": reservoir_discovery_count,
+        "reservoir_unexposed_card_count": reservoir_unexposed_count,
+        "unexposed_target_count": RADIO_UNEXPOSED_TARGET_CARDS,
+        "unexposed_deficit": unexposed_deficit,
+        "exposure_target_count": RADIO_UNEXPOSED_TARGET_CARDS,
+        "exposure_deficit": unexposed_deficit,
         "selected_discovery_card_count": selected_discovery_count,
-        "discovery_target_count": RADIO_DISCOVERY_RESERVE_TARGET_CARDS,
+        "selected_affinity_discovery_card_count": selected_affinity_discovery_count,
+        "known_artist_identity_count": len(known_artist_keys),
+        "selected_discovery_novel_count": selected_discovery_novel_count,
+        "visible_discovery_target_count": RADIO_VISIBLE_DISCOVERY_TARGET,
+        "visible_discovery_target_deficit": max(
+            RADIO_VISIBLE_DISCOVERY_TARGET - selected_discovery_count, 0
+        ),
+        "visible_discovery_fresh_deficit": max(
+            RADIO_VISIBLE_DISCOVERY_TARGET - selected_discovery_novel_count, 0
+        ),
+        "novel_identity_count": novel_identity_count,
+        "fresh_rotation": novel_identity_count >= min(RADIO_VISIBLE_DISCOVERY_MINIMUM, 4),
+        "exact_identity_set_reshuffle": bool(
+            selected_ids and comparison_ids and selected_ids == comparison_ids
+        ),
+        "discovery_target_count": RADIO_VISIBLE_DISCOVERY_TARGET,
         "discovery_deficit": discovery_deficit,
-        "reservoir_shortage": len(selected) < 12,
+        "reservoir_shortage": len(selected) < 10,
     })
     return ArtistRadioInventory(
         user_scope_id=inventory.user_scope_id,
@@ -1355,11 +2040,7 @@ def merge_radio_reservoirs(
     incoming: ArtistRadioInventory,
 ) -> ArtistRadioInventory:
     """Merge qualified local supply by stable card identity, bounded to 36."""
-    if (
-        existing is None
-        or existing.profile_fingerprint != incoming.profile_fingerprint
-        or existing.expires_at <= time.time()
-    ):
+    if existing is None:
         return incoming
     ordered_ids: List[str] = []
     by_id: Dict[str, Dict[str, Any]] = {}
@@ -1375,8 +2056,24 @@ def merge_radio_reservoirs(
             continue
         if card_id not in by_id:
             ordered_ids.append(card_id)
-        if card_id not in by_id:
             by_id[card_id] = dict(card)
+            continue
+        retained = by_id[card_id]
+        retained_first = float(
+            retained.get("first_verified_at")
+            or incoming.generated_at
+            or time.time()
+        )
+        candidate_first = float(
+            card.get("first_verified_at")
+            or existing.generated_at
+            or retained_first
+        )
+        retained["first_verified_at"] = min(retained_first, candidate_first)
+        retained["last_verified_at"] = max(
+            float(retained.get("last_verified_at") or retained_first),
+            float(card.get("last_verified_at") or candidate_first),
+        )
     reservoir = [
         by_id[card_id]
         for card_id in ordered_ids[:RADIO_RESERVOIR_MAX_CARDS]
@@ -1393,7 +2090,7 @@ def merge_radio_reservoirs(
         user_scope_id=incoming.user_scope_id,
         profile_fingerprint=incoming.profile_fingerprint,
         generated_at=max(existing.generated_at, incoming.generated_at),
-        expires_at=max(existing.expires_at, incoming.expires_at),
+        expires_at=max(time.time() + RADIO_INVENTORY_TTL_SECONDS, incoming.expires_at),
         generation_id=incoming.generation_id,
         cards=list(incoming.cards or []),
         reservoir_cards=reservoir,

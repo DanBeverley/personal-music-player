@@ -33,8 +33,8 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
   bool _startupHealthChecked = false;
   Timer? _backgroundRefreshTimer;
   Timer? _queueStatusTimer;
-  DateTime? _queueStatusDeadline;
   bool _queueStatusRequestInFlight = false;
+  String _activeArtifactFetchInFlight = '';
   Duration _queueStatusPollDelay = Duration.zero;
   Future<void> _feedOperationTail = Future<void>.value();
   String _backgroundRefreshKey = '';
@@ -291,13 +291,11 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
     if (!active) {
       _queueStatusTimer?.cancel();
       _queueStatusTimer = null;
-      _queueStatusDeadline = null;
       _queueStatusPollDelay = Duration.zero;
       return;
     }
     // Keep observing delayed/retry states until the backend reaches terminal
     // state; the active feed remains visible while this monitor is armed.
-    _queueStatusDeadline = null;
     if (_queueStatusTimer != null) return;
     _queueStatusTimer = Timer(_queueStatusPollDelay, () {
       _queueStatusTimer = null;
@@ -352,6 +350,25 @@ class RecommendationNotifier extends StateNotifier<RecommendationFeedState> {
             diagnostics: {...state.diagnostics, ...diagnostics},
             clearError: ready >= target,
           );
+          final activeArtifactId =
+              diagnostics['active_artifact_id']?.toString().trim() ?? '';
+          if (activeArtifactId.isNotEmpty &&
+              state.sessionId != activeArtifactId &&
+              _activeArtifactFetchInFlight != activeArtifactId) {
+            _activeArtifactFetchInFlight = activeArtifactId;
+            unawaited(_runSerialized(() async {
+              try {
+                await _refreshFromCurrentSignals(
+                  forceRefresh: false,
+                  promoteReadyOnLaunch: false,
+                );
+              } finally {
+                if (_activeArtifactFetchInFlight == activeArtifactId) {
+                  _activeArtifactFetchInFlight = '';
+                }
+              }
+            }));
+          }
           // A successful bounded wait either observed a revision or reached
           // its timeout. Re-arm immediately so there is no client-side gap
           // between Feed A and Feed B becoming ready.

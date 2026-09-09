@@ -884,11 +884,13 @@ def _recommendation_store_search_event(req: RecommendationSearchEventRequest):
             pass
     _recommendation_invalidate_collaborative_cache()
     try:
-        from ..discovery.feed_state import load_feed_state, mark_feed_dirty
+        from ..home_feed.scheduler import HomeJobScheduler
 
-        feed_state = load_feed_state(resolve_server(), user_scope_id)
-        if feed_state is not None:
-            mark_feed_dirty(resolve_server(), feed_state, "search_interaction")
+        HomeJobScheduler(resolve_server()).candidates(
+            req,
+            reason="signal_reconcile",
+            generation_hint=f"search:{event_id}",
+        )
     except Exception:
         pass
     return True
@@ -1173,11 +1175,13 @@ def _recommendation_store_interaction_event(req: RecommendationInteractionEventR
         except Exception:
             pass
     try:
-        from ..discovery.feed_state import load_feed_state, mark_feed_dirty
+        from ..home_feed.scheduler import HomeJobScheduler
 
-        feed_state = load_feed_state(resolve_server(), user_scope_id)
-        if feed_state is not None:
-            mark_feed_dirty(resolve_server(), feed_state, f"interaction:{event_type}")
+        HomeJobScheduler(resolve_server()).candidates(
+            req,
+            reason="signal_reconcile",
+            generation_hint=f"interaction:{event_id}",
+        )
     except Exception:
         pass
     return True
@@ -2142,61 +2146,137 @@ def _recommendation_worker_heartbeat(worker_mode: str, status: str):
 
 
 @_with_server_globals
+def _run_home_feed_jobs(max_jobs: int = 8) -> int:
+    """Drain a bounded batch through the four independently owned Home lanes."""
+
+    from auralis_backend.home_feed.worker import run_home_feed_lanes
+
+    results = run_home_feed_lanes(resolve_server(), max_jobs=max_jobs)
+    _recommendation_sync_state_set("home_worker_last_run_at", str(time.time()))
+    _recommendation_sync_state_set("home_worker_last_batch_count", str(len(results)))
+    return len(results)
+
+
+def _home_feed_lane_loop(server, stop_event, lane_name, job_types, worker_mode):
+    """Continuously drain one owned lane without waiting for provider lanes."""
+
+    from auralis_backend.home_feed.worker import HomeFeedWorker
+
+    worker = HomeFeedWorker(
+        server,
+        worker_id=f"{worker_mode}:{os.getpid()}:home-feed:{lane_name}",
+        job_types=tuple(job_types),
+    )
+    while not stop_event.is_set():
+        try:
+            result = worker.run_once()
+        except Exception as exc:
+            _recommendation_sync_state_set(
+                f"home_worker_{lane_name}_last_error",
+                f"{type(exc).__name__}:{str(exc)[:500]}",
+            )
+            stop_event.wait(1.0)
+            continue
+        if result.claimed:
+            _recommendation_sync_state_set(
+                f"home_worker_{lane_name}_last_run_at",
+                str(time.time()),
+            )
+            continue
+        stop_event.wait(0.25 if lane_name == "compose" else 1.0)
+
+
+@_with_server_globals
 def _recommendation_scheduler_loop(worker_mode: str = "embedded"):
+    from threading import Thread
+    from auralis_backend.home_feed.worker import HOME_WORKER_LANES
+
     next_sync_at = 0.0
     next_train_at = 0.0
     next_eval_at = 0.0
+    next_charts_at = 0.0
     minimum_sync_interval = max(30, RECOMMENDATION_SYNC_INTERVAL_SECONDS)
     minimum_train_interval = max(60, RECOMMENDATION_TRAIN_INTERVAL_SECONDS)
     minimum_eval_interval = max(60, RECOMMENDATION_EXPERIMENT_EVAL_INTERVAL_SECONDS)
     _recommendation_sync_state_set("worker_started_at", str(time.time()))
     _recommendation_worker_heartbeat(worker_mode, "running")
-    while not recommendation_scheduler_stop.is_set():
-        now = time.time()
-        _recommendation_worker_heartbeat(worker_mode, "running")
-        should_sync = now >= next_sync_at
-        should_train = now >= next_train_at
-        should_evaluate = RECOMMENDATION_PROMOTE_WINNER and now >= next_eval_at
-        if should_sync or should_train:
-            _recommendation_run_maintenance_cycle(
-                force_sync=should_sync,
-                force_train=should_train,
-                run_experiment_evaluation=should_evaluate,
-            )
-            completed_at = time.time()
-            if should_sync:
-                next_sync_at = completed_at + minimum_sync_interval
-            if should_train:
-                next_train_at = completed_at + minimum_train_interval
-            if should_evaluate:
+    server = resolve_server()
+    lane_threads = [
+        Thread(
+            target=_home_feed_lane_loop,
+            args=(
+                server,
+                recommendation_scheduler_stop,
+                lane_name,
+                job_types,
+                worker_mode,
+            ),
+            name=f"home-feed-{lane_name}",
+            daemon=True,
+        )
+        for lane_name, job_types in HOME_WORKER_LANES
+    ]
+    for thread in lane_threads:
+        thread.start()
+    try:
+        while not recommendation_scheduler_stop.is_set():
+            now = time.time()
+            _recommendation_worker_heartbeat(worker_mode, "running")
+            should_sync = now >= next_sync_at
+            should_train = now >= next_train_at
+            should_evaluate = RECOMMENDATION_PROMOTE_WINNER and now >= next_eval_at
+            if now >= next_charts_at:
+                try:
+                    from ..charts import get_charts_service
+
+                    get_charts_service(server).ensure_demand_refreshes()
+                except Exception:
+                    traceback.print_exc()
+                next_charts_at = now + 30 * 60
+            if should_sync or should_train:
+                _recommendation_run_maintenance_cycle(
+                    force_sync=should_sync,
+                    force_train=should_train,
+                    run_experiment_evaluation=should_evaluate,
+                )
+                completed_at = time.time()
+                if should_sync:
+                    next_sync_at = completed_at + minimum_sync_interval
+                if should_train:
+                    next_train_at = completed_at + minimum_train_interval
+                if should_evaluate:
+                    next_eval_at = completed_at + minimum_eval_interval
+            elif should_evaluate:
+                evaluation = _recommendation_evaluate_experiment()
+                completed_at = time.time()
                 next_eval_at = completed_at + minimum_eval_interval
-        elif should_evaluate:
-            evaluation = _recommendation_evaluate_experiment()
-            completed_at = time.time()
-            next_eval_at = completed_at + minimum_eval_interval
-            _recommendation_sync_state_set(
-                "experiment_last_evaluated_at",
-                str(completed_at),
-            )
-            _recommendation_sync_state_set(
-                "experiment_last_evaluation_reason",
-                _recommendation_trim_text(evaluation.get("reason", "")),
-            )
-            if evaluation.get("promoted"):
                 _recommendation_sync_state_set(
-                    "experiment_last_promoted_at",
+                    "experiment_last_evaluated_at",
                     str(completed_at),
                 )
-        sleep_for = max(
-            5.0,
-            min(
-                next_sync_at - time.time(),
-                next_train_at - time.time(),
-                next_eval_at - time.time() if RECOMMENDATION_PROMOTE_WINNER else 30.0,
-                30.0,
-            ),
-        )
-        recommendation_scheduler_stop.wait(sleep_for)
+                _recommendation_sync_state_set(
+                    "experiment_last_evaluation_reason",
+                    _recommendation_trim_text(evaluation.get("reason", "")),
+                )
+                if evaluation.get("promoted"):
+                    _recommendation_sync_state_set(
+                        "experiment_last_promoted_at",
+                        str(completed_at),
+                    )
+            sleep_for = max(
+                1.0,
+                min(
+                    next_sync_at - time.time(),
+                    next_train_at - time.time(),
+                    next_eval_at - time.time() if RECOMMENDATION_PROMOTE_WINNER else 30.0,
+                    next_charts_at - time.time(),
+                    5.0,
+                ),
+            )
+            recommendation_scheduler_stop.wait(sleep_for)
+    finally:
+        for thread in lane_threads:
+            thread.join(timeout=2.0)
     _recommendation_worker_heartbeat(worker_mode, "stopped")
 
 

@@ -6,7 +6,10 @@ import 'package:path_provider/path_provider.dart';
 import 'proxy_runtime.dart';
 import 'recommendation_feed_models.dart';
 
-const int homeFeedCacheVersion = 10;
+const int homeFeedCacheVersion = 12;
+// Version 11 may contain a four-row progressive artifact and is intentionally
+// excluded after restoring complete-feed publication.
+const Set<int> readableHomeFeedCacheVersions = <int>{10, 12};
 const Duration homeFeedCacheTtl = Duration(hours: 18);
 
 String _safeCacheSegment(String value) =>
@@ -14,7 +17,8 @@ String _safeCacheSegment(String value) =>
 
 Future<File> _homeFeedCacheFile(String scopeId) async {
   final dir = await getApplicationDocumentsDirectory();
-  final scope = _safeCacheSegment(scopeId.trim().isNotEmpty ? scopeId : 'guest');
+  final scope =
+      _safeCacheSegment(scopeId.trim().isNotEmpty ? scopeId : 'guest');
   return File('${dir.path}/users/$scope/home_feed_cache.json');
 }
 
@@ -25,10 +29,22 @@ bool shouldCacheHomeFeed(RecommendationFeedState feedState) {
     'built_and_promoted',
   };
   final failedContracts = feedState.diagnostics['artifact_failed_contracts'];
+  final rowKinds = feedState.rows.map((row) => row.kind).toSet();
+  const requiredRows = <String>{
+    'todays_pick',
+    'featured_new_albums',
+    'made_for_you',
+    'popular_radio',
+    'recommended_albums',
+    'recommended_artists',
+    'quiet_picks',
+  };
   return feedState.hasRows &&
+      rowKinds.containsAll(requiredRows) &&
       feedState.feedVersion > 0 &&
       activeActions.contains(feedState.feedAction) &&
-      feedState.diagnostics['feed_state_version'] == 'feed-state-v2' &&
+      const <String>{'feed-state-v2', 'home-repository-v2'}
+          .contains(feedState.diagnostics['feed_state_version']) &&
       feedState.diagnostics['artifact_status'] == 'servable' &&
       (failedContracts is! List || failedContracts.isEmpty);
 }
@@ -42,7 +58,8 @@ Future<RecommendationFeedState?> loadCachedHomeFeed(String scopeId) async {
     final decoded = jsonDecode(raw);
     if (decoded is! Map) return null;
     final envelope = Map<String, dynamic>.from(decoded);
-    if ((envelope['version'] as num?)?.toInt() != homeFeedCacheVersion) {
+    if (!readableHomeFeedCacheVersions
+        .contains((envelope['version'] as num?)?.toInt())) {
       return null;
     }
     if ((envelope['scope_id'] ?? '').toString() != scopeId) return null;

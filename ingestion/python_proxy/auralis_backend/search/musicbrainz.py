@@ -6,6 +6,7 @@ import re
 import threading
 import time
 import unicodedata
+import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Dict, Iterable, List
@@ -23,13 +24,58 @@ MUSICBRAINZ_TIMEOUT_SECONDS = max(
     0.5,
     float(os.environ.get("AURALIS_MUSICBRAINZ_TIMEOUT_SECONDS", "1.8")),
 )
+MUSICBRAINZ_ACQUISITION_TIMEOUT_SECONDS = max(
+    1.0,
+    float(os.environ.get("AURALIS_MUSICBRAINZ_ACQUISITION_TIMEOUT_SECONDS", "8.0")),
+)
 MUSICBRAINZ_MIN_INTERVAL_SECONDS = max(
     1.0,
     float(os.environ.get("AURALIS_MUSICBRAINZ_MIN_INTERVAL_SECONDS", "1.05")),
 )
 
 _rate_lock = threading.Lock()
+# The public API permits a request-start interval, but spacing starts alone is
+# insufficient when several workers are running: they can all remain in flight
+# at once and trigger global load shedding.  Keep one process-wide request lane.
+_inflight_lock = threading.Lock()
 _last_request_at = 0.0
+
+
+class MusicBrainzRequestFailure(RuntimeError):
+    """A provider failure with enough evidence for shared retry handling."""
+
+    def __init__(self, path: str, cause: BaseException, elapsed_ms: int) -> None:
+        self.path = _text(path)
+        self.cause_type = type(cause).__name__
+        self.status_code = int(getattr(cause, "code", 0) or 0)
+        self.elapsed_ms = max(int(elapsed_ms or 0), 0)
+        headers = getattr(cause, "headers", None)
+        retry_after = ""
+        if headers is not None:
+            try:
+                retry_after = _text(headers.get("Retry-After"))
+            except Exception:
+                retry_after = ""
+        try:
+            self.retry_after_seconds = max(float(retry_after or 0), 0.0)
+        except (TypeError, ValueError):
+            self.retry_after_seconds = 0.0
+        self.transient = (
+            isinstance(cause, TimeoutError)
+            or (
+                isinstance(cause, urllib.error.URLError)
+                and not isinstance(cause, urllib.error.HTTPError)
+            )
+            or self.status_code in {408, 425, 429}
+            or self.status_code >= 500
+        )
+        detail = self.cause_type
+        if self.status_code:
+            detail = f"HTTP {self.status_code}"
+        super().__init__(
+            f"MusicBrainz {self.path or 'request'} failed: {detail} "
+            f"after {self.elapsed_ms}ms"
+        )
 
 
 def _text(value: Any) -> str:
@@ -359,11 +405,6 @@ class MusicBrainzClient:
 
     def _get_json(self, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
         global _last_request_at
-        with _rate_lock:
-            delay = MUSICBRAINZ_MIN_INTERVAL_SECONDS - (time.time() - _last_request_at)
-            if delay > 0:
-                time.sleep(delay)
-            _last_request_at = time.time()
         query = urllib.parse.urlencode(
             {key: value for key, value in params.items() if value not in (None, "")}
         )
@@ -375,8 +416,25 @@ class MusicBrainzClient:
                 "User-Agent": self.user_agent,
             },
         )
-        with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-            raw = response.read()
+        started = time.perf_counter()
+        # Hold the lane through the complete HTTP exchange.  This guarantees
+        # one in-flight public MusicBrainz request per backend process while
+        # retaining the documented minimum start interval.
+        with _inflight_lock:
+            with _rate_lock:
+                delay = MUSICBRAINZ_MIN_INTERVAL_SECONDS - (time.time() - _last_request_at)
+                if delay > 0:
+                    time.sleep(delay)
+                _last_request_at = time.time()
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                    raw = response.read()
+            except Exception as exc:
+                raise MusicBrainzRequestFailure(
+                    path,
+                    exc,
+                    int((time.perf_counter() - started) * 1000),
+                ) from exc
         try:
             parsed = json.loads(raw.decode("utf-8"))
         except Exception:
@@ -490,7 +548,9 @@ class MusicBrainzClient:
             {
                 "artist": normalized_artist_id,
                 "type": "album",
-                "inc": "artist-credits+tags",
+                # Tags are not consumed by candidate admission. Omitting them
+                # materially reduces a response repeated for every artist.
+                "inc": "artist-credits",
                 "fmt": "json",
                 "limit": max(1, min(int(limit or 1), 100)),
                 "offset": max(int(offset or 0), 0),
@@ -505,7 +565,7 @@ class MusicBrainzClient:
         self,
         release_group_id: str,
         *,
-        limit: int = 5,
+        limit: int = 1,
     ) -> List[Dict[str, Any]]:
         normalized_id = _text(release_group_id)
         if not normalized_id:
@@ -514,7 +574,11 @@ class MusicBrainzClient:
             "release",
             {
                 "release-group": normalized_id,
-                "inc": "recordings+artist-credits+media",
+                # Recordings already carry their media/track containers. We
+                # need one official edition, not several deluxe/remaster
+                # tracklists for the same release group.
+                "status": "official",
+                "inc": "recordings+artist-credits",
                 "fmt": "json",
                 "limit": max(1, min(int(limit or 1), 25)),
             },
@@ -547,6 +611,7 @@ def browse_musicbrainz_artist_album_items(
     client: MusicBrainzClient | None = None,
     limit: int = 12,
     offset: int = 0,
+    raise_errors: bool = False,
 ) -> List[Dict[str, Any]]:
     """Browse canonical albums for one resolved MusicBrainz artist.
 
@@ -560,7 +625,7 @@ def browse_musicbrainz_artist_album_items(
         resolved_artist_id = _text(artist_id)
         canonical_artist_name = _text(artist_name)
         if not resolved_artist_id:
-            matches = resolved_client.search_artists(canonical_artist_name, limit=8)
+            matches = resolved_client.search_artists(canonical_artist_name, limit=5)
             exact_matches = [
                 artist
                 for artist in matches
@@ -581,6 +646,8 @@ def browse_musicbrainz_artist_album_items(
             offset=offset,
         )
     except Exception:
+        if raise_errors:
+            raise
         return []
 
     items: List[Dict[str, Any]] = []
@@ -609,15 +676,18 @@ def browse_musicbrainz_release_group_tracks(
     *,
     client: MusicBrainzClient | None = None,
     limit: int = 40,
+    raise_errors: bool = False,
 ) -> List[Dict[str, Any]]:
     """Return canonical recordings from the best populated release."""
     resolved_client = client or MusicBrainzClient()
     try:
         releases = resolved_client.browse_release_group_releases(
             release_group_id,
-            limit=5,
+            limit=1,
         )
     except Exception:
+        if raise_errors:
+            raise
         return []
     if not releases:
         return []

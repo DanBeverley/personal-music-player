@@ -56,6 +56,11 @@ class TasteProfile:
     taste_queries: List[str] = field(default_factory=list)
     collaborative_track_ids: List[str] = field(default_factory=list)
     avoid_ids: List[str] = field(default_factory=list)
+    # Identities already visible in the active/prepared queue. Unlike the
+    # longer-lived exposure ledger these are a hard allocation partition, so
+    # two queued feeds cannot select the same mutable item merely because its
+    # score is high.
+    hard_avoid_ids: List[str] = field(default_factory=list)
     force_refresh: bool = False
     refresh_token: str = ""
     rotation_epoch: int = 0

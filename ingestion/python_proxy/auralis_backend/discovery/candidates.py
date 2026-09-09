@@ -685,7 +685,13 @@ def _album_pool(
         if not isinstance(raw, dict):
             continue
         if (
-            not trim(server, raw.get("musicbrainz_release_group_id"))
+            not trim(
+                server,
+                raw.get("canonical_album_identity")
+                or raw.get("musicbrainz_release_group_id")
+                or raw.get("id")
+                or raw.get("browseId"),
+            )
             or raw.get("playable") is not True
             or int(raw.get("track_count") or 0) < 2
         ):

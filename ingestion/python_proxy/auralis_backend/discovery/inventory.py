@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Tuple
+import hashlib
 import json
 import threading
 import time
@@ -20,6 +21,9 @@ INVENTORY_NAMESPACE = "discovery_candidate_inventory"
 # identifier lets an accepted inventory survive a process/app upgrade.
 INVENTORY_MODEL_VERSION = "candidate-inventory-v6"
 INVENTORY_TTL_SECONDS = 60 * 60 * 8
+INVENTORY_REFRESH_WINDOW_SECONDS = 30 * 60
+# Candidate facts are durable.  This interval controls cache refresh and
+# background revalidation; it must never make verified supply unusable.
 INVENTORY_INTENT_NAMESPACE = "discovery_candidate_inventory_intent"
 INVENTORY_INTENT_TTL_SECONDS = 60 * 60 * 2
 
@@ -37,6 +41,28 @@ ROW_RESERVE_TARGETS = {
     "because_you_played": 48,
     "recommended_artists": 30,
     "quiet_picks": 160,
+}
+
+# Replenishment starts before the composer can exhaust the working set and
+# stops at a bounded five-rotation reserve.  Only admitted, usable facts in
+# ``coverage.actual`` count toward these watermarks.
+CANDIDATE_SUPPLY_LOW_WATERMARKS = {
+    "unplayed_tracks": 144,
+    "qualified_album_inventory": 24,
+    "recommended_artists": 30,
+    "quiet_picks": 120,
+}
+CANDIDATE_SUPPLY_HIGH_WATERMARKS = {
+    "unplayed_tracks": 240,
+    "qualified_album_inventory": 40,
+    "recommended_artists": 60,
+    "quiet_picks": 240,
+}
+MAX_VERIFIED_TRACKS_PER_ARTIST = 12
+CANDIDATE_POOL_HARD_LIMITS = {
+    "track": 1200,
+    "album": 160,
+    "artist": 160,
 }
 
 
@@ -76,7 +102,16 @@ class CandidateInventory:
 
     @property
     def is_fresh(self) -> bool:
-        return bool(self.expires_at > time.time())
+        now = time.time()
+        generated_at = float(self.generated_at or 0.0)
+        expires_at = float(self.expires_at or 0.0)
+        return generated_at <= now < expires_at
+
+    @property
+    def is_usable(self) -> bool:
+        """Verified facts remain reusable after their refresh deadline."""
+
+        return float(self.generated_at or 0.0) > 0.0
 
     @property
     def model_version(self) -> str:
@@ -86,6 +121,124 @@ class CandidateInventory:
     def is_ready(self) -> bool:
         return self.coverage.get("ready") is True
 
+
+def candidate_inventory_track_identities(
+    inventory: CandidateInventory | None,
+) -> set[str]:
+    if inventory is None:
+        return set()
+    identities: set[str] = set()
+    for candidates in (inventory.pools or {}).values():
+        for candidate in candidates or []:
+            if getattr(candidate, "item_type", "track") != "track":
+                continue
+            identity = _candidate_identity(candidate)
+            if identity:
+                identities.add(identity)
+    return identities
+
+
+def candidate_inventory_content_identities(
+    inventory: CandidateInventory | None,
+) -> set[str]:
+    """Return the usable identity set that defines one supply revision."""
+
+    if inventory is None:
+        return set()
+    identities: set[str] = set()
+    for candidates in (inventory.pools or {}).values():
+        for candidate in candidates or []:
+            if not _candidate_is_retained(candidate):
+                continue
+            identity = _candidate_identity(candidate)
+            if identity:
+                identities.add(f"{candidate.item_type}:{identity}")
+    return identities
+
+
+def candidate_inventory_content_hash(
+    inventory: CandidateInventory | None,
+) -> str:
+    encoded = "\n".join(sorted(candidate_inventory_content_identities(inventory)))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def candidate_inventory_supply_status(
+    inventory: CandidateInventory | None,
+) -> Dict[str, Any]:
+    actual = dict((inventory.coverage or {}).get("actual") or {}) if inventory else {}
+    low_deficits = {
+        key: max(int(target) - int(actual.get(key) or 0), 0)
+        for key, target in CANDIDATE_SUPPLY_LOW_WATERMARKS.items()
+    }
+    target_deficits = {
+        key: max(int(target) - int(actual.get(key) or 0), 0)
+        for key, target in CANDIDATE_SUPPLY_HIGH_WATERMARKS.items()
+    }
+    return {
+        "below_low_watermark": any(low_deficits.values()),
+        "expansion_needed": any(target_deficits.values()),
+        "low_deficits": low_deficits,
+        "target_deficits": target_deficits,
+        "actual": {
+            key: int(actual.get(key) or 0)
+            for key in CANDIDATE_SUPPLY_HIGH_WATERMARKS
+        },
+    }
+
+
+def candidate_inventory_refresh_seed(
+    inventory: CandidateInventory,
+    *,
+    reason: str,
+) -> CandidateInventory:
+    """Mark durable supply for replenishment without invalidating it."""
+
+    ledger = dict(inventory.acquisition_ledger or {})
+    continuing_refresh = bool(ledger.get("candidate_refresh_required"))
+    expired_generation_id = str(
+        (ledger.get("expired_generation_id") if continuing_refresh else "")
+        or inventory.generation_id
+        or ""
+    )
+    refresh_generation = (
+        f"{expired_generation_id}:"
+        f"{int(time.time() // INVENTORY_REFRESH_WINDOW_SECONDS)}"
+    )
+    ledger.update(
+        {
+            "candidate_refresh_required": True,
+            "candidate_refresh_reason": str(reason or "ttl_expired"),
+            # A refresh generation is a bounded attempt window. Provider
+            # requests may bypass older cached pages once in this window, but
+            # retries cannot repeatedly execute the same request.
+            "candidate_refresh_generation": refresh_generation,
+            "expired_generation_id": expired_generation_id,
+            "expired_generation_at": float(
+                (ledger.get("expired_generation_at") if continuing_refresh else 0.0)
+                or inventory.generated_at
+                or 0.0
+            ),
+        }
+    )
+    # Keep verified candidate facts, readiness and provider cursors.  Feed
+    # artifacts expire independently; candidate age is only a refresh signal.
+    retained_pools = {
+        name: list(values or [])
+        for name, values in (inventory.pools or {}).items()
+        if name not in {"radio_artist_catalog", "popular_radio_cards"}
+        and not name.startswith("radio_")
+    }
+    retained_counts = {
+        name: len(values)
+        for name, values in retained_pools.items()
+    }
+    return replace(
+        inventory,
+        pools=retained_pools,
+        candidate_counts={**dict(inventory.candidate_counts or {}), **retained_counts},
+        acquisition_ledger=ledger,
+    )
 
 def _key(user_scope_id: str) -> str:
     scope = str(user_scope_id or "guest").strip() or "guest"
@@ -146,6 +299,12 @@ def _to_payload(inventory: CandidateInventory) -> Dict[str, Any]:
     }
 
 
+def candidate_inventory_to_payload(inventory: CandidateInventory) -> Dict[str, Any]:
+    """Serialize one candidate generation for the durable Home repository."""
+
+    return _to_payload(inventory)
+
+
 def _from_payload(payload: Dict[str, Any] | None) -> CandidateInventory | None:
     if not isinstance(payload, dict):
         return None
@@ -179,6 +338,14 @@ def _from_payload(payload: Dict[str, Any] | None) -> CandidateInventory | None:
             for key, value in dict(payload.get("canonical_stats") or {}).items()
         },
     )
+
+
+def candidate_inventory_from_payload(
+    payload: Dict[str, Any] | None,
+) -> CandidateInventory | None:
+    """Deserialize one candidate generation from durable Home storage."""
+
+    return _from_payload(payload)
 
 
 def _playable_album_catalog_rows(
@@ -531,12 +698,16 @@ def canonicalize_candidate_pools(
     raw_track_count = 0
     unplayable_count = 0
     best_by_identity: Dict[str, DiscoveryCandidate] = {}
-    for candidates in pools.values():
+    for pool_name, candidates in pools.items():
         for candidate in candidates or []:
             identity = _candidate_identity(candidate)
             if not identity:
                 continue
-            if candidate.item_type == "track":
+            if candidate.item_type == "track" and pool_name not in {
+                "history",
+                "last_played",
+                "frequent",
+            }:
                 raw_track_count += 1
                 provider = str(
                     candidate.item.get("provider")
@@ -620,7 +791,13 @@ def _candidate_is_retained(candidate: DiscoveryCandidate) -> bool:
     }:
         return False
     if candidate.item_type == "album" and (
-        not str(item.get("musicbrainz_release_group_id") or "").strip()
+        not str(
+            item.get("canonical_album_identity")
+            or item.get("musicbrainz_release_group_id")
+            or item.get("id")
+            or item.get("browseId")
+            or ""
+        ).strip()
         or not str(item.get("id") or item.get("browseId") or "").strip()
         or item.get("playable") is not True
         or int(item.get("track_count") or 0) < 2
@@ -920,26 +1097,41 @@ def merge_candidate_inventories(
     previous: CandidateInventory | None,
 ) -> CandidateInventory:
     if previous is None or previous.profile_fingerprint != current.profile_fingerprint:
-        return current
+        previous_pools: Dict[str, List[DiscoveryCandidate]] = {}
+    else:
+        previous_pools = previous.pools
     merged_pools: Dict[str, List[DiscoveryCandidate]] = {}
-    for pool_name in dict.fromkeys([*current.pools.keys(), *previous.pools.keys()]):
+    for pool_name in dict.fromkeys([*current.pools.keys(), *previous_pools.keys()]):
         output: List[DiscoveryCandidate] = []
         seen: set[str] = set()
+        artist_track_counts: Dict[str, int] = {}
         for candidate in [
             *list(current.pools.get(pool_name) or []),
-            *list(previous.pools.get(pool_name) or []),
+            *list(previous_pools.get(pool_name) or []),
         ]:
             if not _candidate_is_retained(candidate):
                 continue
             identity = _candidate_identity(candidate)
             if not identity or identity in seen:
                 continue
+            if candidate.item_type == "track":
+                artist = " ".join(
+                    str(
+                        candidate.item.get("artist")
+                        or candidate.item.get("artist_name")
+                        or candidate.item.get("author")
+                        or candidate.item.get("channel")
+                        or ""
+                    ).strip().casefold().split()
+                )
+                if artist and artist_track_counts.get(artist, 0) >= MAX_VERIFIED_TRACKS_PER_ARTIST:
+                    continue
+                if artist:
+                    artist_track_counts[artist] = artist_track_counts.get(artist, 0) + 1
             seen.add(identity)
             output.append(candidate)
-            # Radio alone may require 12 x 24 canonical tracks.  The old 192
-            # cap truncated an artist catalog mid-batch before eight cards
-            # could qualify.
-            if len(output) >= 512:
+            hard_limit = CANDIDATE_POOL_HARD_LIMITS.get(candidate.item_type, 512)
+            if len(output) >= hard_limit:
                 break
         merged_pools[pool_name] = output
     counts = dict(current.candidate_counts or {})
@@ -949,14 +1141,16 @@ def merge_candidate_inventories(
         current,
         pools=merged_pools,
         candidate_counts=counts,
-        base_generation_id=previous.generation_id,
+        base_generation_id=(previous.generation_id if previous is not None else ""),
         acquisition_ledger={
-            **dict(previous.acquisition_ledger or {}),
+            **(dict(previous.acquisition_ledger or {}) if previous is not None else {}),
             **dict(current.acquisition_ledger or {}),
         },
         canonical_stats={
-            key: int(previous.canonical_stats.get(key) or 0) + int(current.canonical_stats.get(key) or 0)
-            for key in set(previous.canonical_stats) | set(current.canonical_stats)
+            key: int((previous.canonical_stats if previous else {}).get(key) or 0)
+            + int(current.canonical_stats.get(key) or 0)
+            for key in set(previous.canonical_stats if previous else {})
+            | set(current.canonical_stats)
         },
     )
 

@@ -160,21 +160,53 @@ class JsonHttpClient:
     def __init__(self, server: Any = None, *, timeout_seconds: float = 10.0) -> None:
         self.session = getattr(server, "upstream_http", None) or requests.Session()
         self.timeout_seconds = max(float(timeout_seconds), 1.0)
+        self.connect_timeout_seconds = min(self.timeout_seconds, 4.0)
 
     def get(self, url: str, *, params: Dict[str, Any] | None = None) -> Any:
-        response = self.session.get(url, params=params, timeout=self.timeout_seconds)
+        response = self.session.get(
+            url,
+            params=params,
+            timeout=(self.connect_timeout_seconds, self.timeout_seconds),
+        )
         response.raise_for_status()
         return response.json()
 
 
 class ListenBrainzClient(JsonHttpClient):
-    def sitewide_recordings(self, *, limit: int = 40, offset: int = 0) -> List[Dict[str, Any]]:
+    def fresh_releases(
+        self,
+        *,
+        days: int = 45,
+    ) -> List[Dict[str, Any]]:
+        payload = self.get(
+            f"{LISTENBRAINZ_BASE_URL}/explore/fresh-releases/",
+            params={
+                "days": max(1, min(int(days), 90)),
+                "past": "true",
+                "future": "false",
+                "sort": "release_date",
+            },
+        )
+        rows = (
+            (payload.get("payload") or {}).get("releases")
+            if isinstance(payload, dict)
+            else payload
+        ) or []
+        return [dict(row) for row in rows if isinstance(row, dict)]
+
+    def sitewide_recordings(
+        self,
+        *,
+        limit: int = 40,
+        offset: int = 0,
+        range_key: str = "all_time",
+    ) -> List[Dict[str, Any]]:
         payload = self.get(
             f"{LISTENBRAINZ_BASE_URL}/stats/sitewide/recordings",
             params={
                 "count": max(1, min(max(int(limit), 1) * 4, 100)),
                 "offset": max(int(offset), 0),
-                "range": "all_time",
+                "range": _text(range_key) or "all_time",
             },
         )
         rows = (payload.get("payload") or {}).get("recordings") or []
@@ -394,6 +426,98 @@ class LastFmClient(JsonHttpClient):
             raise RuntimeError(f"lastfm_{payload.get('error')}:{payload.get('message', '')}")
         return payload
 
+    def chart_tracks(
+        self,
+        *,
+        country: str = "",
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        safe_limit = max(1, min(int(limit), 100))
+        if _text(country):
+            payload = self._call(
+                "geo.gettoptracks",
+                country=_text(country),
+                limit=safe_limit,
+            )
+        else:
+            payload = self._call("chart.gettoptracks", limit=safe_limit)
+        rows = (payload.get("tracks") or {}).get("track") or []
+        output: List[Dict[str, Any]] = []
+        for rank, row in enumerate(rows, start=1):
+            if not isinstance(row, dict):
+                continue
+            artist = row.get("artist") or {}
+            images = [
+                _text(image.get("#text") or image.get("url"))
+                for image in row.get("image") or []
+                if isinstance(image, dict)
+                and _text(image.get("#text") or image.get("url"))
+            ]
+            output.append(
+                {
+                    "title": row.get("name"),
+                    "artist": (
+                        artist.get("name") if isinstance(artist, dict) else artist
+                    ),
+                    "musicbrainz_recording_id": row.get("mbid"),
+                    "musicbrainz_artist_id": (
+                        artist.get("mbid") if isinstance(artist, dict) else ""
+                    ),
+                    "thumbnail": images[-1] if images else "",
+                    "listen_count": row.get("playcount"),
+                    "listener_count": row.get("listeners"),
+                    "chart_rank": rank,
+                    "chart_provider": "lastfm",
+                    "relationship_provider": "lastfm",
+                    "relationship_evidence": "geo_chart" if country else "global_chart",
+                }
+            )
+        return output
+
+    def artist_info(
+        self,
+        artist: str,
+        *,
+        artist_mbid: str = "",
+    ) -> Dict[str, Any]:
+        """Return identity-bound artist metadata and portrait candidates."""
+
+        params: Dict[str, Any] = {}
+        if artist_mbid:
+            params["mbid"] = artist_mbid
+        else:
+            params["artist"] = artist
+        try:
+            payload = self._call("artist.getinfo", **params)
+        except RuntimeError as exc:
+            if not artist_mbid or not str(exc).startswith("lastfm_6:"):
+                raise
+            payload = self._call("artist.getinfo", artist=artist)
+        raw = payload.get("artist") or {}
+        if not isinstance(raw, dict):
+            return {}
+        images = [
+            _text(value.get("#text") or value.get("url"))
+            for value in raw.get("image") or []
+            if isinstance(value, dict)
+            and _text(value.get("#text") or value.get("url"))
+        ]
+        images = list(dict.fromkeys(images))
+        mbid = _text(raw.get("mbid") or artist_mbid)
+        name = _text(raw.get("name") or artist)
+        return {
+            "name": name,
+            "artist": name,
+            "musicbrainz_artist_id": mbid,
+            "canonical_artist_id": (
+                f"musicbrainz:artist:{mbid.casefold()}" if mbid else ""
+            ),
+            "artist_thumbnail": images[-1] if images else "",
+            "artwork_source_url": images[-1] if images else "",
+            "artwork_source_urls": list(reversed(images)),
+            "artwork_provider": "lastfm",
+        }
+
     def similar_tracks(self, recording: CanonicalRecording, *, limit: int = 30) -> List[Dict[str, Any]]:
         result_limit = max(int(limit), 1)
         params: Dict[str, Any] = {"limit": result_limit}
@@ -471,6 +595,61 @@ class LastFmClient(JsonHttpClient):
             for row in rows
             if isinstance(row, dict) and _text(row.get("name"))
         ]
+
+    def top_tracks(
+        self,
+        artist: str,
+        *,
+        artist_mbid: str = "",
+        limit: int = 24,
+    ) -> List[Dict[str, Any]]:
+        """Return an artist catalogue without requiring MusicBrainz.
+
+        Last.fm may attach MBIDs, but artist/title and relationship evidence
+        are sufficient for the shared source-verification pipeline to resolve
+        a playable canonical recording later.
+        """
+
+        result_limit = max(int(limit), 1)
+        params: Dict[str, Any] = {"limit": result_limit}
+        if artist_mbid:
+            params["mbid"] = artist_mbid
+        else:
+            params["artist"] = artist
+        try:
+            payload = self._call("artist.gettoptracks", **params)
+        except RuntimeError as exc:
+            if not artist_mbid or not str(exc).startswith("lastfm_6:"):
+                raise
+            payload = self._call(
+                "artist.gettoptracks",
+                artist=artist,
+                limit=result_limit,
+            )
+        rows = (payload.get("toptracks") or {}).get("track") or []
+        output: List[Dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            credited = row.get("artist") or {}
+            output.append(
+                {
+                    "title": row.get("name"),
+                    "artist": (
+                        credited.get("name")
+                        if isinstance(credited, dict)
+                        else credited
+                    )
+                    or artist,
+                    "musicbrainz_recording_id": row.get("mbid"),
+                    "musicbrainz_artist_id": artist_mbid,
+                    "listen_count": row.get("playcount"),
+                    "relationship_provider": "lastfm",
+                    "relationship_evidence": "artist_top_catalog",
+                    "source_identity_authority": "verified_catalog",
+                }
+            )
+        return output
 
     def tag_tracks(self, tag: str, *, limit: int = 30) -> List[Dict[str, Any]]:
         payload = self._call("tag.gettoptracks", tag=tag, limit=max(int(limit), 1))

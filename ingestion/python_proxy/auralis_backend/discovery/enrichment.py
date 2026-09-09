@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import (
+    Future,
+    ThreadPoolExecutor,
+    TimeoutError as FuturesTimeoutError,
+    as_completed,
+)
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Iterable, List
 import hashlib
@@ -18,6 +23,7 @@ from .structured_providers import (
 ACQUISITION_JOB_NAMESPACE = "discovery_acquisition_job"
 ACQUISITION_JOB_MODEL = "structured-acquisition"
 ACQUISITION_RESULT_TTL_SECONDS = 60 * 60 * 24 * 14
+MUSICBRAINZ_RESULT_TTL_SECONDS = 60 * 60 * 24 * 90
 RELEASE_METADATA_NAMESPACE = "canonical_recording_release_metadata"
 RELEASE_METADATA_MODEL = "musicbrainz-release-metadata"
 RELEASE_METADATA_RETRY_SECONDS = 60 * 60 * 24 * 7
@@ -37,6 +43,7 @@ _RELEASE_METADATA_POOL_PRIORITY = (
     "album",
     "freshness",
 )
+_MUSICBRAINZ_SHARED_RETRY_DELAYS_SECONDS = (15, 30, 60, 120, 300)
 
 
 @dataclass(frozen=True)
@@ -47,6 +54,19 @@ class EnrichmentRequest:
     relation: str
     limit: int
     metadata: Dict[str, Any] = field(default_factory=dict)
+    provider: str = ""
+
+
+def _request_provider(request: EnrichmentRequest) -> str:
+    explicit = _text(request.provider or request.metadata.get("provider")).casefold()
+    if explicit:
+        return explicit
+    # Non-catalog request kinds remain provider-specific by name.
+    return _text(request.kind).split("_", 1)[0].casefold()
+
+
+def _is_musicbrainz_request(request: EnrichmentRequest) -> bool:
+    return _request_provider(request) == "musicbrainz"
 
 
 @dataclass
@@ -58,7 +78,9 @@ class CandidateEnrichmentPlan:
     anchor_cursor_start: int = 0
     anchor_cursor_next: int = 0
     artist_cursor_next: int = 0
+    radio_discovery_cursor_next: int = 0
     prior_request_progress: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    priority_pools: tuple[str, ...] = ()
 
 
 @dataclass
@@ -784,6 +806,68 @@ def _merge_canonical_recordings(
     return merged
 
 
+def _album_semantic_key(item: Dict[str, Any]) -> str:
+    title = " ".join(
+        _text(item.get("title") or item.get("name") or item.get("album"))
+        .casefold()
+        .split()
+    )
+    artist = " ".join(
+        (_artist(item) or _text(item.get("artist_name"))).casefold().split()
+    )
+    return f"{title}|{artist}" if title and artist else ""
+
+
+def _merge_catalog_albums(
+    existing: Dict[str, Any],
+    incoming: Dict[str, Any],
+) -> Dict[str, Any]:
+    existing_mb = bool(_text(existing.get("musicbrainz_release_group_id")))
+    incoming_mb = bool(_text(incoming.get("musicbrainz_release_group_id")))
+    preferred, secondary = (
+        (incoming, existing)
+        if incoming_mb and not existing_mb
+        else (existing, incoming)
+    )
+    merged = dict(secondary)
+    merged.update(
+        key_value
+        for key_value in preferred.items()
+        if key_value[1] not in (None, "", [], {})
+    )
+    track_map: Dict[str, Dict[str, Any]] = {}
+    for album in (secondary, preferred):
+        for track in album.get("canonical_tracks") or []:
+            if not isinstance(track, dict):
+                continue
+            identity = _track_id(track)
+            if not identity:
+                continue
+            track_map[identity] = (
+                _merge_canonical_recordings(track_map[identity], track)
+                if identity in track_map
+                else dict(track)
+            )
+    merged["canonical_tracks"] = list(track_map.values())
+    merged["track_count"] = len(track_map)
+    merged["canonical_track_count"] = len(track_map)
+    provenances = list(
+        dict.fromkeys(
+            _text(value)
+            for album in (existing, incoming)
+            for value in (
+                album.get("source_provenance"),
+                *(album.get("source_provenances") or []),
+            )
+            if _text(value)
+        )
+    )
+    if provenances:
+        merged["source_provenance"] = provenances[0]
+        merged["source_provenances"] = provenances
+    return merged
+
+
 def canonicalize_materialized_pools(
     pools: Dict[str, List[Dict[str, Any]]],
 ) -> tuple[Dict[str, List[Dict[str, Any]]], Dict[str, int]]:
@@ -826,7 +910,8 @@ def canonicalize_materialized_pools(
     output: Dict[str, List[Dict[str, Any]]] = {}
     for pool, values in pools.items():
         if pool == "album":
-            albums: List[Dict[str, Any]] = []
+            albums_by_semantic: Dict[str, Dict[str, Any]] = {}
+            album_order: List[str] = []
             for album in values or []:
                 album_tracks: Dict[str, Dict[str, Any]] = {}
                 for item in album.get("canonical_tracks") or []:
@@ -847,8 +932,24 @@ def canonicalize_materialized_pools(
                         if identity in album_tracks
                         else normalized
                     )
-                albums.append({**dict(album), "canonical_tracks": list(album_tracks.values())})
-            output[pool] = albums
+                normalized_album = {
+                    **dict(album),
+                    "canonical_tracks": list(album_tracks.values()),
+                }
+                semantic = _album_semantic_key(normalized_album)
+                if not semantic:
+                    continue
+                if semantic not in albums_by_semantic:
+                    albums_by_semantic[semantic] = normalized_album
+                    album_order.append(semantic)
+                else:
+                    albums_by_semantic[semantic] = _merge_catalog_albums(
+                        albums_by_semantic[semantic],
+                        normalized_album,
+                    )
+            output[pool] = [
+                albums_by_semantic[semantic] for semantic in album_order
+            ]
             continue
 
         canonical_items: Dict[str, Dict[str, Any]] = {}
@@ -916,7 +1017,107 @@ def _unique(values: Iterable[str], *, limit: int) -> List[str]:
 
 def _request_signature(request: EnrichmentRequest) -> str:
     cursor = int(request.metadata.get("release_group_offset") or request.metadata.get("offset") or 0)
-    return f"{request.kind}:{request.pool}:{request.key.casefold()}:{cursor}"
+    provider = _request_provider(request)
+    return (
+        f"{request.kind}:{provider}:{request.pool}:"
+        f"{request.key.casefold()}:{cursor}"
+    )
+
+
+def _request_progress_signature(request: EnrichmentRequest) -> str:
+    """Return the durable progress identity for a paged provider request.
+
+    Page offsets identify cached page results, but they must not identify the
+    exhaustion state. Otherwise every empty page starts a new no-progress
+    counter and one artist can be paged forever.
+    """
+
+    if request.kind in {"album_catalog", "artist_catalog"}:
+        return (
+            f"{request.kind}:{_request_provider(request)}:"
+            f"{request.pool}:{request.key.casefold()}"
+        )
+    return _request_signature(request)
+
+
+def _provider_shared_retry_at(
+    request_progress: Dict[str, Dict[str, Any]],
+    provider: str,
+) -> float:
+    """Return the one durable backoff shared by all jobs for a provider."""
+
+    wanted = _text(provider).casefold()
+    return max(
+        (
+            float(progress.get("provider_retry_at") or 0.0)
+            for signature, progress in request_progress.items()
+            if isinstance(progress, dict)
+            and (
+                _text(progress.get("provider")).casefold() == wanted
+                or f":{wanted}:" in f":{signature.casefold()}:"
+            )
+        ),
+        default=0.0,
+    )
+
+
+def _musicbrainz_shared_retry_at(
+    request_progress: Dict[str, Dict[str, Any]],
+) -> float:
+    """Compatibility name for MusicBrainz-specific diagnostics and tests."""
+
+    return _provider_shared_retry_at(request_progress, "musicbrainz")
+
+
+def _provider_failure_details(exc: BaseException) -> Dict[str, Any]:
+    cause_type = _text(getattr(exc, "cause_type", "")) or type(exc).__name__
+    response = getattr(exc, "response", None)
+    status_code = int(
+        getattr(exc, "status_code", 0)
+        or getattr(response, "status_code", 0)
+        or 0
+    )
+    retry_after = getattr(exc, "retry_after_seconds", 0.0) or 0.0
+    if not retry_after and response is not None:
+        try:
+            retry_after = float((response.headers or {}).get("Retry-After") or 0.0)
+        except (TypeError, ValueError):
+            retry_after = 0.0
+    transient = bool(
+        getattr(
+            exc,
+            "transient",
+            cause_type in {"TimeoutError", "URLError"}
+            or status_code == 0
+            or status_code in {408, 425, 429}
+            or status_code >= 500,
+        )
+    )
+    return {
+        "last_error": cause_type,
+        "http_status": status_code,
+        "request_phase": _text(getattr(exc, "path", "")),
+        "provider_elapsed_ms": int(getattr(exc, "elapsed_ms", 0) or 0),
+        "provider_retry_after_seconds": float(
+            retry_after
+        ),
+        "transient": transient,
+    }
+
+
+def _provider_retry_delay_seconds(
+    details: Dict[str, Any],
+    attempts: int,
+    *,
+    provider: str = "musicbrainz",
+) -> float:
+    retry_after = float(details.get("provider_retry_after_seconds") or 0.0)
+    if retry_after > 0:
+        return min(max(retry_after, 1.0), 1800.0)
+    if _text(provider).casefold() == "musicbrainz":
+        index = min(max(int(attempts or 1) - 1, 0), len(_MUSICBRAINZ_SHARED_RETRY_DELAYS_SECONDS) - 1)
+        return float(_MUSICBRAINZ_SHARED_RETRY_DELAYS_SECONDS[index])
+    return float(min(30 * (2 ** min(max(int(attempts or 1) - 1, 0), 4)), 300))
 
 
 def _request_cursor(
@@ -926,13 +1127,14 @@ def _request_cursor(
     pool: str,
     key: str,
 ) -> int:
-    legacy_signature = f"{kind}:{pool}:{key.casefold()}"
-    prefix = f"{legacy_signature}:"
+    prefix = f"{kind}:"
     return max(
         (
             int(value.get("cursor") or 0)
             for signature, value in progress.items()
-            if (signature == legacy_signature or signature.startswith(prefix))
+            if signature.startswith(prefix)
+            and f":{pool}:" in signature
+            and f":{key.casefold()}" in signature
             and isinstance(value, dict)
         ),
         default=0,
@@ -942,10 +1144,12 @@ def _request_cursor(
 def _select_scheduled_requests(
     pending: List[EnrichmentRequest],
     limit: int,
+    *,
+    priority_pools: tuple[str, ...] = (),
 ) -> List[EnrichmentRequest]:
     if limit <= 0:
         return []
-    pool_order = (
+    default_pool_order = (
         "similarity",
         "profile_spine",
         "radio_artist_catalog",
@@ -955,53 +1159,70 @@ def _select_scheduled_requests(
         "popularity",
         "album",
     )
+    pool_order = tuple(
+        dict.fromkeys([*priority_pools, *default_pool_order])
+    )
     buckets: Dict[str, List[EnrichmentRequest]] = {}
     for request in pending:
         buckets.setdefault(request.pool, []).append(request)
-    special_pools = {"radio_artist_catalog", "album"}
     ordered_pools = [
-        pool for pool in pool_order if pool not in special_pools and buckets.get(pool)
+        pool for pool in pool_order if buckets.get(pool)
     ]
-    ordered_pools.extend(
-        pool for pool in buckets if pool not in special_pools and pool not in ordered_pools
-    )
+    ordered_pools.extend(pool for pool in buckets if pool not in ordered_pools)
     selected: List[EnrichmentRequest] = []
+    # MusicBrainz is one optional canonical-enrichment lane.  Select regular
+    # providers first, reserving at most one MB request for the cycle.  This
+    # prevents six album/radio pages from monopolising acquisition capacity.
+    non_mb = [pool for pool in ordered_pools if any(
+        not _is_musicbrainz_request(request)
+        for request in buckets.get(pool, [])
+    )]
 
-    general_capacity = 1 if any(buckets.get(pool) for pool in ordered_pools) else 0
-    radio_bucket = buckets.get("radio_artist_catalog") or []
-    radio_reserve = min(3, max(limit - general_capacity, 0))
-    while radio_bucket and len(selected) < radio_reserve:
-        selected.append(radio_bucket.pop(0))
-
-    # Album work used to be omitted whenever any regular candidate work was
-    # pending.  Reserve two bounded jobs so canonical album pages advance and
-    # complete albums accumulate without increasing the six-job batch.
-    album_bucket = buckets.get("album") or []
-    album_reserve = min(2, max(limit - len(selected) - general_capacity, 0))
-    while album_bucket and album_reserve > 0:
-        selected.append(album_bucket.pop(0))
-        album_reserve -= 1
-
-    while len(selected) < limit:
+    def pop_non_mb(pool: str) -> EnrichmentRequest | None:
+        bucket = buckets.get(pool) or []
+        for index, request in enumerate(bucket):
+            if not _is_musicbrainz_request(request):
+                return bucket.pop(index)
+        return None
+    mb_available = any(
+        _is_musicbrainz_request(request)
+        for request in pending
+    )
+    while len(selected) < limit - (1 if mb_available else 0):
         added = False
-        for pool in ordered_pools:
-            bucket = buckets.get(pool) or []
-            if not bucket:
-                continue
-            selected.append(bucket.pop(0))
-            added = True
-            if len(selected) >= limit:
-                break
+        for pool in non_mb:
+            request = pop_non_mb(pool)
+            if request is not None:
+                selected.append(request)
+                added = True
+                if len(selected) >= limit - (1 if mb_available else 0):
+                    break
         if not added:
             break
-
-    # If there was no regular work, use the remaining capacity for additional
-    # radio/album pages instead of returning a short batch.
-    while len(selected) < limit and (radio_bucket or album_bucket):
-        if radio_bucket and len(selected) < limit:
-            selected.append(radio_bucket.pop(0))
-        if album_bucket and len(selected) < limit:
-            selected.append(album_bucket.pop(0))
+    if mb_available and len(selected) < limit:
+        for pool in ordered_pools:
+            bucket = buckets.get(pool) or []
+            mb_request = next(
+                (request for request in bucket if _is_musicbrainz_request(request)),
+                None,
+            )
+            if mb_request is not None:
+                bucket.remove(mb_request)
+                selected.append(mb_request)
+                break
+    # Fill any remaining capacity with non-MB work only.  MB remains capped at
+    # one even when regular providers have fewer pending jobs.
+    while len(selected) < limit:
+        added = False
+        for pool in non_mb:
+            request = pop_non_mb(pool)
+            if request is not None:
+                selected.append(request)
+                added = True
+                if len(selected) >= limit:
+                    break
+        if not added:
+            break
     return selected
 
 
@@ -1135,6 +1356,7 @@ def build_enrichment_plan(
     allowed_pools: set[str] | None = None,
     radio_discovery_artist_seeds: List[Dict[str, Any]] | None = None,
     radio_discovery_deficit: int = 0,
+    radio_reservoir_deficit: int = 0,
 ) -> CandidateEnrichmentPlan:
     ledger = dict(acquisition_ledger or {})
     request_progress = {
@@ -1174,7 +1396,7 @@ def build_enrichment_plan(
         direct_repairs = sorted(
             incomplete_artists,
             key=lambda artist: max(12 - seed_counts.get(str(artist).casefold(), 0), 0),
-        )[:3]
+        )
         # Discovery seeds come from persisted, profile-compatible artist
         # evidence. They must take precedence over repairing familiar seeds
         # while the radio discovery reserve is deficient.
@@ -1183,18 +1405,33 @@ def build_enrichment_plan(
             name = _text(seed.get("name") if isinstance(seed, dict) else seed)
             if name and name.casefold() not in {a.casefold() for a in all_anchor_artists}:
                 discovery.append(name)
-        anchor_artists = [*discovery[:4], *direct_repairs]
-        anchor_artists = _unique(anchor_artists, limit=4 if int(radio_discovery_deficit or 0) > 0 else 3)
+        # Qualify a bounded batch concurrently. The active seed remains first
+        # on retry, while up to three independent candidates make progress in
+        # the same materialization cycle instead of starving the frontier.
+        active_seed = _text(ledger.get("radio_active_seed"))
+        if active_seed:
+            candidates = [active_seed, *discovery, *direct_repairs]
+        elif int(radio_discovery_deficit or 0) > 0:
+            candidates = [*discovery, *direct_repairs]
+        else:
+            candidates = [*direct_repairs, *discovery]
+        anchor_artists = _unique(candidates, limit=4)
     artist_cursor_next = (
         (artist_cursor + max(len(anchor_artists), 1)) % len(all_anchor_artists)
         if all_anchor_artists
         else 0
     )
-    if allowed_pools == {"radio_artist_catalog"} and radio_discovery_artist_seeds:
-        discovery_cursor = max(int(ledger.get("radio_discovery_cursor") or 0), 0)
-        artist_cursor_next = (
-            discovery_cursor + len(anchor_artists)
-        ) % max(len(radio_discovery_artist_seeds), 1)
+    if allowed_pools == {"radio_artist_catalog"} and _text(ledger.get("radio_active_seed")):
+        # Retries for an in-progress seed must not rotate the familiar artist
+        # cursor; advancement is committed only by the qualification/terminal
+        # transition in the expansion worker.
+        artist_cursor_next = artist_cursor
+    radio_discovery_cursor_next = int(ledger.get("radio_discovery_cursor") or 0)
+    if allowed_pools == {"radio_artist_catalog"}:
+        # Cursor movement is a qualification event, not provider completion.
+        # The expansion worker advances this only after a seed is qualified or
+        # reaches a terminal request state.
+        radio_discovery_cursor_next = max(int(ledger.get("radio_discovery_cursor") or 0), 0)
     artist_ids = {
         str(key): str(value)
         for key, value in dict(ledger.get("canonical_artist_ids") or {}).items()
@@ -1211,11 +1448,18 @@ def build_enrichment_plan(
         str(key): int(value or 0)
         for key, value in dict(ledger.get("optional_row_counts") or {}).items()
     }
+    # Popular Radio acquisition belongs exclusively to the radio-supply
+    # worker.  Feed preparation may consume the persisted radio reservoir,
+    # but must never open a second provider-acquisition path merely because
+    # its optional row is short.
     radio_work_needed = (
-        int(optional_row_counts.get("popular_radio") or 0) < 8
-        or (allowed_pools == {"radio_artist_catalog"} and (
-            int(radio_discovery_deficit or 0) > 0 or bool(radio_discovery_artist_seeds)
-        ))
+        allowed_pools == {"radio_artist_catalog"}
+        and (
+            int(optional_row_counts.get("popular_radio") or 0) < 8
+            or int(radio_discovery_deficit or 0) > 0
+            or int(radio_reservoir_deficit or 0) > 0
+            or bool(radio_discovery_artist_seeds)
+        )
     )
     requests: List[EnrichmentRequest] = []
     if taste.is_cold_start or not anchor_artists:
@@ -1278,54 +1522,70 @@ def build_enrichment_plan(
                 ),
                 "",
             ),
+            "radio_discovery_provenance": next(
+                (
+                    _text(seed.get("source"))
+                    for seed in (radio_discovery_artist_seeds or [])
+                    if isinstance(seed, dict)
+                    and _text(seed.get("name")).casefold() == artist.casefold()
+                ),
+                "",
+            ),
             "user_scope_id": taste.user_scope_id,
         }
-        requests.extend(
-            [
+        # Artist catalogue ownership is shared. Each provider publishes into
+        # the same durable pool and fails independently; MusicBrainz is an
+        # optional canonical contributor instead of a readiness gate.
+        for provider in ("ytmusic", "lastfm", "listenbrainz"):
+            if provider == "listenbrainz" and not artist_mbid:
+                continue
+            requests.append(
                 EnrichmentRequest(
-                    kind="listenbrainz_artist_recordings",
-                    key=artist_mbid or artist,
+                    kind="artist_catalog",
+                    provider=provider,
+                    key=artist_mbid if provider == "listenbrainz" else artist,
                     pool="profile_spine",
                     relation="same_artist_catalog",
                     limit=16,
-                    metadata=metadata,
-                ),
-                *(
-                    [
-                        EnrichmentRequest(
-                            kind="canonical_artist_radio_catalog",
-                            key=artist_mbid or artist,
-                            pool="radio_artist_catalog",
-                            relation="same_artist_catalog",
-                            limit=48,
-                            metadata={
-                                **metadata,
-                                "radio_seed_artist": artist,
-                                "release_group_limit": 4,
-                                "release_group_offset": _request_cursor(
-                                    request_progress,
-                                    kind="canonical_artist_radio_catalog",
-                                    pool="radio_artist_catalog",
-                                    key=artist_mbid or artist,
-                                ),
-                            },
-                        )
-                    ]
-                    if radio_work_needed
-                    else []
-                ),
-                *[
+                    metadata={**metadata, "provider": provider},
+                )
+            )
+        if radio_work_needed:
+            for provider in ("ytmusic", "lastfm", "listenbrainz", "musicbrainz"):
+                if provider in {"listenbrainz", "musicbrainz"} and not artist_mbid:
+                    continue
+                requests.append(
                     EnrichmentRequest(
-                        kind="lastfm_artist_similar",
-                        key=artist_mbid or artist,
-                        pool="artist_graph",
-                        relation="artist_neighbor",
-                        limit=8,
-                        metadata={**metadata, "offset": neighbor_offset},
+                        kind="artist_catalog",
+                        provider=provider,
+                        key=(artist_mbid if provider in {"listenbrainz", "musicbrainz"} else artist),
+                        pool="radio_artist_catalog",
+                        relation="same_artist_catalog",
+                        limit=24 if provider != "musicbrainz" else 12,
+                        metadata={
+                            **metadata,
+                            "provider": provider,
+                            "radio_seed_artist": artist,
+                            "release_group_limit": 1,
+                            "release_group_offset": _request_cursor(
+                                request_progress,
+                                kind="artist_catalog",
+                                pool="radio_artist_catalog",
+                                key=(artist_mbid if provider in {"listenbrainz", "musicbrainz"} else artist),
+                            ),
+                        },
                     )
-                    for neighbor_offset in (0, 3)
-                ],
-            ]
+                )
+        requests.extend(
+            EnrichmentRequest(
+                kind="lastfm_artist_similar",
+                key=artist_mbid or artist,
+                pool="artist_graph",
+                relation="artist_neighbor",
+                limit=8,
+                metadata={**metadata, "offset": neighbor_offset},
+            )
+            for neighbor_offset in (0, 3)
         )
 
     album_shortages = {
@@ -1343,8 +1603,17 @@ def build_enrichment_plan(
             str(key): int(value or 0)
             for key, value in dict(ledger.get("album_artist_counts") or {}).items()
         }
+        album_priority_artists = _unique(
+            list(ledger.get("album_priority_artist_seeds") or []),
+            limit=32,
+        )
+        album_priority_keys = {
+            " ".join(artist.casefold().split())
+            for artist in album_priority_artists
+        }
         album_seed_artists = _unique(
             [
+                *album_priority_artists,
                 *all_anchor_artists,
                 *list(ledger.get("album_expansion_artist_seeds") or []),
                 *list(ledger.get("backbone_artist_seeds") or []),
@@ -1357,6 +1626,7 @@ def build_enrichment_plan(
         }
         album_seed_artists.sort(
             key=lambda artist: (
+                " ".join(artist.casefold().split()) not in album_priority_keys,
                 album_artist_counts.get(" ".join(artist.casefold().split()), 0) >= 3,
                 album_artist_counts.get(" ".join(artist.casefold().split()), 0),
                 seed_order.get(" ".join(artist.casefold().split()), 0),
@@ -1366,30 +1636,47 @@ def build_enrichment_plan(
             artist_key = " ".join(artist.casefold().split())
             artist_mbid = _text(artist_ids.get(artist_key))
             request_key = artist_mbid or artist
+            base_metadata = {
+                "profile_seed_artist": artist,
+                "musicbrainz_artist_id": artist_mbid,
+                "user_scope_id": taste.user_scope_id,
+                "album_artist_qualified_count": album_artist_counts.get(
+                    artist_key,
+                    0,
+                ),
+            }
             requests.append(
                 EnrichmentRequest(
-                    kind="canonical_album_catalog",
-                    key=request_key,
+                    kind="album_catalog",
+                    provider="ytmusic",
+                    key=artist,
                     pool="album",
                     relation="artist_album_catalog",
-                    limit=4,
-                    metadata={
-                        "profile_seed_artist": artist,
-                        "musicbrainz_artist_id": artist_mbid,
-                        "user_scope_id": taste.user_scope_id,
-                        "album_artist_qualified_count": album_artist_counts.get(
-                            artist_key,
-                            0,
-                        ),
-                        "release_group_offset": _request_cursor(
-                            request_progress,
-                            kind="canonical_album_catalog",
-                            pool="album",
-                            key=request_key,
-                        ),
-                    },
+                    limit=3,
+                    metadata={**base_metadata, "provider": "ytmusic"},
                 )
             )
+            if artist_mbid:
+                requests.append(
+                    EnrichmentRequest(
+                        kind="album_catalog",
+                        provider="musicbrainz",
+                        key=request_key,
+                        pool="album",
+                        relation="artist_album_catalog",
+                        limit=1,
+                        metadata={
+                            **base_metadata,
+                            "provider": "musicbrainz",
+                            "release_group_offset": _request_cursor(
+                                request_progress,
+                                kind="album_catalog",
+                                pool="album",
+                                key=request_key,
+                            ),
+                        },
+                    )
+                )
     for genre in _profile_genres(taste):
         requests.append(
             EnrichmentRequest(
@@ -1434,6 +1721,16 @@ def build_enrichment_plan(
             "row_reserve_shortages",
         )
     )
+    refresh_required = bool(ledger.get("candidate_refresh_required"))
+    refresh_generation = _text(ledger.get("candidate_refresh_generation"))
+    refresh_pools = {
+        "similarity",
+        "profile_spine",
+        "artist_graph",
+        "genre_mood",
+        "collaborative",
+        "popularity",
+    }
 
     def needs_reserve(*domains: str) -> bool:
         return any(int(reserve_shortages.get(domain) or 0) > 0 for domain in domains)
@@ -1441,11 +1738,17 @@ def build_enrichment_plan(
     def targets_shortage(request: EnrichmentRequest) -> bool:
         if not has_inventory_coverage:
             return True
-        if request.kind == "canonical_album_catalog":
+        # Freshness and quantity are independent contracts. An expired
+        # inventory must execute discovery acquisition even when its retained
+        # rows still satisfy the low-water marks. Album and radio acquisition
+        # remain owned by their independent workers/contracts.
+        if refresh_required and request.pool in refresh_pools:
+            return True
+        if request.kind == "album_catalog":
             # Optional album shortages are tracked separately from the core
             # feed contracts and still need guaranteed scheduler capacity.
             return album_work_needed
-        if request.kind == "canonical_artist_radio_catalog":
+        if request.kind == "artist_catalog" and request.pool == "radio_artist_catalog":
             return "popular_radio" in failed_domains or (
                 not failed_domains and radio_work_needed
             )
@@ -1482,10 +1785,41 @@ def build_enrichment_plan(
         if allowed_pools is not None and request.pool not in allowed_pools:
             continue
         signature = _request_signature(request)
-        progress = request_progress.get(signature) or {}
-        if signature in seen or progress.get("exhausted") is True or not targets_shortage(request):
+        progress = (
+            request_progress.get(_request_progress_signature(request))
+            or request_progress.get(signature)
+            or {}
+        )
+        refresh_request = bool(
+            refresh_required
+            and refresh_generation
+            and request.pool in refresh_pools
+        )
+        already_attempted_for_refresh = bool(
+            refresh_request
+            and _text(progress.get("refresh_generation")) == refresh_generation
+        )
+        if (
+            signature in seen
+            or already_attempted_for_refresh
+            or (progress.get("exhausted") is True and not refresh_request)
+            or not targets_shortage(request)
+        ):
             continue
         seen.add(signature)
+        if refresh_request:
+            request = EnrichmentRequest(
+                kind=request.kind,
+                key=request.key,
+                pool=request.pool,
+                relation=request.relation,
+                limit=request.limit,
+                metadata={
+                    **dict(request.metadata or {}),
+                    "refresh_generation": refresh_generation,
+                },
+                provider=request.provider,
+            )
         deduped.append(request)
     return CandidateEnrichmentPlan(
         user_scope_id=taste.user_scope_id,
@@ -1495,7 +1829,13 @@ def build_enrichment_plan(
         anchor_cursor_start=cursor,
         anchor_cursor_next=cursor_next,
         artist_cursor_next=artist_cursor_next,
+        radio_discovery_cursor_next=radio_discovery_cursor_next,
         prior_request_progress=request_progress,
+        priority_pools=(
+            ("album", "similarity", "artist_graph", "profile_spine")
+            if int(ledger.get("album_unexposed_artist_deficit") or 0) > 0
+            else ()
+        ),
     )
 
 
@@ -1534,10 +1874,19 @@ def _store_job(
         **dict(payload),
         "request_signature": _request_signature(request),
         "kind": request.kind,
+        "provider": _request_provider(request),
         "pool": request.pool,
         "key": request.key,
         "updated_at": now,
-        "expires_at": now + ACQUISITION_RESULT_TTL_SECONDS,
+        # Successful canonical pages are stable and expensive to reacquire;
+        # retain them for 90 days. Pending/retryable failures keep the normal
+        # short acquisition TTL so a stuck job cannot become permanent.
+        "expires_at": now + (
+            MUSICBRAINZ_RESULT_TTL_SECONDS
+            if _is_musicbrainz_request(request)
+            and str(payload.get("state") or "").casefold() in {"resolved", "exhausted"}
+            else ACQUISITION_RESULT_TTL_SECONDS
+        ),
     }
     try:
         connection = open_recommendation_store_connection(server)
@@ -1566,13 +1915,25 @@ def _store_job(
         connection.close()
 
 
+def _musicbrainz_acquisition_client(server: Any) -> Any:
+    configured = getattr(server, "musicbrainz_client", None)
+    if configured is not None:
+        return configured
+    from ..search.musicbrainz import (
+        MUSICBRAINZ_ACQUISITION_TIMEOUT_SECONDS,
+        MusicBrainzClient,
+    )
+
+    return MusicBrainzClient(
+        timeout_seconds=MUSICBRAINZ_ACQUISITION_TIMEOUT_SECONDS
+    )
+
+
 def _resolve_artist_mbid(server: Any, artist: str, artist_mbid: str = "") -> str:
     if _text(artist_mbid):
         return _text(artist_mbid)
-    from ..search.musicbrainz import MusicBrainzClient
-
-    client = getattr(server, "musicbrainz_client", None) or MusicBrainzClient()
-    matches = client.search_artists(artist, limit=8)
+    client = _musicbrainz_acquisition_client(server)
+    matches = client.search_artists(artist, limit=5)
     wanted = " ".join(_text(artist).casefold().split())
     for match in matches:
         names = {
@@ -1651,7 +2012,9 @@ def _canonical_recording_rows(
                 "relationship_provider": raw.get("relationship_provider"),
                 "relationship_evidence": raw.get("relationship_evidence"),
                 "relationship_score": raw.get("relationship_score"),
-                "source_provenance": f"structured:{request.kind}",
+                "source_provenance": (
+                    f"structured:{request.kind}:{_request_provider(request)}"
+                ),
             }
         )
         if len(output) >= request.limit:
@@ -1659,7 +2022,10 @@ def _canonical_recording_rows(
     return output
 
 
-def _resolve_album_rows(server: Any, request: EnrichmentRequest) -> List[Dict[str, Any]]:
+def _resolve_musicbrainz_album_rows(
+    server: Any,
+    request: EnrichmentRequest,
+) -> List[Dict[str, Any]]:
     from ..search.musicbrainz import (
         browse_musicbrainz_artist_album_items,
         browse_musicbrainz_release_group_tracks,
@@ -1671,20 +2037,23 @@ def _resolve_album_rows(server: Any, request: EnrichmentRequest) -> List[Dict[st
         artist,
         _text(request.metadata.get("musicbrainz_artist_id")),
     )
+    client = _musicbrainz_acquisition_client(server)
     albums = browse_musicbrainz_artist_album_items(
         artist,
         artist_id=artist_mbid,
-        client=getattr(server, "musicbrainz_client", None),
+        client=client,
         limit=request.limit,
         offset=max(int(request.metadata.get("release_group_offset") or 0), 0),
+        raise_errors=True,
     )
     output: List[Dict[str, Any]] = []
     for album in albums:
         release_group_id = _text(album.get("musicbrainz_release_group_id"))
         canonical_tracks = browse_musicbrainz_release_group_tracks(
             release_group_id,
-            client=getattr(server, "musicbrainz_client", None),
+            client=client,
             limit=40,
+            raise_errors=True,
         )
         if not canonical_tracks:
             continue
@@ -1706,6 +2075,9 @@ def _resolve_album_rows(server: Any, request: EnrichmentRequest) -> List[Dict[st
                 **album,
                 "id": f"musicbrainz:release-group:{release_group_id}",
                 "browseId": f"musicbrainz:release-group:{release_group_id}",
+                "canonical_album_identity": (
+                    f"musicbrainz:release-group:{release_group_id}"
+                ),
                 "musicbrainz_artist_id": artist_mbid,
                 "canonical_tracks": canonical_tracks,
                 "track_count": len(canonical_tracks),
@@ -1719,13 +2091,16 @@ def _resolve_album_rows(server: Any, request: EnrichmentRequest) -> List[Dict[st
                 "album_source": "artist_catalog",
                 "relationship_provider": "musicbrainz",
                 "relationship_evidence": "canonical_artist_discography",
-                "source_provenance": "structured:canonical_album_catalog",
+                "source_provenance": "structured:album_catalog:musicbrainz",
             }
         output.append(album_candidate)
     return output
 
 
-def _resolve_artist_radio_rows(server: Any, request: EnrichmentRequest) -> List[Dict[str, Any]]:
+def _resolve_musicbrainz_artist_catalog_rows(
+    server: Any,
+    request: EnrichmentRequest,
+) -> List[Dict[str, Any]]:
     from ..search.musicbrainz import (
         browse_musicbrainz_artist_album_items,
         browse_musicbrainz_release_group_tracks,
@@ -1739,23 +2114,61 @@ def _resolve_artist_radio_rows(server: Any, request: EnrichmentRequest) -> List[
     )
     if not artist_mbid:
         return []
+    client = _musicbrainz_acquisition_client(server)
     albums = browse_musicbrainz_artist_album_items(
         artist,
         artist_id=artist_mbid,
-        client=getattr(server, "musicbrainz_client", None),
+        client=client,
         limit=max(int(request.metadata.get("release_group_limit") or 4), 1),
         offset=max(int(request.metadata.get("release_group_offset") or 0), 0),
+        raise_errors=True,
     )
     rows: List[Dict[str, Any]] = []
     seen_titles: set[str] = set()
-    direct_limit = min(30, request.limit)
+    # The worker qualifies a seed at the publish minimum.  Provider pages can
+    # be noisy, so continue scanning until twelve accepted rows, but never
+    # turn one seed into a 24/27-track deepening job.
+    qualification_limit = min(12, request.limit)
+    direct_limit = qualification_limit
     for album in albums:
         release_group_id = _text(album.get("musicbrainz_release_group_id"))
         for track in browse_musicbrainz_release_group_tracks(
             release_group_id,
-            client=getattr(server, "musicbrainz_client", None),
+            client=client,
             limit=40,
+            raise_errors=True,
         ):
+            # The requested canonical artist is authoritative.  A release
+            # browse can include guest/various-artist recordings; only accept
+            # a track when its credited artist relationship contains the
+            # requested MusicBrainz identity (name matching is a last resort
+            # for providers that omit IDs).
+            requested_mbid = _text(artist_mbid).removeprefix(
+                "musicbrainz:artist:"
+            ).casefold()
+            credited_ids = {
+                _text(value)
+                .removeprefix("musicbrainz:artist:")
+                .casefold()
+                for value in (
+                    track.get("musicbrainz_artist_id"),
+                    track.get("artist_mbid"),
+                )
+                if _text(value)
+            }
+            credited_names = {
+                _artist(track).casefold(),
+                *(
+                    (_artist(value) if isinstance(value, dict) else _text(value))
+                    .casefold()
+                    for value in (track.get("artists") or [])
+                    if (_artist(value) if isinstance(value, dict) else _text(value))
+                ),
+            }
+            if credited_ids and requested_mbid not in credited_ids:
+                continue
+            if not credited_ids and artist.casefold() not in credited_names:
+                continue
             semantic = "|".join(
                 (
                     _text(track.get("title")).casefold(),
@@ -1770,6 +2183,10 @@ def _resolve_artist_radio_rows(server: Any, request: EnrichmentRequest) -> List[
                     **track,
                     "related_to_artist": artist,
                     "radio_seed_artist": artist,
+                    "musicbrainz_artist_id": artist_mbid,
+                    "radio_discovery_provenance": _text(
+                        request.metadata.get("radio_discovery_provenance")
+                    ),
                     "relationship_provider": "musicbrainz",
                     "relationship_evidence": "canonical_artist_discography",
                     "relationship_score": 1.0,
@@ -1779,41 +2196,290 @@ def _resolve_artist_radio_rows(server: Any, request: EnrichmentRequest) -> List[
                 break
         if len(rows) >= direct_limit:
             break
-    if len(rows) < request.limit:
-        neighbors = LastFmClient(server).similar_artists(
+    return _canonical_recording_rows(server, rows, request=request)
+
+
+def _provider_thumbnail(item: Dict[str, Any]) -> str:
+    thumbnails = item.get("thumbnails") or []
+    if isinstance(thumbnails, list):
+        for value in reversed(thumbnails):
+            if isinstance(value, dict) and _text(value.get("url")):
+                return _text(value.get("url"))
+    return _text(item.get("thumbnail") or item.get("image"))
+
+
+def _provider_artist_names(item: Dict[str, Any]) -> List[str]:
+    values = [_artist(item), _text(item.get("artist_name"))]
+    for value in item.get("artists") or []:
+        values.append(_artist(value) if isinstance(value, dict) else _text(value))
+    return _unique(values, limit=8)
+
+
+def _artist_catalog_match(item: Dict[str, Any], wanted_artist: str) -> bool:
+    wanted = " ".join(_text(wanted_artist).casefold().split())
+    return bool(
+        wanted
+        and wanted
+        in {
+            " ".join(value.casefold().split())
+            for value in _provider_artist_names(item)
+            if value
+        }
+    )
+
+
+def _ytmusic_artist_metadata(server: Any, artist: str) -> Dict[str, Any]:
+    """Resolve an exact YTMusic artist entity, never a track thumbnail."""
+
+    client = getattr(server, "ytmusic", None)
+    wanted = " ".join(_text(artist).casefold().split())
+    if client is None or not wanted:
+        return {}
+    try:
+        results = client.search(artist, filter="artists", limit=8) or []
+    except Exception:
+        return {}
+    match = next(
+        (
+            row
+            for row in results
+            if isinstance(row, dict)
+            and " ".join(_text(row.get("artist") or row.get("name")).casefold().split())
+            == wanted
+        ),
+        None,
+    )
+    if not isinstance(match, dict):
+        return {}
+    artist_id = _text(match.get("browseId") or match.get("id"))
+    detail: Dict[str, Any] = {}
+    if artist_id and hasattr(client, "get_artist"):
+        try:
+            detail = client.get_artist(artist_id) or {}
+        except Exception:
+            detail = {}
+    thumbnails: List[str] = []
+    for source in (match, detail):
+        for value in source.get("thumbnails") or []:
+            if isinstance(value, dict) and _text(value.get("url")):
+                thumbnails.append(_text(value.get("url")))
+        thumbnail = _provider_thumbnail(source)
+        if thumbnail:
+            thumbnails.append(thumbnail)
+    thumbnails = list(dict.fromkeys(thumbnails))
+    return {
+        "name": _text(match.get("artist") or match.get("name") or artist),
+        "provider_artist_id": artist_id,
+        "canonical_artist_id": (
+            f"provider:artist:{artist_id.casefold()}" if artist_id else ""
+        ),
+        "artist_thumbnail": thumbnails[-1] if thumbnails else "",
+        "artwork_source_url": thumbnails[-1] if thumbnails else "",
+        "artwork_source_urls": list(reversed(thumbnails)),
+        "artwork_provider": "ytmusic",
+    }
+
+
+def _resolve_ytmusic_artist_catalog_rows(
+    server: Any,
+    request: EnrichmentRequest,
+) -> List[Dict[str, Any]]:
+    client = getattr(server, "ytmusic", None)
+    artist = _text(request.metadata.get("profile_seed_artist") or request.key)
+    if client is None or not artist:
+        return []
+    artist_metadata = _ytmusic_artist_metadata(server, artist)
+    rows = client.search(
+        f"{artist} songs",
+        filter="songs",
+        limit=max(min(int(request.limit) * 2, 48), int(request.limit)),
+    ) or []
+    output: List[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict) or not _artist_catalog_match(row, artist):
+            continue
+        video_id = _text(row.get("videoId") or row.get("id"))
+        title = _text(row.get("title") or row.get("name"))
+        if not video_id or not title:
+            continue
+        album = row.get("album") if isinstance(row.get("album"), dict) else {}
+        output.append(
+            {
+                **row,
+                **{key: value for key, value in artist_metadata.items() if value},
+                "id": video_id,
+                "videoId": video_id,
+                "title": title,
+                "artist": artist,
+                "artist_id": artist_metadata.get("provider_artist_id") or next(
+                    (
+                        _text(value.get("id") or value.get("browseId"))
+                        for value in row.get("artists") or []
+                        if isinstance(value, dict)
+                        and _text(value.get("id") or value.get("browseId"))
+                    ),
+                    "",
+                ),
+                "album": _text(album.get("name") or album.get("title")),
+                "album_id": _text(album.get("id") or album.get("browseId")),
+                "thumbnail": _provider_thumbnail(row),
+                "provider": "ytmusic",
+                "source_provider": "ytmusic",
+                "source_identity_authority": "verified_catalog",
+                "relationship_provider": "ytmusic",
+                "relationship_evidence": "artist_catalog",
+                "relationship_score": 1.0,
+            }
+        )
+        if len(output) >= int(request.limit):
+            break
+    return _canonical_recording_rows(server, output, request=request)
+
+
+def _resolve_ytmusic_album_rows(
+    server: Any,
+    request: EnrichmentRequest,
+) -> List[Dict[str, Any]]:
+    client = getattr(server, "ytmusic", None)
+    artist = _text(request.metadata.get("profile_seed_artist") or request.key)
+    if client is None or not artist:
+        return []
+    results = client.search(
+        artist,
+        filter="albums",
+        limit=max(int(request.limit) * 2, int(request.limit)),
+    ) or []
+    output: List[Dict[str, Any]] = []
+    for row in results:
+        if not isinstance(row, dict) or not _artist_catalog_match(row, artist):
+            continue
+        browse_id = _text(row.get("browseId") or row.get("id"))
+        title = _text(row.get("title") or row.get("name"))
+        if not browse_id or not title:
+            continue
+        try:
+            detail = client.get_album(browse_id) or {}
+        except Exception:
+            detail = {}
+        raw_tracks = detail.get("tracks") or []
+        tracks: List[Dict[str, Any]] = []
+        for track in raw_tracks:
+            if not isinstance(track, dict):
+                continue
+            track_artist = artist if _artist_catalog_match(track, artist) else _artist(track)
+            video_id = _text(track.get("videoId") or track.get("id"))
+            track_title = _text(track.get("title") or track.get("name"))
+            if not video_id or not track_title or not track_artist:
+                continue
+            tracks.append(
+                {
+                    **track,
+                    "id": video_id,
+                    "videoId": video_id,
+                    "title": track_title,
+                    "artist": track_artist,
+                    "album": title,
+                    "album_id": browse_id,
+                    "provider": "ytmusic",
+                    "source_provider": "ytmusic",
+                    "source_identity_authority": "verified_catalog",
+                    "relationship_provider": "ytmusic",
+                    "relationship_evidence": "artist_album_catalog",
+                }
+            )
+        canonical_tracks = _canonical_recording_rows(
+            server,
+            tracks,
+            request=EnrichmentRequest(
+                kind="album_track",
+                provider="ytmusic",
+                key=browse_id,
+                pool="album_tracks",
+                relation="same_album",
+                limit=len(tracks),
+                metadata=request.metadata,
+            ),
+        )
+        if len(canonical_tracks) < 2:
+            continue
+        output.append(
+            {
+                **row,
+                "id": f"ytmusic:album:{browse_id}",
+                "browseId": browse_id,
+                "album_id": browse_id,
+                "canonical_album_identity": f"ytmusic:album:{browse_id}",
+                "title": title,
+                "artist": artist,
+                "thumbnail": _provider_thumbnail(detail or row),
+                "release_year": _text(
+                    detail.get("year") or row.get("year") or row.get("release_year")
+                ),
+                "canonical_tracks": canonical_tracks,
+                "track_count": len(canonical_tracks),
+                "canonical_track_count": len(canonical_tracks),
+                "playable_coverage": 0.0,
+                "playable": False,
+                "source": "ytmusic",
+                "source_provider": "ytmusic",
+                "source_authority": "verified_catalog",
+                "source_identity_authority": "verified_catalog",
+                "album_source": "artist_catalog",
+                "relationship_provider": "ytmusic",
+                "relationship_evidence": "artist_album_catalog",
+                "source_provenance": "structured:album_catalog:ytmusic",
+            }
+        )
+        if len(output) >= int(request.limit):
+            break
+    return output
+
+
+def _resolve_artist_catalog_rows(
+    server: Any,
+    request: EnrichmentRequest,
+) -> List[Dict[str, Any]]:
+    provider = _request_provider(request)
+    artist = _text(request.metadata.get("profile_seed_artist") or request.key)
+    artist_mbid = _text(request.metadata.get("musicbrainz_artist_id"))
+    if provider == "ytmusic":
+        return _resolve_ytmusic_artist_catalog_rows(server, request)
+    if provider == "lastfm":
+        client = LastFmClient(server)
+        artist_metadata = client.artist_info(artist, artist_mbid=artist_mbid)
+        rows = client.top_tracks(
             artist,
             artist_mbid=artist_mbid,
-            limit=3,
+            limit=request.limit,
         )
-        listenbrainz = ListenBrainzClient(server)
-        remaining = request.limit - len(rows)
-        per_neighbor = max(4, (remaining + max(len(neighbors), 1) - 1) // max(len(neighbors), 1))
-        for neighbor in neighbors:
-            neighbor_name = _artist(neighbor)
-            neighbor_mbid = _resolve_artist_mbid(
-                server,
-                neighbor_name,
-                _text(neighbor.get("musicbrainz_artist_id")),
-            )
-            if not neighbor_mbid:
-                continue
-            for track in listenbrainz.top_recordings(neighbor_mbid, limit=per_neighbor):
-                rows.append(
-                    {
-                        **track,
-                        "related_to_artist": artist,
-                        "radio_seed_artist": artist,
-                        "radio_catalog_role": "neighbor",
-                        "relationship_provider": "lastfm+listenbrainz",
-                        "relationship_evidence": "canonical_neighbor_catalog",
-                        "relationship_score": neighbor.get("relationship_score") or 0.7,
-                    }
-                )
-                if len(rows) >= request.limit:
-                    break
-            if len(rows) >= request.limit:
-                break
-    return _canonical_recording_rows(server, rows, request=request)
+        rows = [
+            {**row, **{key: value for key, value in artist_metadata.items() if value}}
+            for row in rows
+        ]
+        return _canonical_recording_rows(server, rows, request=request)
+    if provider == "listenbrainz":
+        if not artist_mbid:
+            return []
+        rows = ListenBrainzClient(server).top_recordings(
+            artist_mbid,
+            limit=request.limit,
+        )
+        return _canonical_recording_rows(server, rows, request=request)
+    if provider == "musicbrainz":
+        return _resolve_musicbrainz_artist_catalog_rows(server, request)
+    raise RuntimeError(f"unsupported_artist_catalog_provider:{provider}")
+
+
+def _resolve_album_catalog_rows(
+    server: Any,
+    request: EnrichmentRequest,
+) -> List[Dict[str, Any]]:
+    provider = _request_provider(request)
+    if provider == "ytmusic":
+        return _resolve_ytmusic_album_rows(server, request)
+    if provider == "musicbrainz":
+        return _resolve_musicbrainz_album_rows(server, request)
+    raise RuntimeError(f"unsupported_album_catalog_provider:{provider}")
 
 
 def _fetch_request(server: Any, request: EnrichmentRequest) -> List[Dict[str, Any]]:
@@ -1864,10 +2530,6 @@ def _fetch_request(server: Any, request: EnrichmentRequest) -> List[Dict[str, An
     if request.kind == "lastfm_tag_tracks":
         rows = LastFmClient(server).tag_tracks(request.key, limit=request.limit)
         return _canonical_recording_rows(server, rows, request=request)
-    if request.kind == "listenbrainz_artist_recordings":
-        artist_mbid = _resolve_artist_mbid(server, artist, artist_mbid_hint) if artist else ""
-        rows = ListenBrainzClient(server).top_recordings(artist_mbid, limit=request.limit)
-        return _canonical_recording_rows(server, rows, request=request)
     if request.kind == "listenbrainz_user_recommendations":
         listenbrainz = ListenBrainzClient(server)
         payload = listenbrainz.get(
@@ -1896,10 +2558,10 @@ def _fetch_request(server: Any, request: EnrichmentRequest) -> List[Dict[str, An
             if (mbid := _text(row.get("musicbrainz_recording_id"))) in metadata
         ]
         return _canonical_recording_rows(server, hydrated, request=request)
-    if request.kind == "canonical_album_catalog":
-        return _resolve_album_rows(server, request)
-    if request.kind == "canonical_artist_radio_catalog":
-        return _resolve_artist_radio_rows(server, request)
+    if request.kind == "album_catalog":
+        return _resolve_album_catalog_rows(server, request)
+    if request.kind == "artist_catalog":
+        return _resolve_artist_catalog_rows(server, request)
     raise RuntimeError(f"unsupported_structured_request:{request.kind}")
 
 
@@ -1924,8 +2586,41 @@ def materialize_enrichment_plan(
     cached = 0
     for request in plan.requests:
         job = _load_job(server, plan.user_scope_id, request)
-        if job and float(job.get("expires_at") or 0) > time.time():
+        refresh_generation = _text(request.metadata.get("refresh_generation"))
+        cached_refresh_generation = _text(
+            (job or {}).get("refresh_generation")
+        )
+        bypass_prior_generation = bool(
+            refresh_generation
+            and refresh_generation != cached_refresh_generation
+        )
+        if (
+            job
+            and not bypass_prior_generation
+            and float(job.get("expires_at") or 0) > time.time()
+        ):
             state = _text(job.get("state"))
+            if state == "retryable":
+                progress_signature = _request_progress_signature(request)
+                prior_progress = dict(request_progress.get(progress_signature) or {})
+                request_progress[progress_signature] = {
+                    **prior_progress,
+                    **{
+                        key: job.get(key)
+                        for key in (
+                            "state",
+                            "attempts",
+                            "retry_at",
+                            "provider",
+                            "provider_retry_at",
+                            "last_error",
+                            "http_status",
+                            "request_phase",
+                            "provider_elapsed_ms",
+                        )
+                        if job.get(key) is not None
+                    },
+                }
             if state == "resolved":
                 results = [dict(value) for value in job.get("results") or [] if isinstance(value, dict)]
                 if results:
@@ -1939,37 +2634,94 @@ def materialize_enrichment_plan(
             if state == "exhausted":
                 completed += 1
                 continue
-            if state == "retryable" and float(job.get("retry_at") or 0) > time.time():
+            if (
+                state == "retryable"
+                and float(job.get("retry_at") or 0) > time.time()
+                and str(job.get("last_error") or "")
+                != "AcquisitionDeadlineExceeded"
+            ):
                 continue
         pending.append(request)
 
     pending_total = len(pending)
+    # Every provider has one persisted circuit/backoff shared by its jobs.
+    # A failing provider is removed from this batch while healthy providers
+    # continue; MusicBrainz additionally remains capped to one request.
+    now = time.time()
+    providers = {
+        _request_provider(request) for request in pending if _request_provider(request)
+    }
+    provider_retry_at = {
+        provider: _provider_shared_retry_at(request_progress, provider)
+        for provider in providers
+    }
+    pending = [
+        request
+        for request in pending
+        if provider_retry_at.get(_request_provider(request), 0.0) <= now
+    ]
+    regular_pending = [
+        request
+        for request in pending
+        if not _is_musicbrainz_request(request)
+    ]
+    canonical_pending = [
+        request
+        for request in pending
+        if _is_musicbrainz_request(request)
+    ]
+    canonical_pending.sort(
+        key=lambda request: int(
+            (
+                request_progress.get(_request_progress_signature(request))
+                or request_progress.get(_request_signature(request))
+                or {}
+            ).get("attempts")
+            or 0
+        )
+    )
+    pending = [*regular_pending, *canonical_pending]
     if max_pending_jobs is None:
         scheduled = pending
     else:
         scheduled = _select_scheduled_requests(
             pending,
             max(int(max_pending_jobs), 0),
+            priority_pools=tuple(plan.priority_pools or ()),
         )
     deferred_count = pending_total - len(scheduled)
     print(
         "[EBB:acquisition] "
         f"planned={len(plan.requests)} cached={cached} "
         f"scheduled={len(scheduled)} deferred={deferred_count} "
-        f"pools={','.join(request.pool for request in scheduled)}"
+        f"pools={','.join(request.pool for request in scheduled)} "
+        f"providers={','.join(_request_provider(request) for request in scheduled)}"
     )
 
     for request in scheduled:
         signature = _request_signature(request)
-        prior = dict(request_progress.get(signature) or {})
+        progress_signature = _request_progress_signature(request)
+        prior = dict(
+            request_progress.get(progress_signature)
+            or request_progress.get(signature)
+            or {}
+        )
         pending_progress = {
             **prior,
             "state": "pending",
             "queued_at": time.time(),
+            "refresh_generation": _text(
+                request.metadata.get("refresh_generation")
+            ),
         }
-        request_progress[signature] = pending_progress
+        request_progress[progress_signature] = pending_progress
         _store_job(server, plan.user_scope_id, request, pending_progress)
 
+    deadline = (
+        started + max(float(time_budget_seconds), 1.0)
+        if time_budget_seconds
+        else None
+    )
     executor = ThreadPoolExecutor(
         max_workers=max(min(int(max_workers or 1), 8), 1),
         thread_name_prefix="auralis-structured-acquisition",
@@ -1978,43 +2730,100 @@ def materialize_enrichment_plan(
         executor.submit(_fetch_request, server, request): request
         for request in scheduled
     }
-    deadline = started + max(float(time_budget_seconds), 1.0) if time_budget_seconds else None
     repeated_batch_count = 0
+    timed_out_request_count = 0
     seen_by_pool: Dict[str, set[str]] = {
         pool: {_track_id(item) for item in values if _track_id(item)}
         for pool, values in pools.items()
     }
     for request in plan.requests:
-        progress = request_progress.get(_request_signature(request)) or {}
+        progress = (
+            request_progress.get(_request_progress_signature(request))
+            or request_progress.get(_request_signature(request))
+            or {}
+        )
         seen_by_pool.setdefault(request.pool, set()).update(
             _text(identity)
             for identity in progress.get("returned_identities") or []
             if _text(identity)
         )
     try:
-        for future in as_completed(futures):
+        completion_timeout = (
+            max(deadline - time.perf_counter(), 0.001)
+            if deadline is not None
+            else None
+        )
+        for future in as_completed(futures, timeout=completion_timeout):
             request = futures[future]
             signature = _request_signature(request)
-            prior = dict(request_progress.get(signature) or {})
+            progress_signature = _request_progress_signature(request)
+            prior = dict(
+                request_progress.get(progress_signature)
+                or request_progress.get(signature)
+                or {}
+            )
             try:
                 results = future.result()
             except Exception as exc:
-                failures[f"{request.kind}:{request.key}"] = type(exc).__name__
+                details = _provider_failure_details(exc)
+                failure_name = str(details.get("last_error") or type(exc).__name__)
+                failures[
+                    f"{request.kind}:{_request_provider(request)}:{request.key}"
+                ] = failure_name
                 attempts = int(prior.get("attempts") or 0) + 1
-                retry_at = time.time() + min(60 * (2 ** min(attempts, 5)), 1800)
-                request_progress[signature] = {
+                is_musicbrainz = _is_musicbrainz_request(request)
+                provider_name = _request_provider(request)
+                transient = bool(details.get("transient"))
+                retry_delay = _provider_retry_delay_seconds(
+                    details,
+                    attempts,
+                    provider=provider_name,
+                )
+                retry_at = time.time() + retry_delay
+                request_progress[progress_signature] = {
                     **prior,
-                    "state": "retryable",
+                    "state": (
+                        "exhausted"
+                        if is_musicbrainz and not transient
+                        else "retryable"
+                    ),
                     "attempts": attempts,
                     "retry_at": retry_at,
-                    "last_error": type(exc).__name__,
+                    "provider": provider_name,
+                    "provider_retry_at": retry_at if transient else 0.0,
+                    "last_error": failure_name,
+                    "http_status": int(details.get("http_status") or 0),
+                    "request_phase": str(details.get("request_phase") or ""),
+                    "provider_elapsed_ms": int(
+                        details.get("provider_elapsed_ms") or 0
+                    ),
+                    "exhausted": bool(is_musicbrainz and not transient),
                 }
                 _store_job(
                     server,
                     plan.user_scope_id,
                     request,
-                    request_progress[signature],
+                    request_progress[progress_signature],
                 )
+                if is_musicbrainz:
+                    print(
+                        "[EBB:musicbrainz] "
+                        f"kind={request.kind} seed={request.key} "
+                        f"phase={details.get('request_phase') or '-'} "
+                        f"error={failure_name} "
+                        f"status={int(details.get('http_status') or 0)} "
+                        f"elapsed_ms={int(details.get('provider_elapsed_ms') or 0)} "
+                        f"retry_in_s={int(retry_delay) if transient else 0}"
+                    )
+                else:
+                    print(
+                        "[EBB:provider] "
+                        f"provider={provider_name or '-'} "
+                        f"kind={request.kind} seed={request.key} "
+                        f"error={failure_name} "
+                        f"status={int(details.get('http_status') or 0)} "
+                        f"retry_in_s={int(retry_delay)}"
+                    )
                 continue
             completed += 1
             pool_seen = seen_by_pool.setdefault(request.pool, set())
@@ -2031,16 +2840,23 @@ def materialize_enrichment_plan(
                 unique_results.append(result)
             pools.setdefault(request.pool, []).extend(unique_results)
             no_new = 0 if unique_results else int(prior.get("consecutive_no_new") or 0) + 1
-            exhausted = no_new >= 2
+            # An empty MusicBrainz release-group page is a definitive end of
+            # that artist catalogue. Duplicate-only pages retain the bounded
+            # two-page rule because a later page may still contain new supply.
+            exhausted = (
+                request.kind in {"album_catalog", "artist_catalog"}
+                and _is_musicbrainz_request(request)
+                and not results
+            ) or no_new >= 2
             cursor_base = int(
                 request.metadata.get("release_group_offset")
                 or request.metadata.get("offset")
                 or 0
             )
-            if request.kind in {"canonical_album_catalog", "canonical_artist_radio_catalog"}:
+            if request.kind in {"album_catalog", "artist_catalog"}:
                 cursor_step = int(
                     request.metadata.get("release_group_limit")
-                    or (request.limit if request.kind == "canonical_album_catalog" else 1)
+                    or (request.limit if request.kind == "album_catalog" else 1)
                 )
             else:
                 cursor_step = len(results)
@@ -2055,10 +2871,54 @@ def materialize_enrichment_plan(
                 "exhausted": exhausted,
                 "results": unique_results,
             }
-            request_progress[signature] = progress
+            request_progress[progress_signature] = progress
             _store_job(server, plan.user_scope_id, request, progress)
             if deadline is not None and time.perf_counter() >= deadline:
                 break
+    except FuturesTimeoutError:
+        now = time.time()
+        for future, request in futures.items():
+            if future.done():
+                continue
+            timed_out_request_count += 1
+            progress_signature = _request_progress_signature(request)
+            signature = _request_signature(request)
+            prior = dict(
+                request_progress.get(progress_signature)
+                or request_progress.get(signature)
+                or {}
+            )
+            attempts = int(prior.get("attempts") or 0) + 1
+            is_musicbrainz = _is_musicbrainz_request(request)
+            provider_name = _request_provider(request)
+            retry_delay = (
+                _provider_retry_delay_seconds(
+                    {"provider_retry_after_seconds": 0},
+                    attempts,
+                    provider=provider_name,
+                )
+            )
+            timeout_progress = {
+                **prior,
+                "state": "retryable",
+                "attempts": attempts,
+                "retry_at": now + retry_delay,
+                "provider": provider_name,
+                "provider_retry_at": now + retry_delay,
+                "last_error": "AcquisitionDeadlineExceeded",
+            }
+            request_progress[progress_signature] = timeout_progress
+            _store_job(
+                server,
+                plan.user_scope_id,
+                request,
+                timeout_progress,
+            )
+            failures[
+                f"{request.kind}:{_request_provider(request)}:{request.key}"
+            ] = (
+                "AcquisitionDeadlineExceeded"
+            )
     finally:
         for future in futures:
             if not future.done():
@@ -2088,14 +2948,40 @@ def materialize_enrichment_plan(
                 pool: sum(1 for request in scheduled if request.pool == pool)
                 for pool in dict.fromkeys(request.pool for request in scheduled)
             },
+            "scheduled_provider_counts": {
+                provider: sum(
+                    1
+                    for request in scheduled
+                    if _request_provider(request) == provider
+                )
+                for provider in dict.fromkeys(
+                    _request_provider(request) for request in scheduled
+                )
+            },
             "deferred_request_count": deferred_count,
             "failed_request_count": len(failures),
+            "timed_out_request_count": timed_out_request_count,
             "failure_types": failures,
+            "musicbrainz_provider_retry_at": _musicbrainz_shared_retry_at(
+                request_progress
+            ),
+            "provider_retry_at": {
+                provider: _provider_shared_retry_at(request_progress, provider)
+                for provider in sorted(
+                    {
+                        _text(progress.get("provider")).casefold()
+                        for progress in request_progress.values()
+                        if isinstance(progress, dict)
+                        and _text(progress.get("provider"))
+                    }
+                )
+            },
             "anchor_track_count": plan.anchor_track_count,
             "anchor_artist_count": plan.anchor_artist_count,
             "anchor_cursor_start": plan.anchor_cursor_start,
             "anchor_cursor_next": plan.anchor_cursor_next,
             "artist_cursor_next": plan.artist_cursor_next,
+            "radio_discovery_cursor_next": plan.radio_discovery_cursor_next,
             "repeated_batch_count": repeated_batch_count,
             **canonical_stats,
             "request_progress": request_progress,

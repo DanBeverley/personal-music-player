@@ -7,7 +7,8 @@ import uuid
 
 from fastapi import HTTPException
 
-from ..discovery.service import DiscoveryService
+from ..home_feed.api import HomeFeedApi
+from ..home_feed.scheduler import HomeJobScheduler
 from .admin_runtime import (
     evaluate_experiments as evaluate_experiments_runtime,
     experiments as experiments_runtime,
@@ -62,7 +63,7 @@ class RecommendationService:
 
     def __init__(self, server: Any) -> None:
         self._server = server
-        self._discovery = DiscoveryService(server)
+        self._home = HomeFeedApi(server)
 
     def recommend(self, req: Any) -> Dict[str, Any]:
         server = self._server
@@ -109,7 +110,7 @@ class RecommendationService:
             )
 
             with request_store_runtime(allow_persistent_reads=False):
-                response = self._discovery.recommend(
+                response = self._home.recommend(
                     req,
                     request_mode=request_mode,
                     trace=trace,
@@ -200,7 +201,6 @@ class RecommendationService:
         return load_recommendation_preferences(self._server, user_scope_id)
 
     def update_recommendation_preferences(self, req: Any):
-        from ..discovery.feed_state import FeedState, load_feed_state, mark_feed_dirty
         from ..discovery.preferences import save_recommendation_preferences
 
         try:
@@ -212,10 +212,11 @@ class RecommendationService:
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        state = load_feed_state(self._server, req.user_scope_id)
-        if state is None:
-            state = FeedState(user_scope_id=req.user_scope_id)
-        mark_feed_dirty(self._server, state, "recommendation_preferences_changed")
+        HomeJobScheduler(self._server).candidates(
+            req,
+            reason="signal_reconcile",
+            generation_hint=f"preferences:{int(time.time() * 1000)}",
+        )
         return payload
 
     def model_status(self):

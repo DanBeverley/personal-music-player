@@ -312,6 +312,19 @@ def infer_source_identity(item: Dict[str, Any]) -> Dict[str, Any]:
     if explicit in {"official", "canonical", "verified_catalog"}:
         authority = "verified_catalog" if authority == "user_upload" else authority
         confidence = max(confidence, 0.74)
+    playback = item.get("playback") if isinstance(item.get("playback"), dict) else {}
+    playback_source_id = _text(playback.get("source_id"))
+    verified_at = float(playback.get("verified_at") or 0.0)
+    verification = (
+        {
+            "verification_state": "verified",
+            "verified_at": verified_at,
+            "verification_method": _text(playback.get("verification_method"))
+            or "search_source_registry",
+        }
+        if verified_at > 0.0 and (not playback_source_id or playback_source_id == key)
+        else {}
+    )
     return {
         "source_provider": provider,
         "source_key": key or re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-"),
@@ -324,6 +337,7 @@ def infer_source_identity(item: Dict[str, Any]) -> Dict[str, Any]:
             "browse_id": _text(item.get("browseId")),
             "source_authority": explicit,
         },
+        **verification,
     }
 
 

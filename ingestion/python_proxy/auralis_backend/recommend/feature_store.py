@@ -33,7 +33,7 @@ _HOT_CACHE_TTL_SECONDS = max(
 
 
 _SCHEMA_LOCK = Lock()
-_SQLITE_SCHEMA_READY = False
+_SQLITE_SCHEMA_READY_PATHS: set[str] = set()
 _POSTGRES_SCHEMA_READY = False
 _HOT_CACHE_LOCK = Lock()
 _REQUEST_STORE_RUNTIME: ContextVar[Dict[str, Any] | None] = ContextVar(
@@ -345,7 +345,17 @@ def hot_runtime_cache_clear(bucket: str) -> None:
 
 
 def ensure_feature_schema(server: Any) -> None:
-    global _SQLITE_SCHEMA_READY, _POSTGRES_SCHEMA_READY
+    global _POSTGRES_SCHEMA_READY
+    sqlite_path = str(
+        getattr(server, "RECOMMENDATION_STORE_DB_PATH", "") or ""
+    ).strip()
+    sqlite_schema_key = (
+        sqlite_path
+        if sqlite_path == ":memory:"
+        else os.path.abspath(sqlite_path)
+        if sqlite_path
+        else f"runtime:{id(server)}"
+    )
     with _SCHEMA_LOCK:
         if (
             persistent_store_reads_enabled()
@@ -360,13 +370,17 @@ def ensure_feature_schema(server: Any) -> None:
                 _POSTGRES_SCHEMA_READY = True
             except Exception:
                 pass
-        if not _SQLITE_SCHEMA_READY:
+        if (
+            sqlite_path == ":memory:"
+            or sqlite_schema_key not in _SQLITE_SCHEMA_READY_PATHS
+        ):
             connection = open_recommendation_store_connection(server)
             try:
                 for statement in _SQLITE_SCHEMA_SQL:
                     connection.execute(statement)
                 connection.commit()
-                _SQLITE_SCHEMA_READY = True
+                if sqlite_path != ":memory:":
+                    _SQLITE_SCHEMA_READY_PATHS.add(sqlite_schema_key)
             finally:
                 connection.close()
 

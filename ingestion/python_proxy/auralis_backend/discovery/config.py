@@ -41,8 +41,8 @@ DISCOVERY_UNIVERSE_TARGET = 640
 # worker keeps enriching accepted cards toward the deeper target in later
 # cycles, but a 24-track minimum made otherwise healthy artist catalogs
 # impossible to publish.
-POPULAR_RADIO_CARD_MIN_TRACKS = 12
-POPULAR_RADIO_CARD_TARGET_TRACKS = 24
+POPULAR_RADIO_CARD_MIN_TRACKS = 8
+POPULAR_RADIO_CARD_TARGET_TRACKS = 12
 
 ROW_RECIPES: Dict[str, RowRecipe] = {
     "todays_pick": RowRecipe(
@@ -63,7 +63,7 @@ ROW_RECIPES: Dict[str, RowRecipe] = {
         title="Featured albums for you",
         item_type="album",
         launch_required=False,
-        min_items=8,
+        min_items=4,
         target_items=8,
         max_items=10,
         page_size=10,
@@ -137,10 +137,10 @@ ROW_RECIPES: Dict[str, RowRecipe] = {
         title="Popular Radio",
         item_type="radio",
         launch_required=False,
-        min_items=12,
-        target_items=16,
-        max_items=20,
-        page_size=20,
+        min_items=10,
+        target_items=12,
+        max_items=15,
+        page_size=15,
         can_page=True,
         candidate_sources=("profile_spine", "artist_graph", "similarity", "collaborative", "popularity"),
         ranking_intent="artist_radio",
@@ -151,7 +151,7 @@ ROW_RECIPES: Dict[str, RowRecipe] = {
         title="Recommended albums",
         item_type="album",
         launch_required=False,
-        min_items=12,
+        min_items=4,
         target_items=12,
         max_items=48,
         page_size=12,

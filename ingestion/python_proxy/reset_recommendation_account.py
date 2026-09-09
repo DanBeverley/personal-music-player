@@ -10,7 +10,7 @@ if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
 
 import server
-from auralis_backend.discovery.feed_state import invalidate_feed_state
+from auralis_backend.home_feed.repositories import HomeRepositorySet
 from auralis_backend.recommend.feature_store import delete_taste_profile, ensure_feature_schema
 from auralis_backend.recommend.session_runtime import clear_feed_sessions
 from auralis_backend.recommend.store_runtime import open_recommendation_store_connection
@@ -53,7 +53,9 @@ def reset_recommendation_account(user_scope_id: str) -> dict[str, int | str]:
         connection.close()
 
     delete_taste_profile(server, user_scope_id=normalized_scope)
-    invalidate_feed_state(server, normalized_scope)
+    deleted_counts.update(
+        HomeRepositorySet.from_server(server).delete_scope(normalized_scope)
+    )
     clear_feed_sessions(server)
 
     return {

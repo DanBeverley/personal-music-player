@@ -844,19 +844,22 @@ def read_entity_artwork(
     return None
 
 
-def schedule_artist_artwork_cache(
+def cache_artist_artwork_now(
     server: Any,
     artist: Dict[str, Any],
-    *,
-    on_cached: Callable[[Dict[str, Any]], None] | None = None,
-) -> bool:
+) -> Dict[str, Any] | None:
+    """Resolve and persist one artist image synchronously.
+
+    Durable Home artwork jobs call this function so job completion means the
+    bytes are actually available.  The async public wrapper below remains for
+    non-Home callers.
+    """
+
     server = getattr(server, "raw", server)
     cached_artist = attach_cached_artist_artwork(server, artist)
     if _clean(cached_artist.get("thumbnail")).startswith("/artist_artwork/"):
         notify_artist_metadata_updated(cached_artist)
-        if on_cached is not None:
-            on_cached(cached_artist)
-        return True
+        return cached_artist
 
     source_urls = _artist_artwork_source_urls(cached_artist)
     canonical_artist_id = _clean(
@@ -888,12 +891,86 @@ def schedule_artist_artwork_cache(
         not source_urls
         or not canonical_artist_id
     ):
-        return False
+        return None
     cache = get_artist_artwork_cache(server)
     if cache is None:
-        return False
+        return None
     token = artist_artwork_token(canonical_artist_id)
     if not token:
+        return None
+    selected_source = ""
+    failure_times = dict(
+        cached_artist.get("artwork_source_failures") or {}
+        if isinstance(cached_artist.get("artwork_source_failures"), dict)
+        else {}
+    )
+    failed_sources = list(
+        dict.fromkeys(
+            _clean(value)
+            for value in cached_artist.get("artwork_failed_source_urls") or []
+            if _clean(value)
+        )
+    )
+    for source_url in source_urls:
+        if cache.store(
+            token=token,
+            source_url=source_url,
+            canonical_artist_id=canonical_artist_id,
+        ):
+            selected_source = source_url
+            break
+        if source_url not in failed_sources:
+            failed_sources.append(source_url)
+        failure_times[source_url] = time.time()
+    if not selected_source:
+        failed = dict(cached_artist)
+        failed["artwork_failed_source_urls"] = failed_sources
+        failed["artwork_source_failures"] = failure_times
+        failed["artwork_cache_status"] = "source_failed"
+        notify_artist_metadata_updated(failed)
+        return failed
+    updated = dict(cached_artist)
+    updated["artwork_source_url"] = selected_source
+    updated["artwork_source_urls"] = [
+        selected_source,
+        *(url for url in source_urls if url != selected_source),
+    ]
+    updated["artwork_failed_source_urls"] = [
+        url for url in failed_sources if url != selected_source
+    ]
+    failure_times.pop(selected_source, None)
+    updated["artwork_source_failures"] = failure_times
+    updated["artwork_cache_status"] = "cached"
+    updated["artwork_cached_at"] = int(time.time())
+    updated["artwork_cache_identity"] = canonical_artist_id
+    updated["artwork_cache_token"] = token
+    updated["thumbnail"] = f"/artist_artwork/{token}"
+    notify_artist_metadata_updated(updated)
+    return updated
+
+
+def schedule_artist_artwork_cache(
+    server: Any,
+    artist: Dict[str, Any],
+    *,
+    on_cached: Callable[[Dict[str, Any]], None] | None = None,
+) -> bool:
+    server = getattr(server, "raw", server)
+    cached = attach_cached_artist_artwork(server, artist)
+    if _clean(cached.get("thumbnail")).startswith("/artist_artwork/"):
+        notify_artist_metadata_updated(cached)
+        if on_cached is not None:
+            on_cached(cached)
+        return True
+    identity = _clean(
+        cached.get("canonical_artist_id")
+        or cached.get("canonical_artist_key")
+        or cached.get("provider_artist_id")
+        or cached.get("id")
+        or cached.get("name")
+    )
+    token = artist_artwork_token(identity)
+    if not token or not _artist_artwork_source_urls(cached):
         return False
     pending_key = f"{id(server)}:{token}"
     with _PENDING_LOCK:
@@ -903,57 +980,8 @@ def schedule_artist_artwork_cache(
 
     def run() -> None:
         try:
-            selected_source = ""
-            failure_times = dict(
-                cached_artist.get("artwork_source_failures") or {}
-                if isinstance(cached_artist.get("artwork_source_failures"), dict)
-                else {}
-            )
-            failed_sources = list(
-                dict.fromkeys(
-                    _clean(value)
-                    for value in cached_artist.get("artwork_failed_source_urls") or []
-                    if _clean(value)
-                )
-            )
-            for source_url in source_urls:
-                if cache.store(
-                    token=token,
-                    source_url=source_url,
-                    canonical_artist_id=canonical_artist_id,
-                ):
-                    selected_source = source_url
-                    break
-                if source_url not in failed_sources:
-                    failed_sources.append(source_url)
-                failure_times[source_url] = time.time()
-            if not selected_source:
-                failed = dict(cached_artist)
-                failed["artwork_failed_source_urls"] = failed_sources
-                failed["artwork_source_failures"] = failure_times
-                failed["artwork_cache_status"] = "source_failed"
-                notify_artist_metadata_updated(failed)
-                if on_cached is not None:
-                    on_cached(failed)
-                return
-            updated = dict(cached_artist)
-            updated["artwork_source_url"] = selected_source
-            updated["artwork_source_urls"] = [
-                selected_source,
-                *(url for url in source_urls if url != selected_source),
-            ]
-            updated["artwork_failed_source_urls"] = [
-                url for url in failed_sources if url != selected_source
-            ]
-            failure_times.pop(selected_source, None)
-            updated["artwork_source_failures"] = failure_times
-            updated["artwork_cache_status"] = "cached"
-            updated["artwork_cached_at"] = int(time.time())
-            updated["artwork_cache_identity"] = canonical_artist_id
-            updated["artwork_cache_token"] = token
-            updated["thumbnail"] = f"/artist_artwork/{token}"
-            notify_artist_metadata_updated(updated)
-            if on_cached is not None:
+            updated = cache_artist_artwork_now(server, cached)
+            if updated is not None and on_cached is not None:
                 on_cached(updated)
         finally:
             with _PENDING_LOCK:

@@ -167,6 +167,36 @@ def _avoid_ids(taste: TasteProfile) -> Set[str]:
     return output
 
 
+def _hard_avoid_ids(taste: TasteProfile) -> Set[str]:
+    output: Set[str] = set()
+    for value in getattr(taste, "hard_avoid_ids", []) or []:
+        raw = str(value or "").strip()
+        if not raw:
+            continue
+        output.add(raw.casefold())
+        normalized = normalize_text(raw)
+        if normalized:
+            output.add(normalized)
+    return output
+
+
+def _track_identity_keys(item: Dict[str, Any]) -> Set[str]:
+    keys = {
+        str(value or "").strip().casefold()
+        for value in (
+            track_id(item),
+            item.get("canonical_track_identity"),
+            item.get("canonical_source_identity"),
+            item.get("canonical_title_artist_identity"),
+        )
+        if str(value or "").strip()
+    }
+    signature = normalize_text(item_signature(item))
+    if signature:
+        keys.add(signature)
+    return keys
+
+
 def _refresh_jitter(taste: TasteProfile, identity: Any) -> float:
     token = str(taste.refresh_token or "").strip()
     key = str(identity or "").strip()
@@ -179,14 +209,20 @@ def _refresh_jitter(taste: TasteProfile, identity: Any) -> float:
 def _album_identity_keys(item: Dict[str, Any]) -> Set[str]:
     title = normalize_text(item.get("title") or item.get("album"))
     artist = normalize_text(item.get("artist") or item.get("artist_name") or item.get("channel"))
-    keys = {
-        normalize_text(item.get("id")),
-        normalize_text(item.get("album_id")),
-        normalize_text(item.get("albumId")),
-        normalize_text(item.get("canonical_album_identity")),
-        normalize_text(item.get("canonical_source_identity")),
-        normalize_text(f"{title}|{artist}"),
-    }
+    release_group = normalize_text(
+        item.get("musicbrainz_release_group_id")
+        or item.get("release_group_mbid")
+        or item.get("canonical_release_group_id")
+    )
+    if release_group:
+        return {f"release-group:{release_group}"}
+    canonical = normalize_text(
+        item.get("canonical_album_identity")
+        or item.get("canonical_source_identity")
+    )
+    keys = {canonical} if canonical else set()
+    if not keys:
+        keys.add(normalize_text(f"{title}|{artist}"))
     keys.discard("")
     return keys
 
@@ -950,11 +986,25 @@ def rank_tracks(
                 collaborative_count += 1
             bounded.append(entry)
         scored = bounded
+    # Previous visible items are a freshness preference, not an absolute
+    # validity rule. Rank unexposed supply first, then use a bounded diverse
+    # backfill when the fresh partition cannot satisfy the row. This prevents
+    # shallow-but-valid supply from turning into a rejected feed loop.
+    effective_excludes = set(exclude_ids or set())
+    if taste.force_refresh and row.kind in REFRESH_MUTABLE_ROWS:
+        prior_visible = _hard_avoid_ids(taste)
+        fresh = [
+            entry
+            for entry in scored
+            if not (_track_identity_keys(entry[1].item) & prior_visible)
+        ]
+        retained = [entry for entry in scored if entry not in fresh]
+        scored = [*fresh, *retained]
     return _select_diverse(
         scored,
         limit=requested_limit,
         row_kind=row.kind,
-        exclude_ids=exclude_ids,
+        exclude_ids=effective_excludes,
     )
 
 
@@ -1010,11 +1060,14 @@ def rank_albums(
     taste_artists = _taste_artist_keys(taste)
     history_ids = _history_track_ids(taste)
     scored: List[Tuple[float, DiscoveryCandidate]] = []
+    exposed_scored: List[Tuple[float, DiscoveryCandidate]] = []
     has_release_metadata = False
     seen = set()
     lane = LANE_RECIPES.get(lane_id)
     preferred_track_ids = set(preferred_track_ids or set())
     exclude_album_keys = set(exclude_album_keys or set())
+    avoid_identities = _avoid_ids(taste)
+    hard_avoid_identities = _hard_avoid_ids(taste)
     listened_album_titles, listened_album_exact = _listened_album_keys(taste)
     for candidate in candidates:
         item = dict(candidate.item)
@@ -1022,19 +1075,28 @@ def rank_albums(
             continue
         title = normalize_text(item.get("title"))
         artist = normalize_text(item.get("artist"))
+        artist_exposure_identity = f"artist:{artist}" if artist else ""
         signature = normalize_text(item.get("id") or f"{title}|{artist}")
-        if not title or signature in seen:
+        identity_keys = _album_identity_keys(item)
+        if not title or identity_keys & seen:
             continue
         feedback_penalty, hard_suppressed = _negative_feedback_penalty(item, taste)
         if hard_suppressed:
             continue
-        album_keys = {
-            signature,
-            normalize_text(f"{title}|{artist}"),
-        }
-        album_keys.discard("")
-        if album_keys & exclude_album_keys:
+        if identity_keys & exclude_album_keys:
             continue
+        previously_visible = bool(
+            taste.force_refresh
+            and row.kind in REFRESH_MUTABLE_ROWS
+            and (
+                identity_keys & hard_avoid_identities
+                or (
+                    row.kind == "featured_new_albums"
+                    and artist_exposure_identity
+                    and artist_exposure_identity in hard_avoid_identities
+                )
+            )
+        )
         release = str(
             item.get("release_year")
             or item.get("release_date")
@@ -1103,8 +1165,14 @@ def rank_albums(
         if release:
             score += 0.35
         if taste.force_refresh and row.kind in REFRESH_MUTABLE_ROWS:
-            if _album_identity_keys(item) & _avoid_ids(taste):
+            if _album_identity_keys(item) & avoid_identities:
                 score -= 4.5
+            if (
+                row.kind == "featured_new_albums"
+                and artist_exposure_identity
+                and artist_exposure_identity in avoid_identities
+            ):
+                score -= 3.0
             score += _refresh_jitter(
                 taste,
                 item.get("canonical_album_identity")
@@ -1124,9 +1192,20 @@ def rank_albums(
             if lane_delta <= 0 and not preferred_album:
                 continue
             score += lane_delta
-        seen.add(signature)
-        scored.append((score, DiscoveryCandidate(item=item, source=candidate.source, score=score, item_type="album")))
+        seen.update(identity_keys)
+        entry = (
+            score,
+            DiscoveryCandidate(
+                item=item,
+                source=candidate.source,
+                score=score,
+                item_type="album",
+            ),
+        )
+        (exposed_scored if previously_visible else scored).append(entry)
     scored.sort(key=lambda item: item[0], reverse=True)
+    exposed_scored.sort(key=lambda item: item[0], reverse=True)
+    scored = [*scored, *exposed_scored]
     if row.kind == "recommended_albums":
         fresh_scored: List[Tuple[float, DiscoveryCandidate]] = []
         listened_scored: List[Tuple[float, DiscoveryCandidate]] = []
@@ -1142,18 +1221,35 @@ def rank_albums(
         if fresh_scored:
             scored = [*fresh_scored, *listened_scored]
     output: List[Dict[str, Any]] = []
+    deferred: List[Tuple[float, DiscoveryCandidate]] = []
     artist_counts: Dict[str, int] = defaultdict(int)
     max_per_artist = 1 if row.kind == "featured_new_albums" else 2
     for _score, candidate in scored:
         item = dict(candidate.item)
         artist_key = normalize_text(item.get("artist"))
         if artist_key and artist_counts[artist_key] >= max_per_artist:
+            deferred.append((_score, candidate))
             continue
         output.append(item)
         if artist_key:
             artist_counts[artist_key] += 1
         if len(output) >= row.max_items:
             break
+    # If the ideal diversity pass cannot reach the viable minimum, admit a
+    # bounded deterministic backfill. This keeps shallow inventories useful
+    # without allowing one artist to dominate a full shelf.
+    if len(output) < row.target_items:
+        backfill_cap = max_per_artist + 2
+        for _score, candidate in deferred:
+            item = dict(candidate.item)
+            artist_key = normalize_text(item.get("artist"))
+            if artist_key and artist_counts[artist_key] >= backfill_cap:
+                continue
+            output.append(item)
+            if artist_key:
+                artist_counts[artist_key] += 1
+            if len(output) >= row.max_items:
+                break
     return output, has_release_metadata
 
 
@@ -1189,8 +1285,22 @@ def rank_artists(
         counts[key] += weight
         labels[key] = name
         thumbnails.setdefault(key, str(candidate.item.get("thumbnail") or ""))
+    ranked = counts.most_common()
+    if taste.force_refresh:
+        avoid = _avoid_ids(taste)
+        hard_avoid = _hard_avoid_ids(taste)
+        fresh = [
+            entry
+            for entry in ranked
+            if entry[0] not in avoid
+            and entry[0] not in hard_avoid
+            and str(ids.get(entry[0]) or "").casefold() not in avoid
+            and str(ids.get(entry[0]) or "").casefold() not in hard_avoid
+        ]
+        exposed = [entry for entry in ranked if entry not in fresh]
+        ranked = [*fresh, *exposed]
     output: List[Dict[str, Any]] = []
-    for key, score in counts.most_common(row.max_items):
+    for key, score in ranked[: row.max_items]:
         output.append(
             {
                 "id": ids.get(key) or key,
@@ -1528,9 +1638,27 @@ def build_popular_radio_cards(
         "direct_card_count": sum(
             1 for card in cards if card.get("seed_affinity") == "direct"
         ),
-        "similar_card_count": sum(
-            1 for card in cards if card.get("seed_affinity") == "similar"
+        "related_card_count": sum(
+            1 for card in cards if card.get("seed_affinity") == "related"
         ),
+        "exploratory_card_count": sum(
+            1 for card in cards if card.get("seed_affinity") == "exploratory"
+        ),
+        # Keep the legacy name for clients that still read it, but expose the
+        # real affinity lanes so a direct-only radio is visible in diagnostics.
+        "similar_card_count": sum(
+            1 for card in cards if card.get("seed_affinity") in {"related", "similar"}
+        ),
+        "selected_discovery_count": sum(
+            1 for card in cards if card.get("seed_affinity") in {"related", "exploratory", "similar"}
+        ),
+        "novel_identity_count": int(
+            max((int(card.get("radio_novel_identity_count") or 0) for card in cards), default=0)
+        ),
+        "fresh_rotation": bool(cards and any(bool(card.get("fresh_rotation")) for card in cards)),
+        "rotation_pending": any(bool(card.get("rotation_pending")) for card in cards),
+        "supply_generation_id": str(cards[0].get("radio_supply_generation_id") or "") if cards else "",
+        "radio_discovery_cursor_next": int(cards[0].get("radio_discovery_cursor_next") or 0) if cards else 0,
     }
 def build_home_lanes(
     pools: Dict[str, List[DiscoveryCandidate]],
@@ -1713,14 +1841,7 @@ def build_rows_from_pools(
                 continue
             if row.kind == "featured_new_albums":
                 for item in items:
-                    normalized_title = normalize_text(item.get("title"))
-                    normalized_artist = normalize_text(item.get("artist"))
-                    featured_album_keys.update(
-                        {
-                            normalize_text(item.get("id")),
-                            normalize_text(f"{normalized_title}|{normalized_artist}"),
-                        }
-                    )
+                    featured_album_keys.update(_album_identity_keys(item))
                 featured_album_keys.discard("")
             meta = {
                 "has_release_metadata": has_release_metadata,

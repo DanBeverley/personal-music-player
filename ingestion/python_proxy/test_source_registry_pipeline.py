@@ -11,6 +11,8 @@ from auralis_backend.discovery.source_registry import (
     _match_source,
     _shortlist,
     _store_sources,
+    playback_source_semantically_compatible,
+    resolve_user_requested_playback_source,
     verify_materialized_supply,
 )
 from auralis_backend.discovery.structured_providers import CanonicalRecording
@@ -51,7 +53,108 @@ def _source(index: int, *, state: str = "verified") -> dict:
         "identity_confidence": 0.96,
         "verification_state": state,
         "verified_at": 9999999999.0,
+        "source_match_version": "source-match-v2",
+        "match_compatible": True,
     }
+
+
+def test_studio_recording_rejects_live_and_tribute_sources() -> None:
+    recording = CanonicalRecording(
+        title="For Whom the Bell Tolls",
+        artist="Metallica",
+        album="Ride the Lightning",
+        duration_seconds=310,
+    )
+    live = {
+        "source_id": "2SUgR7DiJEo",
+        "title": "For Whom the Bell Tolls (Live)",
+        "channel": "Metallica",
+        "album": "Live at Hampton Coliseum",
+        "duration": 310,
+    }
+    tribute = {
+        "source_id": "2V9Bjp6aJog",
+        "title": "For Whom the Bell Tolls",
+        "channel": "Ac City - Topic",
+        "album": "The Best Metallica Tribute",
+        "duration": 310,
+    }
+
+    assert _match_source(recording, live) is None
+    assert _match_source(recording, tribute) is None
+
+
+def test_studio_recording_accepts_matching_remaster() -> None:
+    recording = CanonicalRecording(
+        title="For Whom the Bell Tolls",
+        artist="Metallica",
+        album="Ride the Lightning",
+        duration_seconds=310,
+    )
+    source = {
+        "source_id": "B_HSa1dEL9s",
+        "title": "For Whom the Bell Tolls (Remastered)",
+        "channel": "Metallica - Topic",
+        "catalog_artist": "Metallica",
+        "album": "Ride the Lightning (Remastered)",
+        "duration": 312,
+        "ytmusic_catalog": True,
+    }
+
+    matched = _match_source(recording, source)
+    assert matched is not None
+    assert matched["match_compatible"] is True
+    assert matched["source_match_version"] == "source-match-v2"
+
+
+def test_legacy_stream_proof_is_not_canonical_identity_proof() -> None:
+    assert playback_source_semantically_compatible({
+        "verification_state": "verified",
+        "source_id": "B_HSa1dEL9s",
+    }) is False
+
+
+def test_user_requested_source_is_matched_verified_and_persisted() -> None:
+    pending = {
+        "provider": "youtube",
+        "source_id": "B_HSa1dEL9s",
+        "title": "For Whom the Bell Tolls",
+        "channel": "Metallica - Topic",
+        "duration": 310,
+        "source_match_version": "source-match-v2",
+        "match_compatible": True,
+        "verification_state": "pending",
+    }
+    verified = {
+        **pending,
+        "verification_state": "verified",
+        "verified_at": 9999999999.0,
+    }
+    with patch(
+        "auralis_backend.discovery.source_registry._load_sources",
+        return_value={},
+    ), patch(
+        "auralis_backend.discovery.source_registry._enumerate_youtube_sources",
+        return_value=[pending],
+    ), patch(
+        "auralis_backend.discovery.source_registry._verify_source",
+        return_value=(verified, "verified_resolver"),
+    ) as verify, patch(
+        "auralis_backend.discovery.source_registry._store_sources",
+    ) as store:
+        resolved = resolve_user_requested_playback_source(
+            _Server(),
+            track_key="recording:771ab043-8821-44f9-b8e0-2733c3126c6d",
+            title="For Whom the Bell Tolls",
+            artist="Metallica",
+            album="Ride the Lightning",
+            duration=310,
+            source_id="B_HSa1dEL9s",
+        )
+
+    assert resolved == verified
+    verify.assert_called_once()
+    assert store.call_count == 2
 
 
 def test_verified_registry_hit_is_reused_without_provider_or_stream_calls() -> None:
@@ -781,3 +884,40 @@ def test_unavailable_registry_source_is_not_reset_by_rediscovery(tmp_path) -> No
     assert len(sources) == 1
     assert sources[0]["verification_state"] == "unavailable"
     assert sources[0]["failure_reason"] == "video_unavailable"
+
+
+def test_verified_registry_source_is_not_downgraded_by_rediscovery(tmp_path) -> None:
+    server = _Server()
+    server.RECOMMENDATION_STORE_DB_PATH = str(tmp_path / "recommendation.sqlite3")
+    server.recommendation_store_lock = threading.RLock()
+    entity_key = _entity_key(10)
+
+    _store_sources(server, [(entity_key, _source(10))])
+    _store_sources(server, [(entity_key, _source(10, state="pending"))])
+    sources = _load_sources(server, [entity_key])[entity_key]
+
+    assert len(sources) == 1
+    assert sources[0]["verification_state"] == "verified"
+    assert sources[0]["verified_at"] == 9999999999.0
+
+
+def test_search_identity_preserves_verified_playback_evidence() -> None:
+    from auralis_backend.search.intelligence import infer_source_identity
+
+    identity = infer_source_identity(
+        {
+            "provider": "youtube",
+            "videoId": "abcdefghijk",
+            "title": "Catalog track",
+            "channel": "Catalog Artist - Topic",
+            "playback": {
+                "provider": "youtube",
+                "source_id": "abcdefghijk",
+                "verified_at": 1234.5,
+            },
+        }
+    )
+
+    assert identity["source_key"] == "abcdefghijk"
+    assert identity["verification_state"] == "verified"
+    assert identity["verified_at"] == 1234.5

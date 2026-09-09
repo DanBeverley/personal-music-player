@@ -1,3 +1,5 @@
+FROM node:22-bookworm-slim AS node-runtime
+
 FROM python:3.11-slim
 
 # ffmpeg is required by yt-dlp. ca-certificates keeps provider and R2 TLS
@@ -5,6 +7,9 @@ FROM python:3.11-slim
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates ffmpeg && \
     rm -rf /var/lib/apt/lists/*
+
+# yt-dlp's supported YouTube extraction path requires a JavaScript runtime.
+COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
 
 WORKDIR /app
 

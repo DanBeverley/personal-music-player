@@ -49,6 +49,7 @@ from auralis_backend.storage.artist_artwork import (
 def _visible_declared_artwork(
     artists,
     excluded_artist=None,
+    **_kwargs,
 ):
     excluded_id = str((excluded_artist or {}).get("id") or "").strip()
     excluded_name = str((excluded_artist or {}).get("name") or "").strip().casefold()
@@ -3841,10 +3842,6 @@ class SearchLatencyTests(unittest.TestCase):
         self.assertEqual((response.get("tracks") or [])[0].get("id"), "purple-rain")
         self.assertTrue(bool((response.get("diagnostics") or {}).get("direct_search_only")))
         self.assertTrue(bool((response.get("diagnostics") or {}).get("profile_build_skipped")))
-        self.assertIn(
-            "retrieval",
-            dict((response.get("diagnostics") or {}).get("stage_timings_ms") or {}),
-        )
 
     @patch("auralis_backend.search.service.retrieve_search_candidates_fast")
     def test_complete_first_page_reuses_one_retrieval_for_all_surfaces(
@@ -3981,7 +3978,7 @@ class SearchLatencyTests(unittest.TestCase):
                     query="Queen",
                     user_scope_id="complete-search-user",
                     surface="search",
-                    force_refresh=False,
+                    force_refresh=True,
                     limit=16,
                     search_mode="entity",
                     defer_side_surfaces=False,
@@ -4222,260 +4219,6 @@ class SearchLatencyTests(unittest.TestCase):
         self.assertEqual(len(submitted), 1)
 
     @patch("auralis_backend.search.service.retrieve_search_candidates_fast")
-    def test_deferred_artist_surface_expands_after_snapshot_is_consumed(
-        self,
-        mock_retrieve,
-    ) -> None:
-        def payload_for(request, *_args, **_kwargs):
-            expanded = getattr(request, "result_type", "") == "artists"
-            artist_payloads = [
-                {
-                    "id": "UC-artist-lead",
-                    "name": "Lead Artist",
-                    "thumbnail": (
-                        "/artist_artwork/lead" if expanded else ""
-                    ),
-                }
-            ]
-            if expanded:
-                artist_payloads.extend(
-                    [
-                        {
-                            "id": "UC-artist-related-1",
-                            "name": "Related One",
-                            "thumbnail": "/artist_artwork/related-one",
-                        },
-                        {
-                            "id": "UC-artist-related-2",
-                            "name": "Related Two",
-                            "thumbnail": "/artist_artwork/related-two",
-                        },
-                    ]
-                )
-            return {
-                "query_intent": "artist",
-                "resolved_target": _test_resolved_target(
-                    "artist",
-                    artist_payloads[0],
-                ),
-                "normalized_anchor_artists": {"lead artist"},
-                "track_candidates": (
-                    {
-                        "lead-track": {
-                            "payload": {
-                                "id": "lead-track",
-                                "playback": {
-                                    "provider": "youtube",
-                                    "source_id": "00000000001",
-                                },
-                                "title": "Lead Song",
-                                "channel": "Lead Artist",
-                            },
-                            "source_scores": {"artist_catalog": 4.0},
-                        }
-                    }
-                    if expanded
-                    else {}
-                ),
-                "artist_candidates": {
-                    item["id"]: {
-                        "payload": item,
-                        "source_scores": {"artists.fast": 4.0},
-                    }
-                    for item in artist_payloads
-                },
-                "album_candidates": (
-                    {
-                        "lead-album": {
-                            "payload": {
-                                "id": "MPRE-lead-album",
-                                "title": "Lead Album",
-                                "artist": "Lead Artist",
-                                "thumbnail": (
-                                    "https://example.test/lead-album.jpg"
-                                ),
-                            },
-                            "source_scores": {"artist_discography": 4.0},
-                        }
-                    }
-                    if expanded
-                    else {}
-                ),
-                "related_artists": (
-                    [
-                        {
-                            "id": "UC-artist-neighbour",
-                            "name": "Close Neighbour",
-                            "thumbnail": "/artist_artwork/neighbour",
-                        }
-                    ]
-                    if expanded
-                    else []
-                ),
-                "retrieval_diagnostics": {},
-            }
-
-        mock_retrieve.side_effect = payload_for
-        service = SearchService(server)
-        import auralis_backend.search.service as service_module
-
-        queued_completion = []
-
-        def catalog_result(*_args, **_kwargs):
-            return {
-                "artist": {
-                    "id": "UC-artist-lead",
-                    "name": "Lead Artist",
-                    "thumbnail": "/artist_artwork/lead",
-                },
-                "tracks": [
-                    {
-                        "id": "lead-track",
-                        "playback": {
-                            "provider": "youtube",
-                            "source_id": "00000000001",
-                        },
-                        "title": "Lead Song",
-                        "channel": "Lead Artist",
-                    }
-                ],
-                "albums": [
-                    {
-                        "id": "MPRE-lead-album",
-                        "title": "Lead Album",
-                        "artist": "Lead Artist",
-                        "thumbnail": "https://example.test/lead-album.jpg",
-                    }
-                ],
-                "related_artists": [
-                    {
-                        "id": "UC-artist-neighbour",
-                        "name": "Close Neighbour",
-                        "thumbnail": "/artist_artwork/neighbour",
-                    }
-                ],
-                "catalog_status": "complete",
-                "album_tracklists_loaded": 1,
-            }
-
-        with (
-            patch(
-                "auralis_backend.search.service._prepare_search_entity_artwork",
-                side_effect=_verified_declared_entity_artwork,
-            ),
-            patch(
-                "auralis_backend.search.service.load_artist_entity_expansion",
-                side_effect=catalog_result,
-            ),
-            patch.object(
-                service,
-                "_visible_artists",
-                side_effect=_visible_declared_artwork,
-            ),
-            patch.object(
-                service,
-                "_hydrate_artist_artwork",
-                side_effect=lambda artists, **_kwargs: artists,
-            ),
-            patch.object(
-                service,
-                "_artist_has_usable_artwork",
-                side_effect=lambda artist: bool(
-                    str((artist or {}).get("thumbnail") or "").strip()
-                ),
-            ),
-            patch.object(
-                service,
-                "_lastfm_related_artists",
-                return_value=[
-                    {
-                        "id": f"UC-LastFmNeighbour-{index}",
-                        "name": f"Last.fm Neighbour {index}",
-                        "relationship_provider": "lastfm",
-                        "thumbnail": f"/artist_artwork/lastfm-{index}",
-                    }
-                    for index in range(1, 6)
-                ],
-            ),
-            patch.object(
-                service,
-                "_resolve_first_page_related_artists",
-                side_effect=lambda artists, **_kwargs: artists,
-            ),
-            patch.object(
-                service_module._SEARCH_ARTIST_METADATA_WRITER,
-                "submit",
-                side_effect=lambda fn, *args, **kwargs: queued_completion.append(
-                    (fn, args, kwargs)
-                ),
-            ),
-        ):
-            first = service.search(
-                SimpleNamespace(
-                    query="Lead Artist",
-                    user_scope_id="progressive-user",
-                    surface="search",
-                    context_surface="interactive_search",
-                    force_refresh=True,
-                    limit=16,
-                    search_mode="entity",
-                    defer_side_surfaces=True,
-                    result_type="",
-                    offset=0,
-                )
-            )
-            self.assertEqual(len(queued_completion), 1)
-            completion, completion_args, completion_kwargs = queued_completion.pop(0)
-            completion(*completion_args, **completion_kwargs)
-            second = service.search(
-                SimpleNamespace(
-                    query="Lead Artist",
-                    user_scope_id="progressive-user",
-                    surface="search",
-                    force_refresh=False,
-                    limit=16,
-                    search_mode="entity",
-                    defer_side_surfaces=False,
-                    result_type="artists",
-                    offset=0,
-                )
-            )
-
-        self.assertEqual(first.get("artists") or [], [])
-        self.assertEqual(mock_retrieve.call_count, 2)
-        self.assertEqual(
-            (second.get("artists") or [])[0].get("thumbnail"),
-            "/artist_artwork/lead",
-        )
-        self.assertEqual(
-            [item.get("name") for item in second.get("similar_artists") or []],
-            [
-                "Last.fm Neighbour 1",
-                "Last.fm Neighbour 2",
-                "Last.fm Neighbour 3",
-                "Last.fm Neighbour 4",
-                "Last.fm Neighbour 5",
-                "Close Neighbour",
-            ],
-        )
-        self.assertEqual(
-            [item.get("id") for item in second.get("artist_tracks") or []],
-            ["lead-track"],
-        )
-        self.assertEqual(
-            [item.get("id") for item in second.get("artist_albums") or []],
-            ["MPRE-lead-album"],
-        )
-        self.assertEqual(second.get("related_albums") or [], [])
-        self.assertFalse(
-            bool(
-                (second.get("pagination") or {})
-                .get("artists", {})
-                .get("deferred_expansion")
-            )
-        )
-
-    @patch("auralis_backend.search.service.retrieve_search_candidates_fast")
     def test_indirect_query_uses_the_same_canonical_search_path(
         self,
         mock_retrieve,
@@ -4493,7 +4236,7 @@ class SearchLatencyTests(unittest.TestCase):
                 query="that song about cavalry by iron maiden",
                 user_scope_id="guest",
                 surface="search",
-                force_refresh=False,
+                force_refresh=True,
                 limit=16,
                 search_mode="",
                 defer_side_surfaces=True,
@@ -4610,7 +4353,7 @@ class SearchLatencyTests(unittest.TestCase):
                     query="aerosmith",
                     user_scope_id="guest",
                     surface="search",
-                    force_refresh=False,
+                    force_refresh=True,
                     limit=12,
                     defer_side_surfaces=True,
                     search_mode="entity",

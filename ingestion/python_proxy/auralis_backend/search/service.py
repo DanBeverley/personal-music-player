@@ -103,7 +103,16 @@ _SEARCH_SNAPSHOT_COMPLETION_PENDING: set[str] = set()
 _SEARCH_TARGET_ESSENTIAL_BUDGET_SECONDS = 1.4
 _SEARCH_TARGET_REVALIDATION_MAX_ATTEMPTS = 2
 _SEARCH_SURFACE_MAX_ATTEMPTS = 3
-_SEARCH_ARTWORK_MAX_ATTEMPTS = 5
+_SEARCH_VISIBLE_SURFACES = (
+    "tracks",
+    "artists",
+    "albums",
+    "playlists",
+    "related_artists",
+    "artist_tracks",
+    "artist_albums",
+    "related_albums",
+)
 
 
 def _normalized_search_mode(search_mode: str) -> str:
@@ -622,16 +631,6 @@ def _search_snapshot_visible_fingerprint(snapshot: Dict[str, Any]) -> tuple:
         )
 
     resolved_target = dict(snapshot.get("resolved_target") or {})
-    surfaces = (
-        "tracks",
-        "artists",
-        "albums",
-        "playlists",
-        "related_artists",
-        "artist_tracks",
-        "artist_albums",
-        "related_albums",
-    )
     def published_items(surface: str) -> List[Dict[str, Any]]:
         values = [
             item
@@ -675,7 +674,7 @@ def _search_snapshot_visible_fingerprint(snapshot: Dict[str, Any]) -> tuple:
                     for item in published_items(surface)
                 ),
             )
-            for surface in surfaces
+            for surface in _SEARCH_VISIBLE_SURFACES
         ),
     )
 
@@ -695,11 +694,7 @@ def _persist_listener_snapshots(changed: list[tuple[str, Dict[str, Any]]]) -> No
             current = deepcopy(_SEARCH_SNAPSHOTS.get(key) or {})
         if current:
             merged = deepcopy(current)
-            for surface in (
-                "tracks", "artists", "albums", "playlists",
-                "related_artists", "artist_tracks", "artist_albums",
-                "related_albums",
-            ):
+            for surface in _SEARCH_VISIBLE_SURFACES:
                 incoming_items = snapshot.get(surface)
                 if not isinstance(incoming_items, list):
                     continue
@@ -3104,16 +3099,6 @@ class SearchService:
                     target_correction = bool(
                         completed.pop("_target_correction_applied", False)
                     )
-                    visible_surfaces = (
-                        "tracks",
-                        "artists",
-                        "albums",
-                        "playlists",
-                        "related_artists",
-                        "artist_tracks",
-                        "artist_albums",
-                        "related_albums",
-                    )
                     replace_surfaces = {
                         "artists",
                         "artist_tracks",
@@ -3121,7 +3106,7 @@ class SearchService:
                         "related_artists",
                         "related_albums",
                     } if target_correction else set()
-                    for surface in visible_surfaces:
+                    for surface in _SEARCH_VISIBLE_SURFACES:
                         if surface in replace_surfaces:
                             continue
                         completed[surface] = self._merge_snapshot_items(
@@ -3196,7 +3181,6 @@ class SearchService:
         self,
         snapshot: Dict[str, Any],
     ) -> Dict[str, Any]:
-        lead_artist = dict(snapshot.get("lead_artist") or {})
         related_progress = self._related_artist_progress(snapshot)
         expansion_state = dict(snapshot.get("expansion_state") or {})
         return {
@@ -3825,9 +3809,6 @@ class SearchService:
         surface_attempts = dict(snapshot.get("_surface_attempts") or {})
         surface_attempts[surface] = int(surface_attempts.get(surface) or 0) + 1
         snapshot["_surface_attempts"] = surface_attempts
-        query_intent = str(
-            snapshot.get("query_intent") or ""
-        ).strip().lower()
         if lead_artist:
             previous_tracks = list(snapshot.get("tracks") or [])
             previous_albums = list(snapshot.get("albums") or [])

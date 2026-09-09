@@ -30,7 +30,6 @@ from auralis_backend.search.catalog_pipeline import (
     catalog_album_is_detail_ready,
     catalog_import_coverage_report,
     catalog_playable_tracks_for_query,
-    collect_external_catalog_backfill_seeds,
     enqueue_external_catalog_seeds,
     external_catalog_import_progress,
     populate_catalog_from_user_signals,
@@ -344,47 +343,43 @@ class SearchEnrichmentTests(unittest.TestCase):
             "UC-EricClapton",
         )
 
-    def test_provider_album_stays_detail_ready_after_canonical_enrichment(self) -> None:
-        self.assertTrue(
-            catalog_album_is_detail_ready(
+    def test_album_detail_readiness_contract(self) -> None:
+        cases = [
+            (
+                "provider album",
                 {
                     "id": "MPREb_everlong",
                     "title": "The Colour and the Shape",
                     "artist": "Foo Fighters",
                     "musicbrainz_release_group_id": "release-group-everlong",
                     "playable": False,
-                }
-            )
-        )
-
-    def test_unprepared_musicbrainz_album_is_not_detail_ready(self) -> None:
-        self.assertFalse(
-            catalog_album_is_detail_ready(
+                },
+                True,
+            ),
+            (
+                "unprepared canonical album",
                 {
                     "id": "musicbrainz:release-group:release-id",
                     "musicbrainz_release_group_id": "release-id",
                     "title": "Flight of Icarus",
                     "artist": "Iron Maiden",
-                }
-            )
-        )
-
-    def test_prepared_musicbrainz_album_requires_track_keys(self) -> None:
-        self.assertTrue(
-            catalog_album_is_detail_ready(
+                },
+                False,
+            ),
+            (
+                "prepared canonical album",
                 {
                     "id": "musicbrainz:release-group:release-id",
                     "musicbrainz_release_group_id": "release-id",
                     "playable": True,
-                    "tracks": [
-                        {
-                            "track_key": "recording:recording-id",
-                            "playable": True,
-                        }
-                    ],
-                }
-            )
-        )
+                    "tracks": [{"track_key": "recording:recording-id", "playable": True}],
+                },
+                True,
+            ),
+        ]
+        for label, album, expected in cases:
+            with self.subTest(label=label):
+                self.assertEqual(catalog_album_is_detail_ready(album), expected)
 
     def test_artist_merge_collapses_raw_and_canonical_name_keys(self) -> None:
         merged = SearchService._merge_snapshot_items(
@@ -1978,47 +1973,25 @@ class SearchEnrichmentTests(unittest.TestCase):
         self.assertFalse(artist.get("thumbnail"))
         self.assertNotEqual(artist.get("artwork_cache_token"), legacy_name_token)
 
-    def test_stale_artist_artwork_path_falls_back_to_source_url(self) -> None:
+    def test_stale_artist_artwork_path_uses_source_or_is_removed(self) -> None:
         with patch(
             "auralis_backend.storage.artist_artwork.get_artist_artwork_cache",
             return_value=SimpleNamespace(head=Mock(return_value=None)),
         ):
-            artist = attach_cached_artist_artwork(
-                object(),
-                {
+            for source_url, expected in (
+                ("https://example.test/dio.jpg", "https://example.test/dio.jpg"),
+                ("", ""),
+            ):
+                payload = {
                     "id": "UC-Dio",
                     "name": "Dio",
-                    "thumbnail": (
-                        "/artist_artwork/"
-                        "0123456789abcdef0123456789abcdef"
-                    ),
-                    "artwork_source_url": "https://example.test/dio.jpg",
-                },
-            )
-
-        self.assertEqual(
-            artist.get("thumbnail"),
-            "https://example.test/dio.jpg",
-        )
-
-    def test_stale_artist_artwork_path_without_source_is_removed(self) -> None:
-        with patch(
-            "auralis_backend.storage.artist_artwork.get_artist_artwork_cache",
-            return_value=SimpleNamespace(head=Mock(return_value=None)),
-        ):
-            artist = attach_cached_artist_artwork(
-                object(),
-                {
-                    "id": "UC-Dio",
-                    "name": "Dio",
-                    "thumbnail": (
-                        "/artist_artwork/"
-                        "0123456789abcdef0123456789abcdef"
-                    ),
-                },
-            )
-
-        self.assertFalse(artist.get("thumbnail"))
+                    "thumbnail": "/artist_artwork/0123456789abcdef0123456789abcdef",
+                }
+                if source_url:
+                    payload["artwork_source_url"] = source_url
+                with self.subTest(source_url=source_url):
+                    artist = attach_cached_artist_artwork(object(), payload)
+                    self.assertEqual(artist.get("thumbnail") or "", expected)
 
     @pytest.mark.search_artwork
     def test_related_artist_visibility_requires_usable_artwork(self) -> None:
@@ -2557,8 +2530,8 @@ class SearchEnrichmentTests(unittest.TestCase):
                 "revision": 2,
                 "resolved_target": {},
                 "target_revalidation_attempts": 2,
-                "target_revalidation_state": "retryable",
-                "expansion_state": {"artists": "retryable"},
+                "target_revalidation_state": "exhausted",
+                "expansion_state": {"artists": "exhausted"},
             },
         )
         with (

@@ -17,7 +17,7 @@ from ..domain.catalog import (
 )
 from .server_adapter import adapt_search_server
 from .canonical import source_quality_score
-from .intelligence import search_text_similarity
+from .intelligence import search_text_similarity, query_mentions_artist
 from .runtime import semantic_search_lexical_score
 
 
@@ -31,6 +31,7 @@ def _finalize_ranked_tracks(
     server = adapt_search_server(server)
     ranked.sort(
         key=lambda item: (
+            bool((item.get('ranking_features') or {}).get('resolved_target_match')),
             float(item.get("score") or 0.0),
             item.get("title") or "",
         ),
@@ -75,6 +76,7 @@ def _track_relevance(
     track: Dict[str, Any],
     query_intent: str,
     source_names: List[str],
+    confirmed_track_artist: bool = False,
 ) -> Dict[str, float]:
     playable = bool(verified_playback_source(track))
     title = server.trim_text(track.get("title") or track.get("name"))
@@ -122,6 +124,7 @@ def _track_relevance(
         )
         admitted = (
             artist_score >= 0.70
+            or (normalized_query_title and normalized_query_title == normalized_result_title)
             or combined_score >= 0.78
             or relationship_match
         )
@@ -134,12 +137,9 @@ def _track_relevance(
         )
     else:
         relationship_match = bool(
-            relationship_sources
-            & {
-                "same_artist_catalog",
-                "artist_catalog",
-                "album_tracklist",
-            }
+            (relationship_sources & {'same_artist_catalog', 'artist_catalog'}
+             and (query_mentions_artist(query, artist) or confirmed_track_artist))
+            or ('album_tracklist' in relationship_sources and album_score >= .8)
         )
         provider_hint = "provider_intent" in relationship_sources
         provider_supported = provider_hint and (
@@ -238,10 +238,21 @@ def rank_track_candidates_fast_path(
             track=track,
             query_intent=str(retrieval_payload.get("query_intent") or ""),
             source_names=source_names,
+            confirmed_track_artist=bool(
+                str(retrieval_payload.get("query_intent") or "") == "track"
+                and server.normalize_text(track.get("channel") or track.get("artist") or "")
+                in exact_title_artist_counts
+            ),
         )
         if (
             str(retrieval_payload.get("query_intent") or "") == "artist"
             and resolved_artist_name
+            # A query can name both an artist and a song by someone else.
+            # Keep exact-title playable candidates without changing the target.
+            and not (
+                normalize_track_title(track.get("title") or "") == normalized_canonical_query
+                and source_quality_score(server, track) >= 0.8
+            )
             and search_text_similarity(
                 resolved_artist_name,
                 track.get("channel") or track.get("artist") or "",
@@ -326,6 +337,13 @@ def rank_track_candidates_fast_path(
         track["search_source"] = source_names[0] if source_names else ""
         track["search_sources"] = source_names
         track["ranking_features"] = {
+            'resolved_target_match': bool(
+                (retrieval_payload.get('resolved_target') or {}).get('entity_type') == 'track'
+                and (retrieval_payload.get('resolved_target') or {}).get('confidence_tier') in {'authoritative', 'corroborated'}
+                and (verified_playback_source(track) or {}).get('source_id')
+                and (verified_playback_source(track) or {}).get('source_id') == (
+                    (verified_playback_source((retrieval_payload.get('resolved_target') or {}).get('item') or {}) or {}).get('source_id')
+                    or canonical_resolution.get('provider_source_id'))),
             "source_score": round(float(source_score), 4),
             "retrieval_votes": round(float(retrieval_votes), 4),
             "lexical": round(float(lexical_score), 4),

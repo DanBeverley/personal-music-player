@@ -798,6 +798,24 @@ def _recommendation_store_search_event(req: RecommendationSearchEventRequest):
     user_scope_id = _assistant_safe_scope_id(req.user_scope_id or "guest")
     occurred_at = float(req.occurred_at or time.time())
     payload = dict(req.metadata or {})
+    if _recommendation_trim_text(req.source) == "web_search_selection":
+        selected_item = payload.get("selected_item")
+        selected_type = _recommendation_trim_text(
+            payload.get("selected_entity_type") or payload.get("entity_type") or "track"
+        ).lower()
+        if isinstance(selected_item, dict) and selected_type in {"", "track", "tracks"}:
+            try:
+                from ..search.preferences import remember_selected_query
+
+                remember_selected_query(
+                    resolve_server(), user_scope_id=user_scope_id,
+                    query=query, item=selected_item,
+                )
+            except Exception:
+                pass
+        # This event is preference input only; keep it out of shared search,
+        # inventory and recommendation signal stores.
+        return True
     event_id = hashlib.sha1(
         json.dumps(
             {

@@ -616,6 +616,32 @@ def semantic_search_suggestion_items(
     cached = lookup_search_result("suggestions", cache_key)
     memory_cache_ms = int((time.perf_counter() - memory_cache_started_at) * 1000)
     memory_cache_hit = cached is not None
+    direct_play_items = _recent_track_suggestion_items(req, query, server=server, limit=min(3, limit))
+    if any(server.normalize_text((item.get("track") or {}).get("title")) == server.normalize_text(query)
+           for item in direct_play_items):
+        # An exact playable history match is already available in the request.
+        # Cold SQLite initialization/catalog scans must not delay its button.
+        # Overlay an existing shared memory base; never cache personal rows.
+        output = []
+        seen = set()
+        for item in [*direct_play_items, *(cached if isinstance(cached, list) else [])]:
+            if not isinstance(item, dict):
+                continue
+            key = server.normalize_text(item.get("text"))
+            if key and key not in seen:
+                output.append(item); seen.add(key)
+        if diagnostics_out is not None:
+            source_counts = {}
+            for item in output[:limit]:
+                source = item.get("source_name") or "unknown"
+                source_counts[source] = source_counts.get(source, 0) + 1
+            diagnostics_out.update({
+                "total": int((time.perf_counter() - started_at) * 1000),
+                "memory_cache": memory_cache_ms, "persistent_cache": 0, "catalog": 0,
+                "upstream": 0, "ranking": 0, "source_counts": source_counts,
+                "memory_cache_hit": memory_cache_hit, "persistent_cache_hit": False,
+            })
+        return output[:limit]
     persistent_cache_ms = 0
     persistent_cache_hit = False
     if cached is None:
@@ -630,12 +656,6 @@ def semantic_search_suggestion_items(
 
     normalized_query = server.normalize_text(query)
     candidates = {}
-    direct_play_items = _recent_track_suggestion_items(
-        req,
-        query,
-        server=server,
-        limit=min(3, limit),
-    )
     def add_candidate(
         raw_text: Optional[str],
         source_score: float,

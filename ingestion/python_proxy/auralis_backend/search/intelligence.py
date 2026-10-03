@@ -51,7 +51,9 @@ def _json_loads(value: Any) -> Dict[str, Any]:
 
 
 def search_query_key(query: str) -> str:
-    return normalize_track_title(query)
+    # Apostrophes within words are optional in typed queries. Keep this
+    # normalization local to Search so catalog identities do not change.
+    return normalize_track_title(re.sub(r"(?<=\w)['’](?=\w)", "", str(query or "")))
 
 
 def search_text_similarity(query: str, candidate: str) -> float:
@@ -978,6 +980,23 @@ def load_catalog_artist_records(
                     combined[metadata_key] = preferred[metadata_key]
             records[key] = combined
     return records
+
+
+def query_mentions_artist(query: str, artist: str) -> bool:
+    """Catalog popularity cannot turn a partial name into an artist query."""
+    query_tokens = search_query_key(query).split()
+    artist_tokens = search_query_key(artist).split()
+    if not artist_tokens:
+        return False
+    if ''.join(query_tokens) == ''.join(artist_tokens):
+        return True
+    exact = any(
+        query_tokens[i:i + len(artist_tokens)] == artist_tokens
+        for i in range(len(query_tokens) - len(artist_tokens) + 1))
+    typo = len(query_tokens) == len(artist_tokens) and all(
+        a == b or min(len(a), len(b)) >= 4 and SequenceMatcher(None, a, b).ratio() >= .88
+        for a, b in zip(query_tokens, artist_tokens))
+    return exact or typo
 
 
 def load_fuzzy_catalog_entity_memories(

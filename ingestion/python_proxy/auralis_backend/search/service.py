@@ -58,6 +58,7 @@ from .intelligence import (
     remember_catalog_entity,
     search_text_similarity,
     search_query_key,
+    query_mentions_artist,
 )
 from ..storage.artist_artwork import (
     attach_cached_entity_artwork,
@@ -122,7 +123,7 @@ def _normalized_search_mode(search_mode: str) -> str:
 def _search_snapshot_key(_user_scope_id: str, query: str, search_mode: str) -> str:
     return "||".join(
         [
-            "canonical-target-search-v4",
+            "canonical-target-search-v10",
             search_query_key(query),
             _normalized_search_mode(search_mode),
         ]
@@ -132,11 +133,16 @@ def _search_snapshot_key(_user_scope_id: str, query: str, search_mode: str) -> s
 def _canonical_target_snapshot_key(target_identity: str, search_mode: str) -> str:
     return "||".join(
         [
-            "canonical-target-search-v4",
+            "canonical-target-search-v10",
             "target:" + str(target_identity or "").strip().casefold(),
             _normalized_search_mode(search_mode),
         ]
     )
+
+
+def _snapshot_revalidation_due(snapshot: Dict[str, Any]) -> bool:
+    checked = float(snapshot.get("target_checked_at") or 0)
+    return checked > 0 and time.time() - checked >= 24 * 60 * 60
 
 
 def _snapshot_json(value: Any) -> str:
@@ -151,8 +157,86 @@ def _snapshot_alias_key(query: str) -> str:
     return search_query_key(query)
 
 
+def _target_matches_query(query, target):
+    if target.get('entity_type') != 'artist':
+        return True
+    item = target.get('item') or target.get('lead_artist') or {}
+    return query_mentions_artist(query, item.get('name') or item.get('artist') or '')
+
+
+def _confident_correction(query, response):
+    # Require repeated, near-exact whole-phrase evidence. This keeps short or
+    # unusual exact names intact while allowing common multi-token typos.
+    def key(text):
+        return re.sub(r'^the\s+', '', search_query_key(text))
+
+    q = key(query)
+    source_words = q.split()
+    if len(q) < 6 or not source_words:
+        return None
+
+    def edit_distance(a, b, limit=2):
+        # Bounded Damerau-Levenshtein, including adjacent transpositions.
+        if abs(len(a) - len(b)) > limit:
+            return limit + 1
+        prev2 = None
+        prev = list(range(len(b) + 1))
+        for i, ca in enumerate(a, 1):
+            row = [i]
+            for j, cb in enumerate(b, 1):
+                value = min(row[-1] + 1, prev[j] + 1, prev[j - 1] + (ca != cb))
+                if (prev2 is not None and i > 1 and j > 1
+                        and ca == b[j - 2] and a[i - 2] == cb):
+                    value = min(value, prev2[j - 2] + 1)
+                row.append(value)
+            prev2, prev = prev, row
+        return prev[-1]
+
+    candidates = {}
+    exact = False
+    seen_evidence = set()
+    evidence = [*response.get('tracks', []), *response.get('results', []),
+                *response.get('artists', []), *response.get('albums', [])]
+    for item in evidence:
+        if not isinstance(item, dict):
+            continue
+        identity = item.get('id') or item.get('videoId') or item.get('browseId')
+        if identity:
+            if identity in seen_evidence:
+                continue
+            seen_evidence.add(identity)
+        text = str(item.get('title') or item.get('name') or '').strip()
+        text = re.sub(r'\s*\([^)]*\)\s*$', '', text).strip()
+        candidate_key = key(text)
+        if candidate_key == q:
+            exact = True
+            continue
+        words = candidate_key.split()
+        if len(words) != len(source_words):
+            continue
+        distances = [edit_distance(a, b) for a, b in zip(source_words, words)]
+        changed = [distance for distance in distances if distance]
+        if (not changed or len(changed) > 2 or max(changed) > 2
+                or sum(changed) > 3):
+            continue
+        entry = candidates.setdefault(candidate_key, {'text': text, 'cost': sum(changed), 'support': 0})
+        entry['support'] += 1
+
+    if exact or not candidates:
+        return None
+    ranked = sorted(candidates.items(), key=lambda pair: (pair[1]['cost'], -pair[1]['support']))
+    best = ranked[0][1]
+    runner = ranked[1][1] if len(ranked) > 1 else None
+    if best['support'] < 2:
+        return None
+    if runner and (best['cost'] == runner['cost'] or best['support'] < runner['support'] + 2):
+        return None
+    return best['text']
+
+
 def _resolve_snapshot_key(server: Any, query: str, search_mode: str) -> str:
     base = _search_snapshot_key("", query, search_mode)
+    version_prefix = base.split("||", 1)[0] + "||"
     alias = _snapshot_alias_key(query)
     if not alias:
         return base
@@ -162,7 +246,7 @@ def _resolve_snapshot_key(server: Any, query: str, search_mode: str) -> str:
         connection = open_recommendation_store_connection(server)
         row = connection.execute(
             """
-            SELECT a.snapshot_key
+            SELECT a.snapshot_key, s.payload_json
             FROM search_snapshot_aliases a
             JOIN search_snapshots s ON s.snapshot_key = a.snapshot_key
             WHERE a.alias_key = ? AND a.search_mode = ?
@@ -170,7 +254,12 @@ def _resolve_snapshot_key(server: Any, query: str, search_mode: str) -> str:
             [alias, mode],
         ).fetchone()
         if row:
-            return str(row["snapshot_key"] or base)
+            if not _target_matches_query(query, json.loads(row['payload_json'] or '{}').get('resolved_target') or {}):
+                connection.execute('DELETE FROM search_snapshot_aliases WHERE alias_key = ? AND search_mode = ?', [alias, mode])
+                connection.commit()
+                return base
+            key = str(row["snapshot_key"] or base)
+            return key if key.startswith(version_prefix) else base
         legacy = connection.execute(
             """
             SELECT entity_key, confidence
@@ -187,6 +276,8 @@ def _resolve_snapshot_key(server: Any, query: str, search_mode: str) -> str:
                 "SELECT snapshot_key, payload_json FROM search_snapshots"
             ).fetchall()
             for candidate in snapshot_rows:
+                if not str(candidate["snapshot_key"]).startswith(version_prefix):
+                    continue
                 try:
                     target = (
                         json.loads(candidate["payload_json"] or "{}").get(
@@ -197,7 +288,7 @@ def _resolve_snapshot_key(server: Any, query: str, search_mode: str) -> str:
                 except Exception:
                     target = {}
                 identity = _target_identity(target)
-                if identity and identity == legacy_identity:
+                if identity and identity == legacy_identity and _target_matches_query(query, target):
                     connection.execute(
                         """
                         INSERT OR REPLACE INTO search_snapshot_aliases(
@@ -352,7 +443,7 @@ def _store_search_snapshot(
     *,
     preserve_revision: bool = False,
 ) -> None:
-    stored = deepcopy(snapshot)
+    stored = _prune_artist_surfaces(deepcopy(snapshot))
     now = time.time()
     with _SEARCH_SNAPSHOT_LOCK:
         previous = None
@@ -450,9 +541,15 @@ def _prefer_existing_canonical_snapshot(
     existing: Dict[str, Any],
     incoming: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Keep established visible surfaces while filling fields that were absent."""
+    """Share one target snapshot while allowing fresh evidence to replace it."""
     if not existing:
         return deepcopy(incoming)
+    if float(incoming.get("target_checked_at") or 0) > float(existing.get("target_checked_at") or 0):
+        merged = _prune_artist_surfaces(deepcopy(incoming))
+        merged["revision"] = max(int(existing.get("revision") or 1), int(incoming.get("revision") or 1))
+        if _search_snapshot_visible_fingerprint(merged) != _search_snapshot_visible_fingerprint(existing):
+            merged["revision"] += 1
+        return merged
     merged = deepcopy(existing)
     for key, value in incoming.items():
         if merged.get(key) in (None, "", [], {}) and value not in (None, "", [], {}):
@@ -461,7 +558,7 @@ def _prefer_existing_canonical_snapshot(
         int(existing.get("revision") or 1),
         int(incoming.get("revision") or 1),
     )
-    return merged
+    return _prune_artist_surfaces(merged)
 
 
 def _learn_snapshot_alias(
@@ -472,6 +569,8 @@ def _learn_snapshot_alias(
     snapshot: Dict[str, Any],
 ) -> str:
     target = dict(snapshot.get("resolved_target") or {})
+    if not _target_matches_query(query, target):
+        return snapshot_key
     identity = _target_identity(target)
     tier = str(target.get("confidence_tier") or "").casefold()
     if not identity or tier not in {"authoritative", "corroborated"}:
@@ -857,8 +956,26 @@ def _artist_item_matches(
     }
     if _same_artist_identity(item_artist, artist):
         return True
+    if _artist_identity_tokens(item_artist) and _artist_identity_tokens(artist):
+        return False
     item_name = normalize_artist_name(item_artist.get("name"))
     return bool(item_name and item_name in _artist_alias_keys(artist))
+
+
+def _prune_artist_surfaces(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    target = dict(snapshot.get("resolved_target") or {})
+    lead = dict(snapshot.get("lead_artist") or {})
+    if target.get("entity_type") == "mixed":
+        lead = {}
+        snapshot["lead_artist"] = None
+        snapshot["containing_album"] = None
+    for surface in ("artist_tracks", "artist_albums"):
+        snapshot[surface] = [dict(item) for item in snapshot.get(surface) or []
+                             if lead and isinstance(item, dict) and _artist_item_matches(item, lead)]
+    if not lead:
+        snapshot["related_artists"] = []
+        snapshot["related_albums"] = []
+    return snapshot
 
 
 def _merge_artist_values(
@@ -2655,7 +2772,7 @@ class SearchService:
                 relationship="related_artist_discography",
             ),
         )
-        return refreshed
+        return _prune_artist_surfaces(refreshed)
 
     def _artist_has_usable_artwork(
         self,
@@ -3040,6 +3157,12 @@ class SearchService:
                     schedule_background=False,
                 )
                 _schedule_snapshot_entity_artwork(self._server, snapshot)
+                if _snapshot_revalidation_due(snapshot):
+                    # Reuse the bounded completion worker, retaining the
+                    # visible result while provider evidence is refreshed.
+                    snapshot["target_revalidation_state"] = "pending"
+                    snapshot["target_revalidation_attempts"] = 0
+                    snapshot["target_checked_at"] = time.time()
                 starting_revision = int(snapshot.get("revision") or 1)
                 expansion_state = dict(snapshot.get("expansion_state") or {})
                 pending_surfaces = [
@@ -4150,8 +4273,7 @@ class SearchService:
                 artist_tracks = [
                     item
                     for item in ranked_tracks
-                    if not selected_lead
-                    or _artist_item_matches(item, selected_lead)
+                    if selected_lead and _artist_item_matches(item, selected_lead)
                 ]
                 artist_albums = [
                     item
@@ -4165,8 +4287,8 @@ class SearchService:
                             }
                         )
                         and (
-                            not selected_lead
-                            or _artist_item_matches(item, selected_lead)
+                            selected_lead
+                            and _artist_item_matches(item, selected_lead)
                         )
                     )
                 ]
@@ -4301,6 +4423,7 @@ class SearchService:
         else:
             expansion_state[surface] = "complete"
         snapshot["expansion_state"] = expansion_state
+        _prune_artist_surfaces(snapshot)
         _sync_entity_artwork_expansion_state(snapshot)
         return snapshot
 
@@ -4374,7 +4497,9 @@ class SearchService:
             lead_artist = None
             containing_album = None
         elif bound_type == "artist":
-            lead_artist = bound_item
+            lead_artist = (_merge_artist_values(bound_item, lead_artist)
+                           if lead_artist and _same_artist_identity(bound_item, lead_artist)
+                           else bound_item)
             containing_album = None
         else:
             expected_lead = dict(bound_target.get("lead_artist") or {})
@@ -4398,6 +4523,18 @@ class SearchService:
                 containing_album = rebound_album or None
                 if rebound_album:
                     bound_target["containing_album"] = rebound_album
+        artist_tracks = [item for item in artist_tracks if lead_artist and _artist_item_matches(item, lead_artist)]
+        artist_albums = [item for item in artist_albums if lead_artist and _artist_item_matches(item, lead_artist)]
+        if not lead_artist:
+            related_albums = []
+            similar_artists = []
+        # Reconcile the accepted playable target into the authoritative first
+        # page. Pagination must never prepend an item from a previous page.
+        if bound_type == "track" and not int(getattr(req, "offset", 0) or 0) and verified_playback_source(bound_item):
+            target_id = str(bound_item.get("id") or bound_item.get("videoId") or bound_item.get("track_key") or "")
+            selected = next((item for item in tracks if str(item.get("id") or item.get("videoId") or item.get("track_key") or "") == target_id), bound_item)
+            selected = {**selected, **bound_item, "ranking_features": {**dict(selected.get("ranking_features") or {}), "resolved_target_match": True}}
+            tracks = [selected, *[item for item in tracks if str(item.get("id") or item.get("videoId") or item.get("track_key") or "") != target_id]]
         search.trace_put(trace, "candidate_counts", "search.tracks", len(tracks))
         search.trace_put(trace, "candidate_counts", "search.artists", len(artists))
         search.trace_put(trace, "candidate_counts", "search.albums", len(albums))
@@ -4525,9 +4662,14 @@ class SearchService:
         snapshot_load_ms = int(
             (time.perf_counter() - snapshot_load_started_at) * 1000
         )
+        if snapshot is not None and not _target_matches_query(query, snapshot.get('resolved_target') or {}):
+            snapshot = None
+            snapshot_key = _search_snapshot_key('', query, search_mode)
         if snapshot is not None:
             expansion_state = dict(snapshot.get("expansion_state") or {})
             background_reasons: list[str] = []
+            if _snapshot_revalidation_due(snapshot):
+                background_reasons.append("aged_target")
             if any(
                 state in {"pending", "retryable"}
                 for state in expansion_state.values()
@@ -4705,6 +4847,7 @@ class SearchService:
             diagnostics["request_ms"] = int(
                 (time.perf_counter() - direct_started_at) * 1000
             )
+            diagnostics["total_ms"] = diagnostics["request_ms"]
             return response
 
         canonical_req = SimpleNamespace(
@@ -5116,6 +5259,7 @@ class SearchService:
 
         snapshot = {
             "revision": 1,
+            "target_checked_at": time.time(),
             "query_intent": query_intent,
             "resolved_target": resolved_target,
             "tracks": tracks,
@@ -5376,10 +5520,13 @@ class SearchService:
         diagnostics["profile_build_skipped"] = True
         diagnostics["relevance_admission"] = True
         diagnostics.update(self._snapshot_progress_diagnostics(snapshot))
+        diagnostics["search_snapshot_hit"] = False
+        diagnostics["request_ms"] = int((time.perf_counter() - direct_started_at) * 1000)
+        diagnostics["total_ms"] = diagnostics["request_ms"]
         response["diagnostics"] = diagnostics
         return response
 
-    def search(self, req):
+    def search(self, req, *, _apply_preferences=True):
         server = self._server
         search = self._search_server()
         trace = search.trace_start(
@@ -5390,6 +5537,22 @@ class SearchService:
         )
         request_started_at = time.perf_counter()
         query = search.trim_text(req.query)
+        if (_apply_preferences and query
+                and not getattr(req, 'offset', 0) and not getattr(req, 'revision', 0)):
+            from .preferences import load_selected_query, apply_selected_result
+            preferred = load_selected_query(server, user_scope_id=req.user_scope_id or 'guest', query=query)
+            if preferred and search_query_key(preferred) != search_query_key(query):
+                changes = {'query': preferred, 'auto_correct': False, 'search_mode': ''}
+                updated = req.model_copy(update=changes) if hasattr(req, 'model_copy') else SimpleNamespace(**{**vars(req), **changes})
+                try:
+                    personalized = self.search(updated, _apply_preferences=False)
+                except Exception as exc:
+                    print(f'[EBB:search] event=preference_unavailable reason={type(exc).__name__}')
+                    personalized = {}
+                if personalized.get('tracks') or personalized.get('results'):
+                    personalized = apply_selected_result(server, req.user_scope_id or 'guest', query, personalized)
+                    personalized['search_preference'] = {'query': preferred, 'original': query}
+                    return personalized
         limit = max(8, min(req.limit or 16, 24))
         track_model_version = "canonical_search_v1"
         trace["started_at_perf"] = request_started_at
@@ -5502,20 +5665,9 @@ class SearchService:
                     if waited is None:
                         return {
                             "status": "success",
+                            "not_modified": True,
                             "request_id": trace["request_id"],
                             "model_version": track_model_version,
-                            "query_intent": "mixed",
-                            "results": [],
-                            "tracks": [],
-                            "artists": [],
-                            "albums": [],
-                            "similar_artists": [],
-                            "similar_tracks": [],
-                            "top_result": None,
-                            "artist_tracks": [],
-                            "artist_albums": [],
-                            "related_albums": [],
-                            "playlists": [],
                             "diagnostics": {
                                 "ranking_backend": "canonical_search_snapshot_v1",
                                 "query_mode": search_mode,
@@ -5525,7 +5677,7 @@ class SearchService:
                                 "request_ms": int((time.perf_counter() - request_started_at) * 1000),
                             },
                         }
-                return self._search_canonical_entities(
+                response = self._search_canonical_entities(
                     req=req,
                     trace=trace,
                     query=query,
@@ -5533,6 +5685,18 @@ class SearchService:
                     search_mode=search_mode,
                     track_model_version=track_model_version,
                 )
+                if getattr(req, 'auto_correct', False) and not since_revision and not getattr(req, 'offset', 0):
+                    corrected = _confident_correction(query, response)
+                    if corrected:
+                        updated = req.model_copy(update={'query': corrected, 'auto_correct': False}) if hasattr(req, 'model_copy') else SimpleNamespace(**{**vars(req), 'query': corrected, 'auto_correct': False})
+                        corrected_response = self.search(updated, _apply_preferences=_apply_preferences)
+                        if corrected_response.get('results'):
+                            corrected_response['query_correction'] = {'original': query, 'corrected': corrected}
+                            return corrected_response
+                if _apply_preferences and not since_revision and not getattr(req, 'offset', 0):
+                    from .preferences import apply_selected_result
+                    response = apply_selected_result(server, req.user_scope_id or 'guest', query, response)
+                return response
         except Exception as exc:
             search.trace_finalize(trace, status="failed", error=str(exc))
             search.trace_log_request(

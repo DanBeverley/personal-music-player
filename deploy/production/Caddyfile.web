@@ -1,0 +1,33 @@
+:8080 {
+    header {
+        Cache-Control "no-cache"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "no-referrer"
+    }
+    @apiPost {
+        method POST
+        path /search /search_interaction /related_tracks /playback/resolve /prepare_session /recommend /interaction_event /history_seed
+    }
+    handle @apiPost {
+        header Cache-Control "no-store"
+        reverse_proxy api:8000
+    }
+    @apiGet {
+        method GET HEAD
+        path /playback/stream/* /artist_artwork/* /entity_artwork/* /album/* /artist/*
+    }
+    handle @apiGet {
+        header Cache-Control "no-store"
+        reverse_proxy api:8000 {
+            flush_interval -1
+        }
+    }
+    @static method GET HEAD
+    handle @static {
+        root * /srv
+        file_server
+    }
+    handle {
+        respond 404
+    }
+}

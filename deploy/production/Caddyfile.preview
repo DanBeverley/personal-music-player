@@ -1,0 +1,8 @@
+import /etc/caddy/api.caddy
+
+{$AURALIS_WEB_HOST} {
+    encode zstd gzip
+    reverse_proxy web-preview:8080 {
+        flush_interval -1
+    }
+}

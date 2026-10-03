@@ -23,6 +23,7 @@ from .stream_core_runtime import (
     extract_total_length,
     get_cached_stream_chunk,
     get_stream_info,
+    selected_stream_info,
     iter_upstream_stream,
     open_upstream_stream,
     parse_byte_range,
@@ -373,10 +374,52 @@ def stream_audio(server: Any, video_id: str):
 
 
 def proxy_stream(server: Any, video_id: str, request: Request):
+    started = time.perf_counter()
+    session = request.query_params.get('playback_session', '')
+    session = session if re.fullmatch(r'[A-Za-z0-9_-]{1,80}', session) else 'legacy'
+    try:
+        response = _proxy_stream(server, video_id, request)
+    except Exception as exc:
+        print(f'[EBB:playback] track={video_id} session={session} result=failed '
+              f'error={type(exc).__name__} ms={int((time.perf_counter()-started)*1000)}')
+        raise
+    iterator = response.body_iterator
+    async def measured():
+        sent = 0
+        first_ms = None
+        result = 'cancelled'
+        try:
+            async for chunk in iterator:
+                if first_ms is None:
+                    first_ms = int((time.perf_counter()-started)*1000)
+                sent += len(chunk)
+                yield chunk
+            result = 'complete'
+        except Exception as exc:
+            result = type(exc).__name__
+            raise
+        finally:
+            # Suppress successful probe requests; keep failures and full transfers.
+            if sent > 65536 or result not in {'complete', 'cancelled'} or os.environ.get('AURALIS_PLAYBACK_VERBOSE') == '1':
+                source = response.headers.get('X-Auralis-Stream-Cache', 'upstream')
+                print(f'[EBB:playback] track={video_id} session={session} source={source} '
+                      f'firstMs={first_ms} ms={int((time.perf_counter()-started)*1000)} '
+                      f'bytes={sent} result={result}', flush=True)
+    response.body_iterator = measured()
+    return response
+
+
+def _proxy_stream(server: Any, video_id: str, request: Request):
     try:
         range_header = request.headers.get("range")
+        session = request.query_params.get('playback_session', '')
+        if session and (len(session) > 80 or not re.fullmatch(r'[A-Za-z0-9_-]+', session)):
+            raise HTTPException(status_code=422, detail='Invalid playback session')
+        # Only an active play session may keep us on an upstream representation.
+        # Legacy resolver/preparation entries must not bypass completed audio.
+        selected = selected_stream_info(server, video_id, session) if session else None
         stream_cache = get_stream_cache(server)
-        stream_cache_meta = stream_cache.head(video_id)
+        stream_cache_meta = None if selected is not None else stream_cache.head(video_id)
         if stream_cache_meta:
             total_length = int(stream_cache_meta.get("content_length") or 0) or None
             parsed_range = parse_byte_range(range_header, total_length)
@@ -393,7 +436,7 @@ def proxy_stream(server: Any, video_id: str, request: Request):
                 end=end,
                 ranged=bool(range_header),
             )
-            print(
+            if os.environ.get('AURALIS_PLAYBACK_VERBOSE') == '1': print(
                 "[EBB:stream-cache] "
                 f"video={video_id} event=hit backend={stream_cache.backend_name} "
                 f"bytes={total_length or 0} range={range_header or 'full'}"
@@ -404,17 +447,18 @@ def proxy_stream(server: Any, video_id: str, request: Request):
                 headers=headers,
                 media_type=stream_cache_meta.get("content_type") or "audio/mp4",
             )
-        if stream_cache.enabled:
+        if stream_cache.enabled and os.environ.get('AURALIS_PLAYBACK_VERBOSE') == '1':
             print(
                 "[EBB:stream-cache] "
                 f"video={video_id} event=miss backend={stream_cache.backend_name} "
                 f"range={range_header or 'full'}"
             )
 
-        stream_info = get_stream_info(server, video_id)
-        cached_chunk = get_cached_stream_chunk(server, video_id)
+        stream_info = selected or (get_stream_info(server, video_id, session=session)
+                                   if session else get_stream_info(server, video_id))
+        cached_chunk = None if stream_info.get('pinned') else get_cached_stream_chunk(server, video_id)
 
-        if cached_chunk:
+        if cached_chunk and not stream_info.get('compatibility') and not cached_chunk.get('compatibility'):
             cached_bytes = cached_chunk.get("bytes") or b""
             content_type = cached_chunk.get("content_type") or stream_info.get("mime_type") or "audio/mp4"
             total_length = cached_chunk.get("total_length")
@@ -527,6 +571,7 @@ def proxy_stream(server: Any, video_id: str, request: Request):
                     video_id,
                     chunks,
                     content_type=stream_info.get("mime_type", "audio/mp4"),
+                    capture_duration=stream_info.get('duration', 0) if stream_info.get('compatibility') else None,
                 )
                 return
             yield from chunks
@@ -537,6 +582,13 @@ def proxy_stream(server: Any, video_id: str, request: Request):
             value = upstream_response.headers.get(header)
             if value:
                 resp_headers["-".join(part.capitalize() for part in header.split("-"))] = value
+        if total_length and (stream_info.get('pinned') or stream_info.get('compatibility')):
+            response_end = min(end if end is not None else total_length-1, total_length-1)
+            resp_headers['Content-Length'] = str(response_end-start+1)
+            status_code = 206 if range_header else 200
+            resp_headers.pop('Content-Range', None)
+            if range_header:
+                resp_headers['Content-Range'] = f'bytes {start}-{response_end}/{total_length}'
         return StreamingResponse(
             generate_upstream(),
             status_code=status_code,
@@ -624,7 +676,12 @@ def playback_resolve(
                 "source_kind": "audius_proxy",
             }
         try:
-            stream_info = get_stream_info(server, source_id)
+            cache = get_stream_cache(server)
+            cached = cache.head(source_id)
+            if cached:
+                stream_info = {"mime_type": cached.get("content_type"), "duration": duration}
+            else:
+                stream_info = get_stream_info(server, source_id)
             return {
                 "status": "success",
                 "track_key": track_key,
@@ -638,7 +695,7 @@ def playback_resolve(
                     float(stream_info.get("expires_at") or (time.time() + 1200)),
                     time.time() + 1200,
                 ),
-                "source_kind": "youtube_proxy",
+                "source_kind": f"{cache.backend_name}_proxy" if cached else "youtube_proxy",
             }
         except Exception as exc:
             failures.append(str(classify_stream_failure(exc)))
@@ -693,6 +750,15 @@ def _proxy_audius(server: Any, source_id: str, request: Request):
 
 def playback_stream(server: Any, track_key: str, request: Request):
     sources = playback_source_candidates(server, track_key)
+    if not sources and request.query_params.get("resolve") == "1" and not request.query_params.get("background"):
+        # Direct browser playback must start within the user's tap. Reuse the
+        # POST resolver here only when the canonical source is still missing.
+        from ..contracts import PlaybackResolveRequest
+        try:
+            identity = PlaybackResolveRequest(**{**dict(request.query_params), "track_key": track_key})
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Invalid playback identity")
+        sources = [playback_resolve(server, **identity.model_dump())]
     if not sources:
         raise HTTPException(
             status_code=404,

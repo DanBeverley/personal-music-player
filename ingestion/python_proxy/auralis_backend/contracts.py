@@ -18,6 +18,7 @@ class TrackSnapshot(BaseModel):
 
 class SearchRequest(BaseModel):
     query: str = ""
+    auto_correct: bool = False
     user_scope_id: str = "guest"
     session_id: Optional[str] = None
     force_refresh: bool = False
@@ -123,6 +124,7 @@ class DownloadRequest(BaseModel):
 
 
 class PrepareSessionRequest(BaseModel):
+    cache_full: bool = False
     track_keys: List[str] = Field(default_factory=list)
     current_track_key: Optional[str] = None
     active_queue: bool = False
@@ -150,6 +152,8 @@ class RelatedTracksRequest(BaseModel):
     source_provider: str = "youtube"
     user_scope_id: str = "guest"
     avoid_ids: List[str] = Field(default_factory=list)
+    discovery_session: str = Field(default="", max_length=128)
+    recent_ids: List[str] = Field(default_factory=list, max_length=100)
     offset: int = 0
     limit: int = 18
 

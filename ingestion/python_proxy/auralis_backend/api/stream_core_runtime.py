@@ -1,16 +1,107 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import time
 import urllib.parse
+import re
+from threading import BoundedSemaphore
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, List, Optional
 
 import yt_dlp
 import yt_dlp.plugins
 
-from .stream_cache import get_stream_cache
+from .stream_cache import get_stream_cache, iter_and_store_full_stream
+
+_capture_cache_slots = BoundedSemaphore(2)
+
+
+def cache_prepared_track(server, video_id):
+    cache = get_stream_cache(server)
+    if not cache.enabled:
+        return False
+    if cache.head(video_id):
+        return True
+    with server.stream_info_lock:
+        pending = server.stream_info_inflight.get(f'cache:{video_id}')
+    if pending is not None:
+        try:
+            return bool(pending.result(timeout=75))
+        except Exception:
+            return False
+    if not _capture_cache_slots.acquire(blocking=False):
+        return False
+    try:
+        info = selected_stream_info(server, video_id)
+        if not info:
+            return False
+        for _ in iter_and_store_full_stream(server, video_id,
+                iter_upstream_stream(server, video_id, {**info, 'pinned': True}),
+                content_type=info.get('mime_type', 'audio/mp4'),
+                capture_duration=info.get('duration', 0) if info.get('compatibility') else None):
+            pass
+        return bool(cache.head(video_id))
+    except Exception as exc:
+        print(f'[EBB:stream] video={video_id} event=queue_cache_failed error={type(exc).__name__}')
+        return False
+    finally:
+        _capture_cache_slots.release()
+
+
+def _cache_capture(server, video_id, info):
+    if not info.get('compatibility') or not hasattr(server, 'stream_warm_executor'):
+        return
+    retry_key = f'capture_retry:{video_id}'
+    with server.stream_info_lock:
+        retry = server.stream_info_cache.get(retry_key)
+        if retry and retry['expires_at'] > time.time():
+            return
+    if not _capture_cache_slots.acquire(blocking=False):
+        return
+    key = f'cache:{video_id}'
+    with server.stream_info_lock:
+        if key in server.stream_info_inflight:
+            _capture_cache_slots.release()
+            return
+        pending = Future()
+        server.stream_info_inflight[key] = pending
+    def store():
+        stored = False
+        try:
+            cache = get_stream_cache(server)
+            if cache.enabled and not cache.head(video_id):
+                for _ in iter_and_store_full_stream(server, video_id,
+                        iter_upstream_stream(server, video_id, info),
+                        content_type=info['mime_type'],
+                        capture_duration=info.get('duration', 0)):
+                    pass
+            stored = bool(cache.head(video_id)) if cache.enabled else False
+        except Exception as exc:
+            print(f'[EBB:stream] video={video_id} event=capture_cache_failed error={type(exc).__name__}')
+        finally:
+            pending.set_result(stored)
+            with server.stream_info_lock:
+                server.stream_info_inflight.pop(key, None)
+                # Avoid retry storms, but do not permanently lose capture
+                # persistence after a transient upload/transport failure.
+                server.stream_info_cache[retry_key] = {
+                    'expires_at': time.time() + (300 if stored else 30),
+                    'payload': {},
+                }
+                for old in list(server.stream_info_cache):
+                    if (old.startswith('capture_retry:')
+                            and server.stream_info_cache[old]['expires_at'] <= time.time()):
+                        server.stream_info_cache.pop(old, None)
+            _capture_cache_slots.release()
+    try:
+        server.stream_warm_executor.submit(store)
+    except Exception:
+        pending.set_result(False)
+        with server.stream_info_lock:
+            server.stream_info_inflight.pop(key, None)
+        _capture_cache_slots.release()
 
 _STREAM_RESOLUTION_NAMESPACE = "playback_stream_resolution"
 _STREAM_RESOLUTION_MODEL = "youtube"
@@ -310,12 +401,15 @@ def extract_stream_info(server: Any, video_id: str):
         "url": selected["url"],
         "headers": headers,
         "mime_type": selected.get("ext") or selected.get("acodec") or "audio/mp4",
+        "protocol": selected.get("protocol") or (info or {}).get("protocol"),
         "duration": selected.get("duration") or (info or {}).get("duration") or 0,
     }
 
 
 def validate_stream_info(server: Any, video_id: str, stream_info: dict) -> dict:
     """Prove that an extracted URL yields media before it can be cached."""
+    if stream_info.get("protocol") not in {None, "", "http", "https"}:
+        raise RuntimeError("Requested format is not available: direct audio required")
     headers = dict(stream_info.get("headers") or {})
     headers["range"] = "bytes=0-0"
     response = server.upstream_http.get(
@@ -333,6 +427,8 @@ def validate_stream_info(server: Any, video_id: str, stream_info: dict) -> dict:
         if not first_chunk:
             raise RuntimeError("stream_preflight_empty")
         content_type = str(response.headers.get("content-type") or "").casefold()
+        if "mpegurl" in content_type or "dash+xml" in content_type:
+            raise RuntimeError("Requested format is not available: playlist is not audio")
         if content_type.startswith(("text/", "application/json")):
             raise RuntimeError(f"stream_preflight_invalid_content_type:{content_type}")
         validated = dict(stream_info)
@@ -506,7 +602,7 @@ def warm_initial_stream_chunk(server: Any, video_id: str, stream_info: dict, tar
     target_bytes = max(int(target_bytes or 0), 64 * 1024)
     while True:
         cached = get_cached_stream_chunk(server, video_id, min_bytes=target_bytes)
-        if cached is not None:
+        if cached is not None and cached.get("compatibility") == stream_info.get("compatibility"):
             return cached
 
         with server.stream_chunk_inflight_lock:
@@ -527,6 +623,8 @@ def warm_initial_stream_chunk(server: Any, video_id: str, stream_info: dict, tar
 
         try:
             existing = get_cached_stream_chunk(server, video_id)
+            if existing and existing.get("compatibility") != stream_info.get("compatibility"):
+                existing = None
             existing_bytes = existing.get("bytes") if existing else b""
             total_length = existing.get("total_length") if existing else None
             if total_length is not None and len(existing_bytes) >= total_length:
@@ -566,6 +664,7 @@ def warm_initial_stream_chunk(server: Any, video_id: str, stream_info: dict, tar
                         stream_info.get("mime_type") or "audio/mp4",
                     ),
                     "total_length": extract_total_length(req.headers) or total_length,
+                    "compatibility": stream_info.get("compatibility"),
                 }
                 store_stream_chunk(server, video_id, payload)
                 pending.set_result(payload)
@@ -610,9 +709,6 @@ def prepare_stream_track(
     defer_chunk: bool = False,
 ):
     total_start = time.perf_counter()
-    cached_failure = _get_stream_failure(server, video_id)
-    if cached_failure is not None:
-        raise RuntimeError(cached_failure.get("message") or cached_failure.get("code") or "stream_failed")
     stream_cache = get_stream_cache(server)
     stream_cache_head_start = time.perf_counter()
     stream_cache_meta = stream_cache.head(video_id)
@@ -646,7 +742,7 @@ def prepare_stream_track(
         return metrics
     resolve_start = time.perf_counter()
     resolve_cache_hit = is_stream_info_cached(server, video_id)
-    stream_info = get_stream_info(server, video_id)
+    stream_info = get_stream_info(server, video_id, background=not active_queue)
     resolve_ms = int((time.perf_counter() - resolve_start) * 1000)
 
     chunk_cache_hit = get_cached_stream_chunk(
@@ -670,7 +766,7 @@ def prepare_stream_track(
         except Exception as exc:
             if not should_refresh_stream_info(exc):
                 raise
-            stream_info = refresh_stream_info(server, video_id)
+            stream_info = refresh_stream_info(server, video_id, background=not active_queue)
             chunk_payload = warm_initial_stream_chunk(
                 server,
                 video_id,
@@ -829,7 +925,94 @@ def prepare_streams(
     return prepared
 
 
-def get_stream_info(server: Any, video_id: str):
+def selected_stream_info(server: Any, video_id: str, session: str = ''):
+    if not hasattr(server, 'stream_info_lock'):
+        return None
+    with server.stream_info_lock:
+        entry = server.stream_info_cache.get(f'selected:{session}:{video_id}')
+        if entry and entry['expires_at'] > time.time():
+            return entry['payload']
+        if entry and session:
+            raise RuntimeError('Playback source expired; start playback again')
+    return None
+
+
+def get_stream_info(server: Any, video_id: str, *, background=False, session=''):
+    if not os.environ.get('AURALIS_BROWSER_AUDIO_URL', '').strip():
+        return _resolve_stream_info(server, video_id, background=background)
+    selected = selected_stream_info(server, video_id, session)
+    if selected is not None:
+        _cache_capture(server, video_id, selected)
+        return selected
+    key = f'selected:{session}:{video_id}'
+    with server.stream_info_lock:
+        pending = server.stream_info_inflight.get(key)
+        owner = pending is None
+        if owner:
+            pending = Future()
+            server.stream_info_inflight[key] = pending
+    if not owner:
+        return pending.result(timeout=85)
+    try:
+        payload = selected_stream_info(server, video_id, session)
+        if payload is None and session:
+            payload = selected_stream_info(server, video_id)
+            if payload is not None and payload.get('compatibility'):
+                try:
+                    payload = validate_stream_info(server, video_id, payload)
+                except Exception:
+                    with server.stream_info_lock:
+                        server.stream_info_cache.pop(f'selected::{video_id}', None)
+                    payload = None
+            if payload is not None:
+                print(f'[EBB:stream] video={video_id} event=prepared_source_reused')
+        if payload is None:
+            payload = _resolve_stream_info(server, video_id, background=background,
+                                           priority=0 if session else (2 if background else 1))
+        payload = {**payload, 'pinned': bool(session)}
+        if session and payload.get('compatibility'):
+            parts = urllib.parse.urlsplit(payload['url'])
+            query = dict(urllib.parse.parse_qsl(parts.query))
+            query.pop('background', None)
+            query.pop('priority', None)
+            payload['url'] = urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
+        with server.stream_info_lock:
+            keys = [k for k in server.stream_info_cache if k.startswith('selected:')]
+            for old in keys[:-255]:
+                server.stream_info_cache.pop(old, None)
+            server.stream_info_cache[key] = {
+                'payload': payload,
+                'expires_at': float(payload.get('expires_at') or time.time()+1200),
+            }
+        pending.set_result(payload)
+        _cache_capture(server, video_id, payload)
+        return payload
+    except Exception as exc:
+        pending.set_exception(exc)
+        raise
+    finally:
+        with server.stream_info_lock:
+            server.stream_info_inflight.pop(key, None)
+
+
+def _resolve_stream_info(server: Any, video_id: str, *, background=False, priority=0):
+    try:
+        if not background and os.environ.get('AURALIS_BROWSER_AUDIO_URL', '').strip():
+            from .browser_compat import race_primary, resolve_browser_audio
+            return race_primary(lambda: _get_primary_stream_info(server, video_id),
+                                lambda: resolve_browser_audio(video_id, 'slow_primary', priority=priority))
+        return _get_primary_stream_info(server, video_id)
+    except Exception as exc:
+        from .browser_compat import resolve_browser_audio
+        failure = _get_stream_failure(server, video_id) or classify_stream_failure(exc)
+        fallback = (resolve_browser_audio(video_id, failure.get('code'), background=True)
+                    if background else resolve_browser_audio(video_id, failure.get('code'), priority=priority))
+        if fallback is not None:
+            return fallback
+        raise
+
+
+def _get_primary_stream_info(server: Any, video_id: str):
     now = time.time()
     cached_failure = _get_stream_failure(server, video_id)
     if cached_failure is not None:
@@ -896,11 +1079,12 @@ def get_stream_info(server: Any, video_id: str):
                 server.stream_info_inflight.pop(video_id, None)
 
 
-def refresh_stream_info(server: Any, video_id: str):
+def refresh_stream_info(server: Any, video_id: str, *, background=False):
     with server.stream_info_lock:
         server.stream_info_cache.pop(video_id, None)
+        server.stream_info_cache.pop(f'selected::{video_id}', None)
     _delete_persisted_stream_info(server, video_id)
-    return get_stream_info(server, video_id)
+    return get_stream_info(server, video_id, background=True) if background else get_stream_info(server, video_id)
 
 
 def should_refresh_stream_info(exc: Exception):
@@ -921,9 +1105,12 @@ def open_upstream_stream(
     refreshed = False
     while True:
         headers = dict(current_stream_info.get("headers") or {})
-        if start > 0 or end is not None:
+        if start > 0 or end is not None or current_stream_info.get('pinned') or current_stream_info.get('compatibility'):
+            request_end = end
+            if current_stream_info.get('pinned') or current_stream_info.get('compatibility'):
+                request_end = min(end if end is not None else start+1048575, start+1048575)
             headers["range"] = (
-                f"bytes={start}-" if end is None else f"bytes={start}-{end}"
+                f"bytes={start}-" if request_end is None else f"bytes={start}-{request_end}"
             )
         response = server.upstream_http.get(
             current_stream_info["url"],
@@ -936,7 +1123,7 @@ def open_upstream_stream(
             return response, current_stream_info
         except Exception as exc:
             response.close()
-            if refreshed or not should_refresh_stream_info(exc):
+            if current_stream_info.get('pinned') or refreshed or not should_refresh_stream_info(exc):
                 raise
             refreshed = True
             current_stream_info = refresh_stream_info(server, video_id)
@@ -950,6 +1137,48 @@ def iter_upstream_stream(
     end: Optional[int] = None,
     initial_response: Any = None,
 ):
+    if stream_info.get('pinned') or stream_info.get('compatibility'):
+        offset = start
+        response = initial_response
+        total = None
+        failures = 0
+        while True:
+            try:
+                if response is None:
+                    response, _ = open_upstream_stream(server, video_id, stream_info, offset, end)
+                match = re.fullmatch(r'bytes (\d+)-(\d+)/(\d+)', response.headers.get('content-range', ''))
+                if response.status_code != 206 or not match or int(match[1]) != offset:
+                    raise ValueError('Upstream did not honor the byte range')
+                response_end, length = int(match[2]), int(match[3])
+                if total is not None and total != length:
+                    raise ValueError('Audio representation length changed')
+                total = length
+                target = min(end if end is not None else total-1, total-1)
+                for chunk in response.iter_content(chunk_size=65536):
+                    if not chunk:
+                        continue
+                    if offset+len(chunk) > min(response_end, target)+1:
+                        raise ValueError('Upstream exceeded the byte range')
+                    offset += len(chunk)
+                    yield chunk
+                if offset != response_end+1:
+                    raise IOError('Incomplete audio range')
+                if offset > target:
+                    return
+            except ValueError:
+                raise
+            except Exception:
+                failures += 1
+                if failures > 2:
+                    print(f'[EBB:stream] video={video_id} event=retry_exhausted offset={offset} attempts={failures}')
+                    raise
+                print(f'[EBB:stream] video={video_id} event=same_source_retry offset={offset} attempt={failures}')
+                time.sleep(.15)
+            finally:
+                if response is not None:
+                    response.close()
+                    response = None
+        return
     current_start = max(start, 0)
     current_stream_info = stream_info
     attempts = 0
@@ -979,6 +1208,10 @@ def iter_upstream_stream(
                     return
             return
         except Exception as exc:
+            if current_stream_info.get('compatibility') or current_stream_info.get('pinned'):
+                # A partial capture must not become a successful EOF or be
+                # resumed from a different representation and cached as full.
+                raise
             if attempts >= 2:
                 if emitted_bytes:
                     print(

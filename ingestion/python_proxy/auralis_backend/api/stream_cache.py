@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -32,6 +33,8 @@ def _safe_video_id(video_id: str) -> str:
 
 
 def _log(event: str, video_id: str, **fields: Any) -> None:
+    if event in {'upload_coalesced', 'upload_buffer_start', 'upload_start'} and os.environ.get('AURALIS_PLAYBACK_VERBOSE') != '1':
+        return
     safe_id = _safe_video_id(video_id)
     suffix = " ".join(
         f"{key}={value}"
@@ -158,9 +161,12 @@ class R2StreamCache(StreamCacheBackend):
             }
         except ClientError as exc:
             status = int((exc.response or {}).get("ResponseMetadata", {}).get("HTTPStatusCode") or 0)
+            if status != 404:
+                _log("head_failed", video_id, status=status, reason=type(exc).__name__)
             if status not in {403, 404}:
                 raise
-        except Exception:
+        except Exception as exc:
+            _log("head_failed", video_id, reason=type(exc).__name__)
             metadata = None
         ttl = self._head_hit_ttl if metadata is not None else self._head_miss_ttl
         with self._head_cache_lock:
@@ -292,12 +298,38 @@ def should_cache_full_response(
     return False
 
 
+def validate_capture_file(path: str, duration: float, content_type: str) -> str:
+    """Validate decoded coverage and rebuild MSE containers without changing live bytes."""
+    if not duration or duration <= 0:
+        raise ValueError('capture_duration_missing')
+    output = path + ('.webm' if 'webm' in content_type else '.m4a')
+    try:
+        result = subprocess.run(
+            ['ffmpeg', '-nostdin', '-v', 'error', '-i', path, '-map', '0:a:0',
+             '-c:a', 'copy', '-y', output], capture_output=True, timeout=45)
+        if result.returncode:
+            raise ValueError('capture_remux_failed')
+        checked = subprocess.run(
+            ['ffmpeg', '-nostdin', '-v', 'error', '-i', output, '-map', '0:a:0',
+             '-progress', 'pipe:1', '-f', 'null', '-'], capture_output=True, timeout=45)
+        times = [int(line.split('=')[1]) / 1_000_000
+                 for line in checked.stdout.decode().splitlines()
+                 if line.startswith('out_time_us=') and line.split('=')[1].isdigit()]
+        if checked.returncode or checked.stderr.strip() or not times or abs(max(times) - duration) > 2:
+            raise ValueError('capture_decode_or_duration_invalid')
+        return output
+    except BaseException:
+        Path(output).unlink(missing_ok=True)
+        raise
+
+
 def iter_and_store_full_stream(
     server: Any,
     video_id: str,
     chunks: Iterable[bytes],
     *,
     content_type: str,
+    capture_duration: Optional[float] = None,
 ) -> Iterable[bytes]:
     cache = get_stream_cache(server)
     if not cache.enabled:
@@ -324,6 +356,7 @@ def iter_and_store_full_stream(
     Path(temp_dir).mkdir(parents=True, exist_ok=True)
     total = 0
     temp_path = ""
+    validated_path = ""
     wrote_cache_bytes = 0
     truncated = False
     try:
@@ -341,6 +374,13 @@ def iter_and_store_full_stream(
                     truncated = True
                 yield chunk
         if min_bytes <= total <= max_bytes:
+            if capture_duration is not None:
+                try:
+                    validated_path = validate_capture_file(temp_path, capture_duration, content_type)
+                except Exception as exc:
+                    reason = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
+                    _log('validation_failed', video_id, reason=reason)
+                    return
             _log(
                 "upload_start",
                 video_id,
@@ -349,9 +389,11 @@ def iter_and_store_full_stream(
             )
             stored = cache.put_file(
                 video_id,
-                temp_path,
+                validated_path or temp_path,
                 content_type=content_type or "audio/mp4",
-                metadata={"video_id": _safe_video_id(video_id), "bytes": str(total)},
+                metadata={"video_id": _safe_video_id(video_id),
+                          "bytes": str(os.path.getsize(validated_path or temp_path)),
+                          "validated": 'capture-v1' if validated_path else 'source'},
             )
             if stored:
                 _log("upload_success", video_id, backend=cache.backend_name, bytes=total)
@@ -386,6 +428,8 @@ def iter_and_store_full_stream(
         )
         raise
     finally:
+        if validated_path:
+            Path(validated_path).unlink(missing_ok=True)
         with _STREAM_UPLOAD_LEASES_LOCK:
             _STREAM_UPLOAD_LEASES.discard(upload_key)
         if temp_path:

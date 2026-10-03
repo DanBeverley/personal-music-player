@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from threading import Lock
 from typing import Any
 
 from fastapi import HTTPException
@@ -17,6 +18,32 @@ from ..details.detail_runtime import (
     build_track_details_payload,
 )
 from ..lyrics import LyricsService
+from ..storage.cache_runtime import (
+    detail_result_cache, detail_result_cache_lock, lookup_ttl_cache, store_ttl_cache,
+)
+
+# Bounded striped locks coalesce a seed's requests without retaining futures.
+_related_locks = [Lock() for _ in range(32)]
+
+
+def _related_watch(server: Any, source_id: str, depth: int):
+    key = f"{id(server.ytmusic)}:{source_id}"
+    with _related_locks[hash(key) % len(_related_locks)]:
+        cached = lookup_ttl_cache(detail_result_cache, detail_result_cache_lock, "related", key)
+        if cached and cached["depth"] >= depth:
+            return cached["watch"]
+        watch = server.ytmusic.get_watch_playlist(
+            videoId=source_id, radio=True, limit=depth,
+        ) or {}
+        # Empty/transient results must remain retryable; exclude per-user filters.
+        if watch.get("tracks"):
+            with detail_result_cache_lock:
+                entries = detail_result_cache.setdefault("related", {})
+                for old in list(entries)[:max(0, len(entries) - 255)]:
+                    entries.pop(old, None)
+            store_ttl_cache(detail_result_cache, detail_result_cache_lock, "related", key,
+                            {"depth": depth, "watch": watch}, 300)
+        return watch
 
 
 class MediaService:
@@ -104,10 +131,19 @@ def prepare_session(server: Any, req: Any):
         active_queue=req.active_queue,
         defer_all_chunks=req.background,
     )
+    if getattr(req, 'cache_full', False):
+        from .stream_core_runtime import cache_prepared_track
+        for value in list(prepared.values())[:1]:
+            if value.get('provider') == 'youtube':
+                value['fully_cached'] = cache_prepared_track(server, value['source_id'])
     if req.background and failed:
         from ..discovery.source_registry import record_youtube_background_failures
 
         record_youtube_background_failures(server, failed)
+    print(f'[EBB:prepare] tracks={",".join(req.track_keys[:limit])} '
+          f'ms={int((time.perf_counter()-start_time)*1000)} '
+          f'prepared={len(prepared)} failed={len(failed)} '
+          f'fullyCached={sum(v.get("fully_cached") is True for v in prepared.values())}', flush=True)
     return {
         "status": "success",
         "prepared": prepared,
@@ -196,11 +232,8 @@ def get_related_tracks(server: Any, req: Any):
     try:
         # Fetch beyond tracks the client already owns; the provider defaults to
         # a short first page, which makes repeated retries return only duplicates.
-        watch = server.ytmusic.get_watch_playlist(
-            videoId=source_id,
-            radio=True,
-            limit=min(300, max(50, len(req.avoid_ids) + int(req.offset) + int(req.limit) + 1)),
-        ) or {}
+        depth = min(300, max(50, len(req.avoid_ids) + int(req.offset) + int(req.limit) + 1))
+        watch = _related_watch(server, source_id, depth)
     except Exception as exc:
         print(f"[EBB:related-tracks] source={source_id} provider_error={type(exc).__name__}")
         return {
@@ -246,6 +279,23 @@ def get_related_tracks(server: Any, req: Any):
         })
     offset = max(int(req.offset), 0)
     limit = min(max(int(req.limit), 1), 30)
+    discovery_session = str(getattr(req, "discovery_session", "") or "").strip()[:128]
+    if discovery_session:
+        recent = {str(value or "").strip() for value in getattr(req, "recent_ids", [])[:100]}
+        seed = str(track_key or source_id)
+        provider_positions = {item["id"]: index for index, item in enumerate(candidates)}
+
+        def discovery_order(item):
+            identity = item["id"]
+            # Preserve provider relevance bands while varying order inside each
+            # band. Recent tracks stay eligible and fall behind fresh tracks.
+            band = provider_positions[identity] // 12
+            digest = hashlib.sha256(
+                f"{seed}\0{discovery_session}\0{identity}".encode("utf-8")
+            ).hexdigest()
+            return band, identity in recent, digest
+
+        candidates.sort(key=discovery_order)
     page = candidates[offset : offset + limit]
     next_offset = offset + len(page)
     return {

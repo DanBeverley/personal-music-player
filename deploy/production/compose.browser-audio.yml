@@ -1,0 +1,31 @@
+# Optional private compatibility transport; omit this overlay to disable it.
+services:
+  api:
+    environment:
+      AURALIS_BROWSER_AUDIO_URL: http://browser-audio:8020
+    depends_on:
+      browser-audio:
+        condition: service_healthy
+  browser-audio:
+    init: true
+    build:
+      context: ../../ingestion/browser_audio
+    environment:
+      BROWSER_AUDIO_COOKIES: /run/cookies.txt
+    volumes:
+      - /var/lib/neatie/secrets/youtube-cookies.txt:/run/cookies.txt:ro
+    shm_size: 512m
+    mem_limit: 2g
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:8020/health',timeout=3))['ready']"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "2"
+    restart: unless-stopped
+    networks:
+      - backend

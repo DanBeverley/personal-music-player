@@ -1,0 +1,505 @@
+import 'dart:async';
+import 'dart:convert';
+import 'package:flutter/foundation.dart';
+import '../logic/track_metadata.dart';
+import 'music_api.dart';
+import 'playback_port.dart';
+
+class WebPlayer extends ChangeNotifier {
+  final MusicApi api;
+  final PlaybackPort audio;
+  SessionStore store;
+  late final StreamSubscription<String> _subscription;
+  List<Map<String, dynamic>> queue = [];
+  int index = 0;
+  String title = 'Your queue';
+  String? error;
+  String? relatedError;
+  String? storageError;
+  bool loading = false;
+  bool loadingRelated = false;
+  bool startupInterrupted = false;
+  bool _hiddenDuringStartup = false;
+  bool _awaitingFirstPlayback = false;
+  bool hasMore = true;
+  int _session = 0;
+  int _operation = 0;
+  int _listeningEpoch = 0;
+  int get listeningEpoch => _listeningEpoch;
+  bool _disposed = false;
+  final Map<String, Uri> _ready = {};
+  final Map<String, Future<Uri>> _pending = {};
+  List<Map<String, dynamic>> _searchPreparation = [];
+  bool _preparingSearch = false;
+  bool _preparingQueue = false;
+  final Set<String> _queueCacheAttempts = {};
+  String _discoverySession = '';
+  final List<String> _recentPlayed = [];
+
+  void preloadSearch(List<Map<String, dynamic>> tracks) {
+    final seen = <String>{};
+    _searchPreparation = tracks.where((track) {
+      final id = extractTrackId(track);
+      return id != null && seen.add(id);
+    }).take(5).toList();
+    unawaited(_drainSearchPreparation());
+  }
+
+  Future<void> _drainSearchPreparation() async {
+    if (_preparingSearch || _disposed) return;
+    _preparingSearch = true;
+    try {
+      while (!_disposed && !loading && !_preparingQueue && _searchPreparation.isNotEmpty) {
+        final track = _searchPreparation.removeAt(0);
+        try {
+          await _prepare(track);
+        } catch (_) {
+          // A speculative failure must not prevent explicit playback.
+        }
+      }
+    } finally {
+      _preparingSearch = false;
+    }
+  }
+  double _restoredPosition = 0;
+  double _knownDuration = 0;
+  bool _metadataReady = false;
+  int _lastSavedSecond = -1;
+  String? _loadedId;
+
+  WebPlayer(this.api, this.audio, this.store) {
+    _restore();
+    _subscription = audio.events.listen(_onEvent);
+  }
+
+  void _restore() {
+    try {
+      final raw = store.read();
+      if (raw != null) {
+        final saved = jsonDecode(raw) as Map;
+        if (saved['version'] == 1) {
+          queue = MusicApi.tracks(saved['queue']);
+          final savedIndex =
+              queue.indexWhere((t) => extractTrackId(t) == saved['current']);
+          if (savedIndex >= 0) {
+            index = savedIndex;
+            title = saved['title']?.toString() ?? title;
+            _restoredPosition = (saved['position'] as num? ?? 0).toDouble();
+            _knownDuration = (saved['duration'] as num? ?? trackDurationSeconds(current!)).toDouble();
+            hasMore = saved['hasMore'] != false;
+            _discoverySession = saved['discoverySession']?.toString() ?? '';
+            final savedRecent = saved['recentPlayed'] is List
+                ? (saved['recentPlayed'] as List).whereType<String>()
+                : const <String>[];
+            _recentPlayed
+              ..clear()
+              ..addAll(savedRecent.toList().reversed.take(40).toList().reversed);
+          } else {
+            queue = [];
+          }
+        }
+      }
+    } catch (_) {
+      storageError = 'The saved queue could not be restored.';
+    }
+  }
+
+  void changeAccount(SessionStore nextStore) {
+    save();
+    audio.pause();
+    _operation++;
+    _session++;
+    queue = [];
+    index = 0;
+    title = 'Your queue';
+    _loadedId = null;
+    _metadataReady = false;
+    _restoredPosition = 0;
+    _knownDuration = 0;
+    _lastSavedSecond = -1;
+    loading = loadingRelated = false;
+    error = relatedError = storageError = null;
+    startupInterrupted = false;
+    _hiddenDuringStartup = false;
+    _awaitingFirstPlayback = false;
+    _searchPreparation = [];
+    _ready.clear();
+    _queueCacheAttempts.clear();
+    _discoverySession = '';
+    _recentPlayed.clear();
+    hasMore = true;
+    store = nextStore;
+    _restore();
+    _notify();
+  }
+
+  Future<void> startQueue(List<Map<String, dynamic>> tracks, int selected, String label) async {
+    if (selected < 0 || selected >= tracks.length) return;
+    _session++;
+    _queueCacheAttempts.clear();
+    queue = List.of(tracks);
+    index = selected;
+    title = label;
+    _discoverySession = '';
+    loadingRelated = false;
+    relatedError = null;
+    hasMore = false;
+    final playback = playIndex(selected);
+    unawaited(api.recordExplicitSearchSelection(tracks[selected]).catchError((_) {}));
+    await playback;
+  }
+
+  Map<String, dynamic>? get current => queue.isEmpty ? null : queue[index];
+  double get position => !_metadataReady ? _restoredPosition : audio.position;
+  double get duration => _metadataReady && audio.duration > 0
+      ? audio.duration : _knownDuration;
+
+  void _notify() {
+    if (!_disposed) notifyListeners();
+  }
+
+  Map<String, dynamic> get diagnostics => {
+    'selectedTrack': extractTrackId(current), 'loadedTrack': _loadedId,
+    'queueIndex': index, 'operation': _operation, 'loading': loading,
+    'error': error,
+    'startupInterrupted': startupInterrupted,
+    'awaitingFirstPlayback': _awaitingFirstPlayback,
+    'hiddenDuringStartup': _hiddenDuringStartup,
+  };
+
+  void reconcile() {
+    if (_disposed || current == null) return;
+    if (_loadedId != null && (_loadedId != audio.loadedTrackId ||
+        _loadedId != extractTrackId(current) || !audio.sourceMatches)) {
+      _operation++;
+      _loadedId = null;
+      _metadataReady = false;
+      loading = false;
+      audio.pause();
+      error = 'Playback state changed. Tap Play to resume this track.';
+    }
+    audio.syncMetadata(current!);
+    save();
+    _notify();
+  }
+
+  Future<Uri> _prepare(Map<String, dynamic> track, {bool activeQueue = false}) {
+    final id = extractTrackId(track)!;
+    final session = _session;
+    return _pending.putIfAbsent(
+        id,
+        () => api.prepare(track, activeQueue: activeQueue).then((uri) {
+              if (!_disposed && session == _session) _ready[id] = uri;
+              return uri;
+            }).whenComplete(() {
+              _pending.remove(id);
+            }));
+  }
+
+  void _primeNext() => unawaited(_cacheQueue());
+
+  Future<void> _cacheQueue() async {
+    if (_preparingQueue || _disposed || loading) return;
+    _preparingQueue = true;
+    try {
+      // Finish an existing speculative request before starting queue work.
+      if (_pending.isNotEmpty) {
+        await Future.wait(_pending.values.toList()).catchError((_) => <Uri>[]);
+      }
+      while (!_disposed && !loading) {
+        final upcoming = queue.skip(index + 1).take(5).where((t) =>
+            !_queueCacheAttempts.contains(extractTrackId(t))).toList();
+        if (upcoming.isEmpty) break;
+        final track = upcoming.first;
+        final id = extractTrackId(track)!;
+        final session = _session;
+        _queueCacheAttempts.add(id);
+        try {
+          final uri = await api.prepare(track, activeQueue: true, cacheFull: true);
+          if (!_disposed && session == _session) _ready[id] = uri;
+        } catch (_) { /* Explicit playback can retry a failed preparation. */ }
+      }
+    } finally {
+      _preparingQueue = false;
+    }
+  }
+
+  Future<void> start(Map<String, dynamic> track) async {
+    _session++;
+    _discoverySession = '${DateTime.now().microsecondsSinceEpoch}-${_session.toRadixString(36)}';
+    _queueCacheAttempts.clear();
+    loadingRelated = false;
+    relatedError = null;
+    hasMore = true;
+    _loadedId = null;
+    _metadataReady = false;
+    _knownDuration = trackDurationSeconds(track).toDouble();
+    _restoredPosition = 0;
+    queue = [track];
+    index = 0;
+    title = 'Inspired by ${track['title']}';
+    _restoredPosition = 0;
+    final playback = playIndex(0);
+    unawaited(api.recordExplicitSearchSelection(track).catchError((_) {}));
+    await playback;
+    if (hasMore) unawaited(replenish());
+  }
+
+  Future<void> playIndex(int target, {bool resume = false}) async {
+    if (target < 0 || target >= queue.length) return;
+    // Stop speculative requests; the selected song and queue now take priority.
+    _searchPreparation = [];
+    final operation = ++_operation;
+    audio.pause();
+    final track = queue[target];
+    final id = extractTrackId(track)!;
+    if (!resume || index != target) {
+      _listeningEpoch++;
+      _restoredPosition = 0;
+      _knownDuration = trackDurationSeconds(track).toDouble();
+    }
+    _metadataReady = false;
+    index = target;
+    loading = true;
+    error = null;
+    startupInterrupted = false;
+    _hiddenDuringStartup = false;
+    _awaitingFirstPlayback = true;
+    _loadedId = null;
+    _notify();
+    try {
+      // Call play within the tap. The stream endpoint resolves/prepares audio;
+      // awaiting an HTTP request here loses iPhone's first-play permission.
+      final source = _ready[id] ?? api.streamUri(track);
+      final uri = source.replace(queryParameters: {
+        ...source.queryParameters,
+        'playback_session': '${DateTime.now().microsecondsSinceEpoch}-$operation',
+      });
+      if (_disposed || operation != _operation) return;
+      _loadedId = id;
+      audio.load(uri, track);
+      await audio.play();
+      if (_disposed || operation != _operation) return;
+      if (_loadedId != id || startupInterrupted) return;
+      startupInterrupted = false;
+      _markPlayed(id);
+      _primeNext();
+      if (queue.length - index <= 3 && hasMore) unawaited(replenish());
+    } catch (e) {
+      if (operation != _operation || _disposed) return;
+      // A media error event may have already invalidated this loaded source.
+      if (_loadedId != id) return;
+      if (e is PlaybackStartException && e.kind == PlaybackStartFailure.interrupted &&
+          (e.cause == 'permission' || e.cause == 'abort')) {
+        startupInterrupted = true;
+        error = e.cause == 'permission'
+            ? 'Browser playback permission was interrupted. Tap Play to resume this track.'
+            : 'Playback was interrupted while starting. Tap Play to resume this track.';
+      } else {
+        _ready.remove(id);
+        _loadedId = null;
+        _metadataReady = false;
+        audio.pause();
+        startupInterrupted = false;
+        debugPrint('Browser playback start failed: ${e.runtimeType}');
+        error = 'Playback could not start. Tap Play to retry.';
+      }
+    } finally {
+      if (!_disposed && operation == _operation) {
+        loading = false;
+        if (error == null) _primeNext();
+        save();
+        _notify();
+      }
+    }
+  }
+
+  Future<void> play() async {
+    if (current == null) return;
+    reconcile();
+    if (_loadedId == extractTrackId(current)) {
+      final operation = ++_operation;
+      final session = _session;
+      final id = extractTrackId(current);
+      error = null;
+      startupInterrupted = false;
+      _hiddenDuringStartup = false;
+      _awaitingFirstPlayback = true;
+      loading = true;
+      try {
+        await audio.play();
+      } catch (e) {
+        if (_disposed || operation != _operation || session != _session ||
+            id != extractTrackId(current) || _loadedId != id) return;
+        if (e is PlaybackStartException && e.kind == PlaybackStartFailure.interrupted &&
+            (e.cause == 'permission' || e.cause == 'abort')) {
+          startupInterrupted = true;
+          error = e.cause == 'permission'
+              ? 'Browser playback permission was interrupted. Tap Play to resume this track.'
+              : 'Playback was interrupted while starting. Tap Play to resume this track.';
+        } else {
+          startupInterrupted = false;
+          _loadedId = null;
+          _metadataReady = false;
+          audio.pause();
+          error = 'Playback could not start. Tap Play to retry.';
+        }
+      }
+      if (!_disposed && operation == _operation) {
+        loading = false;
+        save();
+        _notify();
+      }
+    } else {
+      await playIndex(index, resume: true);
+    }
+  }
+
+  void pause() {
+    _operation++;
+    loading = false;
+    audio.pause();
+    save();
+    _notify();
+  }
+
+  /// Records browser lifecycle evidence without changing the selected track.
+  void lifecycle(String kind, {required bool visible}) {
+    if (!visible && (loading || _awaitingFirstPlayback)) _hiddenDuringStartup = true;
+    if (visible && startupInterrupted && !loading) {
+      error = 'Playback was interrupted while starting. Tap Play to resume this track.';
+      _notify();
+    }
+  }
+
+  void seek(double seconds) {
+    if (_metadataReady) {
+      audio.seek(seconds);
+    } else if (duration > 0) {
+      _restoredPosition = seconds.clamp(0, duration);
+    }
+    save();
+    _notify();
+  }
+
+  Future<void> next() => playIndex(index + 1);
+  Future<void> previous() => playIndex(index - 1);
+
+  Future<void> replenish() async {
+    if (loadingRelated || current == null) return;
+    final session = _session;
+    loadingRelated = true;
+    relatedError = null;
+    _notify();
+    try {
+      final page = await api.related(current!, queue,
+          discoverySession: _discoverySession,
+          recentIds: List<String>.unmodifiable(_recentPlayed));
+      if (_disposed || session != _session) return;
+      final seen = queue.map(extractTrackId).toSet();
+      queue = [
+        ...queue,
+        ...page.tracks.where((t) => seen.add(extractTrackId(t)))
+      ];
+      hasMore = page.hasMore;
+      _primeNext();
+      save();
+    } catch (_) {
+      if (session == _session)
+        relatedError = 'Related songs could not load. Retry below.';
+    } finally {
+      if (!_disposed && session == _session) {
+        loadingRelated = false;
+        _notify();
+      }
+    }
+  }
+
+  void _markPlayed(String? id) {
+    if (id == null || id.isEmpty) return;
+    _recentPlayed.remove(id);
+    _recentPlayed.add(id);
+    if (_recentPlayed.length > 40) {
+      _recentPlayed.removeRange(0, _recentPlayed.length - 40);
+    }
+  }
+
+  void _onEvent(String event) {
+    if (_loadedId == null && event != 'pause') return;
+    if (event != 'pause' && (_loadedId != audio.loadedTrackId ||
+        _loadedId != extractTrackId(current) || !audio.sourceMatches)) return;
+    if (event == 'playing') {
+      _awaitingFirstPlayback = false;
+      _hiddenDuringStartup = false;
+    }
+    if (event == 'ended') {
+      unawaited(next());
+    }
+    if (event == 'loadedmetadata' && _loadedId != null) {
+      _metadataReady = true;
+      if (audio.duration > 0) _knownDuration = audio.duration;
+      if (_restoredPosition > 0) audio.seek(_restoredPosition);
+    }
+    if (event == 'media-aborted') {
+      if (_metadataReady && audio.position > 0) _restoredPosition = audio.position;
+      _metadataReady = false;
+      startupInterrupted = true;
+      error = 'Playback was interrupted while starting. Tap Play to resume this track.';
+      loading = false;
+      audio.pause();
+      if (current != null) audio.syncMetadata(current!);
+      save();
+    } else if (event == 'error') {
+      if (_metadataReady && audio.position > 0) _restoredPosition = audio.position;
+      _metadataReady = false;
+      _ready.remove(_loadedId);
+      _loadedId = null;
+      startupInterrupted = false;
+      error = 'The audio stream failed. Tap Play to retry.';
+      loading = false;
+      audio.pause();
+      if (current != null) audio.syncMetadata(current!);
+      save();
+    }
+    if (event == 'pause' ||
+        event == 'ended' ||
+        (event == 'timeupdate' && position.toInt() != _lastSavedSecond))
+      save();
+    _notify();
+  }
+
+  void save() {
+    if (queue.isEmpty) return;
+    try {
+      store.write(jsonEncode({
+        'version': 1,
+        'queue': queue,
+        'current': extractTrackId(current),
+        'title': title,
+        'position': position,
+        'duration': duration,
+        'hasMore': hasMore,
+        'discoverySession': _discoverySession,
+        'recentPlayed': _recentPlayed,
+      }));
+      _restoredPosition = position;
+      _knownDuration = duration;
+      _lastSavedSecond = position.toInt();
+    } catch (_) {
+      storageError =
+          'Browser storage is unavailable; this queue cannot survive a reload.';
+    }
+  }
+
+  @override
+  void dispose() {
+    save();
+    _disposed = true;
+    _operation++;
+    _session++;
+    _subscription.cancel();
+    audio.dispose();
+    api.client.close();
+    super.dispose();
+  }
+}

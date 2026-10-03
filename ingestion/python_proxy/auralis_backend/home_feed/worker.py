@@ -11,13 +11,15 @@ import time
 
 from ..contracts import SearchRequest
 from ..discovery.signals import build_taste_profile
+from ..discovery.inventory import candidate_inventory_from_payload
 from .candidate_supply import CandidateSupplyService
-from .composer import HomeFeedComposer
+from .composer import HomeFeedComposer, candidate_artist_artwork_repairs
 from .contracts import (
     QUEUE_TARGET_DEPTH,
     SUPPLY_IDLE_NO_PROGRESS_RECHECK_SECONDS,
     SUPPLY_IDLE_PROGRESS_RECHECK_SECONDS,
     HomeJobRecord,
+    HomeJobStatus,
     HomeJobType,
     home_supply_profile_fingerprint,
     with_home_supply_profile,
@@ -259,6 +261,11 @@ class HomeFeedWorker:
                     ),
                 )
             return outcome
+        self._schedule_candidate_artist_artwork(
+            request,
+            outcome.snapshot_id,
+            taste.profile_key,
+        )
         state = self._repositories.state.reconcile(job.user_scope_id)
         current_artifacts = [
             self._repositories.artifacts.get(artifact_id)
@@ -329,6 +336,46 @@ class HomeFeedWorker:
                 ),
             )
         return outcome
+
+    def _schedule_candidate_artist_artwork(
+        self,
+        request: SearchRequest,
+        snapshot_id: str,
+        profile_fingerprint: str,
+    ) -> None:
+        if not snapshot_id:
+            return
+        record = self._repositories.candidates.get(snapshot_id)
+        if record is None:
+            return
+        candidate = candidate_inventory_from_payload(dict(record.payload or {}))
+        if candidate is None:
+            return
+        artwork_records = candidate_artist_artwork_repairs(
+            candidate,
+            self._server,
+            limit=160,
+        )
+        if artwork_records:
+            offset = (
+                int(time.time() // (15 * 60)) * HOME_ARTWORK_BATCH_LIMIT
+            ) % len(artwork_records)
+            artwork_records = artwork_records[offset:] + artwork_records[:offset]
+        scheduled = 0
+        for artist in artwork_records:
+            result = self._scheduler.artwork(
+                request,
+                artist,
+                profile_fingerprint=profile_fingerprint,
+            )
+            if result.status in {
+                HomeJobStatus.PENDING,
+                HomeJobStatus.RETRY,
+                HomeJobStatus.RUNNING,
+            }:
+                scheduled += 1
+                if scheduled >= HOME_ARTWORK_BATCH_LIMIT:
+                    break
 
     def _refresh_radio(self, job: HomeJobRecord) -> Any:
         started = time.perf_counter()
@@ -475,7 +522,6 @@ class HomeFeedWorker:
             generation_hint=generation,
             run_after=run_after,
         )
-
     def _repair_artwork(self, job: HomeJobRecord) -> None:
         request = self._request(job)
         taste = build_taste_profile(self._server, request)
@@ -511,6 +557,18 @@ class HomeFeedWorker:
             generation_hint=f"artwork-batch:{int(time.time() // 600)}",
             coalesce_terminal=True,
         )
+        if candidate is not None:
+            radio = self._repositories.radio.latest_usable(
+                job.user_scope_id,
+                profile_fingerprint=candidate.profile_fingerprint,
+            )
+            self._scheduler.compose(
+                request,
+                reason="artist_artwork_reconcile",
+                profile_fingerprint=candidate.profile_fingerprint,
+                candidate_snapshot_id=candidate.snapshot_id,
+                radio_snapshot_id=radio.snapshot_id if radio is not None else "",
+            )
 
     def _compose_feed(self, job: HomeJobRecord) -> Any:
         started = time.perf_counter()
@@ -577,6 +635,7 @@ class HomeFeedWorker:
             candidate_snapshot_id=candidate_snapshot_id,
             radio_snapshot_id=radio_snapshot_id,
             allocation_epoch=allocation_epoch,
+            server=self._server,
         )
         print(
             "[EBB:home-worker] "

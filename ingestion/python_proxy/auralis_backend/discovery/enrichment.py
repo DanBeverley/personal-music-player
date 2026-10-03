@@ -13,6 +13,7 @@ import json
 import time
 
 from .schema import DiscoveryArtifact, DiscoveryCandidate, DiscoveryRow, TasteProfile
+from ..domain.catalog import normalize_artist_name
 from .structured_providers import (
     CanonicalRecording,
     LastFmClient,
@@ -1375,6 +1376,8 @@ def build_enrichment_plan(
         ],
         limit=32,
     )
+    all_anchor_artists = [artist for artist in all_anchor_artists
+                          if normalize_artist_name(artist) not in {"", "unknown", "unknown artist"}]
     artist_cursor = max(int(ledger.get("artist_cursor") or 0), 0)
     rotated_artists = [
         *all_anchor_artists[artist_cursor:],
@@ -1405,9 +1408,46 @@ def build_enrichment_plan(
             name = _text(seed.get("name") if isinstance(seed, dict) else seed)
             if name and name.casefold() not in {a.casefold() for a in all_anchor_artists}:
                 discovery.append(name)
-        # Qualify a bounded batch concurrently. The active seed remains first
-        # on retry, while up to three independent candidates make progress in
-        # the same materialization cycle instead of starving the frontier.
+        # Skip seeds whose provider requests are durably exhausted before
+        # applying the batch bound. Otherwise exhausted candidates at the
+        # front of the frontier can starve later eligible artists forever.
+        candidate_artist_ids = {
+            str(key).casefold(): str(value)
+            for key, value in dict(ledger.get("canonical_artist_ids") or {}).items()
+            if _text(key) and _text(value)
+        }
+        candidate_artist_ids.update(_artist_musicbrainz_ids(taste))
+        for seed in radio_discovery_artist_seeds or []:
+            if isinstance(seed, dict):
+                name = _text(seed.get("name"))
+                identity = _text(seed.get("musicbrainz_artist_id"))
+                if name and identity:
+                    candidate_artist_ids[name.casefold()] = identity
+
+        def has_non_exhausted_radio_request(artist: str) -> bool:
+            artist_mbid = _text(candidate_artist_ids.get(artist.casefold()))
+            for provider in ("ytmusic", "lastfm", "listenbrainz", "musicbrainz"):
+                if provider in {"listenbrainz", "musicbrainz"} and not artist_mbid:
+                    continue
+                request = EnrichmentRequest(
+                    kind="artist_catalog",
+                    provider=provider,
+                    key=(artist_mbid if provider in {"listenbrainz", "musicbrainz"} else artist),
+                    pool="radio_artist_catalog",
+                    relation="same_artist_catalog",
+                    limit=24 if provider != "musicbrainz" else 12,
+                    metadata={"provider": provider},
+                )
+                progress = request_progress.get(_request_progress_signature(request), {})
+                if (
+                    progress.get("exhausted") is not True
+                    and _text(progress.get("state")).casefold() != "exhausted"
+                ):
+                    return True
+            return False
+
+        # The active seed remains first on retry, while up to four eligible
+        # candidates make progress in the same materialization cycle.
         active_seed = _text(ledger.get("radio_active_seed"))
         if active_seed:
             candidates = [active_seed, *discovery, *direct_repairs]
@@ -1415,7 +1455,12 @@ def build_enrichment_plan(
             candidates = [*discovery, *direct_repairs]
         else:
             candidates = [*direct_repairs, *discovery]
-        anchor_artists = _unique(candidates, limit=4)
+        eligible = [
+            artist
+            for artist in _unique(candidates, limit=max(len(candidates), 1))
+            if has_non_exhausted_radio_request(artist)
+        ]
+        anchor_artists = eligible[:4]
     artist_cursor_next = (
         (artist_cursor + max(len(anchor_artists), 1)) % len(all_anchor_artists)
         if all_anchor_artists
@@ -1632,7 +1677,27 @@ def build_enrichment_plan(
                 seed_order.get(" ".join(artist.casefold().split()), 0),
             )
         )
+        # An empty shelf needs a bounded share of directly supported artists.
+        # A long discovery-priority list otherwise occupies all 16 slots on
+        # every pass, starving the listener's own artists indefinitely.
+        supported = [
+            artist for artist in album_seed_artists
+            if normalize_artist_name(artist) not in {"", "unknown", "unknown artist"}
+            and artist.casefold() in {value.casefold() for value in all_anchor_artists}
+            and album_artist_counts.get(" ".join(artist.casefold().split()), 0) < 3
+        ]
+        if any(album_shortages.values()) and supported:
+            discovery = [artist for artist in album_seed_artists if artist not in supported]
+            interleaved = []
+            for index in range(max(len(discovery), len(supported))):
+                if index < len(discovery):
+                    interleaved.append(discovery[index])
+                if index < len(supported):
+                    interleaved.append(supported[index])
+            album_seed_artists = interleaved
         for artist in album_seed_artists[:16]:
+            if normalize_artist_name(artist) in {"", "unknown", "unknown artist"}:
+                continue
             artist_key = " ".join(artist.casefold().split())
             artist_mbid = _text(artist_ids.get(artist_key))
             request_key = artist_mbid or artist
@@ -2303,10 +2368,19 @@ def _resolve_ytmusic_artist_catalog_rows(
         if not video_id or not title:
             continue
         album = row.get("album") if isinstance(row.get("album"), dict) else {}
+        track_artist_metadata = {
+            key: value
+            for key, value in artist_metadata.items()
+            if value and key not in {
+                "artwork_provider",
+                "artwork_source_url",
+                "artwork_source_urls",
+            }
+        }
         output.append(
             {
                 **row,
-                **{key: value for key, value in artist_metadata.items() if value},
+                **track_artist_metadata,
                 "id": video_id,
                 "videoId": video_id,
                 "title": title,

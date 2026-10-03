@@ -379,6 +379,34 @@ def _lookup_is_deferred(sources: Iterable[Dict[str, Any]], *, now: float) -> boo
     )
 
 
+def _lookup_no_match_is_deferred(
+    sources: Iterable[Dict[str, Any]],
+    *,
+    now: float,
+) -> bool:
+    """Whether a prior empty lookup is still cooling down.
+
+    Enumerated lookups may have pending source candidates that still need
+    verification, so only an explicit no-match marker is excluded from a new
+    bounded shortlist.
+    """
+
+    rows = list(sources)
+    # A source learned after an empty lookup must still reach verification.
+    # Semantic rematching remains the responsibility of the verifier below.
+    if any(source.get("provider") == "youtube"
+           and source.get("verification_state") == "pending"
+           for source in rows):
+        return False
+    return any(
+        source.get("provider") == _LOOKUP_PROVIDER
+        and source.get("source_id") == _LOOKUP_SOURCE_ID
+        and source.get("verification_state") == "no_match"
+        and float(source.get("retry_at") or 0.0) > now
+        for source in rows
+    )
+
+
 def _lookup_marker(candidates: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     source_ids = list(
         dict.fromkeys(
@@ -1016,9 +1044,25 @@ def _shortlist(
     *,
     limit: int,
     rejection_counts: Dict[str, int] | None = None,
+    source_registry_by_key: Dict[str, List[Dict[str, Any]]] | None = None,
+    now: float | None = None,
 ) -> List[Tuple[str, str, Dict[str, Any]]]:
     history_keys = {_recording_key(item) for item in taste.full_history_tracks if isinstance(item, dict)}
     rejected = rejection_counts if rejection_counts is not None else {}
+    registry = source_registry_by_key or {}
+    current_time = time.time() if now is None else float(now)
+    deferred_keys: set[str] = set()
+
+    def lookup_cooling_down(key: str) -> bool:
+        deferred = _lookup_no_match_is_deferred(
+            registry.get(key) or [],
+            now=current_time,
+        )
+        if deferred:
+            deferred_keys.add(key)
+            rejected["lookup_cooldown"] = len(deferred_keys)
+        return deferred
+
     queues: Dict[str, List[Tuple[Tuple[int, float, float, str], str, Dict[str, Any]]]] = {}
 
     def verification_rank(item: Dict[str, Any], key: str) -> Tuple[int, float, float, str] | None:
@@ -1077,7 +1121,7 @@ def _shortlist(
                     if not isinstance(item, dict):
                         continue
                     key = _recording_key(item)
-                    if not key or key in verified_by_key:
+                    if not key or key in verified_by_key or lookup_cooling_down(key):
                         continue
                     rank = verification_rank(item, key)
                     if rank is not None:
@@ -1107,7 +1151,7 @@ def _shortlist(
             if not isinstance(item, dict):
                 continue
             key = _recording_key(item)
-            if not key or key in verified_by_key:
+            if not key or key in verified_by_key or lookup_cooling_down(key):
                 continue
             rank = verification_rank(item, key)
             if rank is not None:
@@ -1130,7 +1174,10 @@ def _shortlist(
             item for item in items if _recording_key(item) in verified_by_key
         ]
         unresolved = [
-            item for item in items if _recording_key(item) not in verified_by_key
+            item
+            for item in items
+            if _recording_key(item) not in verified_by_key
+            and not lookup_cooling_down(_recording_key(item))
         ]
         if not unresolved:
             continue
@@ -1302,18 +1349,21 @@ def verify_materialized_supply(
     )
     scan_limit = min(unresolved_count, max(verification_limit * 2, verification_limit))
     preverification_rejections: Dict[str, int] = {}
+    shortlist_now = time.time()
     shortlist = _shortlist(
         supply,
         taste,
         verified_by_key,
         limit=scan_limit,
         rejection_counts=preverification_rejections,
+        source_registry_by_key=stored_by_key,
+        now=shortlist_now,
     )
     attempted_by_pool: Dict[str, int] = {}
     attempted_by_authority: Dict[str, int] = {}
     verified_by_pool: Dict[str, int] = {}
     source_lookup_misses = 0
-    source_lookup_deferred = 0
+    source_lookup_deferred = preverification_rejections.get("lookup_cooldown", 0)
     timed_out_tasks = 0
     if not _provider_is_blocked(server):
         pending_tasks: List[Tuple[str, str, Dict[str, Any], Dict[str, Any]]] = []

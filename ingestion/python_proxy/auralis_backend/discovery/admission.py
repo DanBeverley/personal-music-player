@@ -269,6 +269,15 @@ def _evaluate_candidate_profile_compatibility(
             reason,
         )
 
+    # A playback event proves personal relevance, not display metadata. Old
+    # persisted history candidates may contain normalizer placeholders; they
+    # must not bypass metadata admission through profile_verified authority.
+    if candidate.item_type == "track":
+        title = normalize_text(candidate.item.get("title") or candidate.item.get("name"))
+        artist = normalize_text(artist_name(candidate.item))
+        if not title or title == "unknown track" or not artist or artist == "unknown artist":
+            return rejected("missing_track_display_metadata")
+
     if row_kind not in DISCOVERY_ROWS:
         return CompatibilityResult(
             True,

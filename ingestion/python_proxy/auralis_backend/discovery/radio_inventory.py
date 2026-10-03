@@ -11,7 +11,7 @@ from ..search.intelligence import catalog_entity_key, load_catalog_artist_record
 from ..storage.artist_artwork import attach_persisted_artist_artwork, artist_artwork_token
 from .candidates import artist_name
 from .config import POPULAR_RADIO_CARD_MIN_TRACKS, POPULAR_RADIO_CARD_TARGET_TRACKS
-from .inventory import canonical_item_identity
+from .inventory import canonical_item_identity, playable_source_rank
 from .schema import DiscoveryCandidate, TasteProfile
 
 
@@ -122,6 +122,10 @@ class ArtistRadioInventory:
             )
             and len(card.get("tracks") or card.get("items") or [])
             >= POPULAR_RADIO_CARD_MIN_TRACKS
+            and all(_radio_metadata_complete(track) and _is_playable_radio_record(track)
+                    for track in card.get("tracks") or card.get("items") or [])
+            and len({_radio_source_key(track) for track in card.get("tracks") or card.get("items") or []})
+            == len(card.get("tracks") or card.get("items") or [])
             for card in self.cards
         )
         if not qualified:
@@ -150,9 +154,52 @@ def _is_playable_radio_record(item: Dict[str, Any]) -> bool:
             return True
         if key in item and item.get(key) is False:
             return False
-    return bool(
-        str(item.get("playable_source_id") or item.get("videoId") or item.get("source_id") or "").strip()
-    )
+    playback = item.get("playback") if isinstance(item.get("playback"), dict) else {}
+    return bool(str(item.get("playable_source_id") or item.get("videoId") or item.get("source_id")
+                    or (playback.get("source_id") if playback.get("provider") else "") or "").strip())
+
+
+def _radio_metadata_complete(item: Dict[str, Any]) -> bool:
+    title = _artist_key(item.get("title") or item.get("name"))
+    artist = _artist_key(artist_name(item))
+    return bool(title and artist and title not in {"unknown", "unknown track", "untitled"}
+                and artist not in {"unknown", "unknown artist"})
+
+
+def _radio_source_key(item: Dict[str, Any]) -> str:
+    playback = item.get("playback") if isinstance(item.get("playback"), dict) else {}
+    source = str(playback.get("source_id") or item.get("playable_source_id") or item.get("playback_source_id")
+                 or item.get("source_id") or item.get("videoId") or item.get("id") or _track_key(item)).strip()
+    return source.removeprefix("youtube:").removeprefix("ytmusic:track:")
+
+
+def _merge_radio_tracks(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Reconcile the same physical source before checking publication facts."""
+    merged: Dict[str, Dict[str, Any]] = {}
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        key = _radio_source_key(raw)
+        if not key:
+            continue
+        previous = merged.get(key, {})
+        # Sparse normalizations must never erase a known title/credit. New
+        # complete metadata can repair retained placeholders for the same ID.
+        richer = _radio_metadata_complete(raw) or not _radio_metadata_complete(previous)
+        base, extra = (previous, raw) if richer else (raw, previous)
+        merged[key] = {**base, **{k: v for k, v in extra.items() if v not in (None, "", [], {})}}
+        if _radio_metadata_complete(extra):
+            merged[key]["title"] = extra.get("title") or extra.get("name")
+            merged[key]["artist"] = artist_name(extra)
+    canonical: Dict[str, Dict[str, Any]] = {}
+    for item in merged.values():
+        if not _radio_metadata_complete(item) or not _is_playable_radio_record(item):
+            continue
+        identity = _track_key(item)
+        previous = canonical.get(identity)
+        if previous is None or playable_source_rank(item) > playable_source_rank(previous):
+            canonical[identity] = item
+    return list(canonical.values())
 
 
 def _radio_seed_keys(item: Dict[str, Any], fallback: str = "") -> List[str]:
@@ -314,6 +361,7 @@ def _load_radio_catalog_index(
         else:
             rows = []
         indexed_by_seed: Dict[str, List[Dict[str, Any]]] = {}
+        indexed_keys: Dict[str, str] = {}
         global_rows_needing_rewrite: set[str] = set()
         for row in rows:
             try:
@@ -344,39 +392,22 @@ def _load_radio_catalog_index(
                     global_rows_needing_rewrite.add(seed_key)
                 indexed_items.append(cleaned)
             indexed_by_seed.setdefault(seed_key, []).extend(indexed_items)
+            if is_global or seed_key not in indexed_keys:
+                indexed_keys[seed_key] = str(row["entity_id"])
 
         changed: Dict[str, List[Dict[str, Any]]] = {}
         for seed_key in set(indexed_by_seed) | set(merged):
-            seen: set[str] = set()
-            combined: List[Dict[str, Any]] = []
-            for item in [
+            combined = _merge_radio_tracks([
                 *indexed_by_seed.get(seed_key, []),
                 *merged.get(seed_key, []),
-            ]:
-                identity = _track_key(item)
-                if (
-                    not identity
-                    or identity in seen
-                    or not _is_playable_radio_record(item)
-                ):
-                    continue
-                seen.add(identity)
-                combined.append(dict(item))
-                if len(combined) >= RADIO_CATALOG_INDEX_MAX_TRACKS:
-                    break
-            if not combined:
-                continue
+            ])[:RADIO_CATALOG_INDEX_MAX_TRACKS]
             merged[seed_key] = combined
-            before = [
-                _track_key(item) for item in indexed_by_seed.get(seed_key, [])
-            ]
-            after = [_track_key(item) for item in combined]
-            if before != after or seed_key in global_rows_needing_rewrite:
+            if combined != indexed_by_seed.get(seed_key, []) or seed_key in global_rows_needing_rewrite:
                 changed[seed_key] = combined
 
         now = time.time()
         for seed_key, tracks in changed.items():
-            cache_key = _radio_catalog_index_key(
+            cache_key = indexed_keys.get(seed_key) or _radio_catalog_index_key(
                 user_scope_id, seed_key, items=tracks
             )
             persisted_tracks = (
@@ -509,7 +540,12 @@ def _merge_radio_catalog_index(
                 if not isinstance(raw, dict) or not _track_key(raw):
                     continue
                 if not _is_playable_radio_record(raw):
-                    raw = {**raw, **(source_cache.get(_track_key(raw)) or source_cache.get(catalog_entity_key("track", raw)) or {})}
+                    cached = source_cache.get(_track_key(raw)) or source_cache.get(catalog_entity_key("track", raw)) or {}
+                    # Source verification supplies playback facts, but sparse
+                    # cached metadata must not erase an acquisition's credit.
+                    raw = {**cached, **{key: value for key, value in raw.items()
+                                       if value not in (None, "", [], {})
+                                       and key not in {"playable", "source_verified", "source_id", "playable_source_id"}}}
                     raw = raw if _is_playable_radio_record(raw) else None
                 if raw is None:
                     continue
@@ -556,22 +592,13 @@ def _merge_radio_catalog_index(
                     ]
                 except Exception:
                     indexed = []
-            seen: set[str] = set()
-            combined: List[Dict[str, Any]] = []
-            for item in [*indexed, *merged.get(seed_key, []), *touched.get(seed_key, [])]:
-                key = _track_key(item)
-                if not key or key in seen or not _is_playable_radio_record(item):
-                    continue
-                seen.add(key)
-                combined.append(dict(item))
-                if len(combined) >= RADIO_CATALOG_INDEX_MAX_TRACKS:
-                    break
+            combined = _merge_radio_tracks([*indexed, *merged.get(seed_key, []), *touched.get(seed_key, [])])[:RADIO_CATALOG_INDEX_MAX_TRACKS]
             if cache_key.startswith("global:"):
                 combined = [
                     _sanitize_global_catalog_item(item) for item in combined
                 ]
-            if combined:
-                merged[seed_key] = combined
+            merged[seed_key] = combined
+            if combined or indexed:
                 connection.execute(
                     """INSERT INTO recommendation_feature_store(namespace, entity_id, model_id, payload_json, updated_at)
                     VALUES (?, ?, ?, ?, ?) ON CONFLICT(namespace, entity_id) DO UPDATE SET
@@ -903,16 +930,7 @@ def merge_store_artist_radio_inventory(
                 if not card_id:
                     continue
                 candidate = dict(card)
-                tracks = []
-                seen_tracks: set[str] = set()
-                for track in candidate.get("tracks") or candidate.get("items") or []:
-                    if not isinstance(track, dict):
-                        continue
-                    track_id = _track_key(track)
-                    if not track_id or track_id in seen_tracks:
-                        continue
-                    seen_tracks.add(track_id)
-                    tracks.append(dict(track))
+                tracks = _merge_radio_tracks(candidate.get("tracks") or candidate.get("items") or [])
                 if len(tracks) < POPULAR_RADIO_CARD_MIN_TRACKS:
                     continue
                 candidate["tracks"] = tracks
@@ -1753,12 +1771,12 @@ def select_radio_rotation(
     fallback = []
     for card in reservoir:
         cid = str(card.get("id") or "")
-        tracks = [
-            dict(track)
-            for track in (card.get("tracks") or card.get("items") or [])
-            if isinstance(track, dict) and _track_key(track)
-        ]
+        tracks = _merge_radio_tracks(card.get("tracks") or card.get("items") or [])
         if not tracks:
+            continue
+        if _artist_key(card.get("artist_name")) in {"unknown", "unknown artist"}:
+            continue
+        if any(_artist_key(name) in {"unknown", "unknown artist"} for name in card.get("collage_artists") or []):
             continue
         # Do not weaken the card contract while selecting.  Invalid cards are
         # never admitted as a fallback or counted as novelty.
@@ -2074,6 +2092,12 @@ def merge_radio_reservoirs(
             float(retained.get("last_verified_at") or retained_first),
             float(card.get("last_verified_at") or candidate_first),
         )
+        tracks = _merge_radio_tracks([
+            *(card.get("tracks") or card.get("items") or []),
+            *(retained.get("tracks") or retained.get("items") or []),
+        ])[:RADIO_CATALOG_INDEX_MAX_TRACKS]
+        retained["tracks"] = tracks
+        retained["items"] = tracks
     reservoir = [
         by_id[card_id]
         for card_id in ordered_ids[:RADIO_RESERVOIR_MAX_CARDS]

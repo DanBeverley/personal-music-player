@@ -317,6 +317,10 @@ def evaluate_popular_radio_contract(
 ) -> ContractReport:
     """Own all Popular Radio publication and rotation-novelty gates."""
 
+    from ..discovery.radio_inventory import (
+        _is_playable_radio_record, _radio_metadata_complete, _radio_source_key,
+    )
+
     contract = POPULAR_RADIO_CONTRACT
     violations: list[str] = []
     if len(cards) < contract.min_cards:
@@ -363,6 +367,16 @@ def evaluate_popular_radio_contract(
             violations.append(
                 f"radio_track_depth:{identity or index}:{track_count}/{contract.min_tracks_per_card}"
             )
+        # Revalidate retained reservoirs and persisted cards at publication,
+        # not just the newly acquired tracks used to create a rotation.
+        valid_tracks = [track for track in tracks or [] if isinstance(track, Mapping)]
+        if len(valid_tracks) != track_count or any(
+            not _radio_metadata_complete(track) or not _is_playable_radio_record(track)
+            for track in valid_tracks
+        ):
+            violations.append(f"radio_track_metadata_incomplete:{identity or index}")
+        if len({_radio_source_key(track) for track in valid_tracks}) != len(valid_tracks):
+            violations.append(f"radio_track_source_duplicate:{identity or index}")
         affinity_is_discovery = str(
             card.get("seed_affinity") or ""
         ).strip().casefold() in {

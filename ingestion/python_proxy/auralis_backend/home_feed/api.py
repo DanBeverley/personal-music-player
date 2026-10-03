@@ -168,17 +168,44 @@ class HomeFeedApi:
             else None
         )
         if candidate is None or candidate_inventory is None or not candidate_inventory.is_ready:
-            if not self._repositories.jobs.has_active(
+            active = self._repositories.jobs.has_active(
                 scope,
                 job_types=(HomeJobType.REFRESH_CANDIDATES,),
                 ignore_delayed_idle=True,
-            ):
+            )
+            retry_initial = (not state.active_artifact_id and
+                             bool(getattr(request, "force_refresh", False)) and
+                             not self._repositories.jobs.has_runnable(
+                                 scope, job_types=(HomeJobType.REFRESH_CANDIDATES,)))
+            if not active or retry_initial:
+                # Explicit Retry on a never-published Home must consume the
+                # current signals instead of waiting on a delayed stale job.
+                # Singleton replacement preserves leased work; the provider
+                # circuit/backoff still governs every acquisition request.
                 self._scheduler.candidates(
                     request,
                     reason="candidate_inventory_refresh",
                     profile_fingerprint=profile,
+                    generation_hint=(f"initial-retry:{int(time.time() // 300)}"
+                                     if retry_initial else ""),
                 )
             return
+        if reason == "background_prepare" and any(
+            getattr(request, key, None)
+            for key in ("recent_track_ids", "top_track_ids", "last_played_tracks",
+                        "library_track_ids", "artist_hints", "playlist_names")
+        ) and not self._repositories.jobs.has_active(
+            scope, job_types=(HomeJobType.REFRESH_CANDIDATES,), ignore_delayed_idle=True,
+        ):
+            # Listening/library changes need to enter durable supply even
+            # while the old inventory is fresh and the ready queue is full.
+            # Coalesce terminal attempts too: one refresh per five-minute
+            # window, no provider work or active-feed promotion here.
+            self._scheduler.candidates(
+                request, reason="signal_reconcile", profile_fingerprint=profile,
+                generation_hint=f"signals:{int(time.time() // (5 * 60))}",
+                coalesce_terminal=True,
+            )
         if fresh_candidate is None and not self._repositories.jobs.has_active(
             scope,
             job_types=(HomeJobType.REFRESH_CANDIDATES,),

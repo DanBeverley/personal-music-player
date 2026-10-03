@@ -736,7 +736,6 @@ class RadioSupplyService:
                     or name.casefold() in familiar
                     or key in occupied
                     or key in seen
-                    or int(own_counts.get(key) or own_counts.get(name.casefold()) or 0) >= 12
                 ):
                     continue
                 seen.add(key)

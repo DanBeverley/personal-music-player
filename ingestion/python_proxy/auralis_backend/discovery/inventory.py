@@ -363,6 +363,12 @@ def _playable_album_catalog_rows(
             or item.get("mb_release_group_id")
             or ""
         ).strip()
+        browse_id = str(item.get("browseId") or item.get("album_id") or "").strip()
+        provider_album = (
+            str(item.get("canonical_album_identity") or item.get("id") or "")
+            == f"ytmusic:album:{browse_id}"
+            and bool(browse_id)
+        )
         tracks: List[Dict[str, Any]] = []
         for raw_track in item.get("tracks") or item.get("canonical_tracks") or []:
             if not isinstance(raw_track, dict) or not str(raw_track.get("track_key") or "").strip():
@@ -372,7 +378,7 @@ def _playable_album_catalog_rows(
             if not str(track.get("thumbnail") or "").strip() and len(source_id) == 11:
                 track["thumbnail"] = f"https://i.ytimg.com/vi/{source_id}/hqdefault.jpg"
             tracks.append(track)
-        if not release_group_id or item.get("playable") is not True or not tracks:
+        if (not release_group_id and not provider_album) or item.get("playable") is not True or not tracks:
             continue
         thumbnail = str(item.get("thumbnail") or item.get("image") or "").strip()
         if not thumbnail:
@@ -386,8 +392,9 @@ def _playable_album_catalog_rows(
             )
         payload = {
             **item,
-            "id": f"musicbrainz:release-group:{release_group_id}",
-            "musicbrainz_release_group_id": release_group_id,
+            "id": (f"musicbrainz:release-group:{release_group_id}" if release_group_id
+                   else f"ytmusic:album:{browse_id}"),
+            **({"musicbrainz_release_group_id": release_group_id} if release_group_id else {}),
             "tracks": tracks,
             "canonical_tracks": tracks,
             "track_count": len(tracks),
@@ -397,7 +404,9 @@ def _playable_album_catalog_rows(
         }
         title = str(payload.get("title") or payload.get("name") or "").strip()
         artist = str(payload.get("artist") or payload.get("artist_name") or "").strip()
-        entity_key = f"musicbrainz:release:{release_group_id}"
+        # Provider browse IDs are accepted by the existing album detail route.
+        # Persist verified tracks so opening a Home card needs no provider fetch.
+        entity_key = f"musicbrainz:release:{release_group_id}" if release_group_id else browse_id
         rows[entity_key] = [
             "album",
             entity_key,

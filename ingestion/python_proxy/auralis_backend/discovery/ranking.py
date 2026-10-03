@@ -14,6 +14,7 @@ from .admission import (
 from .allocation import allocate_home_rows
 from .candidates import album_name, artist_name, item_signature, metadata_text, normalize_text, track_id
 from .config import LANE_ORDER, LANE_RECIPES, ROW_RECIPES
+from ..domain.catalog import normalize_artist_name
 from .schema import DiscoveryCandidate, DiscoveryRow, LaneRecipe, RowRecipe, TasteProfile
 
 
@@ -880,6 +881,12 @@ def _select_diverse(
     if row_kind == "quiet_picks":
         max_same_artist = 4
         max_same_album = 2
+    if row_kind in {"personal_mix_slice", "personal_replay_slice"}:
+        # These are ranked reservoirs for several cards, not one visible
+        # shelf. A two-track artist cap here starves all five mixes together.
+        # Card-level diversity is enforced by the allocator below.
+        max_same_artist = max(limit, 1)
+        max_same_album = max(limit, 1)
     for _score, candidate in scored:
         item = dict(candidate.item)
         item_id = track_id(item)
@@ -1266,17 +1273,18 @@ def rank_artists(
     ids: Dict[str, str] = {}
     taste_artists = _taste_artist_keys(taste)
     for candidate in explicit_artists:
-        name = str(candidate.item.get("name") or candidate.item.get("artist") or "").strip()
-        key = normalize_text(name)
+        name = _artist_candidate_name(candidate.item)
+        key = _artist_key(name)
         if not key:
             continue
         counts[key] += candidate.score + 2.0
         labels[key] = name
-        ids[key] = str(candidate.item.get("id") or key)
+        ids[key] = _artist_identity(candidate.item) or str(candidate.item.get("id") or key)
         thumbnails.setdefault(key, str(candidate.item.get("thumbnail") or ""))
     for candidate in candidates:
-        name = artist_name(candidate.item)
-        key = normalize_text(name)
+        item = candidate.item
+        name = _artist_candidate_name(item)
+        key = _artist_key(name)
         if not key:
             continue
         weight = candidate.score + SOURCE_WEIGHTS.get(candidate.source.split("+")[0], 0.0)
@@ -1284,7 +1292,12 @@ def rank_artists(
             weight += 0.35
         counts[key] += weight
         labels[key] = name
-        thumbnails.setdefault(key, str(candidate.item.get("thumbnail") or ""))
+        identity = _artist_identity(item)
+        if identity and (key not in ids or ids[key] == key):
+            ids[key] = identity
+        portrait = _artist_specific_thumbnail(item)
+        if portrait and not thumbnails.get(key):
+            thumbnails[key] = portrait
     ranked = counts.most_common()
     if taste.force_refresh:
         avoid = _avoid_ids(taste)
@@ -1314,23 +1327,96 @@ def rank_artists(
 
 def _artists_from_tracks(tracks: Iterable[Dict[str, Any]], *, limit: int = 12) -> List[Dict[str, Any]]:
     artists: List[Dict[str, Any]] = []
-    seen: Set[str] = set()
+    indexes: Dict[str, int] = {}
     for track in tracks or []:
-        name = artist_name(track)
-        key = normalize_text(name)
-        if not key or key in seen:
+        name = _artist_candidate_name(track)
+        key = _artist_key(name)
+        if not key:
             continue
-        seen.add(key)
+        if key in indexes:
+            existing = artists[indexes[key]]
+            identity = _artist_identity(track)
+            if identity and existing["id"] == key:
+                existing["id"] = identity
+            portrait = _artist_specific_thumbnail(track)
+            if portrait and not existing["thumbnail"]:
+                existing["thumbnail"] = portrait
+            continue
+        indexes[key] = len(artists)
         artists.append(
             {
-                "id": key,
+                "id": _artist_identity(track) or key,
                 "name": name,
-                "thumbnail": str(track.get("thumbnail") or ""),
+                "thumbnail": _artist_specific_thumbnail(track),
             }
         )
         if len(artists) >= limit:
             break
     return artists
+
+
+def _artist_candidate_name(item: Dict[str, Any]) -> str:
+    """Read an artist credit whether providers return it as text or an entity."""
+    artist = item.get("artist")
+    if isinstance(artist, dict):
+        return str(artist.get("name") or artist.get("title") or "").strip()
+    if item.get("name") and not artist:
+        return str(item.get("name") or "").strip()
+    return artist_name(item)
+
+
+def _artist_key(name: str) -> str:
+    normalized = normalize_artist_name(name)
+    if normalized.casefold() in {"", "unknown", "unknown artist"}:
+        return ""
+    return normalize_text(normalized)
+
+
+def _artist_identity(item: Dict[str, Any]) -> str:
+    """Keep a supplied artist/provider identity instead of synthesizing one from its name."""
+    artist = item.get("artist")
+    records = [artist] if isinstance(artist, dict) else []
+    artists = item.get("artists")
+    if isinstance(artists, list):
+        records.extend(entry for entry in artists if isinstance(entry, dict))
+    fields = (
+        "provider_artist_id",
+        "artist_id",
+        "artistId",
+        "artist_browse_id",
+        "musicbrainz_artist_id",
+        "canonical_artist_id",
+        "id",
+    )
+    for record in records:
+        for field in fields:
+            value = str(record.get(field) or "").strip()
+            if value:
+                return value
+    for field in fields[:-1]:
+        value = str(item.get(field) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _artist_specific_thumbnail(item: Dict[str, Any]) -> str:
+    """Return artist artwork evidence; a track's own cover is never a portrait."""
+    for field in ("artist_thumbnail", "artist_artwork", "artist_image", "artist_image_url"):
+        value = str(item.get(field) or "").strip()
+        if value:
+            return value
+    artist = item.get("artist")
+    if isinstance(artist, dict):
+        return str(artist.get("thumbnail") or artist.get("image") or "").strip()
+    artists = item.get("artists")
+    if isinstance(artists, list):
+        for record in artists:
+            if isinstance(record, dict):
+                value = str(record.get("thumbnail") or record.get("image") or "").strip()
+                if value:
+                    return value
+    return ""
 
 
 def build_personal_mixes(
@@ -1502,6 +1588,19 @@ def build_personal_mixes(
     # Reserve the visible eight tracks for every card together. This prevents
     # the first mix from consuming the only viable tracks for later mixes.
     visible_used: Set[str] = set()
+    mix_artist_counts: Dict[str, Counter[str]] = defaultdict(Counter)
+    mix_album_counts: Dict[str, Counter[str]] = defaultdict(Counter)
+
+    def diversity_allows(mix_id: str, track: Dict[str, Any], *, visible: bool) -> bool:
+        artist = normalize_text(artist_name(track))
+        album = normalize_text(album_name(track))
+        return not ((artist and mix_artist_counts[mix_id][artist] >= (2 if visible else 6))
+                    or (album and mix_album_counts[mix_id][album] >= (1 if visible else 3)))
+
+    def count_diversity(mix_id: str, track: Dict[str, Any]) -> None:
+        mix_artist_counts[mix_id][normalize_text(artist_name(track))] += 1
+        mix_album_counts[mix_id][normalize_text(album_name(track))] += 1
+
     for _slot in range(min_tracks):
         for mix_id, _title, _subtitle, _sources, _discovery in definitions:
             match = next(
@@ -1511,6 +1610,7 @@ def build_personal_mixes(
                     if (track_signature := signature(track))
                     and track_signature not in visible_used
                     and track_signature not in selected_signatures[mix_id]
+                    and diversity_allows(mix_id, track, visible=True)
                 ),
                 None,
             )
@@ -1523,6 +1623,7 @@ def build_personal_mixes(
             selected[mix_id].append(match)
             selected_signatures[mix_id].add(track_signature)
             visible_used.add(track_signature)
+            count_diversity(mix_id, match)
 
     occurrence_counts: Counter[str] = Counter(visible_used)
     complete_mix_ids = [
@@ -1541,11 +1642,13 @@ def build_personal_mixes(
                 not track_signature
                 or track_signature in selected_signatures[mix_id]
                 or occurrence_counts[track_signature] > 0
+                or not diversity_allows(mix_id, track, visible=False)
             ):
                 continue
             selected[mix_id].append(track)
             selected_signatures[mix_id].add(track_signature)
             occurrence_counts[track_signature] += 1
+            count_diversity(mix_id, track)
     for mix_id in complete_mix_ids:
         for track in candidate_lists[mix_id]:
             if (
@@ -1562,12 +1665,14 @@ def build_personal_mixes(
                 or track_signature in selected_signatures[mix_id]
                 or occurrence_counts[track_signature] <= 0
                 or occurrence_counts[track_signature] >= 2
+                or not diversity_allows(mix_id, track, visible=False)
             ):
                 continue
             selected[mix_id].append(track)
             selected_signatures[mix_id].add(track_signature)
             occurrence_counts[track_signature] += 1
             overlap_counts[mix_id] += 1
+            count_diversity(mix_id, track)
 
     mixes: List[Dict[str, Any]] = []
     history_ids = _history_track_ids(taste)

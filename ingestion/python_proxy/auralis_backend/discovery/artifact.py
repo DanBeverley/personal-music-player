@@ -75,18 +75,30 @@ def _row_by_kind(rows: List[DiscoveryRow], kind: str) -> DiscoveryRow | None:
     return next((row for row in rows or [] if row.kind == kind), None)
 
 
-def _applicable_row_kinds(taste: TasteProfile) -> List[str]:
+def _applicable_row_kinds(
+    taste: TasteProfile,
+    rows: List[DiscoveryRow] | None = None,
+) -> List[str]:
+    row_counts = {row.kind: len(row.items or []) for row in rows or []}
     return [
         kind
         for kind in ROW_ORDER
         if kind not in OPTIONAL_COMPLETE_ROWS
         if not (
             kind == "last_played"
-            and len(taste.last_played_tracks) < ROW_RECIPES[kind].min_items
+            and (
+                row_counts.get(kind, 0) < ROW_RECIPES[kind].min_items
+                if rows is not None
+                else len(taste.last_played_tracks) < ROW_RECIPES[kind].min_items
+            )
         )
         and not (
             kind == "frequently_listened"
-            and len(taste.frequent_tracks) < ROW_RECIPES[kind].min_items
+            and (
+                row_counts.get(kind, 0) < ROW_RECIPES[kind].min_items
+                if rows is not None
+                else len(taste.frequent_tracks) < ROW_RECIPES[kind].min_items
+            )
         )
         and not (
             kind == "because_you_played"
@@ -106,7 +118,7 @@ def row_shortage_domains(
 ) -> List[str]:
     row_counts = {row.kind: len(row.items or []) for row in rows or []}
     shortages: List[str] = []
-    for kind in _applicable_row_kinds(taste):
+    for kind in _applicable_row_kinds(taste, rows):
         if row_counts.get(kind, 0) >= ROW_RECIPES[kind].min_items:
             continue
         domain = ROW_REPLENISHMENT_DOMAINS.get(kind)
@@ -123,7 +135,7 @@ def row_contract_report(
 ) -> Dict[str, Any]:
     row_ids = [row.kind for row in rows or []]
     row_counts = {row.kind: len(row.items or []) for row in rows or []}
-    applicable_rows = _applicable_row_kinds(taste)
+    applicable_rows = _applicable_row_kinds(taste, rows)
     contracts: Dict[str, bool] = {
         "min_rows": all(kind in row_ids for kind in applicable_rows),
         "made_for_you": row_counts.get("made_for_you", 0) >= ROW_RECIPES["made_for_you"].min_items,

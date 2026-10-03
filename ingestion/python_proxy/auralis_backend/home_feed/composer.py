@@ -32,9 +32,12 @@ from ..discovery.radio_inventory import (
 )
 from ..discovery.ranking import build_rows_from_pools
 from ..discovery.schema import DiscoveryArtifact, DiscoveryRow
+from ..search.intelligence import load_catalog_artist_records, normalize_artist_name
+from ..storage.artist_artwork import attach_persisted_artist_artwork
 from .contracts import (
     ACTIVE_ARTIFACT_TTL_SECONDS,
     HOME_DISCOVERY_EXPOSURE_COOLDOWN_SECONDS,
+    HOME_ROW_CONTRACT_BY_KIND,
     QUEUE_TARGET_DEPTH,
     FeedArtifactRecord,
     artist_identity_aliases,
@@ -66,6 +69,168 @@ _MUTABLE_SUCCESSOR_ROWS = {
     "quiet_picks",
 }
 FEATURED_ALBUM_MIN_NEW_ARTISTS = 3
+
+
+def _earned_row_kinds(taste: Any, rows: Sequence[Any] | None = None) -> set[str]:
+    """Return earned rows the row builder is actually eligible to emit.
+
+    History rows have explicit minimum-history gates in ``build_rows_from_pools``.
+    Treating any non-empty history as earned makes a 1-7 track history require
+    an 8-track row that the builder deliberately omits. Other rows are gated by
+    anchor existence and remain required when any anchor exists; their output
+    quality is still enforced by the feed contract.
+    """
+
+    earned: set[str] = set()
+    row_counts = {
+        str(getattr(row, "kind", "")): len(getattr(row, "items", []) or [])
+        for row in rows or []
+    }
+    for kind, evidence in (
+        ("last_played", getattr(taste, "last_played_tracks", [])),
+        ("frequently_listened", getattr(taste, "frequent_tracks", [])),
+    ):
+        minimum = HOME_ROW_CONTRACT_BY_KIND[kind].min_items
+        eligible_count = row_counts.get(kind, 0) if rows is not None else len(evidence or [])
+        if eligible_count >= minimum:
+            earned.add(kind)
+    if (
+        getattr(taste, "full_history_tracks", [])
+        or getattr(taste, "recent_tracks", [])
+        or getattr(taste, "anchor_tracks", [])
+    ):
+        earned.add("because_you_played")
+    return earned
+
+
+def _stable_artist_ids(value: Mapping[str, Any]) -> set[tuple[str, str]]:
+    identities: set[tuple[str, str]] = set()
+    canonical = str(value.get("canonical_artist_id") or "").strip()
+    if canonical.casefold().startswith("musicbrainz:artist:"):
+        identities.add(("musicbrainz", canonical.removeprefix("musicbrainz:artist:").casefold()))
+    elif canonical.casefold().startswith("provider:artist:"):
+        identities.add(("provider", canonical.removeprefix("provider:artist:")))
+    for key in ("musicbrainz_artist_id", "artist_mbid", "mb_artist_id"):
+        raw = str(value.get(key) or "").strip().casefold().removeprefix("musicbrainz:artist:")
+        if raw:
+            identities.add(("musicbrainz", raw))
+    for key in ("provider_artist_id", "artist_id", "artistId", "browseId"):
+        raw = str(value.get(key) or "").strip()
+        if raw.casefold().startswith("provider:artist:"):
+            raw = raw.removeprefix("provider:artist:")
+        if raw:
+            identities.add(("provider", raw))
+    raw_id = str(value.get("id") or "").strip()
+    if raw_id.casefold().startswith("musicbrainz:artist:"):
+        identities.add(("musicbrainz", raw_id.removeprefix("musicbrainz:artist:").casefold()))
+    elif raw_id.casefold().startswith("provider:artist:"):
+        identities.add(("provider", raw_id.removeprefix("provider:artist:")))
+    elif raw_id and not raw_id.casefold().startswith(("artist-name:", "mix:")):
+        identities.add(("provider", raw_id))
+    return identities
+
+
+def candidate_artist_artwork_repairs(
+    candidate: CandidateInventory,
+    server: Any,
+    *,
+    limit: int = 8,
+) -> list[dict[str, Any]]:
+    """Return bounded artist-only candidates without verified persisted art."""
+    artists: list[dict[str, Any]] = []
+    seen: set[tuple[tuple[str, str], ...]] = set()
+    for pool in (candidate.pools or {}).values():
+        for entry in pool or []:
+            if getattr(entry, "item_type", "track") != "artist":
+                continue
+            item = dict(getattr(entry, "item", {}) or {})
+            name = str(item.get("name") or item.get("artist") or "").strip()
+            stable_ids = _stable_artist_ids(item)
+            if not name or not stable_ids:
+                continue
+            identity = tuple(sorted(stable_ids))
+            if identity in seen:
+                continue
+            seen.add(identity)
+            if not item.get("provider_artist_id"):
+                provider_id = next((value for kind, value in stable_ids if kind == "provider"), "")
+                if provider_id:
+                    item["provider_artist_id"] = provider_id
+            item["name"] = name
+            artists.append(item)
+            if len(artists) >= max(0, limit) * 3:
+                break
+        if len(artists) >= max(0, limit) * 3:
+            break
+    if not artists or limit <= 0:
+        return []
+
+    persisted = load_catalog_artist_records(
+        server,
+        artist_names=[str(item.get("name") or "") for item in artists],
+    )
+    repairs: list[dict[str, Any]] = []
+    for item in artists:
+        name_key = normalize_artist_name(item.get("name"))
+        record = persisted.get(name_key) or {}
+        item_ids = _stable_artist_ids(item)
+        record_ids = _stable_artist_ids(record)
+        matching_record = record if item_ids & record_ids else {}
+        verified_candidate = attach_persisted_artist_artwork(server, dict(item))
+        verified_record = attach_persisted_artist_artwork(server, dict(matching_record))
+        if str(verified_candidate.get("thumbnail") or "").startswith("/artist_artwork/"):
+            continue
+        if str(verified_record.get("thumbnail") or "").startswith("/artist_artwork/"):
+            continue
+        repairs.append(item)
+        if len(repairs) >= limit:
+            break
+    return repairs
+
+
+def _attach_inventory_portraits(
+    rows: Sequence[DiscoveryRow],
+    radio: ArtistRadioInventory | None,
+    server: Any = None,
+) -> None:
+    """Reuse artist-owned portraits from persisted radio supply; never fetch."""
+    portraits: dict[tuple[str, str], set[str]] = {}
+    for card in (radio.reservoir_cards or radio.cards) if radio is not None else []:
+        thumbnail = str(card.get('thumbnail') or '')
+        owner = str(card.get('artwork_owner_identity') or '')
+        if (card.get('radio_mode') != 'artist_inventory'
+                or not thumbnail.startswith('/artist_artwork/')
+                or not owner or owner != card.get('seed_artist_identity')):
+            continue
+        for identity in _stable_artist_ids({"id": owner}):
+            portraits.setdefault(identity, set()).add(thumbnail)
+    artist_items = [
+        item for row in rows if row.item_type == "artist"
+        for item in row.items if not item.get("thumbnail")
+    ]
+    persisted = load_catalog_artist_records(
+        server,
+        artist_names=[str(item.get("name") or item.get("artist") or "") for item in artist_items],
+    ) if server is not None else {}
+    for row in rows:
+        if row.item_type != 'artist':
+            continue
+        for item in row.items:
+            if item.get('thumbnail'):
+                continue
+            item_ids = _stable_artist_ids(item)
+            if server is not None and item_ids:
+                name_key = normalize_artist_name(item.get("name") or item.get("artist"))
+                record = persisted.get(name_key) or {}
+                if item_ids & _stable_artist_ids(record):
+                    verified = attach_persisted_artist_artwork(server, dict(record))
+                    thumbnail = str(verified.get("thumbnail") or "")
+                    if thumbnail.startswith("/artist_artwork/"):
+                        item["thumbnail"] = thumbnail
+                        continue
+            matches = set().union(*(portraits.get(identity, set()) for identity in item_ids)) if item_ids else set()
+            if len(matches) == 1:
+                item['thumbnail'] = next(iter(matches))
 
 
 @dataclass(frozen=True)
@@ -406,9 +571,10 @@ def compose_snapshot_artifact(
     exposure_ids: Iterable[str] = (),
     rotation_epoch: int,
     reason: str,
+    server: Any = None,
     now: float | None = None,
 ) -> DiscoveryArtifact:
-    """Purely compose one immutable artifact from supplied snapshots."""
+    """Compose an immutable artifact, enriching artist art from local records."""
 
     started = time.perf_counter()
     generated_at = time.time() if now is None else float(now)
@@ -511,6 +677,14 @@ def compose_snapshot_artifact(
         pools,
         rotation_taste,
     )
+    _attach_inventory_portraits(rows, radio, server)
+    # A history list can contain repeated or unplayable records. Only publish
+    # the earned row when the builder produced its contracted eligible count.
+    rows = [
+        row for row in rows
+        if row.kind not in {"last_played", "frequently_listened"}
+        or len(row.items or []) >= HOME_ROW_CONTRACT_BY_KIND[row.kind].min_items
+    ]
     if parent is not None:
         current_featured = next(
             (row for row in rows if row.kind == "featured_new_albums"),
@@ -543,20 +717,7 @@ def compose_snapshot_artifact(
         taste=rotation_taste,
         home_tab_diagnostics=lane_diagnostics,
     )
-    earned = {
-        kind
-        for kind, evidence in (
-            ("last_played", getattr(rotation_taste, "last_played_tracks", [])),
-            ("frequently_listened", getattr(rotation_taste, "frequent_tracks", [])),
-            (
-                "because_you_played",
-                getattr(rotation_taste, "full_history_tracks", [])
-                or getattr(rotation_taste, "recent_tracks", [])
-                or getattr(rotation_taste, "anchor_tracks", []),
-            ),
-        )
-        if evidence
-    }
+    earned = _earned_row_kinds(rotation_taste, rows)
     final_contract = evaluate_feed_contract(
         [
             {"kind": row.kind, "items": list(row.items or [])}
@@ -706,6 +867,7 @@ class HomeFeedComposer:
         candidate_snapshot_id: str = "",
         radio_snapshot_id: str = "",
         allocation_epoch: int = 0,
+        server: Any = None,
     ) -> ComposeOutcome:
         scope = str(taste.user_scope_id or "guest")
         state = self._repositories.state.reconcile(scope)
@@ -794,6 +956,7 @@ class HomeFeedComposer:
             ),
             rotation_epoch=epoch,
             reason=reason,
+            server=server,
         )
         if not artifact.accepted:
             return ComposeOutcome(

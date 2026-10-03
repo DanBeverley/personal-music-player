@@ -5,7 +5,9 @@ from typing import Any, Mapping, Sequence
 import json
 
 
-FEED_BUNDLE_SCHEMA = "home-feed-bundle-v1"
+# Recompose older bundles under display-metadata admission. They may contain
+# placeholder tracks accepted through the former history-authority bypass.
+FEED_BUNDLE_SCHEMA = "home-feed-bundle-v2"
 
 
 def _canonical_json(value: Any) -> str:

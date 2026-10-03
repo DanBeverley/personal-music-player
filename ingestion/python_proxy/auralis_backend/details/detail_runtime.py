@@ -283,6 +283,11 @@ def build_track_details_payload(server: Any, video_id: str) -> Dict[str, Any]:
 
     watch = server.ytmusic.get_watch_playlist(videoId=video_id)
     video_details = watch.get("videoDetails", {})
+    # Some watch responses omit videoDetails while their selected queue item
+    # still carries authoritative metadata. Match the requested source only.
+    selected_track = next((track for track in watch.get("tracks", [])
+                           if track.get("videoId") == video_id), {})
+    video_details = {**selected_track, **{key: value for key, value in video_details.items() if value}}
     track_title = video_details.get("title") or ""
     if not artist:
         artist = server.extract_artist(video_details)

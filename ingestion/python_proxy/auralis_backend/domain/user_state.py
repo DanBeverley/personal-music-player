@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from copy import deepcopy
 import json
+import sqlite3
 import threading
 import time
 from typing import Any, Dict, List, Tuple, TypedDict
@@ -39,7 +40,7 @@ _NOISY_QUERY_TOKENS = {
 }
 
 _HISTORY_SNAPSHOT_NAMESPACE = "history_profile_snapshot"
-_HISTORY_SNAPSHOT_MODEL = "history-profile-snapshot"
+_HISTORY_SNAPSHOT_MODEL = "history-profile-snapshot-v2"
 _HISTORY_SNAPSHOT_CACHE: Dict[str, Dict[str, Any]] = {}
 _HISTORY_SNAPSHOT_LOCK = threading.RLock()
 _HISTORY_SNAPSHOT_BUILDS: Dict[str, threading.RLock] = {}
@@ -253,6 +254,7 @@ def _snapshot_from_event_payload(
         "canonical_entity_id",
         "canonical_track_identity",
         "musicbrainz_recording_id",
+        "canonical_recording_id",
         "recording_mbid",
         "isrc",
         "release_year",
@@ -266,9 +268,61 @@ def _snapshot_from_event_payload(
     return snapshot
 
 
+def _history_display_value(value: Any) -> str:
+    text = trim_text(value)
+    return "" if text.casefold() in {"unknown", "unknown track", "unknown artist"} else text
+
+
+def _merge_history_metadata(older: Dict[str, Any], newer: Dict[str, Any]) -> Dict[str, Any]:
+    merged = dict(older)
+    for key, value in newer.items():
+        if value in (None, "", [], {}):
+            continue
+        if key in {"title", "artist", "channel", "author"} and not _history_display_value(value):
+            continue
+        merged[key] = value
+    return merged
+
+
+def _persisted_history_tracks(server: DomainServerAdapter, track_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Recover display metadata by exact catalog/source identity, without providers."""
+    connection = open_recommendation_store_connection(server)
+    output: Dict[str, Dict[str, Any]] = {}
+    try:
+        for track_id in track_ids[:180]:
+            rows = connection.execute(
+                """SELECT e.payload_json, e.display_title, e.display_artist,
+                          e.display_album FROM catalog_entities e
+                   LEFT JOIN catalog_entity_sources s
+                     ON s.entity_type=e.entity_type AND s.entity_key=e.entity_key
+                   WHERE e.entity_type='track' AND (e.entity_key=? OR s.source_key=?)
+                   ORDER BY e.confidence DESC, e.updated_at DESC LIMIT 4""",
+                [track_id, track_id],
+            ).fetchall()
+            for row in rows:
+                payload = json.loads(row["payload_json"] or "{}")
+                title = _history_display_value(payload.get("title")) or _history_display_value(row["display_title"])
+                artist = _history_display_value(payload.get("artist") or payload.get("channel")) or _history_display_value(row["display_artist"])
+                if not title or not artist:
+                    continue
+                output[track_id] = {**payload, "id": track_id, "title": title,
+                                    "artist": artist, "channel": artist,
+                                    "album": payload.get("album") or row["display_album"]}
+                break
+    except (sqlite3.Error, ValueError, TypeError):
+        # Older stores may predate the catalog tables. Event metadata remains
+        # usable; absence never turns an upstream skeleton into display facts.
+        pass
+    finally:
+        connection.close()
+    return output
+
+
 def _build_scope_history_seed_from_events(
     server: DomainServerAdapter,
     user_scope_id: str,
+    *,
+    allow_remote_metadata: bool = False,
 ) -> Dict[str, Any]:
     normalized_scope = trim_text(user_scope_id or "guest") or "guest"
     if normalized_scope == "guest":
@@ -314,6 +368,29 @@ def _build_scope_history_seed_from_events(
         "persisted_search_event_count": len(list(search_rows or [])),
         "persisted_scope": normalized_scope,
     }
+    persisted_tracks = _persisted_history_tracks(
+        server, server.unique_track_ids([row["track_id"] for row in event_rows], 180)
+    )
+    if allow_remote_metadata:
+        missing = [track_id for track_id in server.unique_track_ids(
+            [row["track_id"] for row in event_rows], 24
+        ) if track_id not in persisted_tracks][:8]
+        try:
+            from ..search.intelligence import remember_catalog_entity
+            for track in server.recommendation_fetch_tracks_for_ids(missing, limit=len(missing)) if missing else []:
+                if not (_history_display_value(track.get("title")) and
+                        _history_display_value(track.get("artist") or track.get("channel"))):
+                    continue
+                track_id = trim_text(track.get("id"))
+                if track_id not in missing:
+                    continue
+                persisted_tracks[track_id] = dict(track)
+                remember_catalog_entity(server.raw, user_scope_id=normalized_scope, query="",
+                                        entity_type="track", item=track, confidence=0.8,
+                                        event_weight=0, source="history_metadata_repair",
+                                        learn_query_alias=False)
+        except Exception:
+            pass
     recent_track_ids: List[str] = []
     top_track_scores: Dict[str, float] = defaultdict(float)
     library_track_ids: List[str] = []
@@ -366,13 +443,17 @@ def _build_scope_history_seed_from_events(
         if track_id not in seen_recent_ids:
             seen_recent_ids.add(track_id)
             recent_track_ids.append(track_id)
-        if artist_name:
+        if _history_display_value(artist_name):
             artist_hints.append(artist_name)
         snapshot = _snapshot_from_event_payload(
             track_id=track_id,
             artist_name=artist_name,
             payload=payload,
         )
+        snapshot = _merge_history_metadata(persisted_tracks.get(track_id) or {}, snapshot or {})
+        if not (_history_display_value(snapshot.get("title")) and
+                _history_display_value(snapshot.get("artist") or snapshot.get("channel"))):
+            snapshot = None
         if snapshot is not None:
             canonical_identity = trim_text(
                 snapshot.get("canonical_entity_id")
@@ -390,6 +471,10 @@ def _build_scope_history_seed_from_events(
             snapshot["canonical_entity_id"] = canonical_identity
             if canonical_identity not in history_snapshot_by_identity:
                 history_snapshot_by_identity[canonical_identity] = dict(snapshot)
+            else:
+                history_snapshot_by_identity[canonical_identity] = _merge_history_metadata(
+                    snapshot, history_snapshot_by_identity[canonical_identity]
+                )
             if event_type == "play":
                 last_counted = last_counted_play_by_identity.get(canonical_identity)
                 if last_counted is None or last_counted - occurred_at >= 30.0:
@@ -399,10 +484,11 @@ def _build_scope_history_seed_from_events(
                     latest_play_by_identity.get(canonical_identity, 0.0),
                     occurred_at,
                 )
-            track_payload_by_id[track_id] = snapshot
+            track_payload_by_id[track_id] = _merge_history_metadata(
+                snapshot, track_payload_by_id.get(track_id) or {}
+            )
             recent_track_snapshots.append(snapshot)
-            if snapshot.get("album"):
-                artist_hints.extend(server.extract_artist_names(snapshot))
+            artist_hints.extend(server.extract_artist_names(snapshot))
         if event_type in {"library", "download", "save"} and track_id not in seen_library_ids:
             seen_library_ids.add(track_id)
             library_track_ids.append(track_id)
@@ -416,30 +502,6 @@ def _build_scope_history_seed_from_events(
             reverse=True,
         )[:16]
     ]
-
-    fetch_ids = [
-        track_id
-        for track_id in server.unique_track_ids(
-            [*recent_track_ids, *top_track_ids],
-            24,
-        )
-        if track_id not in track_payload_by_id
-    ]
-    if fetch_ids:
-        try:
-            fetched_tracks = server.recommendation_fetch_tracks_for_ids(fetch_ids, limit=len(fetch_ids))
-        except Exception:
-            fetched_tracks = []
-        for track in list(fetched_tracks or []):
-            if not isinstance(track, dict):
-                continue
-            track_id = trim_text(track.get("id"))
-            if not track_id or track_id in track_payload_by_id:
-                continue
-            normalized = server.normalize_recommendation_track(track)
-            if normalized is None:
-                continue
-            track_payload_by_id[track_id] = server.merge_track_metadata(track, normalized)
 
     recent_track_snapshots = unique_snapshot_tracks(
         [
@@ -622,6 +684,7 @@ def _load_scope_history_seed(
         seed = _build_scope_history_seed_from_events(server, normalized_scope)
         if seed:
             _store_history_snapshot(server, normalized_scope, seed)
+            schedule_history_seed_snapshot_refresh(server.raw, normalized_scope)
         return _history_snapshot_copy(seed, source="rebuilt") if seed else {}
 
 
@@ -644,6 +707,7 @@ def schedule_history_seed_snapshot_refresh(
             seed = _build_scope_history_seed_from_events(
                 domain_server,
                 normalized_scope,
+                allow_remote_metadata=True,
             )
             if seed:
                 _store_history_snapshot(domain_server, normalized_scope, seed)

@@ -27,6 +27,8 @@ from ..search.intelligence import (
     remove_unconfirmed_display_memories,
     remove_untrusted_catalog_query_aliases,
     search_text_similarity,
+    search_query_key,
+    query_mentions_artist,
 )
 from ..search.catalog_pipeline import (
     catalog_albums_for_artist,
@@ -444,6 +446,20 @@ def _artist_from_album(
     return {"name": name} if name else {}
 
 
+def _compatible_artist_credit(left: Any, right: Any) -> bool:
+    left_key = normalize_artist_name(left)
+    right_key = normalize_artist_name(right)
+    if not left_key or not right_key:
+        return False
+    if left_key == right_key:
+        return True
+    def credits(value: Any) -> set[str]:
+        return {normalize_artist_name(part) for part in re.split(
+            r"\s+(?:&|and|feat\.?|featuring|with)\s+|,\s*", str(value or ""), flags=re.IGNORECASE
+        )}
+    return left_key in credits(right) or right_key in credits(left)
+
+
 def _provider_recording_families(
     query: str,
     tracks: Iterable[Dict[str, Any]],
@@ -463,6 +479,39 @@ def _provider_recording_families(
     ]
     groups: Dict[str, Dict[str, Any]] = {}
     catalog_credit_counts: Dict[str, int] = {}
+    query_key = search_query_key(query)
+    complete_title_matches = any(
+        query_key and query_key in search_query_key(track.get("title") or track.get("name") or "")
+        for track in provider_tracks
+    )
+    query_requests_live = bool(re.search(r"\blive\b", query, re.IGNORECASE))
+    standard_counterparts = [
+        track
+        for track in provider_tracks
+        if not query_requests_live
+        and search_text_similarity(
+            query, trim_text(track.get("title") or track.get("name"))
+        ) >= 0.80
+        and not re.search(
+            r"\blive\b",
+            trim_text(track.get("title") or track.get("name")),
+            re.IGNORECASE,
+        )
+    ]
+    has_exact_live_match = bool(
+        not query_requests_live
+        and any(
+            search_text_similarity(
+                query, trim_text(track.get("title") or track.get("name"))
+            ) >= 0.94
+            and re.search(
+                r"\blive\b",
+                trim_text(track.get("title") or track.get("name")),
+                re.IGNORECASE,
+            )
+            for track in provider_tracks
+        )
+    )
     for track in provider_tracks:
         artist_key = normalize_artist_name(track.get("channel") or track.get("artist"))
         if artist_key:
@@ -471,8 +520,20 @@ def _provider_recording_families(
         title = trim_text(track.get("title") or track.get("name"))
         artist = trim_text(track.get("channel") or track.get("artist"))
         title_match = search_text_similarity(query, title)
+        contains_query = bool(query_key and query_key in search_query_key(title))
         artist_key = normalize_artist_name(artist)
-        if title_match < 0.94 or not artist_key or not _track_provider_identity(track):
+        title_is_live = bool(re.search(r"\blive\b", title, re.IGNORECASE))
+        rendition_counterpart = bool(
+            has_exact_live_match
+            and not title_is_live
+            and title_match >= 0.80
+        )
+        if (
+            (title_match < 0.94 and not rendition_counterpart and not (contains_query and title_match >= 0.80))
+            or (complete_title_matches and not contains_query and not rendition_counterpart)
+            or not artist_key
+            or not _track_provider_identity(track)
+        ):
             continue
         authority = trim_text(
             track.get("source_authority") or track.get("authority")
@@ -507,10 +568,31 @@ def _provider_recording_families(
                 "stable_album_id": "",
             },
         )
-        if index < int(group["best_index"]):
+        current_best = dict(group["best_track"])
+        current_title = trim_text(
+            current_best.get("title") or current_best.get("name")
+        )
+        current_is_live = bool(
+            re.search(r"\blive\b", current_title, re.IGNORECASE)
+        )
+        candidate_is_live = bool(re.search(r"\blive\b", title, re.IGNORECASE))
+        same_work = bool(
+            normalize_track_title(current_title) == normalize_track_title(title)
+            or (
+                search_text_similarity(query, current_title) >= 0.94
+                and search_text_similarity(query, title) >= 0.94
+            )
+        )
+        replace_live_representative = bool(
+            not query_requests_live
+            and same_work
+            and current_is_live
+            and not candidate_is_live
+        )
+        if index < int(group["best_index"]) or replace_live_representative:
             group["best_index"] = index
             group["best_track"] = track
-        if title_match >= 0.98:
+        if title_match >= 0.98 or (contains_query and title_match >= 0.80):
             group["exact_count"] = int(group["exact_count"]) + 1
         group["views"] = max(
             float(group["views"]),
@@ -562,14 +644,15 @@ def _provider_recording_families(
             if title_match >= 0.94:
                 album_score = max(
                     album_score,
-                    2.4 * title_match
-                    + (0.45 if _album_provider_identity(album) else 0.0)
-                    + normalized_popularity(album) * 0.8,
+                    # A single named after its song proves a relationship,
+                    # not that this artist owns the user's title-only intent.
+                    0.25 * title_match
+                    + (0.10 if _album_provider_identity(album) else 0.0),
                 )
         best_track = dict(group["best_track"])
         track_album_title = trim_text(best_track.get("album") or best_track.get("album_title"))
         if track_album_title and search_text_similarity(query, track_album_title) >= 0.94:
-            album_score = max(album_score, 2.2)
+            album_score = max(album_score, 0.35)
         rank_tiebreaker = max(
             0.0, 0.35 * (1.0 - (int(group["best_index"]) / result_count))
         )
@@ -584,6 +667,19 @@ def _provider_recording_families(
         group["artist_evidence_score"] = round(artist_score, 4)
         group["album_relationship_score"] = round(album_score, 4)
         group["rank_tiebreaker"] = round(rank_tiebreaker, 4)
+        best_title = trim_text(best_track.get("title") or best_track.get("name"))
+        live_rendition_penalty = bool(
+            not query_requests_live
+            and re.search(r"\blive\b", best_title, re.IGNORECASE)
+            and any(
+                _compatible_artist_credit(
+                    group["artist"],
+                    track.get("channel") or track.get("artist"),
+                )
+                for track in standard_counterparts
+            )
+        )
+        group["rendition_preference_penalty"] = 3.0 if live_rendition_penalty else 0.0
         group["intent_score"] = round(
             min(int(group["exact_count"]), 3) * 0.70
             + float(group["authority"])
@@ -594,7 +690,8 @@ def _provider_recording_families(
             + album_score
             + (0.25 if group.get("stable_artist_id") else 0.0)
             + (0.20 if group.get("stable_album_id") else 0.0)
-            + rank_tiebreaker,
+            + rank_tiebreaker
+            - float(group["rendition_preference_penalty"]),
             4,
         )
     return sorted(
@@ -886,7 +983,7 @@ def resolve_search_target(
             evidence.append("provider_catalog_credit")
         if authority_supported:
             evidence.append("source_authority")
-        if name_match >= 0.72 and stable_id and artist_supported:
+        if query_mentions_artist(query, name) and stable_id and artist_supported:
             candidates.append(
                 {
                     "entity_type": "artist",
@@ -1241,6 +1338,34 @@ def _best_track_match(
     if not valid:
         return {}
 
+    # A partial title query can match a longer work. An abbreviated, different
+    # title must not win solely because the canonical catalog knows its credit.
+    query_key = search_query_key(query)
+    complete = [item for item in valid if query_key and query_key in
+                search_query_key(item.get("title") or item.get("name") or "")]
+    if complete:
+        valid = complete
+
+    # Provider catalogs can place a popular concert recording ahead of the
+    # standard recording. When both are present for the same credited work,
+    # prefer the unqualified recording for a title-only query. Keep explicit
+    # live queries intact, and keep a live result eligible when no counterpart
+    # exists.
+    query_requests_live = bool(re.search(r"\blive\b", query, re.IGNORECASE))
+    standard_counterparts = [
+        item
+        for item in valid
+        if not query_requests_live
+        and search_text_similarity(
+            query, trim_text(item.get("title") or item.get("name"))
+        ) >= 0.80
+        and not re.search(
+            r"\blive\b",
+            trim_text(item.get("title") or item.get("name")),
+            re.IGNORECASE,
+        )
+    ]
+
     def match_score(item: Dict[str, Any]) -> tuple[float, float, float]:
         title = trim_text(item.get("title") or item.get("name"))
         artist = trim_text(item.get("channel") or item.get("artist"))
@@ -1270,8 +1395,20 @@ def _best_track_match(
         popularity = parse_compact_number(
             item.get("popularity") or item.get("views"),
         )
+        live_without_counterpart = bool(
+            not query_requests_live
+            and re.search(r"\blive\b", title, re.IGNORECASE)
+            and any(
+                _compatible_artist_credit(
+                    artist,
+                    candidate.get("channel") or candidate.get("artist"),
+                )
+                for candidate in standard_counterparts
+            )
+        )
         return (
-            query_score * 2.0 + canonical_pair_score * 4.0,
+            query_score * 2.0 + canonical_pair_score * 4.0
+            - (1.5 if live_without_counterpart else 0.0),
             canonical_pair_score,
             popularity,
         )
@@ -1516,6 +1653,36 @@ def _canonical_track_resolution(
         return {}
     corroborated.sort(key=lambda entry: entry[0], reverse=True)
     score, pair_match, item, provider_track = corroborated[0]
+    # The canonical catalog can have only a cover while the provider has a
+    # strongly supported different credit. Catalog existence is not intent.
+    provider_decision = _provider_recording_decision(
+        query, providers, artists=provider_artists, albums=provider_albums,
+    )
+    provider_track = provider_decision.get("track") or {}
+    provider_artist = trim_text(
+        provider_track.get("channel") or provider_track.get("artist")
+    )
+    candidate_artist = trim_text(item.get("channel") or item.get("artist"))
+    provider_track_title = trim_text(
+        provider_track.get("title") or provider_track.get("name")
+    )
+    candidate_title = trim_text(item.get("title") or item.get("name"))
+    explicit_provider_credit = bool(
+        provider_artist
+        and query_mentions_artist(query, provider_artist)
+        and not query_mentions_artist(query, candidate_artist)
+        and search_text_similarity(provider_track_title, candidate_title) >= 0.90
+        and (
+            provider_decision.get("authority_supported")
+            or provider_decision.get("structurally_supported")
+        )
+    )
+    if explicit_provider_credit:
+        return {}
+    if (provider_decision.get("decisive")
+            and normalize_artist_name(provider_decision.get("artist"))
+            != normalize_artist_name(candidate_artist)):
+        return {}
     runner_score = corroborated[1][0] if len(corroborated) > 1 else 0.0
     margin = score - runner_score
     if len(corroborated) > 1 and margin < 0.30:
@@ -2525,6 +2692,8 @@ def retrieve_search_candidates_fast(
             if (
                 cached_payload is not None
                 and not legacy_track_target
+                and (cached_target.get('entity_type') != 'artist' or query_mentions_artist(query,
+                    (cached_target.get('item') or {}).get('name') or (cached_target.get('item') or {}).get('artist') or ''))
                 and (
                     search_mode == "taste"
                     or bool(cached_target.get("target_identity"))

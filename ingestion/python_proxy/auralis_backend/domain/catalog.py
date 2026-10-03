@@ -509,6 +509,17 @@ def catalog_artwork_source_urls(
             ),
             reverse=True,
         )
+    elif normalized_type == "track":
+        artist_thumbnail = _text(item.get("artist_thumbnail"))
+        if artist_thumbnail and artist_thumbnail in urls:
+            track_artwork = [url for url in urls if url != artist_thumbnail]
+            source = verified_playback_source(item)
+            if track_artwork:
+                urls = track_artwork
+            elif source.get("provider") == "youtube":
+                # Let catalog_thumbnail_url use its verified-video fallback;
+                # the artist portrait is not a track cover.
+                urls = []
     return urls
 
 

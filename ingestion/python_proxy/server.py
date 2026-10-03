@@ -421,11 +421,14 @@ def _normalize_artist_album_entries(raw_results, fallback_artist: str = ""):
         if not browse_id or not title or browse_id in seen:
             continue
         seen.add(browse_id)
+        entry_artist = extract_artist(entry)
         albums.append(
             {
                 "id": browse_id,
                 "title": title,
-                "artist": extract_artist(entry) or fallback_artist,
+                "artist": fallback_artist
+                if _normalize_text(entry_artist) == "unknown artist"
+                else entry_artist,
                 "thumbnail": extract_thumbnail(entry),
                 "year": entry.get("year") or "",
                 "track_count": entry.get("trackCount") or entry.get("track_count") or 0,

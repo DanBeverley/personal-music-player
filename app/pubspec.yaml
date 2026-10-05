@@ -36,6 +36,13 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  fonts:
+    - family: NeatieSans
+      fonts:
+        - asset: assets/fonts/Manrope.ttf
+    - family: NeatieDisplay
+      fonts:
+        - asset: assets/fonts/DMSerifDisplay.ttf
   assets:
     - assets/branding/neatie_3rd.png
     - assets/branding/neatie_login_wave_bg.png

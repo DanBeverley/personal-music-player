@@ -1,50 +1,29 @@
 # Neatie Personal Music Player
 
-Neatie is an Android-first Flutter music application backed by a local Python/FastAPI service. It combines personalized recommendations, canonical music search, source-aware playback, playlists, history, downloads, lyrics, recognition, and assistant features.
+Neatie has an Android Flutter client and a separate Flutter web client for PC/iPhone browsers, sharing FastAPI services for canonical Search, durable Home, source-aware playback, discovery, library, Charts/Releases, lyrics and assistant/recognition.
+
+## Start here
+
+The six [handoff guides](docs/handoff/PROJECT_OVERVIEW.md) own current information. Read [status](docs/handoff/CURRENT_STATUS.md), [full queue](docs/handoff/NEXT_STEPS.md), [architecture](docs/handoff/ARCHITECTURE.md), [known issues](docs/handoff/KNOWN_ISSUES.md) and project overview before implementation; use [operations](docs/handoff/OPERATIONS.md) for hosting, backup or deployment.
+
+Current serving build is `2026-10-03-history-search` on AWS. Main source tree uses develop; deployed web/backend work is in the separate codex/web-app tree. Both intentionally differ despite committed e720709. Inspect Git status and preserve unrelated changes. Complete queue: 66 entries with implementation, acceptance, recheck and deferred statuses.
 
 ## Repository
 
-- `app/`: Flutter/Riverpod Android client.
-- `ingestion/python_proxy/`: FastAPI service, recommendation worker, canonical search, catalog, source resolution, playback, assistant, recognition, and backend tests.
-- `core_native/`: native audio/FFI source.
-- `supabase/`: authentication and synchronized user-data material.
-- `runtime/`: ignored local recommendation and assistant state.
-- `docs/handoff/`: authoritative current status, architecture, known issues, and next actions.
+- app/: Android Flutter app and, in the web worktree, separate browser modules.
+- ingestion/python_proxy/: FastAPI, recommendation worker, source/stream/Search/Home and feature services/tests.
+- ingestion/browser_audio/: optional browser-backed transport in the web worktree.
+- core_native/: native audio/FFI source; Android builds it through CMake/managedJniLibs.
+- supabase/: auth and cloud-user schema/setup guidance.
+- deploy/production/ and tools/: deployment, backup and local verification helpers.
+- runtime/, .env and cookies: ignored private/local state, not supplied by Git.
 
-## Current Architecture
+## Architecture rules
 
-- The backend is the sole authority for active/prepared home-feed promotion.
-- Home recommendations consume persisted canonical candidate inventory rather than performing broad discovery in `/recommend`.
-- Search uses one canonical `/search` path and keeps canonical identity separate from playable provider identity.
-- Playback resolves canonical tracks through persisted source mappings, prepared prefixes, R2, and bounded yt-dlp resolution.
-- Popular Radio owns an independent artist catalog and allocation contract.
-- Replaced search and recommendation paths are removed instead of retained as parallel fallbacks.
+Backend alone promotes active/ready Home; composition uses persisted inventory and bounded background acquisition. Popular Radio owns independent supply/contracts. Use one canonical Search/source pipeline; canonical identity is not proof of playability, meaningful artwork or usable details. Fix existing ownership/state paths instead of adding overlapping systems.
 
-The home feed currently supports `todays_pick`, `featured_new_albums`, `last_played`, `frequently_listened`, `made_for_you`, `because_you_played`, `popular_radio`, `recommended_albums`, `recommended_artists`, and `quiet_picks`.
+## Local work and releases
 
-## Current Development State
+Windows Android workflow: run `.\start_dev.ps1` with configured emulator (normally emulator-5554), Python/Flutter and protected root .env. Emulator backend is http://10.0.2.2:8000; localhost inside Android is the emulator, not Windows.
 
-The active work is on `travel/work`. Recommendation/feed completeness improved materially and the yt-dlp background error storm is now bounded. Canonical search correctness and artwork persistence remain behind a device-validation gate: same-title track resolution can fail closed because canonical evidence starts too late, Flutter can still invent a top result from the first track, and album/playlist artwork can be admitted before its source is verified.
-
-Read these files before changing code:
-
-1. `AGENTS.md`
-2. `docs/handoff/CURRENT_STATUS.md`
-3. `docs/handoff/NEXT_STEPS.md`
-4. `docs/handoff/ARCHITECTURE.md`
-5. `docs/handoff/KNOWN_ISSUES.md`
-6. `docs/handoff/PROJECT_OVERVIEW.md`
-
-## Local Development
-
-The normal Windows workflow is:
-
-```powershell
-.\start_dev.ps1
-```
-
-The script expects a running Android emulator at `emulator-5554`, a usable Python environment, Flutter on `PATH`, and the ignored root `.env`. For Android emulators, the app reaches the host backend through `http://10.0.2.2:8000`.
-
-Private and machine-specific state is intentionally not committed. Preserve `.env`, `runtime/`, yt-dlp cookies, and `app/android/app/src/main/jniLibs/` separately when moving machines.
-
-Focused backend commands and the complete Windows setup checklist are in `docs/handoff/NEXT_STEPS.md`. Flutter commands, especially `flutter analyze`, must be run by the user locally because they are unreliable in the agent environment.
+Use focused verification commands in NEXT_STEPS; user runs flutter analyze. See [Android release](docs/ANDROID_RELEASE.md), [deployment guide](docs/PRODUCTION_DEPLOYMENT.md) and [auth setup](supabase/README.md). Documentation-only changes do not authorize application deployment, publishing or cloud resource changes.

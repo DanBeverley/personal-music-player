@@ -1,248 +1,355 @@
 # Architecture
 
-## System Shape
+October 3 clarification: history response construction recovers exact persisted catalog/entity-source metadata; bounded provider repair runs in background. Playback evidence is retained independently from display readiness. Shared Home admission requires usable title/artist even for trusted history, and bundle schema v2 invalidates older placeholder-containing bundles for recomposition. Personal mix slices are multi-card ranked reservoirs; diversity is enforced within each card, with unique visible recording sets and bounded deep overlap. Search revision timeouts acknowledge `not_modified` without replacement surfaces; only actual revisions replace client results. See [deployment and verification](CURRENT_STATUS.md).
+
+Last reconciled: 2026-10-04. Current ownership/contracts are retained here; diagnostic deviations belong in KNOWN_ISSUES and remaining work in NEXT_STEPS.
+
+## Current System Shape
 
 ```text
-Flutter client
-    |
-    | HTTP on port 8000
-    v
-FastAPI / Python proxy
-    |
-    +-- canonical search and catalog
-    +-- candidate acquisition and feed state
-    +-- playback/source registry and stream cache
-    +-- details, lyrics, assistant, recognition
-    |
-    +-- SQLite runtime state
-    +-- optional Supabase/Postgres sync
-    +-- optional Cloudflare R2 objects
-    +-- MusicBrainz / Last.fm / ListenBrainz / YTMusic / YouTube
+Flutter Android client + separate Flutter web client
+        |
+        | HTTP / JSON
+        v
+FastAPI Python proxy
+        |
+        +-- canonical Search
+        +-- Home repository API and promotion
+        +-- playback/source/stream endpoints
+        +-- Charts, New Releases, Lyrics, Assistant, Recognition
+        |
+        +----------------------+
+                               |
+                               v
+                  Recommendation worker process
+                    +-- candidate acquisition
+                    +-- Popular Radio acquisition
+                    +-- artist artwork repair
+                    +-- immutable feed composition
+
+Durable state: SQLite runtime repositories, optional Supabase/Postgres sync
+Durable objects: Cloudflare R2 stream/artwork cache when configured
+Providers: YTMusic/YouTube, Last.fm, ListenBrainz, MusicBrainz, optional Audius
 ```
 
-`start_dev.ps1` loads the root `.env`, stops stale repo-owned Python processes, starts the recommendation worker when enabled, starts FastAPI on port 8000, then runs Flutter against `emulator-5554`.
+`start_dev.ps1` starts three visible responsibilities:
 
-For the Android emulator, the client reaches the host backend at `http://10.0.2.2:8000`. `127.0.0.1` inside Android is the emulator itself, not the Windows host.
+1. Recommendation worker — owns slow acquisition, verification, artwork repair, and feed composition. Most `[EBB:acquisition]`, `[EBB:source-registry]`, and `[EBB:home-worker]` logs belong here.
+2. Python proxy/FastAPI (“A-terminal”) — owns HTTP request handling and therefore now mostly shows requests and endpoint logs.
+3. Flutter terminal — owns application/device logs.
 
-## Flutter Client
+Background work moved out of the API process deliberately. It prevents slow provider operations from blocking `/recommend` responses and makes jobs durable across request boundaries. It is not evidence that the backend stopped working.
 
-### Entry and navigation
+For the Android emulator, the host backend is normally `http://10.0.2.2:8000`. `127.0.0.1` inside Android points to the emulator, not Windows.
 
-- `app/lib/main.dart`: application bootstrap and shared part structure.
-- `app/lib/main_shell.dart`: authenticated shell and main navigation.
-- `app/lib/main_home.dart`: home/search orchestration, refresh gestures, row paging, and search navigation.
-- `app/lib/main_details.dart`: detail-screen routing.
-- `app/lib/main_player.dart`: full-player composition.
+## Android Client
 
-### Core state
+### Application Structure
 
-- `logic/audio_provider.dart`: central audio state and shared exports.
-- `logic/audio_provider_recommendation.dart`: launch feed, `/recommend`, active/prepared versions, polling, refresh, and row pages.
-- `logic/audio_provider_request_builder.dart`: recommendation request signals.
-- `logic/recommendation_feed_models.dart`: row/feed models and backend diagnostics.
-- `logic/home_feed_cache.dart`: offline/crash recovery for valid backend-active feeds.
-- `logic/search_provider.dart`: query submission, search snapshots, paging, and progressive completion.
-- `logic/search_payload_runtime.dart`: conversion from backend search payloads.
-- `logic/details_provider.dart`: album/artist/track detail retrieval.
-- `logic/audio_stream_runtime.dart`: playback resolution, prepared prefixes, cache source, and timing.
-- `logic/audio_queue_runtime.dart`: queue progression.
-- `logic/history_manager.dart`: persisted local history and backend history synchronization.
-- `logic/track_metadata.dart`: canonical metadata and display helpers.
-- `logic/recommendation_preferences_provider.dart`: Neatie/Blended/ListenBrainz-first settings.
-- `logic/collection_likes_provider.dart`: likes for albums, mixes, and radio cards.
+- Main working tree: `app/lib/main.dart` owns Android bootstrap. In the web worktree it conditionally selects `main_android.dart` or `web/web_app.dart`.
+- `app/lib/main_shell.dart` — authenticated navigation shell and global mini-player placement.
+- `app/lib/main_home.dart` — Home and Search entry points, refresh, row paging, Charts and New Releases navigation.
+- `app/lib/main_details.dart` — album, artist, mix, radio, and collection detail routing.
+- `app/lib/main_player.dart` — full player.
+- `app/lib/main_library.dart` — library surfaces.
 
-### Shared presentation
+### Important State and Runtime Modules
 
-- `widgets/app_artwork.dart`: shared track/album/artist artwork behavior.
-- `widgets/home/neatie_home_sections.dart`: home shelves, mixes, radio, albums, artists, and Quiet Picks.
-- `widgets/home/search_surface_widgets.dart`: search input, tabs, results, paging, and loading visuals.
-- `widgets/details/details_sections.dart`: artist, album, mix, and collection details.
-- `widgets/player/*`: player, queue, lyrics, and Behind the Lyrics.
-- `screens/radio_detail_screen.dart`: Popular Radio queue/detail screen.
+- `logic/audio_provider.dart` — central playback-facing state and shared exports.
+- `logic/audio_provider_recommendation.dart` — launch/refresh/queue-status Home requests and backend diagnostics.
+- `logic/home_feed_cache.dart` — scoped offline/crash recovery for an accepted backend artifact.
+- `logic/audio_provider_queue.dart` — queue/session ownership and related-song replenishment.
+- `logic/audio_queue_runtime.dart` — identity-based queue lookup and stall recovery decisions.
+- `logic/audio_stream_runtime.dart` — stream resolution/preparation and cache/source selection.
+- `logic/playback_models.dart` — canonical and playable source payloads.
+- `logic/details_provider.dart` — details, lyrics, and Behind the Lyrics requests.
+- `logic/search_provider.dart` and `logic/search_payload_runtime.dart` — canonical backend Search state/decoding.
+- `logic/charts_provider.dart` — chart filters, snapshots, preparation, and results.
+- `logic/new_releases_provider.dart` — New Releases state.
+- `logic/history_manager.dart` — local history plus backend synchronization.
+- `logic/track_metadata.dart` — shared canonical/display metadata helpers.
 
-Flutter must not reimplement feed quality. It may validate account scope/version and retain the last valid offline feed, but active/prepared promotion belongs to the backend.
+Flutter does not decide Home quality or independently promote a feed. It may validate account scope/version and retain the last valid artifact for offline recovery. The backend is the sole authority for active/ready promotion.
 
-## Recommendation Backend
 
-### Request-independent candidate supply
+## Web Client and Shared Backend
+
+Android and web are separate clients sharing backend contracts and cloud accounts. This is not a wholesale Android UI port. Backend improvements benefit both only after both use the same deployed version and endpoint; client-specific playback behavior remains separate.
+
+In the web worktree, `app/lib/main.dart` conditionally imports the platform entry point. Web modules under `app/lib/web/` own:
+
+| Module | Responsibility |
+| --- | --- |
+| `browser_audio.dart` | HTML audio, browser media events, Media Session controls and session storage |
+| `web_player.dart` | Selected/loaded source ownership, queue, preparation, reconciliation and diagnostics |
+| `music_api.dart` | Shared HTTP transport, authentication and account scope |
+| `web_auth.dart` | Browser Supabase session, email/Google login and recovery |
+| `web_library.dart` | Account-scoped cloud likes and playlists; gated targeted playlist writes |
+| `catalog_api.dart` | Canonical search, recommendation and detail contracts |
+| `catalog_screen.dart` | Search and Home, authoritative revision replacement, bounded polling and separate paged inventory |
+| `catalog_detail.dart` | Artist and album detail views |
+| `home_widgets.dart` | Web-only Home cover/hero, circular artists, collection collages and track-strip presentation; no acquisition or readiness decisions |
+| `account_screen.dart`, `library_screen.dart`, `web_app.dart` | Responsive account/library/navigation surfaces |
+
+Browser playback reuses an already prepared source. Gesture-sensitive playback, media-button actions, foreground return and UI/queue reconciliation must agree on the same track, operation and audio element. Stored position/duration restore is local and account-scoped; it is not cloud device handoff.
+
+Preparation is bounded and sequential: first search candidates and a limited queue lookahead. Actual playback takes priority over speculative preparation. This is not indefinite caching of the entire growing queue.
+
+The Oracle browser-audio adapter is an optional compatibility layer, not a replacement source system. Bounded byte requests/retries preserve source identity. Capture completion follows expected-byte validation and pending writes, rather than waiting for playback to end; media validation precedes durable cache admission. Upstream cold preparation can still be slow.
+
+Failure diagnostics retain source/session identity and useful failure history. Compact backend summaries distinguish queue wait, preparation and transfer. These mechanisms improve evidence and recovery; they do not establish that every reported iPhone failure is fixed.
+
+Supabase remains the account/library authority. Existing likes/playlists can be loaded and played. Playlist mutation support is implemented but disabled by default (`WEB_PLAYLIST_WRITES=false`) pending Android sync rollout and concurrent-edit validation. Google/email are enabled; GitHub remains hidden unless explicitly configured. See the acceptance gates in [NEXT_STEPS.md](NEXT_STEPS.md).
+
+The outer Caddy handles HTTPS and routes to the API/static preview gateway. The web gateway exposes the existing search/playback/catalog/recommendation contracts. Installability, offline downloads and explicit cross-device handoff remain future work.
+
+## Home Feed Architecture
+
+October 4 deployed H10–H14 presentation: the web shell forwards visibility/tab activity to Home. A return checks existing queue status without long polling, at most once per 30 seconds and with in-flight coalescing; populated rows/scroll stay stable until explicit refresh. Empty Home can recover the ordinary backend artifact. Backend diagnostic lanes remain the sole lane contents; the client does not infer lanes from titles or refetch providers. The album hero combines persisted qualified album rows, respects reduced motion/inactive Home and only plays supplied embedded previews within the gesture; otherwise it opens persisted detail. Home likes consume the existing scoped library. Track options and collection details use existing player/catalog callbacks; playlist writes remain gated. CURRENT_STATUS owns the serving build; device acceptance is pending.
+
+October 5 visual layer: `app/lib/web/design_system.dart` owns the web palette, typography and themes, with locally bundled Manrope/DM Serif Display and OFL licenses. `home_widgets.dart` owns the daily pick, album spotlight and artist/card/track presentation; `editorial_placeholder.dart` keeps missing covers explicit after exact alternatives fail. `web_app.dart` opens Home and selects a sidebar or bottom navigation at 850px. `playback_dock.dart` consumes the existing WebPlayer/BrowserAudio: the desktop dock and phone modal control one audio element. Seek, repeat, queue, likes, loading and interruption messages retain their callbacks. Hover/carousel motion respects reduced-motion settings. Account, library and details retain data/write gates. This layer does not acquire provider data, admit inventory, promote feeds or change source verification.
+
+The old `discovery/feed_state.py` and `discovery/service.py` lifecycle has been removed. Current Home ownership lives under `auralis_backend/home_feed/`.
+
+### Package Responsibilities
+
+| Module | Responsibility |
+| --- | --- |
+| `contracts.py` | Immutable row, radio, snapshot, state, artifact, bundle, and job contracts |
+| `repositories.py` | Durable SQLite repositories, schema, immutable writes, leases, compare-and-swap state |
+| `candidate_supply.py` | Builds/merges the account candidate snapshot from persisted inventory and bounded acquisition |
+| `radio_supply.py` | Sole radio acquisition/composition owner plus independent artist-artwork repair |
+| `composer.py` | Pure snapshot-to-artifact composition and durable artifact/state commit |
+| `worker.py` | Claims durable jobs, renews leases, runs isolated worker lanes, retries only useful work |
+| `scheduler.py` | Idempotent/coalesced candidate, radio, artwork, and compose scheduling |
+| `api.py` | Serves/promotes active and ready artifacts, row pages, queue status, and replenishment requests |
+| `bundles.py` | Immutable row/detail bundle support |
+
+### Durable Supply Flow
 
 ```text
-history/library/search/interaction signals
-    -> canonical taste anchors
-    -> acquisition ledger jobs
-    -> structured provider results
-    -> canonicalization and deduplication
-    -> playable-source verification
-    -> admitted CandidateInventory
+account history/library/search/feedback
+        -> stable account Home supply profile
+        -> provider-neutral acquisition plan
+        -> YTMusic / Last.fm / ListenBrainz / optional MusicBrainz calls
+        -> canonical merge and semantic deduplication
+        -> playable-source verification
+        -> retained verified candidate inventory
+        -> immutable candidate snapshot
 ```
 
-Key modules:
+The supply profile is stable per account. Launch tokens, request seeds, and temporary history fingerprints influence ranking but do not create competing candidate stores.
 
-- `discovery/enrichment.py`: bounded acquisition plans and persisted provider work.
-- `discovery/structured_providers.py`: Last.fm, ListenBrainz, MusicBrainz-facing structured operations.
-- `discovery/source_registry.py`: canonical recording to verified playback source mapping.
-- `discovery/admission.py`: source authority, relationship, language/region, negative feedback, and profile compatibility.
-- `discovery/inventory.py`: persisted canonical pools, coverage, reserves, ledger, and generation publication.
-- `discovery/radio_inventory.py`: independent per-artist Popular Radio catalogs.
-- `discovery/candidates.py`: converts persisted supply into candidate objects.
+MusicBrainz provides canonical artist/release/recording evidence. It does not provide audio and is not a Home readiness dependency. YTMusic, Last.fm, and ListenBrainz can still contribute useful supply when MusicBrainz is unavailable. Successful results are persisted before another provider's retry.
 
-Customer `/recommend` responses should not perform broad external candidate discovery. Provider work belongs to background acquisition and is persisted incrementally.
+### Fresh Versus Usable
 
-### Feed construction
+- Candidate snapshot TTL: 8 hours.
+- Radio snapshot TTL: 8 hours.
+- Ready artifact TTL: 8 hours.
+- Active artifact freshness: 24 hours.
+- Accepted stale-active display fallback: at most 3 days.
+- Discovery exposure cooldown: 24 hours.
+
+`fresh` answers whether a replacement should be scheduled. `usable` answers whether verified stored data can still safely build or display something while refresh runs. Expiry must never delete or invalidate all useful verified candidates merely because eight hours passed.
+
+### Background Jobs and Progress
+
+There are four durable job types:
+
+- `refresh_candidates`;
+- `refresh_radio`;
+- `repair_artwork`;
+- `compose_feed`.
+
+Jobs use leases, idempotent generation keys, coalescing, retry/backoff, and compare-and-swap state. Provider acquisition may be slow, but it is isolated from local composition/artwork lanes. Progress means useful persisted supply, verified artwork, or a published artifact—not merely scheduling the same request.
+
+The composer consumes only persisted snapshots. It does not call MusicBrainz or YTMusic directly. It uses allocation epochs, content fingerprints, exposure history, and supply watermarks to prevent duplicate workers from repeatedly publishing the same rotation.
+
+### Feed Lifecycle
 
 ```text
-ready CandidateInventory
-    -> row builders
-    -> reserved/global allocation
-    -> post-allocation contracts
-    -> DiscoveryArtifact
-    -> active/prepared FeedState
+candidate snapshot + optional complete radio snapshot
+        -> pure row composition
+        -> row and artifact contracts
+        -> immutable artifact/bundles
+        -> compare-and-swap commit
+        -> active artifact + two ready successors
 ```
 
-Key modules:
+- Queue target depth is 2.
+- Launch serves active immediately and may promote one ready artifact once per launch token.
+- Pull-to-refresh promotes one ready artifact immediately when available.
+- Promotion schedules successor replenishment.
+- If no successor exists, active remains visible while work runs.
+- A stale accepted active artifact may remain visible during recovery but is not counted as ready and cannot be promoted again.
+- Incomplete artifacts never replace active.
+- Initial publication waits for complete core supply. Once an accepted active feed exists, an incomplete independent radio replacement must not block improvements in other rows.
+- The abandoned progressive/partial-row experiment is not the current architecture; it was reverted because it produced missing rows and empty states.
 
-- `discovery/ranking.py`: row-specific ranking, Made For You, albums, artists, and radio.
-- `discovery/allocation.py`: cross-row canonical deduplication and row reservations.
-- `discovery/artifact.py`: final contracts, serialization, row diagnostics, and shortage domains.
-- `discovery/feed_state.py`: active/prepared state, versions, promotion, and dirty reasons.
-- `discovery/service.py`: `/recommend` lifecycle and background preparation orchestration.
-- `recommend/taste_runtime.py`: authoritative user taste and history evidence.
-- `recommend/maintenance_runtime.py`: events, search learning, dirty signals, and maintenance.
-- `recommend/feature_store.py`: persisted feature/feed records.
+### Home Row Contracts
 
-### Row contracts
+| Row | Requirement | Minimum | Target | Maximum | Reuse window |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Today’s Pick | Core | 6 | 6 | 8 | None |
+| Featured Albums | Independent | 4 | 8 | 10 | 24 h |
+| Last Played | Earned | 8 | 8 | 16 | Evidence-owned |
+| Frequently Listened | Earned | 8 | 8 | 16 | Evidence-owned |
+| Made For You | Core | 5 | 8 | 12 | None |
+| Because You Played | Earned | 12 | 12 | 48 | Evidence-owned |
+| Popular Radio | Independent | 10 | 12 | 15 | 8 h |
+| Recommended Albums | Independent | 4 | 12 | 48 | 24 h |
+| Recommended Artists | Core | 10 | 10 | 48 | None |
+| Quiet Picks | Core | 20 | 20 | 200 | None |
 
-| Row | Minimum | Target / maximum | Notes |
-| --- | ---: | ---: | --- |
-| Today’s Pick | 6 | 6 / 8 | Core discovery tracks |
-| Featured Albums | 8 | 8 / 10 | Optional; only valid albums |
-| Last Played | 8 when earned | 8 / 16 | Chronological history |
-| Frequently Listened | 8 when earned | 8 / 16 | Canonical play-count ranking |
-| Made For You | 5 | 8 / 12 | Each mix owns its queue |
-| Because You Played | 12 | 12 / 48 | Pageable, anchor-related |
-| Popular Radio | 8 cards | 12 / 12 | Optional; independent inventory |
-| Recommended Albums | 12 | 12 / 48 | Optional; canonical playable albums |
-| Recommended Artists | 10 | 10 / 48 | Playable catalog backing |
-| Quiet Picks | 20 | 20 / 200 | Taste-connected retained reserve |
+Earned rows appear only when the user has sufficient evidence. Independent rows cannot be fabricated or thinned below their own contract merely to show a title.
 
-Popular Radio cards require twelve playable tracks to publish and continue enriching toward twenty-four.
+### Popular Radio
 
-### Feed lifecycle
+Popular Radio is not allocated as a normal track row.
 
-- `active_feed` is the complete feed currently served.
-- `prepared_feed` is a complete replacement waiting for promotion.
-- Launch serves active immediately.
-- Background work never mutates active.
-- Pull refresh should promote an existing prepared feed first.
-- A failed or incomplete replacement must leave active untouched.
-- The server assigns monotonically increasing `feed_version` values.
-- Flutter must not turn `preparing` into an empty feed when a valid active feed exists.
+```text
+fresh/usable candidate snapshot
+        -> related, exploratory, and familiar artist seeds
+        -> radio-only multi-provider acquisition
+        -> canonical playable artist catalogs
+        -> independent artist artwork jobs
+        -> immutable radio snapshot
+        -> Home composer reference
+```
 
-The long-term product decision still pending is to maintain two ready rotations rather than one prepared slot. That work must replace the current single-slot behavior instead of layering another client-side fallback over it.
+Publication contract:
 
-## Search Architecture
+- 10–15 cards, target 12;
+- at least 8 playable tracks per card, target 12;
+- at least 3 non-mix discovery artist cards;
+- at least 2 verified multi-artist mixes;
+- at least 3 artist identities new relative to the previous rotation;
+- artist cards require canonical identity and persisted `/artist_artwork/` artwork;
+- mix cards require at least two distinct source artists and two verified artwork sources.
 
-The current production search path is one canonical `/search` service in `auralis_backend/search/service.py`. Flutter no longer owns a separate payload cache or selection-override engine; identical in-flight requests may be coalesced, but persisted search state belongs to the backend.
+Artwork absence schedules artwork work and allows acquisition to advance to another seed. The radio worker is the sole owner of radio acquisition. The feed composer only consumes a persisted complete radio snapshot.
+
+October 4 deployed H05–H08 corrections: radio acquisition projects identity-owned artist credits through shared admission; the compact index rematches every stored verified physical source against title/artist/version before joining playback. Readiness and publication share the non-mix discovery/depth contract. Artist thumbnail paths must match identity tokens; mix images must be distinct and belong to credited source identities. Novelty counts actual artists rather than synthetic mix IDs. Album planning applies its 16-artist bound after exhausted-provider filtering, rotates supported seeds and preserves zero cursor wrap and aggregate seed progress in the persisted ledger. Provider and source-verification failures remain distinct existing stages. Existing immutable artifacts are retained; fresh provider enrichment/complete supply remains an acceptance gate.
+
+## Canonical Search
+
+There is one production `/search` implementation in `auralis_backend/search/service.py`.
 
 ```text
 normalized query
-    -> direct/local retrieval
-    -> unconditioned YTMusic/provider candidates
-    -> provider-only entity-type classification
-    -> type-gated canonical identity evidence
-    -> accepted target bundle
-    -> canonical artist catalog
-    -> tracks/albums/artist works
-    -> Last.fm related artists
-    -> playlists
-    -> artwork and playable/detail validation
-    -> persisted search snapshot
-    -> paged/progressive Flutter surfaces
+        -> local/direct retrieval and provider candidates
+        -> entity-type classification
+        -> type-gated canonical evidence
+        -> accepted canonical target bundle
+        -> artist/release/catalog expansion
+        -> playable and detail validation
+        -> persisted semantic snapshot
+        -> progressive/paged Flutter surfaces
 ```
 
-Supporting modules:
+Important invariants:
 
-- `search/canonical.py`: canonical identity helpers.
-- `search/intelligence.py`: query normalization, aliases, typo/partial scoring, and intent evidence.
-- `search/catalog_pipeline.py`: artist catalog and album/track construction.
-- `search/musicbrainz.py`: MusicBrainz lookup helpers.
-- `search/upstream_runtime.py`: bounded provider calls.
-- `storage/artist_artwork.py`: canonical artist artwork objects, current album/playlist proxy transport, and R2 persistence.
+- query text is evidence, not an identity assigned to every result;
+- type classification precedes consumption of type-specific canonical evidence;
+- the accepted target owns artist/release identity for dependent surfaces;
+- canonical identity is not proof of playability;
+- source IDs and canonical recording IDs remain separate;
+- revisions advance only for visible semantic change;
+- a newer semantic revision replaces its ranked first page and can retract invalid rows or clear null targets; separately loaded pages survive, and same-revision timeout acknowledgements preserve visible results;
+- Flutter cannot invent a top result or substitute the first track when the backend has no accepted target;
+- artwork is considered publishable only after persistent verification, not because a proxy token exists.
 
-Important rules:
+Search remains one canonical pipeline. The web branch adds confidence-based correction, original-query opt-out, stricter query-to-artist admission, alias learning/invalidation, and cached-target revalidation. Preserve uncertain valid names; do not create a separate web search engine.
 
-- A submitted query is not attached blindly to every returned item.
-- Entity type is classified before identity resolution. A MusicBrainz recording lookup may run concurrently for latency, but cannot affect the type decision and can only be consumed after `track` is locked.
-- One canonical target bundle must be accepted before artist catalog construction. It owns the selected item, credited/lead artist, containing album, stable target identity, confidence, margin, and evidence.
-- Artist works and albums must follow the chosen artist identity, not a provider text label alone.
-- Provider intent is ranking evidence, not permission to append unrelated tracks indefinitely.
-- Canonical identity is not proof that a card is playable or that its details exist.
-- Exact query tracks/albums and accepted-artist catalog tracks/albums are separate inventories.
-- Search snapshots may complete progressively, but already correct lead results must not be replaced by a lower-authority identity and already visible valid cards must not disappear.
-- A snapshot revision represents a user-visible semantic change, not merely another completion attempt.
-- Flutter may poll a pending snapshot, but it must not invent a top result, lead artist, containing album, or target-derived surface.
-
-### Current deviation requiring correction
-
-The travel branch has implemented most of the structure above, but the current code still starts MusicBrainz recording evidence only after the provider branches finish or time out. This can starve the evidence required to resolve ambiguous same-title tracks. The current Flutter decoder also falls back to promoting the first track when the backend returns no top result. These are known violations, not intended architecture; replace them in the existing path as described in `NEXT_STEPS.md`.
-
-## Artwork
-
-Track/album artwork and artist artwork are different domains:
-
-- Track/album artwork may come from playable-source metadata or canonical release metadata.
-- Artist artwork is keyed by canonical artist identity and served through `/artist_artwork/{key}`.
-- Album and playlist artwork may be served through `/entity_artwork/{key}`, but the route is only transport. The object must be verified/persisted before the card is admitted.
-- R2 is used when configured; otherwise artwork may remain in process/local cache.
-- Entering an artist profile should persist newly resolved canonical artwork for later search and feed use.
-- Entering an album profile must persist artwork through the same canonical entity-artwork path used by search; detail-only cache hydration is not sufficient.
-- Flutter uses `cached_network_image` plus `flutter_cache_manager`; stale file paths must fall back to the network/backend URL rather than being treated as permanent success.
-
-Do not fill an artist avatar with arbitrary album art merely to avoid a placeholder.
-
-The current entity proxy is incomplete: it can create a proxy token from an unverified external URL, and the presence of that token currently satisfies artwork publication. This is a known bug. The corrected architecture persists verified bytes/state, bounded failure retry, canonical aliases, and snapshot notifications before publication.
-
-## Playback
+## Playback and Related Tracks
 
 ```text
-canonical track key
-    -> persisted source registry
-    -> local prepared prefix / local cache
-    -> R2 stream cache
-    -> verified YouTube or Audius source
-    -> yt-dlp stream resolution
-    -> Flutter just_audio queue
+canonical requested track
+        -> persisted source identities and alternates
+        -> version/artist/title/duration compatibility ranking
+        -> local prepared prefix or local cache
+        -> Cloudflare R2 stream object
+        -> live verified YouTube/Audius resolution
+        -> Android just_audio queue / browser HTML audio element
 ```
 
-Key backend modules:
+YouTube Data and YTMusic metadata do not themselves prove stream playability. yt-dlp resolves the actual audio stream. YouTube may reject a source because of bot, age, region, privacy, deletion, format, signature, or token behavior; the registry must mark the failing source and try an eligible alternate.
 
-- `api/media_runtime.py`
-- `api/stream_runtime.py`
-- `api/stream_core_runtime.py`
-- `api/stream_cache.py`
-- `discovery/source_registry.py`
+For canonical studio tracks, source ranking rejects or heavily penalizes live, remix, cover, karaoke, tribute, instrumental, backing-track, sped/slowed, and similar version conflicts unless that version was explicitly requested. Artist/title/duration and release evidence must still align.
 
-Key client modules:
+The Flutter queue uses logical track identity rather than assuming the audio engine index is always synchronized. Search playback creates a discovery playlist, `/related_tracks` pages recommendations, and near-end queue state triggers bounded replenishment. A temporary provider failure is retryable and must not become a permanent “No more related songs” state.
 
-- `logic/playback_models.dart`
-- `logic/audio_stream_runtime.dart`
-- `logic/audio_queue_runtime.dart`
+Stall recovery distinguishes a true unchanged playback position from normal buffering. It allows one bounded soft seek or source refresh rather than an endless loop.
 
-YouTube Data API provides metadata/video identities, not audio bytes. A YouTube result counts as playable only after the stream path can resolve it. Bot, age, geo, private, and unavailable failures should mark that source and permit an alternate source.
+Android release Gradle uses CMake and the `managedJniLibs` source set. Older ignored `app/android/app/src/main/jniLibs/` files may still exist in transferred archives, but copying them alone does not establish current release/native parity. Verify compiled ABI libraries and Dart FFI symbols on device; a mismatch can select the safe Flutter path.
 
-The C++ FFI library is packaged as ignored Android `.so` files under `app/android/app/src/main/jniLibs/`. The current app can use the Flutter/just_audio path when FFI is unavailable, but exact parity requires transferring or rebuilding those libraries.
+## Charts and Trending
 
-## Persistence and Portability
+`auralis_backend/charts/service.py` owns persistent chart snapshots.
 
-| Data | Normal location | In Git? | Why it matters |
-| --- | --- | --- | --- |
-| Source code and tests | repository | Yes | Main implementation |
-| `.env` | repository root | No | Provider, Supabase, R2, assistant configuration |
-| Feed/candidate runtime | `runtime/recommendation_store.sqlite` | No | Existing user feed, inventory, search/source history |
-| Assistant memory | `runtime/assistant_memory.sqlite` | No | Assistant context |
-| Native Android libraries | `app/android/app/src/main/jniLibs/` | No | FFI parity on emulator/device |
-| Flutter packages/build | `app/.dart_tool`, `app/build` | No | Re-creatable |
-| Python environment | `.venv`/`venv` | No | Re-creatable; often not portable |
-| Stream bytes | R2 or local cache | No | R2 survives machine changes |
+| Provider | Scope used by this product | Notes |
+| --- | --- | --- |
+| ListenBrainz | Sitewide and longer-range charts | Not falsely labeled regional |
+| Last.fm | Current global/regional charts | Artwork may require independent enrichment |
+| YTMusic | Global/regional chart playlists | Does not require YouTube Data API for enumeration |
 
-For travel, the ZIP should include `.git`, `.env`, `runtime/`, and `app/android/app/src/main/jniLibs/`. Dependencies may be included, but Flutter and Python caches can contain absolute paths and may need regeneration.
+Provider collection and playable verification are parallelized within bounded limits. Publication requires at least 10 playable entries. All Sources balances providers; source filters show that provider's available ranked list. Snapshots store prior rank so `is_new_entry` means absent from the prior comparable chart, not simply first seen by the UI.
+
+Demand for recently selected country/range pairs is persisted and warmed in the background. The system should not preload every country indefinitely.
+
+## New Releases
+
+`auralis_backend/releases/service.py` and the Flutter New Releases screen replace the former Search redirect.
+
+- YTMusic and ListenBrainz supply releases;
+- refresh starts with a 45-day window and can extend to the configured 90-day release window;
+- results are canonicalized, deduplicated, artwork/detail checked, persisted, and refreshed in the background;
+- a visible release should open to a usable album detail and playable track backing.
+
+## Lyrics and Behind the Lyrics
+
+`auralis_backend/lyrics/service.py` uses:
+
+1. YouTube Music lyrics for a resolved video/source;
+2. LRCLIB exact and searched matches using normalized artist/title/album/duration evidence.
+
+It distinguishes found, instrumental, provider failure, and not-found states and supports synchronized or plain text. Behind the Lyrics is a separate AI interpretation endpoint and still needs its own reliability/device gate. Long copyrighted lyric text must not be logged or unnecessarily persisted in interpretation records.
+
+## Artwork Domains
+
+- Track artwork belongs to a verified playable source or authoritative release.
+- Album artwork belongs to an authoritative release identity and must be persisted before card admission.
+- Artist artwork belongs to canonical artist identity and is served through `/artist_artwork/{token}`.
+- `/entity_artwork/{token}` is transport for verified album/entity bytes, not proof that the object exists.
+- Mixed radio artwork contains distinct verified artist sources.
+
+Never use arbitrary track/album art as an artist portrait merely to remove a placeholder.
+
+## Persistence and Deployment
+
+| Data | Normal location | In Git? |
+| --- | --- | --- |
+| Source and tests | Repository | Yes |
+| Provider/secrets configuration | Root `.env` locally or protected deployment env | No |
+| Home/Search/source runtime | `runtime/` SQLite state | No |
+| Assistant memory | `runtime/assistant_memory.sqlite` | No |
+| Stream/artwork bytes | R2 or local cache | No |
+| Android native libraries | CMake output / `managedJniLibs`; legacy ignored `jniLibs` may exist | Generated/local |
+| Flutter/Python build caches | Local tool directories | No |
+
+AWS currently runs Caddy → FastAPI + recommendation worker, a separate static web gateway, token provider and the optional browser-audio compatibility service in Docker. The adapter originated for Oracle but remains a transport option on AWS. Runtime/download directories and Caddy volumes persist separately from releases. See [OPERATIONS.md](OPERATIONS.md) for current host, paths, backups and rollback. The preview is independent of the PC.
+
+## Architecture Guardrails
+
+- One Home lifecycle: `home_feed`, not the deleted discovery feed service.
+- One canonical Search path.
+- One playback/source registry and stream path.
+- Backend alone promotes Home artifacts.
+- Customer requests consume persisted supply; broad provider work runs in the worker.
+- Popular Radio remains independent from regular allocation.
+- Canonical identity is never treated as proof of playability, detail readiness, or artwork bytes.
+- Provider failures are isolated; successful persisted work survives.
+- Fix root ownership/state errors; do not add success-looking fallback states.
+- Replaced systems are deleted, not retained as parallel safety layers.
+- No hardcoded artist/title/language blocklists as product logic.

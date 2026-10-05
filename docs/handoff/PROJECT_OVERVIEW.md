@@ -1,125 +1,45 @@
 # Project Overview
 
+Reconciled October 4, 2026. Neatie has an Android Flutter client and a separate Flutter web client for desktop/iPhone browsers, sharing canonical backend services and cloud accounts. They do not share identical UI/audio implementations. A change in one worktree is not automatically in the other or deployed.
+
 ## Product
 
-Neatie is an Android-first personal music application built with Flutter and a Python/FastAPI backend. It combines:
+Android exposes Search, durable Home/Popular Radio, source-aware playback/discovery queues, library/downloads, Charts/New Releases, lyrics/Behind the Lyrics, assistant/recognition and signed-update infrastructure. User accepted related-song queues, Search scrolling and New Releases baselines.
 
-- personalized home recommendations;
-- canonical music search;
-- playable YouTube/YTMusic sources with optional Audius fallback;
-- playlists, library, likes, history, and downloads;
-- album, artist, mix, and radio details;
-- lyrics and AI interpretation;
-- song recognition;
-- account-scoped persistence and optional cloud caches.
+Web exposes responsive navigation, browser audio/local scoped queue persistence, auth/cloud likes/existing playlists, richer canonical Search, artist/album details and Home. It is deployed on AWS; full Android presentation, additional product surfaces, cross-device handoff and PWA/offline remain open. Browser playback is observed; long-session/background reliability is not fully accepted. Current status and all 66 task IDs live in the first two guides below.
 
-The product goal is a complete, responsive music experience with relevant discovery. A technically successful response that displays a thin or empty product is not acceptable.
+## Six-document handoff map and read order
 
-## Repository Map
+| Order / file | Owns |
+| --- | --- |
+| 1. [CURRENT_STATUS.md](CURRENT_STATUS.md) | Serving version, shipped changes, recorded tests and user acceptance |
+| 2. [NEXT_STEPS.md](NEXT_STEPS.md) | Complete 66-entry queue, stable IDs, status and completion checks |
+| 3. [ARCHITECTURE.md](ARCHITECTURE.md) | Module ownership, data flow and contracts |
+| 4. [KNOWN_ISSUES.md](KNOWN_ISSUES.md) | Current artwork/UI and account defects, historical causes, diagnostics and cleanup findings |
+| 5. PROJECT_OVERVIEW.md | Product/worktree orientation and this map |
+| Operations: [OPERATIONS.md](OPERATIONS.md) | Hosting, private file locations, backups, rollback and dated alternative-host research |
 
-- `app/` — Flutter/Riverpod Android client.
-- `ingestion/python_proxy/` — FastAPI server, recommendation worker, search, playback, catalog, assistant, recognition, and tests.
-- `core_native/` — C++ audio/FFI source.
-- `supabase/` — account/auth/database integration material.
-- `runtime/` — ignored local SQLite state for recommendations and assistant memory.
-- `tools/` — release/build helpers.
-- `docs/handoff/` — authoritative continuation context.
-- `resources/` — loose design/source resources; not all are runtime assets.
+Dated release/investigation reports were merged into their owning guides rather than left as competing current-state documents. Keep dates, exact verification limits and unique recovery details when updating them; do not start a new report file for each minor checkpoint. Update the owning guide and queue status.
 
-## External Responsibilities
+## Repository/worktree map
 
-| Service | Responsibility | Does it provide playable audio? |
-| --- | --- | --- |
-| MusicBrainz | Canonical artists, recordings, releases, release groups, credits, tags | No |
-| Last.fm | Similar tracks/artists and tags | No |
-| ListenBrainz | Popular recordings/releases and optional personal recommendations | No |
-| YTMusic | Fast candidate enumeration and direct search | Identifies likely YouTube sources |
-| YouTube Data API | Video/channel metadata and authority validation | No stream bytes |
-| yt-dlp | Resolves actual YouTube stream access | Yes, when YouTube permits |
-| Audius | High-confidence alternate source | Sometimes |
-| Cloudflare R2 | Persisted stream and artist-artwork cache | Stores verified bytes |
-| Supabase/Postgres | Authentication and optional synchronized user/recommendation data | No |
-| Ollama/LangGraph | Ask Neatie and Behind the Lyrics | No |
-| ACRCloud | Optional song recognition | No playback source |
+| Location | Responsibility |
+| --- | --- |
+| Main develop tree | Android bootstrap/logic plus unreleased playlist delta-sync changes |
+| Web codex/web-app tree | Conditional Android/browser bootstrap and deployed web/backend work |
+| app/lib/main.dart / main_android.dart | Platform entry; main_android exists in web tree |
+| app/lib/web/ | Browser shell, audio/player, auth, library, catalog and diagnostics |
+| app/lib/logic/ | Android state and reusable metadata |
+| ingestion/python_proxy/auralis_backend/ | FastAPI, worker, Search/Home, source/stream, Charts/Releases, lyrics/assistant/recognition |
+| ingestion/browser_audio/ | Optional browser-backed transport in web tree |
+| deploy/production/ / tools/ | Compose/gateways/backup/deploy helpers and local checks |
+| runtime/, .env, cookies | Ignored local/private state; Git alone is not a full runtime transfer |
+| Android CMake / managedJniLibs | Current release native build; legacy ignored jniLibs may remain in archives |
 
-## Core Design Decisions
+The trees intentionally differ: main develop remains committed e720709; the web application checkpoint is e4e7529, including H01–H14 and the October 5 quiet minimal frontend. H09 extends verification of existing history; H10–H14 improve presentation/freshness. The user's visual preference is quiet minimal with desktop priority: restrained dark surfaces, warm typography, soft sage accents, generous spacing, artwork and a compact playback dock. Home is the initial web destination; the phone dock expands into the same playback session. CURRENT_STATUS owns the verified serving build. Fresh supply and device acceptance remain open. Inspect Git status and owning implementation; preserve unrelated changes.
 
-- The backend is the only authority for active/prepared home-feed promotion.
-- Home feed composition uses persisted candidate inventory; live broad retrieval does not belong in `/recommend`.
-- Canonical identity and playable source identity are separate.
-- MusicBrainz defines entities; it does not prove that an entity can play.
-- Search selects one canonical lead and builds all artist-specific surfaces from it.
-- Popular Radio owns an independent artist catalog and allocation space.
-- History rows are hidden until earned rather than shortened or fabricated.
-- `Frequently Listened` is play-count ordered; `Last Played` is chronological.
-- Hidden Gems was removed because it duplicated Quiet Picks.
-- Optional album/radio rows must be internally complete before appearing, but cannot prevent the core feed from being served.
-- Provider failures are isolated and persisted; completed acquisition should not be discarded.
-- Replaced systems are removed rather than retained as parallel safety layers.
+## External services and rules
 
-## Current Branch and Checkpoints
+Supabase owns auth/cloud library. R2 optionally stores durable validated stream/artwork bytes. YTMusic/YouTube and eligible Audius sources provide playable candidates; yt-dlp/browser transport acquire bytes. MusicBrainz provides canonical evidence, Last.fm/ListenBrainz discovery/charts, LRCLIB lyric fallback. Provider metadata or identity does not prove playback, meaningful art or usable details.
 
-- Active branch: `travel/work`
-- Current committed head: `9fd0956`
-- Backend checkpoint: `c378092`
-- Flutter checkpoint: `30b0ae4`
-- Branding checkpoint: `ac4ce49`
-- Flutter dependency/launcher checkpoint: `9fd0956`
-
-The `pubspec`/lock edits are already committed. The current working tree is a large intentional canonical search, artwork, progressive UI, and bounded source-resolution checkpoint. It should be split into logical commits; the handoff package and `AGENTS.md` are still untracked until committed. The current handoff supersedes the earlier claim that the final search/artwork correction was only awaiting device validation: multiple device passes have now exposed concrete remaining faults.
-
-## Current Travel-Branch Outcome
-
-What improved:
-
-- Flutter client-side search caching and selection overrides were removed.
-- Provider/MusicBrainz artist identities can coalesce through authoritative evidence.
-- Search now fails closed on unresolved competing recording credits instead of knowingly expanding the wrong artist.
-- Dio main and related artist artwork improved after R2 dependency/identity fixes.
-- Related artists moved below target-specific results; artist albums precede regular albums.
-- Background source verification is capped and systemic yt-dlp format failures open a short circuit.
-
-What remains before search can be called complete:
-
-- canonical recording evidence starts too late and can time out after classification;
-- Flutter still promotes the first track to Top result when the backend returns no target;
-- containing album resolution loses useful canonical release identity;
-- album/playlist proxy paths are admitted before artwork bytes are verified;
-- album detail artwork hydration does not update the canonical search catalog;
-- snapshot revisions and logs advance without visible enrichment;
-- latency and related-artist completion remain inconsistent.
-
-The exact device-pass chronology and resolution matrix are in `CURRENT_STATUS.md`.
-
-## What Was Proven Versus What Was Observed
-
-Automated backend tests prove contracts against fixtures and controlled provider behavior. They do not prove:
-
-- real YTMusic response time;
-- YouTube bot/age/geo behavior;
-- Flutter cache-file lifecycle;
-- emulator queue audio continuity;
-- real feed rotation timing;
-- artwork persistence across device/backend restarts.
-
-Always distinguish:
-
-- **implemented** — code exists;
-- **automated-test verified** — focused tests passed;
-- **device verified** — the user observed correct behavior;
-- **production proven** — repeated behavior with real providers.
-
-The last inherited broad focused result was `127 passed` before later travel-branch changes. On 2026-08-02 the combined modified test gate could not start because the Codex shell had no installed/active Python interpreter. Do not describe this exact working tree as automated-test verified until the commands in `NEXT_STEPS.md` run successfully.
-
-## Travel Continuation Model
-
-The Codex conversation itself does not live inside this repository. A new agent should use:
-
-1. `AGENTS.md`
-2. `docs/handoff/CURRENT_STATUS.md`
-3. `docs/handoff/NEXT_STEPS.md`
-4. `docs/handoff/ARCHITECTURE.md`
-5. `docs/handoff/KNOWN_ISSUES.md`
-6. this file
-
-The repository is already on the travel device and the active branch is `travel/work`. If another archive is made, it must still contain ignored private/runtime/native state as explained in `NEXT_STEPS.md`. Git alone does not carry `.env`, runtime databases, cookies, or packaged native `.so` files.
+Preserve one canonical Search/source pipeline and one backend-owned Home lifecycle. Feed composition consumes persisted supply; provider work is bounded/background, and radio is independent. Canonical identity is not playability. Never expose credentials/private runtime in docs/Git. Documentation-only work does not authorize application changes/deployment.

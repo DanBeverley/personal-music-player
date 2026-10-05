@@ -265,6 +265,7 @@ class HomeFeedWorker:
             request,
             outcome.snapshot_id,
             taste.profile_key,
+            taste=taste,
         )
         state = self._repositories.state.reconcile(job.user_scope_id)
         current_artifacts = [
@@ -342,6 +343,7 @@ class HomeFeedWorker:
         request: SearchRequest,
         snapshot_id: str,
         profile_fingerprint: str,
+        taste: Any = None,
     ) -> None:
         if not snapshot_id:
             return
@@ -355,6 +357,7 @@ class HomeFeedWorker:
             candidate,
             self._server,
             limit=160,
+            taste=taste,
         )
         if artwork_records:
             offset = (

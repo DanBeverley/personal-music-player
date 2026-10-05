@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Mapping
 import json
 import time
 import uuid
@@ -111,6 +111,8 @@ class ArtistRadioInventory:
                     == artist_artwork_token(card.get("seed_artist_identity"))
                     and str(card.get("artwork_owner_identity") or "").strip()
                     == str(card.get("seed_artist_identity") or "").strip()
+                    and str(card.get("thumbnail") or "").strip()
+                    == f"/artist_artwork/{artist_artwork_token(card.get('seed_artist_identity'))}"
                 )
             )
             and bool(
@@ -120,6 +122,8 @@ class ArtistRadioInventory:
                     if str(value or "").strip().startswith("/artist_artwork/")
                 ]
             )
+            and (str(card.get("radio_mode") or "").casefold() != "multi_artist_mix"
+                 or _radio_mix_artwork_complete(card))
             and len(card.get("tracks") or card.get("items") or [])
             >= POPULAR_RADIO_CARD_MIN_TRACKS
             and all(_radio_metadata_complete(track) and _is_playable_radio_record(track)
@@ -130,9 +134,8 @@ class ArtistRadioInventory:
         )
         if not qualified:
             return False
-        discovery = sum(str(card.get("seed_affinity") or "").casefold() in {"related", "exploratory"} for card in self.cards)
-        mixes = sum(str(card.get("radio_mode") or "").casefold() == "multi_artist_mix" for card in self.cards)
-        return discovery >= 3 and mixes >= 2
+        from ..home_feed.contracts import evaluate_popular_radio_contract
+        return evaluate_popular_radio_contract(self.cards).accepted
 
 
 def _key(user_scope_id: str) -> str:
@@ -171,6 +174,18 @@ def _radio_source_key(item: Dict[str, Any]) -> str:
     source = str(playback.get("source_id") or item.get("playable_source_id") or item.get("playback_source_id")
                  or item.get("source_id") or item.get("videoId") or item.get("id") or _track_key(item)).strip()
     return source.removeprefix("youtube:").removeprefix("ytmusic:track:")
+
+
+def _radio_mix_artwork_complete(card: Mapping[str, Any]) -> bool:
+    """Mix images must belong to at least two distinct credited identities."""
+    identities = {str(value or "").strip().casefold()
+                  for value in card.get("seed_artist_identities") or []
+                  if str(value or "").strip()}
+    images = {str(value or "").strip() for value in card.get("collage_images") or []
+              if str(value or "").startswith("/artist_artwork/")}
+    expected = {f"/artist_artwork/{artist_artwork_token(identity)}" for identity in identities}
+    return bool(len(identities) >= 2 and len(expected & images) >= 2
+                and images.issubset(expected) and card.get("thumbnail") in expected)
 
 
 def _merge_radio_tracks(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -465,6 +480,8 @@ def _merge_radio_catalog_index(
     This is intentionally lazy/idempotent: completed acquisition rows are the
     durable source of truth and are compacted into one bounded row per seed.
     """
+    from .source_registry import _apply_source, _verified_source
+
     try:
         connection = open_recommendation_store_connection(server)
     except Exception:
@@ -476,7 +493,7 @@ def _merge_radio_catalog_index(
             "WHERE namespace = ? ORDER BY updated_at DESC LIMIT 500",
             [ACQUISITION_JOB_NAMESPACE],
         ).fetchall()
-        source_cache: Dict[str, Dict[str, Any]] = {}
+        source_cache: Dict[str, List[Dict[str, Any]]] = {}
         source_keys: set[str] = set()
         for row in rows:
             try:
@@ -513,7 +530,7 @@ def _merge_radio_catalog_index(
                             or float(payload.get("expires_at")) > time.time()
                         )
                     ):
-                        source_cache[str(source_row["entity_key"])] = {
+                        source_cache.setdefault(str(source_row["entity_key"]), []).append({
                             **payload,
                             "source_id": source_row["source_key"],
                             "playable_source_id": source_row["source_key"],
@@ -521,7 +538,7 @@ def _merge_radio_catalog_index(
                             "source_verified": True,
                             "provider": source_row["source_provider"],
                             "source_authority": source_row["source_authority"],
-                        }
+                        })
         touched: Dict[str, List[Dict[str, Any]]] = {}
         for row in rows:
             try:
@@ -540,13 +557,12 @@ def _merge_radio_catalog_index(
                 if not isinstance(raw, dict) or not _track_key(raw):
                     continue
                 if not _is_playable_radio_record(raw):
-                    cached = source_cache.get(_track_key(raw)) or source_cache.get(catalog_entity_key("track", raw)) or {}
-                    # Source verification supplies playback facts, but sparse
-                    # cached metadata must not erase an acquisition's credit.
-                    raw = {**cached, **{key: value for key, value in raw.items()
-                                       if value not in (None, "", [], {})
-                                       and key not in {"playable", "source_verified", "source_id", "playable_source_id"}}}
-                    raw = raw if _is_playable_radio_record(raw) else None
+                    sources = source_cache.get(_track_key(raw)) or source_cache.get(catalog_entity_key("track", raw)) or []
+                    # Matching a canonical key alone does not prove this edition
+                    # is playable. Reuse the exact existing source matcher before
+                    # projecting physical playback onto a retained catalog row.
+                    matched = _verified_source(sources, raw)
+                    raw = _apply_source(raw, matched) if matched else None
                 if raw is None:
                     continue
                 for seed_key in _radio_seed_keys(raw, fallback):
@@ -1781,16 +1797,15 @@ def select_radio_rotation(
         # Do not weaken the card contract while selecting.  Invalid cards are
         # never admitted as a fallback or counted as novelty.
         is_mix = str(card.get("radio_mode") or "").strip().casefold() in {"multi_artist_mix", "mix", "artist_mix"}
-        mix_sources = [str(value).strip() for value in (card.get("seed_artist_identities") or []) if str(value).strip()]
-        valid_mix = is_mix and len(set(mix_sources)) >= 2 and sum(
-            str(value or "").startswith("/artist_artwork/") for value in (card.get("collage_images") or [])
-        ) >= 2
+        valid_mix = is_mix and _radio_mix_artwork_complete(card)
         if (
             not str(card.get("thumbnail") or "").startswith("/artist_artwork/")
+            or (is_mix and not valid_mix)
             or not str(card.get("seed_artist_identity") or "").strip()
             or (not valid_mix and (not str(card.get("artwork_owner_token") or "").strip()
             or str(card.get("artwork_owner_token") or "").strip() != str(card.get("seed_artist_identity_token") or "").strip()
             or str(card.get("seed_artist_identity_token") or "").strip() != artist_artwork_token(card.get("seed_artist_identity"))
+            or str(card.get("thumbnail") or "").strip() != f"/artist_artwork/{artist_artwork_token(card.get('seed_artist_identity'))}"
             or str(card.get("artwork_owner_identity") or "").strip() != str(card.get("seed_artist_identity") or "").strip()))
             or not any(
                 str(value or "").startswith("/artist_artwork/")
@@ -1928,8 +1943,9 @@ def select_radio_rotation(
     overlap_count = len(fallback)
     valid_count = len(novel) + len(fallback_candidates)
     diagnostics = dict(inventory.diagnostics or {})
+    valid_reservoir = [candidate[0] for candidate in [*novel, *fallback_candidates]]
     reservoir_discovery_count = sum(
-        is_genuine_discovery((card,)) for card in reservoir
+        is_genuine_discovery((card,)) for card in valid_reservoir
     )
     selected_discovery_count = sum(
         is_genuine_discovery((card,)) for card in selected
@@ -1954,7 +1970,7 @@ def select_radio_rotation(
     )
     reservoir_unexposed_count = sum(
         _radio_card_identity(card) not in exposure_ledger
-        for card in reservoir
+        for card in valid_reservoir
         if isinstance(card, dict) and _radio_card_identity(card)
     )
     unexposed_deficit = max(
@@ -1964,9 +1980,12 @@ def select_radio_rotation(
     selected_ids = {
         str(card.get("id") or "").strip() for card in selected if str(card.get("id") or "").strip()
     }
-    selected_identity_ids = {
-        _radio_card_identity(card) for card in selected if _radio_card_identity(card)
-    }
+    def actual_artist_identities(card: Dict[str, Any]) -> set[str]:
+        if str(card.get("radio_mode") or "").casefold() == "multi_artist_mix":
+            return {_artist_key(value) for value in card.get("seed_artist_identities") or [] if _artist_key(value)}
+        return {_radio_card_identity(card)} - {""}
+
+    selected_identity_ids = {identity for card in selected for identity in actual_artist_identities(card)}
     comparison_ids = {
         str(value).strip() for value in (comparison_card_ids if comparison_card_ids is not None else excluded_card_ids)
         if str(value).strip()
@@ -1979,7 +1998,7 @@ def select_radio_rotation(
             or identity in comparison_ids
         ):
             if identity:
-                comparison_identity_ids.add(identity)
+                comparison_identity_ids.update(actual_artist_identities(card))
     novel_identity_count = len(selected_identity_ids - comparison_identity_ids)
     diagnostics.update({
         "reservoir_size": len(reservoir),
@@ -2032,7 +2051,7 @@ def select_radio_rotation(
             RADIO_VISIBLE_DISCOVERY_TARGET - selected_discovery_novel_count, 0
         ),
         "novel_identity_count": novel_identity_count,
-        "fresh_rotation": novel_identity_count >= min(RADIO_VISIBLE_DISCOVERY_MINIMUM, 4),
+        "fresh_rotation": novel_identity_count >= 3,
         "exact_identity_set_reshuffle": bool(
             selected_ids and comparison_ids and selected_ids == comparison_ids
         ),

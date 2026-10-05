@@ -82,6 +82,7 @@ class CandidateEnrichmentPlan:
     radio_discovery_cursor_next: int = 0
     prior_request_progress: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     priority_pools: tuple[str, ...] = ()
+    album_seed_diagnostics: Dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -1643,6 +1644,7 @@ def build_enrichment_plan(
         or any(album_shortages.values())
         or album_reserve_shortage > 0
     )
+    album_seed_diagnostics: Dict[str, int] = {}
     if album_work_needed:
         album_artist_counts = {
             str(key): int(value or 0)
@@ -1659,7 +1661,7 @@ def build_enrichment_plan(
         album_seed_artists = _unique(
             [
                 *album_priority_artists,
-                *all_anchor_artists,
+                *rotated_artists,
                 *list(ledger.get("album_expansion_artist_seeds") or []),
                 *list(ledger.get("backbone_artist_seeds") or []),
             ],
@@ -1695,7 +1697,9 @@ def build_enrichment_plan(
                 if index < len(supported):
                     interleaved.append(supported[index])
             album_seed_artists = interleaved
-        for artist in album_seed_artists[:16]:
+        selected_album_seeds = 0
+        exhausted_album_seeds = 0
+        for artist in album_seed_artists:
             if normalize_artist_name(artist) in {"", "unknown", "unknown artist"}:
                 continue
             artist_key = " ".join(artist.casefold().split())
@@ -1710,7 +1714,7 @@ def build_enrichment_plan(
                     0,
                 ),
             }
-            requests.append(
+            artist_requests = [
                 EnrichmentRequest(
                     kind="album_catalog",
                     provider="ytmusic",
@@ -1720,9 +1724,9 @@ def build_enrichment_plan(
                     limit=3,
                     metadata={**base_metadata, "provider": "ytmusic"},
                 )
-            )
+            ]
             if artist_mbid:
-                requests.append(
+                artist_requests.append(
                     EnrichmentRequest(
                         kind="album_catalog",
                         provider="musicbrainz",
@@ -1742,6 +1746,31 @@ def build_enrichment_plan(
                         },
                     )
                 )
+            eligible_requests = []
+            for request in artist_requests:
+                progress = (request_progress.get(_request_progress_signature(request))
+                            or request_progress.get(_request_signature(request)) or {})
+                if (
+                    progress.get("exhausted") is True
+                    or _text(progress.get("state")).casefold() == "exhausted"
+                ):
+                    continue
+                eligible_requests.append(request)
+            if not eligible_requests:
+                exhausted_album_seeds += 1
+                continue
+            # Apply the seed bound after terminal provider filtering. Exhausted
+            # frontiers must not hide later profile artists on every pass.
+            requests.extend(eligible_requests)
+            selected_album_seeds += 1
+            if selected_album_seeds >= 16:
+                break
+        album_seed_diagnostics = {
+            "offered_seed_count": len(album_seed_artists),
+            "supported_seed_count": len(supported),
+            "selected_seed_count": selected_album_seeds,
+            "exhausted_seed_count": exhausted_album_seeds,
+        }
     for genre in _profile_genres(taste):
         requests.append(
             EnrichmentRequest(
@@ -1896,6 +1925,7 @@ def build_enrichment_plan(
         artist_cursor_next=artist_cursor_next,
         radio_discovery_cursor_next=radio_discovery_cursor_next,
         prior_request_progress=request_progress,
+        album_seed_diagnostics=album_seed_diagnostics,
         priority_pools=(
             ("album", "similarity", "artist_graph", "profile_spine")
             if int(ledger.get("album_unexposed_artist_deficit") or 0) > 0
@@ -3015,6 +3045,7 @@ def materialize_enrichment_plan(
         pools=pools,
         diagnostics={
             "planned_request_count": len(plan.requests),
+            "album_seed_diagnostics": dict(plan.album_seed_diagnostics),
             "completed_request_count": completed,
             "cached_request_count": cached,
             "scheduled_request_count": len(scheduled),

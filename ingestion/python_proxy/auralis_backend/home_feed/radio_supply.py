@@ -27,6 +27,7 @@ from ..discovery.radio_inventory import (
     select_radio_rotation,
 )
 from ..discovery.source_registry import verify_materialized_supply
+from ..discovery.ranking import admitted_artist_candidates
 from ..discovery.structured_providers import LastFmClient
 from ..search.intelligence import remember_catalog_entity
 from ..storage.artist_artwork import cache_artist_artwork_now
@@ -719,7 +720,9 @@ class RadioSupplyService:
         )
         output: list[dict[str, Any]] = []
         seen: set[str] = set()
-        lanes = [list(inventory.pools.get(name, []) or []) for name in DISCOVERY_SOURCE_POOLS]
+        lanes = [list(admitted_artist_candidates(
+            inventory.pools, taste, source_pools=(name,), row_kind="popular_radio",
+        )) for name in DISCOVERY_SOURCE_POOLS]
         for index in range(max((len(lane) for lane in lanes), default=0)):
             for pool_name, lane in zip(DISCOVERY_SOURCE_POOLS, lanes):
                 if index >= len(lane):

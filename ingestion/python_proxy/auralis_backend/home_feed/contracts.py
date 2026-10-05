@@ -319,6 +319,7 @@ def evaluate_popular_radio_contract(
 
     from ..discovery.radio_inventory import (
         _is_playable_radio_record, _radio_metadata_complete, _radio_source_key,
+        _radio_mix_artwork_complete,
     )
 
     contract = POPULAR_RADIO_CONTRACT
@@ -358,9 +359,12 @@ def evaluate_popular_radio_contract(
         ):
             violations.append(f"radio_artwork_unverified:{identity or index}")
         if str(card.get("radio_mode") or "").strip().casefold() in {"multi_artist_mix", "mix", "artist_mix"}:
-            source_ids = [str(value).strip().casefold() for value in (card.get("seed_artist_identities") or []) if str(value).strip()]
-            if len(set(source_ids)) < 2 or len([value for value in collage if value.startswith(contract.verified_artwork_prefix)]) < 2:
+            if not _radio_mix_artwork_complete(card):
                 violations.append(f"radio_mix_sources_unverified:{identity or index}")
+        else:
+            from ..storage.artist_artwork import artist_artwork_token
+            if thumbnail != f"/artist_artwork/{artist_artwork_token(identity)}":
+                violations.append(f"radio_artwork_owner_mismatch:{identity or index}")
         tracks = card.get("tracks") or card.get("items")
         track_count = len(tracks) if isinstance(tracks, list) else 0
         if track_count < contract.min_tracks_per_card:

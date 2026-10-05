@@ -704,30 +704,18 @@ class RadioSupplyService:
         own_counts: Mapping[str, int],
         exposed_artist_identities: Iterable[str] = (),
     ) -> list[dict[str, Any]]:
-        familiar = {
-            str(value).strip().casefold()
-            for value in (
+        familiar: set[str] = set()
+        for value in (
                 *list(getattr(taste, "listened_artists", []) or []),
                 *list(getattr(taste, "top_artists", []) or []),
                 *list(getattr(taste, "artist_hints", []) or []),
-            )
-            if str(value).strip()
-        }
-        occupied = {
-            str(
-                card.get("seed_artist_identity")
-                or card.get("seed_artist_key")
-                or card.get("artist_name")
-                or ""
-            ).strip().casefold()
-            for card in existing_cards
-            if isinstance(card, Mapping)
-        }
-        occupied.update(
-            str(value or "").strip().casefold()
-            for value in exposed_artist_identities
-            if str(value or "").strip()
-        )
+        ):
+            familiar.update(artist_identity_aliases(str(value or "")))
+        occupied: set[str] = set()
+        for card in existing_cards:
+            occupied.update(artist_identity_aliases(card))
+        for identity in exposed_artist_identities:
+            occupied.update(artist_identity_aliases(str(identity or "")))
         output: list[dict[str, Any]] = []
         seen: set[str] = set()
         lanes = [list(admitted_artist_candidates(
@@ -746,8 +734,7 @@ class RadioSupplyService:
                 if (
                     not name
                     or not identity
-                    or name.casefold() in familiar
-                    or key in occupied
+                    or artist_identity_aliases(item) & (familiar | occupied)
                     or key in seen
                 ):
                     continue
@@ -769,8 +756,10 @@ class RadioSupplyService:
                         "source": pool_name,
                     }
                 )
-                if len(output) >= 12:
-                    return output
+                # Keep the persisted frontier intact. The planner skips
+                # exhausted provider requests before selecting four seeds;
+                # truncating here lets exhausted/aliased seeds starve later
+                # eligible discoveries without saving any network work.
         return output
 
     def _publish_snapshot(self, inventory: ArtistRadioInventory) -> str:

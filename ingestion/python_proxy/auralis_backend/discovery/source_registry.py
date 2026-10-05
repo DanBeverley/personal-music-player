@@ -1762,6 +1762,17 @@ def verify_materialized_supply(
             artwork_updates.append((entity_key, source))
         _store_sources(server, artwork_updates, store_initialized=True)
 
+    def source_for_item(item: Dict[str, Any]) -> Dict[str, Any] | None:
+        # One canonical key may occur with different editions/credits across
+        # albums. The key-level verification cache saves acquisition work;
+        # it cannot authorize that source for every occurrence's metadata.
+        key = _recording_key(item)
+        selected = verified_by_key.get(key)
+        return _verified_source(
+            [*(stored_by_key.get(key) or []), *([selected] if selected else [])],
+            item,
+        )
+
     pools: Dict[str, List[Dict[str, Any]]] = {}
     for pool, items in supply.pools.items():
         if pool != "album":
@@ -1769,7 +1780,7 @@ def verify_materialized_supply(
                 _apply_source(item, source)
                 for item in items or []
                 if isinstance(item, dict)
-                and (source := verified_by_key.get(_recording_key(item))) is not None
+                and (source := source_for_item(item)) is not None
             ]
             continue
         albums: List[Dict[str, Any]] = []
@@ -1780,7 +1791,7 @@ def verify_materialized_supply(
             playable_tracks = [
                 _apply_source(item, source)
                 for item in canonical_tracks
-                if (source := verified_by_key.get(_recording_key(item))) is not None
+                if (source := source_for_item(item)) is not None
             ]
             # Different canonical rows can resolve to the same physical song.
             # Keep the strongest match in track-list order; repeated bytes

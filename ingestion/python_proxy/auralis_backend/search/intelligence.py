@@ -2052,9 +2052,8 @@ def _merge_entity_metadata_payload(
         existing,
         entity_type=entity_type,
     )
-    incoming_has_explicit_artwork = any(
-        incoming.get(key) not in (None, "", [], {})
-        for key in (
+    supplied_artwork = []
+    for key in (
             "thumbnail",
             "thumbnails",
             "artwork_url",
@@ -2064,7 +2063,16 @@ def _merge_entity_metadata_payload(
             "image_url",
             "image",
             "images",
-        )
+            "artwork_source_url",
+            "artwork_source_urls",
+        ):
+        value = incoming.get(key)
+        supplied_artwork.extend(value if isinstance(value, list) else [value])
+    valid_sources = catalog_artwork_source_urls(incoming, entity_type=entity_type)
+    incoming_has_explicit_artwork = any(
+        (value.get("url") or value.get("src") if isinstance(value, dict) else value)
+        in [*valid_sources, *([incoming_thumbnail] if incoming_thumbnail.startswith("/") else [])]
+        for value in supplied_artwork if value
     )
     existing_has_verified_entity_artwork = existing_thumbnail.startswith(
         "/entity_artwork/"
@@ -2100,6 +2108,13 @@ def _merge_entity_metadata_payload(
         merged.pop("thumbnail", None)
 
     if entity_type != "artist":
+        sources = catalog_artwork_source_urls(merged, entity_type=entity_type)
+        if sources:
+            merged["artwork_source_urls"] = sources
+            merged["artwork_source_url"] = sources[0]
+        else:
+            merged.pop("artwork_source_urls", None)
+            merged.pop("artwork_source_url", None)
         return merged
 
     artwork_sources: List[str] = []
@@ -2258,6 +2273,18 @@ def remember_catalog_entity(
                 safe_confidence,
                 float(existing_row["confidence"] or 0.0),
             )
+        repaired_thumbnail = catalog_thumbnail_url(stored_item, entity_type=normalized_type)
+        if repaired_thumbnail:
+            stored_item["thumbnail"] = repaired_thumbnail
+        else:
+            stored_item.pop("thumbnail", None)
+        artwork_sources = catalog_artwork_source_urls(stored_item, entity_type=normalized_type)
+        if artwork_sources:
+            stored_item["artwork_source_urls"] = artwork_sources
+            stored_item["artwork_source_url"] = artwork_sources[0]
+        else:
+            stored_item.pop("artwork_source_urls", None)
+            stored_item.pop("artwork_source_url", None)
         display = _entity_display_fields(stored_item)
         identity = infer_source_identity(stored_item)
         alias_keys = _catalog_alias_keys(

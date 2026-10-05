@@ -1260,42 +1260,80 @@ def rank_albums(
     return output, has_release_metadata
 
 
+def admitted_artist_candidates(
+    pools: Dict[str, List[DiscoveryCandidate]],
+    taste: TasteProfile,
+    *,
+    source_pools: Iterable[str] = ("artist_graph", "similarity", "genre_mood", "popularity"),
+    row_kind: str = "recommended_artists",
+) -> Iterable[DiscoveryCandidate]:
+    """Project admitted credits for both ranking and identity-owned repairs."""
+    for pool in source_pools:
+        for candidate in pools.get(pool) or []:
+            if candidate.item_type not in {"artist", "track"}:
+                continue
+            item = dict(candidate.item)
+            name = _artist_candidate_name(item)
+            if not _artist_key(name):
+                continue
+            item["artist"] = name
+            admitted = replace(candidate, item=item)
+            if not _candidate_is_admitted(admitted, taste, row_kind=row_kind):
+                continue
+            if candidate.item_type == "artist":
+                item["name"] = name
+            else:
+                # Do not project the recording ID or cover as artist evidence.
+                identity = _artist_identity(candidate.item)
+                item = {key: value for key, value in item.items() if key in {
+                    "provider_artist_id", "artist_id", "artistId", "artist_browse_id",
+                    "musicbrainz_artist_id", "canonical_artist_id", "artist_mbid", "mb_artist_id",
+                    "source_authority", "recommendation_path", "compatibility_reason",
+                    "profile_compatibility_score", "artist_graph_keys", "relation_type",
+                    "related_to_artist", "profile_evidence", "profile_spine",
+                }}
+                item.update(id=identity or _artist_key(name), name=name,
+                            thumbnail=_artist_specific_thumbnail(candidate.item))
+                if identity:
+                    if identity.startswith("musicbrainz:artist:"):
+                        item["canonical_artist_id"] = identity
+                    elif not item.get("musicbrainz_artist_id"):
+                        item["provider_artist_id"] = identity.removeprefix("provider:artist:")
+            yield replace(admitted, item=item, item_type="artist")
+
+
 def rank_artists(
     pools: Dict[str, List[DiscoveryCandidate]],
     taste: TasteProfile,
     row: RowRecipe,
 ) -> List[Dict[str, Any]]:
-    explicit_artists = _collect_candidates(pools, ("artist_graph",), item_type="artist")
-    candidates = _collect_candidates(pools, ("artist_graph", "similarity", "genre_mood", "popularity"), item_type="track")
+    projected = list(admitted_artist_candidates(pools, taste))
     counts: Counter[str] = Counter()
     thumbnails: Dict[str, str] = {}
     labels: Dict[str, str] = {}
     ids: Dict[str, str] = {}
+    metadata: Dict[str, Dict[str, Any]] = {}
     taste_artists = _taste_artist_keys(taste)
-    for candidate in explicit_artists:
-        name = _artist_candidate_name(candidate.item)
-        key = _artist_key(name)
-        if not key:
-            continue
-        counts[key] += candidate.score + 2.0
-        labels[key] = name
-        ids[key] = _artist_identity(candidate.item) or str(candidate.item.get("id") or key)
-        thumbnails.setdefault(key, str(candidate.item.get("thumbnail") or ""))
-    for candidate in candidates:
+    for candidate in projected:
         item = candidate.item
         name = _artist_candidate_name(item)
-        key = _artist_key(name)
-        if not key:
+        name_key = _artist_key(name)
+        if not name_key:
             continue
+        identity = _artist_identity(item) or str(item.get("id") or name_key)
+        # Homonymous credits with different provider IDs do not share portraits.
+        key = identity
         weight = candidate.score + SOURCE_WEIGHTS.get(candidate.source.split("+")[0], 0.0)
-        if key in taste_artists:
+        if name_key in taste_artists:
             weight += 0.35
         counts[key] += weight
         labels[key] = name
-        identity = _artist_identity(item)
-        if identity and (key not in ids or ids[key] == key):
-            ids[key] = identity
-        portrait = _artist_specific_thumbnail(item)
+        ids[key] = identity
+        metadata[key] = {field: item[field] for field in (
+            "provider_artist_id", "musicbrainz_artist_id", "canonical_artist_id",
+            "recommendation_path", "compatibility_reason", "profile_compatibility_score",
+        ) if item.get(field)}
+        portrait = str(item.get("thumbnail") or "")
         if portrait and not thumbnails.get(key):
             thumbnails[key] = portrait
     ranked = counts.most_common()
@@ -1305,7 +1343,9 @@ def rank_artists(
         fresh = [
             entry
             for entry in ranked
-            if entry[0] not in avoid
+            if _artist_key(labels.get(entry[0], "")) not in avoid
+            and _artist_key(labels.get(entry[0], "")) not in hard_avoid
+            and entry[0] not in avoid
             and entry[0] not in hard_avoid
             and str(ids.get(entry[0]) or "").casefold() not in avoid
             and str(ids.get(entry[0]) or "").casefold() not in hard_avoid
@@ -1316,6 +1356,7 @@ def rank_artists(
     for key, score in ranked[: row.max_items]:
         output.append(
             {
+                **metadata.get(key, {}),
                 "id": ids.get(key) or key,
                 "name": labels.get(key) or key.title(),
                 "thumbnail": thumbnails.get(key) or "",
@@ -1389,14 +1430,16 @@ def _artist_identity(item: Dict[str, Any]) -> str:
         "id",
     )
     for record in records:
+        if _artist_key(str(record.get("name") or record.get("title") or "")) != _artist_key(_artist_candidate_name(item)):
+            continue
         for field in fields:
             value = str(record.get(field) or "").strip()
             if value:
-                return value
+                return f"musicbrainz:artist:{value.removeprefix('musicbrainz:artist:')}" if field == "musicbrainz_artist_id" else value
     for field in fields[:-1]:
         value = str(item.get(field) or "").strip()
         if value:
-            return value
+            return f"musicbrainz:artist:{value.removeprefix('musicbrainz:artist:')}" if field == "musicbrainz_artist_id" else value
     return ""
 
 
@@ -1412,7 +1455,7 @@ def _artist_specific_thumbnail(item: Dict[str, Any]) -> str:
     artists = item.get("artists")
     if isinstance(artists, list):
         for record in artists:
-            if isinstance(record, dict):
+            if isinstance(record, dict) and _artist_key(str(record.get("name") or record.get("title") or "")) == _artist_key(_artist_candidate_name(item)):
                 value = str(record.get("thumbnail") or record.get("image") or "").strip()
                 if value:
                     return value

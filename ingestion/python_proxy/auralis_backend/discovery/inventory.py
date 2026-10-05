@@ -902,7 +902,7 @@ def candidate_inventory_coverage(
     # published rows. Raw album identities previously reported 147 available
     # while both visible shelves admitted zero.
     from .config import ROW_RECIPES
-    from .ranking import build_personal_mixes, rank_albums
+    from .ranking import admitted_artist_candidates, build_personal_mixes, rank_albums
 
     featured_albums, _ = rank_albums(
         pools,
@@ -939,16 +939,8 @@ def candidate_inventory_coverage(
         for mix in complete_personal_mixes
     )
     artist_ids = {
-        " ".join(
-            str(candidate.item.get("name") or candidate.item.get("artist") or "")
-            .strip()
-            .casefold()
-            .split()
-        )
-        for source in ("artist_graph", "similarity", "collaborative", "profile_spine", "popularity")
-        for candidate in pools.get(source, []) or []
-        if candidate.item_type == "artist"
-        or str(candidate.item.get("name") or candidate.item.get("artist") or "").strip()
+        str(candidate.item.get("id") or candidate.item.get("name") or "")
+        for candidate in admitted_artist_candidates(pools, taste)
     }
     artist_ids.discard("")
     radio_card_count = len(pools.get("popular_radio_cards") or [])
@@ -1508,13 +1500,13 @@ def build_candidate_inventory(
         acquisition_ledger={
             "cycle": int((previous.acquisition_ledger if previous else {}).get("cycle") or 0) + 1,
             "anchor_cursor": int(
-                dict(materialized_supply.diagnostics or {}).get("anchor_cursor_next")
-                or (previous.acquisition_ledger if previous else {}).get("anchor_cursor")
+                diagnostics.get("anchor_cursor_next",
+                    (previous.acquisition_ledger if previous else {}).get("anchor_cursor"))
                 or 0
             ),
             "artist_cursor": int(
-                dict(materialized_supply.diagnostics or {}).get("artist_cursor_next")
-                or (previous.acquisition_ledger if previous else {}).get("artist_cursor")
+                diagnostics.get("artist_cursor_next",
+                    (previous.acquisition_ledger if previous else {}).get("artist_cursor"))
                 or 0
             ),
             "planned_request_count": int(
@@ -1532,6 +1524,11 @@ def build_candidate_inventory(
             "request_progress": dict(
                 dict(materialized_supply.diagnostics or {}).get("request_progress")
                 or (previous.acquisition_ledger if previous else {}).get("request_progress")
+                or {}
+            ),
+            "album_seed_diagnostics": dict(
+                diagnostics.get("album_seed_diagnostics")
+                or (previous.acquisition_ledger if previous else {}).get("album_seed_diagnostics")
                 or {}
             ),
             "backbone_artist_seeds": backbone_artist_seeds,

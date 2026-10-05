@@ -22,6 +22,7 @@ TRUSTED_AUTHORITIES = {
 GLOBAL_REGION_KEYS = {"global", "world", "international"}
 
 DISCOVERY_ROWS = {
+    "recommended_artists",
     "todays_pick",
     "made_for_you",
     "because_you_played",
@@ -48,6 +49,7 @@ EXPLORATORY_SOURCES = {
 BROAD_GLOBAL_PATHS = {"", "broad_global", "unproven"}
 
 PERSONAL_PATH_ROWS = {
+    "recommended_artists",
     "todays_pick",
     "made_for_you",
     "because_you_played",

@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import unicodedata
 import math
+from urllib.parse import urlparse
 from typing import Any, Dict, Iterable, List, Sequence
 
 from ..storage.postgres import upsert_catalog_rows
@@ -409,6 +410,18 @@ def verified_playback_source(item: Dict[str, Any]) -> Dict[str, str]:
     return {}
 
 
+def is_placeholder_artwork_url(value: Any) -> bool:
+    """Last.fm's observed star image is a successful response, not artwork."""
+    try:
+        parsed = urlparse(_text(value))
+        host = (parsed.hostname or "").casefold()
+        return (host in {"lastfm.freetls.fastly.net", "lastfm-img.freetls.fastly.net"}
+                and parsed.path.rsplit("/", 1)[-1].split(".", 1)[0].casefold()
+                == "2a96cbd8b46e442fc41c2b86b821562f")
+    except ValueError:
+        return False
+
+
 def catalog_thumbnail_url(
     item: Dict[str, Any],
     *,
@@ -464,6 +477,8 @@ def catalog_artwork_source_urls(
         url = _text(value)
         if not url.startswith(("http://", "https://")):
             return
+        if is_placeholder_artwork_url(url):
+            return
         youtube_match = _YOUTUBE_THUMBNAIL_ID_RE.search(url)
         if youtube_match:
             source_id = youtube_match.group(1)
@@ -479,7 +494,8 @@ def catalog_artwork_source_urls(
         if url not in urls:
             urls.append(url)
 
-    for value in item.get("artwork_source_urls") or []:
+    raw_sources = item.get("artwork_source_urls") or []
+    for value in raw_sources if isinstance(raw_sources, list) else [raw_sources]:
         add(value)
     for key in (
         "artwork_source_url",
@@ -520,6 +536,9 @@ def catalog_artwork_source_urls(
                 # Let catalog_thumbnail_url use its verified-video fallback;
                 # the artist portrait is not a track cover.
                 urls = []
+        source = verified_playback_source(item)
+        if source.get("provider") == "youtube":
+            add(f"https://i.ytimg.com/vi/{source['source_id']}/hqdefault.jpg")
     return urls
 
 
@@ -798,6 +817,13 @@ def normalized_track_payload(track: Dict[str, Any]) -> Dict[str, Any]:
         if playback["provider"] == "youtube":
             payload["videoId"] = playback["source_id"]
     thumbnail = catalog_thumbnail_url(payload, entity_type="track")
+    sources = catalog_artwork_source_urls(payload, entity_type="track")
+    if sources:
+        payload["artwork_source_urls"] = sources
+        payload["artwork_source_url"] = sources[0]
+    else:
+        payload.pop("artwork_source_urls", None)
+        payload.pop("artwork_source_url", None)
     if thumbnail:
         payload["thumbnail"] = thumbnail
     else:

@@ -30,7 +30,7 @@ from ..discovery.radio_inventory import (
     radio_card_candidates,
     select_radio_rotation,
 )
-from ..discovery.ranking import build_rows_from_pools
+from ..discovery.ranking import admitted_artist_candidates, build_rows_from_pools
 from ..discovery.schema import DiscoveryArtifact, DiscoveryRow
 from ..search.intelligence import load_catalog_artist_records, normalize_artist_name
 from ..storage.artist_artwork import attach_persisted_artist_artwork
@@ -135,17 +135,24 @@ def candidate_artist_artwork_repairs(
     server: Any,
     *,
     limit: int = 8,
+    taste: Any = None,
 ) -> list[dict[str, Any]]:
     """Return bounded artist-only candidates without verified persisted art."""
     artists: list[dict[str, Any]] = []
     seen: set[tuple[tuple[str, str], ...]] = set()
-    for pool in (candidate.pools or {}).values():
+    pools = ({"admitted": list(admitted_artist_candidates(candidate.pools, taste))}
+             if taste is not None else candidate.pools)
+    for pool in (pools or {}).values():
         for entry in pool or []:
             if getattr(entry, "item_type", "track") != "artist":
                 continue
             item = dict(getattr(entry, "item", {}) or {})
             name = str(item.get("name") or item.get("artist") or "").strip()
             stable_ids = _stable_artist_ids(item)
+            if str(item.get("id") or "") == normalize_artist_name(name) and not any(
+                item.get(field) for field in ("provider_artist_id", "musicbrainz_artist_id", "canonical_artist_id", "artist_id")
+            ):
+                stable_ids = set()
             if not name or not stable_ids:
                 continue
             identity = tuple(sorted(stable_ids))

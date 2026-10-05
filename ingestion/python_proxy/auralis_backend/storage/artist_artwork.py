@@ -8,7 +8,7 @@ import threading
 import time
 from typing import Any, Callable, Dict
 
-from ..domain.catalog import catalog_artwork_source_urls
+from ..domain.catalog import catalog_artwork_source_urls, is_placeholder_artwork_url
 from ..recommend.store_runtime import open_recommendation_store_connection
 
 try:
@@ -42,6 +42,11 @@ _ENTITY_PENDING_LOCK = threading.Lock()
 _TOKEN_RE = re.compile(r"^[a-f0-9]{32}$")
 _SOURCE_RETRY_SECONDS = 6 * 60 * 60
 _ENTITY_SOURCE_ATTEMPT_LIMIT = 4
+# SHA-256 of the inspected 174px/300px Last.fm star PNG responses.
+_PLACEHOLDER_IMAGE_HASHES = {
+    "2e751fc6de153bcb0070857465fdd1622aece7604496a4ebdef69b02bac5d8c9",
+    "fad5bb8e6aadc987246977682d7b85fd841fc5ff048b955df4837189beacffcf",
+}
 
 
 def _clean(value: Any) -> str:
@@ -91,6 +96,8 @@ def _artist_artwork_source_urls(artist: Dict[str, Any]) -> list[str]:
 
 
 def _valid_image_bytes(data: bytes, content_type: str) -> bool:
+    if hashlib.sha256(data).hexdigest() in _PLACEHOLDER_IMAGE_HASHES:
+        return False
     normalized_type = _clean(content_type).casefold()
     if normalized_type in {"image/jpeg", "image/jpg"}:
         return data.startswith(b"\xff\xd8\xff")
@@ -109,7 +116,7 @@ def _download_artwork(
     server: Any,
     source_url: str,
 ) -> tuple[bytes, str] | None:
-    if not _http_artwork_url(source_url):
+    if not _http_artwork_url(source_url) or is_placeholder_artwork_url(source_url):
         return None
     try:
         response = server.upstream_http.get(
@@ -313,6 +320,8 @@ class ArtistArtworkCache:
         if not _TOKEN_RE.match(token):
             return None
         with self._verified_tokens_lock:
+            if token in self._missing_tokens:
+                return None
             if token in self._verified_tokens:
                 return {"content_type": "image/jpeg", "content_length": 1}
         try:
@@ -325,6 +334,11 @@ class ArtistArtworkCache:
         content_length = int(response.get("ContentLength") or 0)
         if content_length <= 0:
             return None
+        if (response.get("Metadata") or {}).get("artwork-validation") != "meaningful-v1":
+            legacy = self.read(token)
+            if legacy is None:
+                return None
+            return {"content_type": legacy[1], "content_length": len(legacy[0])}
         with self._verified_tokens_lock:
             self._verified_tokens.add(token)
             self._missing_tokens.discard(token)
@@ -343,7 +357,7 @@ class ArtistArtworkCache:
             )
             body = response["Body"]
             try:
-                data = body.read()
+                data = body.read(2 * 1024 * 1024 + 1)
             finally:
                 body.close()
         except Exception as exc:
@@ -359,7 +373,8 @@ class ArtistArtworkCache:
                     self._missing_tokens.add(token)
                     self._verified_tokens.discard(token)
             return None
-        if not data:
+        content_type = _clean(response.get("ContentType")) or "image/jpeg"
+        if not data or len(data) > 2 * 1024 * 1024 or not _valid_image_bytes(data, content_type):
             with self._verified_tokens_lock:
                 self._missing_tokens.add(token)
                 self._verified_tokens.discard(token)
@@ -367,7 +382,7 @@ class ArtistArtworkCache:
         with self._verified_tokens_lock:
             self._verified_tokens.add(token)
             self._missing_tokens.discard(token)
-        return data, _clean(response.get("ContentType")) or "image/jpeg"
+        return data, content_type
 
     def object_missing(self, token: str) -> bool:
         with self._verified_tokens_lock:
@@ -401,6 +416,7 @@ class ArtistArtworkCache:
                         cache_identity or canonical_artist_id
                     )[:512],
                     "cached-at": str(int(time.time())),
+                    "artwork-validation": "meaningful-v1",
                 },
             )
             with self._verified_tokens_lock:
@@ -622,6 +638,10 @@ def attach_persisted_artist_artwork(
 ) -> Dict[str, Any]:
     """Attach only explicitly persisted verified artwork; never performs R2 I/O."""
     updated = dict(artist or {})
+    if is_placeholder_artwork_url(updated.get("artwork_source_url")):
+        updated.pop("thumbnail", None)
+        updated["artwork_cache_status"] = "pending"
+        return updated
     status = _clean(updated.get("artwork_cache_status")).casefold()
     token = _clean(updated.get("artwork_cache_token"))
     identity = _clean(updated.get("artwork_cache_identity"))

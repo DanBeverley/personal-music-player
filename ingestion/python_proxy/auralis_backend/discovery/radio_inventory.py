@@ -1939,25 +1939,20 @@ def select_radio_rotation(
     fallback_candidates = [candidate for _score, candidate in fallback]
 
     target_limit = min(15, 12 + (max(int(epoch or 0), 0) % 4))
+    mixes = [candidate for candidate in [*novel, *fallback_candidates]
+             if str(candidate[0].get("radio_mode") or "").strip().casefold() == "multi_artist_mix"]
     discovery_novel = [
         candidate for candidate in novel
         if is_genuine_discovery(candidate)
     ]
-    familiar_novel = [candidate for candidate in novel if candidate not in discovery_novel]
+    familiar_novel = [candidate for candidate in novel
+                      if candidate not in discovery_novel and candidate not in mixes]
     discovery_fallback = [
         candidate for candidate in fallback_candidates
         if is_genuine_discovery(candidate)
     ]
-    selected_candidates = [
-        *familiar_novel[: max(target_limit - RADIO_VISIBLE_DISCOVERY_TARGET, 0)],
-        *[ *discovery_novel, *discovery_fallback ][:RADIO_VISIBLE_DISCOVERY_TARGET],
-    ]
-    selected_candidates.extend(
-        candidate for candidate in [*familiar_novel, *discovery_novel, *fallback_candidates]
-        if candidate not in selected_candidates
-    )
-    selected_candidates = selected_candidates[:target_limit]
-    mixes = [candidate for candidate in [*novel, *fallback_candidates] if str(candidate[0].get("radio_mode") or "").strip().casefold() == "multi_artist_mix"]
+    familiar_fallback = [candidate for candidate in fallback_candidates
+                         if candidate not in discovery_fallback and candidate not in mixes]
     # Reservoir generations retain old mixes. Selecting all of them can repeat
     # source artists across mixes and fail the publication identity contract.
     # Reserve two disjoint pairs, then fill with the already ranked artist cards.
@@ -1969,12 +1964,15 @@ def select_radio_rotation(
             right[0].get("seed_artist_identities") or []
         )
     ), [])
-    artist_candidates = [
-        candidate for candidate in [*selected_candidates, *novel, *fallback_candidates]
-        if candidate not in mixes
+    # Mixes have their own slots. Retained mixes must not displace familiar
+    # artists and make a slice consume discovery reserved for its successors.
+    artist_limit = max(target_limit - len(mix_pair), 0)
+    selected_candidates = [
+        *mix_pair,
+        *familiar_novel[:max(artist_limit - RADIO_VISIBLE_DISCOVERY_TARGET, 0)],
+        *[*discovery_novel, *discovery_fallback][:RADIO_VISIBLE_DISCOVERY_TARGET],
     ]
-    selected_candidates = list(mix_pair)
-    for candidate in artist_candidates:
+    for candidate in [*familiar_novel, *familiar_fallback, *discovery_novel, *discovery_fallback]:
         if candidate not in selected_candidates:
             selected_candidates.append(candidate)
         if len(selected_candidates) >= target_limit:

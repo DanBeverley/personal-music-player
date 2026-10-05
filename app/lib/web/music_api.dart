@@ -105,10 +105,45 @@ class MusicApi {
           resolved.host.isEmpty) {
         return null;
       }
+      if (const {'lastfm.freetls.fastly.net', 'lastfm-img.freetls.fastly.net'}
+              .contains(resolved.host.toLowerCase()) &&
+          resolved.pathSegments.isNotEmpty &&
+          resolved.pathSegments.last.split('.').first.toLowerCase() ==
+              '2a96cbd8b46e442fc41c2b86b821562f') return null;
       return resolved;
     } on FormatException {
       return null;
     }
+  }
+
+  List<String> artworkUrls(Map<String, dynamic> item, String type) {
+    final track = type == 'track' || type == 'tracks';
+    final source = track ? extractPlaybackSourceId(item) : null;
+    final youtube = source != null && extractPlaybackProvider(item) == 'youtube' &&
+        item['playable'] != false && RegExp(r'^[A-Za-z0-9_-]{11}$').hasMatch(source);
+    final values = <dynamic>[item['thumbnail'], item['thumbnail_url'],
+      if (type == 'artist' || type == 'artists') item['artist_thumbnail'],
+      item['artwork_url'], item['artwork'], item['cover_url'], item['image_url'],
+      if (item['artwork_source_urls'] is List) ...item['artwork_source_urls'] as List,
+      item['artwork_source_url'],
+      if (item['thumbnails'] is List) ...(item['thumbnails'] as List).reversed,
+      if (item['images'] is List) ...(item['images'] as List).reversed,
+      if (youtube) 'https://i.ytimg.com/vi/$source/hqdefault.jpg',
+    ];
+    final urls = <String>[];
+    for (var value in values) {
+      if (value is Map) value = value['url'] ?? value['src'];
+      if (value is! String) continue;
+      final uri = artworkUri(value);
+      if (uri == null) continue;
+      final videoImage = RegExp(r'/vi(?:_webp)?/([^/]+)/').firstMatch(uri.path);
+      if (track && videoImage != null &&
+          (!youtube || videoImage.group(1) != source)) continue;
+      if (track && value == item['artist_thumbnail']) continue;
+      final url = uri.toString();
+      if (!urls.contains(url)) urls.add(url);
+    }
+    return urls;
   }
 
   Future<Map<String, dynamic>> post(

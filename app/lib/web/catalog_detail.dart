@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import 'catalog_api.dart';
+import 'artwork_image.dart';
 import 'music_api.dart';
 import 'web_player.dart';
 
@@ -17,6 +18,8 @@ class CatalogDetail extends StatefulWidget {
     required this.onLike,
     required this.onOpen,
     required this.onBack,
+    this.isLiked,
+    this.onTrackOptions,
   });
 
   final CatalogApi api;
@@ -27,6 +30,8 @@ class CatalogDetail extends StatefulWidget {
   final Future<void> Function(Map<String, dynamic>) onLike;
   final void Function(String kind, String id, String title) onOpen;
   final VoidCallback onBack;
+  final bool Function(Map<String, dynamic>)? isLiked;
+  final ValueChanged<Map<String, dynamic>>? onTrackOptions;
 
   @override
   State<CatalogDetail> createState() => _CatalogDetailState();
@@ -96,8 +101,6 @@ class _CatalogDetailState extends State<CatalogDetail> {
     return _text(value);
   }
 
-  String get _thumbnail => _text(_detail?['thumbnail']);
-
   String get _biography {
     final full = _text(_detail?['full_description']);
     return full.isNotEmpty ? full : _text(_detail?['description']);
@@ -153,7 +156,8 @@ class _CatalogDetailState extends State<CatalogDetail> {
         _Header(
           title: _title,
           artist: _artist,
-          thumbnail: widget.api.api.artworkUri(_thumbnail)?.toString() ?? '',
+          thumbnail: widget.api.api
+              .artworkUrls(_detail ?? {}, _isArtist ? 'artist' : 'album'),
         ),
         const SizedBox(height: 20),
         if (_isArtist && _biography.isNotEmpty) ...[
@@ -212,7 +216,7 @@ class _CatalogDetailState extends State<CatalogDetail> {
       child: ListTile(
         enabled: id.isNotEmpty,
         leading: _Cover(
-          url: widget.api.api.artworkUri(album['thumbnail'])?.toString() ?? '',
+          urls: widget.api.api.artworkUrls(album, 'album'),
           size: 48,
         ),
         title: Text(title.isEmpty ? 'Untitled album' : title),
@@ -229,13 +233,25 @@ class _CatalogDetailState extends State<CatalogDetail> {
         _text(track['channel'] ?? track['artist'] ?? track['author']);
     return ListTile(
       leading: _Cover(
-        url: widget.api.api.artworkUri(track['thumbnail'])?.toString() ?? '',
+        urls: widget.api.api.artworkUrls(track, 'track'),
         size: 48,
       ),
       title: Text(title.isEmpty ? 'Untitled track' : title),
       subtitle: artist.isEmpty ? null : Text(artist),
-      trailing: IconButton(tooltip: 'Like $title', icon: const Icon(Icons.favorite_border),
-        onPressed: () => unawaited(widget.onLike(track))),
+      trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+        IconButton(
+            tooltip:
+                '${widget.isLiked?.call(track) == true ? 'Unlike' : 'Like'} $title',
+            icon: Icon(widget.isLiked?.call(track) == true
+                ? Icons.favorite
+                : Icons.favorite_border),
+            onPressed: () => unawaited(widget.onLike(track))),
+        if (widget.onTrackOptions != null)
+          IconButton(
+              tooltip: 'Options for $title',
+              icon: const Icon(Icons.more_horiz),
+              onPressed: () => widget.onTrackOptions!(track)),
+      ]),
       onTap: () => unawaited(
         _isArtist ? _playArtistTrack(track) : _playAlbum(index),
       ),
@@ -252,13 +268,13 @@ class _Header extends StatelessWidget {
 
   final String title;
   final String artist;
-  final String thumbnail;
+  final List<String> thumbnail;
 
   @override
   Widget build(BuildContext context) => Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          _Cover(url: thumbnail, size: 112),
+          _Cover(urls: thumbnail, size: 112),
           const SizedBox(width: 16),
           Expanded(
             child: Column(
@@ -277,31 +293,17 @@ class _Header extends StatelessWidget {
 }
 
 class _Cover extends StatelessWidget {
-  const _Cover({required this.url, required this.size});
+  const _Cover({required this.urls, required this.size});
 
-  final String url;
+  final List<String> urls;
   final double size;
 
   @override
   Widget build(BuildContext context) {
-    final fallback = SizedBox(
-      width: size,
-      height: size,
-      child: const ColoredBox(
-        color: Color(0xff2a2d32),
-        child: Icon(Icons.album_outlined),
-      ),
-    );
-    if (url.isEmpty) return fallback;
     return ClipRRect(
       borderRadius: BorderRadius.circular(12),
-      child: Image.network(
-        url,
-        width: size,
-        height: size,
-        fit: BoxFit.cover,
-        errorBuilder: (_, __, ___) => fallback,
-      ),
+      child: ArtworkImage(
+          urls: urls, width: size, height: size, icon: Icons.album_outlined),
     );
   }
 }

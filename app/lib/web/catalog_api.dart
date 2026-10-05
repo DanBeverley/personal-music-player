@@ -41,11 +41,23 @@ class CatalogApi {
       _get('/artist/${Uri.encodeComponent(id)}');
 
   static const _homeSignalKeys = <String>{
-    'client_signal_tier', 'fresh_account_empty_home', 'recent_track_ids',
-    'top_track_ids', 'recent_track_snapshots', 'top_track_snapshots',
-    'last_played_tracks', 'recent_queries', 'taste_queries', 'playlist_names',
-    'library_track_ids', 'offline_track_ids', 'artist_hints', 'album_hints',
-    'seed_id', 'seed_ids', 'avoid_ids',
+    'client_signal_tier',
+    'fresh_account_empty_home',
+    'recent_track_ids',
+    'top_track_ids',
+    'recent_track_snapshots',
+    'top_track_snapshots',
+    'last_played_tracks',
+    'recent_queries',
+    'taste_queries',
+    'playlist_names',
+    'library_track_ids',
+    'offline_track_ids',
+    'artist_hints',
+    'album_hints',
+    'seed_id',
+    'seed_ids',
+    'avoid_ids',
   };
 
   Future<Map<String, dynamic>> home({
@@ -71,52 +83,84 @@ class CatalogApi {
   }
 
   Future<Map<String, dynamic>> history() => api.post('/history_seed', {
-    'user_scope_id': api.homeRequestScopeId, 'limit': 32,
-  });
+        'user_scope_id': api.homeRequestScopeId,
+        'limit': 32,
+      });
 
-  Future<void> recordPlay(Map<String, dynamic> track, {required String scope, required double occurredAt}) async {
+  Future<void> recordPlay(Map<String, dynamic> track,
+      {required String scope, required double occurredAt}) async {
     final id = extractTrackId(track);
     if (id == null || scope != api.homeRequestScopeId) return;
     await api.post('/interaction_event', {
-      'user_scope_id': scope, 'track_id': id, 'event_type': 'play',
-      'source': 'web_playback', 'occurred_at': occurredAt,
+      'user_scope_id': scope,
+      'track_id': id,
+      'event_type': 'play',
+      'source': 'web_playback',
+      'occurred_at': occurredAt,
       'artist_name': track['artist'] ?? track['channel'],
       'metadata': {
-        for (final key in const ['id', 'track_key', 'title', 'artist', 'channel', 'album', 'album_id',
-          'thumbnail', 'duration', 'videoId', 'source_id', 'canonical_recording_id', 'musicbrainz_recording_id'])
+        for (final key in const [
+          'id',
+          'track_key',
+          'title',
+          'artist',
+          'channel',
+          'album',
+          'album_id',
+          'thumbnail',
+          'duration',
+          'videoId',
+          'source_id',
+          'canonical_recording_id',
+          'musicbrainz_recording_id'
+        ])
           if (track[key] != null) key: track[key],
-        if (track['playback'] is Map) 'playback': {
-          for (final key in const ['provider', 'source_id'])
-            if ((track['playback'] as Map)[key] != null) key: (track['playback'] as Map)[key],
-        },
+        if (track['playback'] is Map)
+          'playback': {
+            for (final key in const ['provider', 'source_id'])
+              if ((track['playback'] as Map)[key] != null)
+                key: (track['playback'] as Map)[key],
+          },
       },
     });
   }
 
-  Future<Map<String, dynamic>> homeQueueStatus({int revision = 0}) async {
-    final payload = await api.post('/recommend', {
-      'query': '',
-      'limit': 0,
-      'offset': 0,
-      'user_scope_id': api.homeRequestScopeId,
-      'feed_queue_status_only': true,
-      'feed_queue_revision': revision < 0 ? 0 : revision,
-      'feed_queue_wait_ms': 9000,
-    }, timeout: const Duration(seconds: 12));
+  Future<Map<String, dynamic>> homeQueueStatus(
+      {int revision = 0, bool wait = true}) async {
+    final payload = await api.post(
+        '/recommend',
+        {
+          'query': '',
+          'limit': 0,
+          'offset': 0,
+          'user_scope_id': api.homeRequestScopeId,
+          'feed_queue_status_only': true,
+          'feed_queue_revision': revision < 0 ? 0 : revision,
+          'feed_queue_wait_ms': wait ? 9000 : 0,
+        },
+        timeout: const Duration(seconds: 12));
     return _withNormalizedTrackLists(payload);
   }
 
-  Future<Map<String, dynamic>> homeRow(String session, String row, int offset) => api.post('/recommend', {
-    'query': '', 'user_scope_id': api.homeRequestScopeId, 'session_id': session,
-    'row_id': row, 'offset': offset, 'limit': 20,
-  });
+  Future<Map<String, dynamic>> homeRow(
+          String session, String row, int offset) =>
+      api.post('/recommend', {
+        'query': '',
+        'user_scope_id': api.homeRequestScopeId,
+        'session_id': session,
+        'row_id': row,
+        'offset': offset,
+        'limit': 20,
+      });
 
   Future<Map<String, dynamic>> _get(String path) async {
     final response = await api.client.get(api.endpoint(path), headers: {
-      if (api.accessToken?.call() case final String token) 'Authorization': 'Bearer $token',
+      if (api.accessToken?.call() case final String token)
+        'Authorization': 'Bearer $token',
     }).timeout(const Duration(seconds: 30));
     if (response.statusCode != 200) {
-      throw StateError('Music service returned ${response.statusCode}. Please retry.');
+      throw StateError(
+          'Music service returned ${response.statusCode}. Please retry.');
     }
     final decoded = jsonDecode(response.body);
     if (decoded is! Map) {

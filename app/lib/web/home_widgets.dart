@@ -162,11 +162,13 @@ class HomeAlbumHero extends StatefulWidget {
       required this.albums,
       required this.active,
       required this.onOpen,
-      required this.onPlay});
+      required this.onPlay,
+      this.action});
   final MusicApi api;
   final List<Map<String, dynamic>> albums;
   final bool active;
   final ValueChanged<Map<String, dynamic>> onOpen, onPlay;
+  final Widget? action;
   @override
   State<HomeAlbumHero> createState() => _HomeAlbumHeroState();
 }
@@ -177,6 +179,7 @@ class _HomeAlbumHeroState extends State<HomeAlbumHero> {
   int index = 0;
   bool reducedMotion = false;
   bool interacting = false;
+  bool moving = false;
   String _ids(List<Map<String, dynamic>> albums) => albums
       .map((a) => a['id'] ?? a['album_id'] ?? a['browseId'] ?? a['title'])
       .join('|');
@@ -206,24 +209,41 @@ class _HomeAlbumHeroState extends State<HomeAlbumHero> {
         !widget.active ||
         reducedMotion ||
         interacting ||
+        moving ||
         widget.albums.length < 2) return;
     timer = Timer(const Duration(seconds: 7), () {
-      if (mounted && controller.hasClients && widget.active)
-        _go((index + 1) % widget.albums.length);
+      if (mounted && controller.hasClients && widget.active) _go(index + 1);
     });
   }
 
   void _go(int target) {
     timer?.cancel();
-    if (!controller.hasClients) return;
-    if (reducedMotion)
+    if (!controller.hasClients || moving) return;
+    if (reducedMotion) {
       controller.jumpToPage(target);
-    else
+      _schedule();
+    } else {
+      moving = true;
       unawaited(controller
           .animateToPage(target,
-              duration: const Duration(milliseconds: 650),
+              duration: const Duration(milliseconds: 850),
               curve: Curves.easeInOutCubic)
-          .whenComplete(_schedule));
+          .whenComplete(() {
+        if (!mounted) return;
+        moving = false;
+        _settleLoop();
+      }));
+    }
+  }
+
+  void _settleLoop() {
+    if (!mounted || !controller.hasClients) return;
+    // A duplicate first card makes last -> first one forward swipe. Reset only
+    // after it settles, so the jump is visually identical and never traverses
+    // the intervening cards backwards.
+    if (controller.page == widget.albums.length.toDouble())
+      controller.jumpToPage(0);
+    _schedule();
   }
 
   @override
@@ -242,10 +262,7 @@ class _HomeAlbumHeroState extends State<HomeAlbumHero> {
       final extraScale = (MediaQuery.textScalerOf(context).scale(16) / 16 - 1)
           .clamp(0.0, double.infinity);
       return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Padding(
-            padding: const EdgeInsets.only(top: 32, bottom: 16),
-            child: Text('Featured Albums',
-                style: Theme.of(context).textTheme.titleLarge)),
+        SectionHeading(title: 'Featured Albums', action: widget.action),
         SizedBox(
             height: (compact ? 306 : 300) + extraScale * (compact ? 180 : 150),
             child: Listener(
@@ -261,92 +278,109 @@ class _HomeAlbumHeroState extends State<HomeAlbumHero> {
                   interacting = false;
                   _schedule();
                 },
-                child: PageView.builder(
-                    controller: controller,
-                    itemCount: widget.albums.length,
-                    onPageChanged: (value) {
-                      setState(() => index = value);
-                      _schedule();
+                child: NotificationListener<ScrollNotification>(
+                    onNotification: (notice) {
+                      if (notice.depth != 0) return false;
+                      if (notice is ScrollStartNotification) timer?.cancel();
+                      if (notice is ScrollEndNotification && !moving) {
+                        WidgetsBinding.instance
+                            .addPostFrameCallback((_) => _settleLoop());
+                      }
+                      return false;
                     },
-                    itemBuilder: (context, page) {
-                      final album = widget.albums[page];
-                      final title = '${album['title'] ?? album['name'] ?? ''}';
-                      return ClipRRect(
-                          borderRadius: BorderRadius.circular(26),
-                          child: Stack(fit: StackFit.expand, children: [
-                            ArtworkImage(
-                                urls: widget.api.artworkUrls(album, 'album'),
-                                width: constraints.maxWidth,
-                                height: 320,
-                                placeholder: const ColoredBox(
-                                    color: NeatieDesign.raised)),
-                            const DecoratedBox(
-                                decoration: BoxDecoration(
-                                    gradient: LinearGradient(
-                                        begin: Alignment.centerLeft,
-                                        end: Alignment.centerRight,
-                                        colors: [
-                                  Color(0xfa111916),
-                                  Color(0xe6111715),
-                                  Color(0x9c111916)
-                                ]))),
-                            InkWell(
-                                onTap: () => widget.onOpen(album),
-                                child: Padding(
-                                    padding: EdgeInsets.all(compact ? 20 : 32),
-                                    child: Row(children: [
-                                      HomeArtwork(
-                                          api: widget.api,
-                                          item: album,
-                                          kind: 'album',
-                                          size: size),
-                                      const SizedBox(width: 18),
-                                      Expanded(
-                                          child: Column(
-                                              mainAxisAlignment:
-                                                  MainAxisAlignment.center,
-                                              crossAxisAlignment:
-                                                  CrossAxisAlignment.start,
-                                              children: [
-                                            Text('IN THE SPOTLIGHT',
-                                                style: NeatieDesign.eyebrow
-                                                    .copyWith(
-                                                        color: NeatieDesign
-                                                            .accent)),
-                                            const SizedBox(height: 12),
-                                            Text(title,
-                                                maxLines: compact ? 2 : 3,
-                                                overflow: TextOverflow.ellipsis,
-                                                style: NeatieDesign.display(
-                                                    compact ? 27 : 42)),
-                                            const SizedBox(height: 6),
-                                            Text(
-                                                '${album['artist'] ?? album['artist_name'] ?? album['channel'] ?? ''}',
-                                                maxLines: 2,
-                                                overflow:
-                                                    TextOverflow.ellipsis),
-                                            const SizedBox(height: 14),
-                                            Wrap(
-                                                spacing: 8,
-                                                runSpacing: 4,
-                                                children: [
-                                                  FilledButton.icon(
-                                                      onPressed: () =>
-                                                          widget.onPlay(album),
-                                                      icon: const Icon(
-                                                          Icons.play_arrow),
-                                                      label:
-                                                          const Text('Play')),
-                                                  TextButton(
-                                                      onPressed: () =>
-                                                          widget.onOpen(album),
-                                                      child: const Text(
-                                                          'Open album')),
-                                                ]),
-                                          ])),
+                    child: PageView.builder(
+                        controller: controller,
+                        itemCount: widget.albums.length +
+                            (widget.albums.length > 1 ? 1 : 0),
+                        onPageChanged: (value) {
+                          setState(() => index = value % widget.albums.length);
+                        },
+                        itemBuilder: (context, page) {
+                          final album =
+                              widget.albums[page % widget.albums.length];
+                          final title =
+                              '${album['title'] ?? album['name'] ?? ''}';
+                          return ClipRRect(
+                              borderRadius: BorderRadius.circular(26),
+                              child: Stack(fit: StackFit.expand, children: [
+                                ArtworkImage(
+                                    urls:
+                                        widget.api.artworkUrls(album, 'album'),
+                                    width: constraints.maxWidth,
+                                    height: 320,
+                                    placeholder: const ColoredBox(
+                                        color: NeatieDesign.raised)),
+                                const DecoratedBox(
+                                    decoration: BoxDecoration(
+                                        gradient: LinearGradient(
+                                            begin: Alignment.centerLeft,
+                                            end: Alignment.centerRight,
+                                            colors: [
+                                      Color(0xfa111916),
+                                      Color(0xe6111715),
+                                      Color(0x9c111916)
                                     ]))),
-                          ]));
-                    }))),
+                                InkWell(
+                                    onTap: () => widget.onOpen(album),
+                                    child: Padding(
+                                        padding:
+                                            EdgeInsets.all(compact ? 20 : 32),
+                                        child: Row(children: [
+                                          HomeArtwork(
+                                              api: widget.api,
+                                              item: album,
+                                              kind: 'album',
+                                              size: size),
+                                          const SizedBox(width: 18),
+                                          Expanded(
+                                              child: Column(
+                                                  mainAxisAlignment:
+                                                      MainAxisAlignment.center,
+                                                  crossAxisAlignment:
+                                                      CrossAxisAlignment.start,
+                                                  children: [
+                                                Text('IN THE SPOTLIGHT',
+                                                    style: NeatieDesign.eyebrow
+                                                        .copyWith(
+                                                            color: NeatieDesign
+                                                                .accent)),
+                                                const SizedBox(height: 12),
+                                                Text(title,
+                                                    maxLines: compact ? 2 : 3,
+                                                    overflow:
+                                                        TextOverflow.ellipsis,
+                                                    style: NeatieDesign.display(
+                                                        compact ? 27 : 42)),
+                                                const SizedBox(height: 6),
+                                                Text(
+                                                    '${album['artist'] ?? album['artist_name'] ?? album['channel'] ?? ''}',
+                                                    maxLines: 2,
+                                                    overflow:
+                                                        TextOverflow.ellipsis),
+                                                const SizedBox(height: 14),
+                                                Wrap(
+                                                    spacing: 8,
+                                                    runSpacing: 4,
+                                                    children: [
+                                                      FilledButton.icon(
+                                                          onPressed: () =>
+                                                              widget.onPlay(
+                                                                  album),
+                                                          icon: const Icon(
+                                                              Icons.play_arrow),
+                                                          label: const Text(
+                                                              'Play')),
+                                                      TextButton(
+                                                          onPressed: () =>
+                                                              widget.onOpen(
+                                                                  album),
+                                                          child: const Text(
+                                                              'Open album')),
+                                                    ]),
+                                              ])),
+                                        ]))),
+                              ]));
+                        })))),
         if (widget.albums.length > 1)
           SizedBox(
               height: 44,
@@ -359,9 +393,18 @@ class _HomeAlbumHeroState extends State<HomeAlbumHero> {
                           tooltip: 'Show album ${i + 1}',
                           isSelected: i == index,
                           onPressed: () => _go(i),
-                          icon: Icon(
-                              i == index ? Icons.circle : Icons.circle_outlined,
-                              size: 10)),
+                          icon: AnimatedContainer(
+                              duration: reducedMotion
+                                  ? Duration.zero
+                                  : const Duration(milliseconds: 300),
+                              curve: Curves.easeOutCubic,
+                              width: i == index ? 24 : 6,
+                              height: 6,
+                              decoration: BoxDecoration(
+                                  color: i == index
+                                      ? NeatieDesign.accent
+                                      : NeatieDesign.line,
+                                  borderRadius: BorderRadius.circular(6)))),
                   ])),
       ]);
     });

@@ -27,6 +27,15 @@ class ArtworkImage extends StatelessWidget {
         width: width,
         height: height,
         fit: BoxFit.cover,
+        frameBuilder: (context, child, frame, synchronous) {
+          if (synchronous || MediaQuery.disableAnimationsOf(context))
+            return child;
+          return AnimatedOpacity(
+              opacity: frame == null ? 0 : 1,
+              duration: const Duration(milliseconds: 320),
+              curve: Curves.easeOut,
+              child: child);
+        },
         errorBuilder: (_, __, ___) => _image(index + 1));
   }
 

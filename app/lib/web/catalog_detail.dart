@@ -131,7 +131,8 @@ class _CatalogDetailState extends State<CatalogDetail> {
   @override
   Widget build(BuildContext context) {
     final body = _loading
-        ? const Center(child: CircularProgressIndicator())
+        ? const Center(
+            child: NeatieLoading(label: 'Opening your music', showLabel: true))
         : _error != null
             ? _Failure(onRetry: _load)
             : _detail == null

@@ -26,7 +26,22 @@ class PlaybackDock extends StatelessWidget {
   Widget _play({double size = 44}) => IconButton.filled(
       tooltip: audio.paused ? 'Play' : 'Pause',
       onPressed: () => audio.paused ? unawaited(player.play()) : player.pause(),
-      icon: Icon(audio.paused ? Icons.play_arrow_rounded : Icons.pause_rounded),
+      icon: Builder(
+          builder: (context) => AnimatedSwitcher(
+              duration: MediaQuery.disableAnimationsOf(context)
+                  ? Duration.zero
+                  : const Duration(milliseconds: 180),
+              child: player.loading
+                  ? const NeatieLoading(
+                      key: ValueKey('loading'),
+                      label: 'Loading song',
+                      size: 22,
+                      color: NeatieDesign.background)
+                  : Icon(
+                      audio.paused
+                          ? Icons.play_arrow_rounded
+                          : Icons.pause_rounded,
+                      key: ValueKey(audio.paused)))),
       constraints: BoxConstraints.tightFor(width: size, height: size));
   Widget _transport() =>
       Row(mainAxisAlignment: MainAxisAlignment.center, children: [
@@ -155,8 +170,6 @@ class PlaybackDock extends StatelessWidget {
                                       },
                                       icon: const Icon(Icons.queue_music)),
                                 ]),
-                            if (player.loading)
-                              const LinearProgressIndicator(minHeight: 2),
                           ]))));
             }));
   }
@@ -169,7 +182,6 @@ class PlaybackDock extends StatelessWidget {
             color: NeatieDesign.surface,
             border: Border(top: BorderSide(color: NeatieDesign.line))),
         child: Column(mainAxisSize: MainAxisSize.min, children: [
-          if (player.loading) const LinearProgressIndicator(minHeight: 2),
           Padding(
               padding: EdgeInsets.symmetric(
                   horizontal: wide ? 28 : 12, vertical: wide ? 10 : 8),

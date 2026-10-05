@@ -1,3 +1,4 @@
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 
 abstract final class NeatieDesign {
@@ -209,6 +210,8 @@ class _EditorialSurfaceState extends State<EditorialSurface> {
           duration: MediaQuery.disableAnimationsOf(context)
               ? Duration.zero
               : const Duration(milliseconds: 180),
+          curve: Curves.easeOutCubic,
+          transform: Matrix4.translationValues(0, hovered ? -2 : 0, 0),
           decoration: BoxDecoration(
               color: hovered ? NeatieDesign.raised : widget.color,
               borderRadius: BorderRadius.circular(widget.radius),
@@ -217,4 +220,172 @@ class _EditorialSurfaceState extends State<EditorialSurface> {
                       hovered ? const Color(0xff465548) : NeatieDesign.line)),
           clipBehavior: Clip.antiAlias,
           child: widget.child));
+}
+
+/// A quiet equalizer shared by loading surfaces and the playback button.
+class NeatieLoading extends StatefulWidget {
+  const NeatieLoading(
+      {super.key,
+      this.label = 'Loading',
+      this.size = 28,
+      this.showLabel = false,
+      this.color = NeatieDesign.accent});
+  final String label;
+  final double size;
+  final bool showLabel;
+  final Color color;
+  @override
+  State<NeatieLoading> createState() => _NeatieLoadingState();
+}
+
+class _NeatieLoadingState extends State<NeatieLoading>
+    with SingleTickerProviderStateMixin {
+  late final animation = AnimationController(
+      vsync: this, duration: const Duration(milliseconds: 1400));
+  bool animate = false;
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final enabled =
+        !MediaQuery.disableAnimationsOf(context) && TickerMode.of(context);
+    if (enabled != animate) {
+      animate = enabled;
+      if (enabled) {
+        animation.repeat();
+      } else {
+        animation.stop();
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => Semantics(
+      label: widget.label,
+      liveRegion: true,
+      child: ExcludeSemantics(
+          child: Row(mainAxisSize: MainAxisSize.min, children: [
+        AnimatedBuilder(
+            animation: animation,
+            builder: (_, __) => CustomPaint(
+                size: Size.square(widget.size),
+                painter: _EqualizerPainter(
+                    animate ? animation.value : 0, widget.color))),
+        if (widget.showLabel) ...[
+          const SizedBox(width: 10),
+          Text(widget.label,
+              style: const TextStyle(fontSize: 12, color: NeatieDesign.muted))
+        ],
+      ])));
+  @override
+  void dispose() {
+    animation.dispose();
+    super.dispose();
+  }
+}
+
+class _EqualizerPainter extends CustomPainter {
+  _EqualizerPainter(this.phase, this.color);
+  final double phase;
+  final Color color;
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..color = color
+      ..strokeWidth = size.width / 12
+      ..strokeCap = StrokeCap.round;
+    for (var i = 0; i < 5; i++) {
+      final wave = (math.sin(phase * math.pi * 2 - i * .9) + 1) / 2;
+      final height = size.height * (.22 + .46 * wave);
+      final x = size.width * (.18 + i * .16);
+      canvas.drawLine(Offset(x, (size.height - height) / 2),
+          Offset(x, (size.height + height) / 2), paint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(_EqualizerPainter old) =>
+      phase != old.phase || color != old.color;
+}
+
+class SectionHeading extends StatelessWidget {
+  const SectionHeading({super.key, required this.title, this.action});
+  final String title;
+  final Widget? action;
+  @override
+  Widget build(BuildContext context) => Padding(
+      padding: const EdgeInsets.only(top: 28, bottom: 14),
+      child: Row(children: [
+        Expanded(
+            child: Text(title, style: Theme.of(context).textTheme.titleLarge)),
+        if (action != null) ...[const SizedBox(width: 12), action!],
+      ]));
+}
+
+class BrowseMoreButton extends StatelessWidget {
+  const BrowseMoreButton(
+      {super.key, required this.label, required this.onPressed});
+  final String label;
+  final VoidCallback? onPressed;
+  @override
+  Widget build(BuildContext context) => IconButton.outlined(
+      tooltip: label,
+      onPressed: onPressed,
+      style: IconButton.styleFrom(
+          minimumSize: const Size(42, 42),
+          side: const BorderSide(color: NeatieDesign.line)),
+      icon: const Icon(Icons.arrow_forward_rounded, size: 19));
+}
+
+/// Animate tab entry while keeping the page subtree, scroll and requests alive.
+class PageEntrance extends StatefulWidget {
+  const PageEntrance({super.key, required this.active, required this.child});
+  final bool active;
+  final Widget child;
+  @override
+  State<PageEntrance> createState() => _PageEntranceState();
+}
+
+class _PageEntranceState extends State<PageEntrance>
+    with SingleTickerProviderStateMixin {
+  late final animation = AnimationController(
+      vsync: this, duration: const Duration(milliseconds: 420));
+  bool reduced = false;
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    reduced = MediaQuery.disableAnimationsOf(context);
+    if (reduced)
+      animation.value = 1;
+    else if (widget.active && animation.value == 0) animation.forward();
+  }
+
+  @override
+  void didUpdateWidget(covariant PageEntrance old) {
+    super.didUpdateWidget(old);
+    if (widget.active && !old.active) {
+      if (reduced)
+        animation.value = 1;
+      else
+        animation.forward(from: 0);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final curved = animation.drive(CurveTween(curve: Curves.easeOutCubic));
+    return TickerMode(
+        enabled: widget.active,
+        child: FadeTransition(
+            opacity: curved,
+            child: SlideTransition(
+                position: Tween(begin: const Offset(0, .012), end: Offset.zero)
+                    .animate(curved),
+                child: widget.child)));
+  }
+
+  @override
+  void dispose() {
+    animation.dispose();
+    super.dispose();
+  }
 }

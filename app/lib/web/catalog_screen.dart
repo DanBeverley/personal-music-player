@@ -402,11 +402,10 @@ class _CatalogScreenState extends State<CatalogScreen> {
                 onPressed: () => _trackOptions(track)),
           ]));
 
-  Widget _trackStrip(String title, List<Map<String, dynamic>> tracks) =>
+  Widget _trackStrip(String title, List<Map<String, dynamic>> tracks,
+          {Widget? action}) =>
       Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Padding(
-            padding: const EdgeInsets.only(top: 24, bottom: 10),
-            child: Text(title, style: Theme.of(context).textTheme.titleLarge)),
+        SectionHeading(title: title, action: action),
         HomeTrackStrip(
             key: PageStorageKey('home-tracks:$title'),
             api: widget.api,
@@ -951,9 +950,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
 
   Widget section(String title, String type, List<Map<String, dynamic>> items) =>
       Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Padding(
-            padding: const EdgeInsets.only(top: 24, bottom: 8),
-            child: Text(title, style: Theme.of(context).textTheme.titleLarge)),
+        SectionHeading(title: title),
         for (final item in items) itemTile(type, item),
       ]);
 
@@ -978,10 +975,13 @@ class _CatalogScreenState extends State<CatalogScreen> {
         kind == 'mix' ||
         kind == 'radio') {
       return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Padding(
-            padding: const EdgeInsets.only(top: 24, bottom: 8),
-            child:
-                Text(rowTitle, style: Theme.of(context).textTheme.titleLarge)),
+        SectionHeading(
+            title: rowTitle,
+            action: row['has_more'] == true
+                ? BrowseMoreButton(
+                    label: 'More $rowTitle',
+                    onPressed: busy ? null : () => moreHome(row))
+                : null),
         SizedBox(
             height: (kind == 'artist' ? 222 : 342) +
                 (MediaQuery.textScalerOf(context).scale(16) / 16 - 1)
@@ -994,28 +994,28 @@ class _CatalogScreenState extends State<CatalogScreen> {
                 children: [
                   for (final item in items) _homeCollectionCard(kind, item),
                 ])),
-        if (row['has_more'] == true)
-          TextButton(
-              onPressed: busy ? null : () => moreHome(row),
-              child: Text('More $rowTitle')),
       ]);
     }
     final tracks = MusicApi.tracks(items);
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
       if (row['kind'] == 'last_played' || row['kind'] == 'frequently_listened')
-        _trackStrip(rowTitle, tracks)
+        _trackStrip(rowTitle, tracks,
+            action: row['has_more'] == true
+                ? BrowseMoreButton(
+                    label: 'More $rowTitle',
+                    onPressed: busy ? null : () => moreHome(row))
+                : null)
       else ...[
-        Padding(
-            padding: const EdgeInsets.only(top: 24, bottom: 8),
-            child:
-                Text(rowTitle, style: Theme.of(context).textTheme.titleLarge)),
+        SectionHeading(
+            title: rowTitle,
+            action: row['has_more'] == true
+                ? BrowseMoreButton(
+                    label: 'More $rowTitle',
+                    onPressed: busy ? null : () => moreHome(row))
+                : null),
         for (var index = 0; index < tracks.length; index++)
           _homeTrackTile(tracks[index], tracks, index, rowTitle),
       ],
-      if (row['has_more'] == true)
-        TextButton(
-            onPressed: busy ? null : () => moreHome(row),
-            child: Text('More $rowTitle')),
     ]);
   }
 
@@ -1180,24 +1180,35 @@ class _CatalogScreenState extends State<CatalogScreen> {
                   ? IconButton.outlined(
                       tooltip: 'Refresh Home',
                       onPressed: busy ? null : () => load(refresh: true),
-                      icon: const Icon(Icons.refresh_rounded, size: 20))
+                      icon: busy
+                          ? const NeatieLoading(
+                              label: 'Refreshing Home', size: 20)
+                          : Badge(
+                              isLabelVisible: readyCount > 0,
+                              smallSize: 6,
+                              backgroundColor: NeatieDesign.accent,
+                              child:
+                                  const Icon(Icons.refresh_rounded, size: 20)))
                   : null),
           if (!widget.home) ...[
-            const SizedBox(height: 16),
-            TextField(
-                controller: query,
-                textInputAction: TextInputAction.search,
-                onSubmitted: (_) => load(manualSearch: true),
-                decoration: InputDecoration(
-                    labelText: 'Search songs',
-                    hintText: 'Songs, artists and albums',
-                    prefixIcon: const Icon(Icons.search_rounded),
-                    suffixIcon: IconButton(
-                        tooltip: 'Search',
-                        onPressed: () => load(manualSearch: true),
-                        icon: const Icon(Icons.search)))),
-            const SizedBox(height: 12),
-            Wrap(spacing: 8, children: [
+            Semantics(
+                label: 'Search songs',
+                child: TextField(
+                    controller: query,
+                    textInputAction: TextInputAction.search,
+                    onSubmitted: (_) => load(manualSearch: true),
+                    decoration: InputDecoration(
+                        hint: const ExcludeSemantics(
+                            child: Text('Songs, artists and albums')),
+                        contentPadding: const EdgeInsets.symmetric(
+                            horizontal: 20, vertical: 24),
+                        prefixIcon: const Icon(Icons.search_rounded),
+                        suffixIcon: IconButton(
+                            tooltip: 'Search',
+                            onPressed: () => load(manualSearch: true),
+                            icon: const Icon(Icons.arrow_forward_rounded))))),
+            const SizedBox(height: 18),
+            Wrap(spacing: 8, runSpacing: 8, children: [
               for (final type in ['all', ...labels.keys])
                 ChoiceChip(
                     label: Text(type == 'all' ? 'Top' : labels[type]!),
@@ -1205,7 +1216,11 @@ class _CatalogScreenState extends State<CatalogScreen> {
                     onSelected: (_) => setState(() => filter = type))
             ]),
           ],
-          if (busy) const LinearProgressIndicator(),
+          if (busy && !widget.home)
+            const Padding(
+                padding: EdgeInsets.only(top: 18),
+                child: NeatieLoading(
+                    label: 'Finding your music', showLabel: true)),
           if (error != null) ...[
             Text(error!),
             TextButton(onPressed: () => load(), child: const Text('Retry'))
@@ -1230,8 +1245,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
               return Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text('Top result',
-                        style: Theme.of(context).textTheme.titleLarge),
+                    const SectionHeading(title: 'Top result'),
                     itemTile(topSurface, topItem!),
                   ]);
             }),
@@ -1247,10 +1261,6 @@ class _CatalogScreenState extends State<CatalogScreen> {
               (filter == 'all' || filter == 'albums'))
             itemTile('albums', containingAlbum),
           if (widget.home) ...[
-            if (readyCount > 0)
-              TextButton(
-                  onPressed: busy ? null : () => load(refresh: true),
-                  child: const Text('New recommendations are ready')),
             if (selectedLane == 'all')
               for (final row in rows)
                 if (row['kind'] == 'todays_pick') homeRow(row),
@@ -1260,7 +1270,14 @@ class _CatalogScreenState extends State<CatalogScreen> {
                 albums: heroAlbums,
                 active: homeActive,
                 onOpen: (album) => _openHomeItem('album', album),
-                onPlay: _playHomeAlbum),
+                onPlay: _playHomeAlbum,
+                action: Row(mainAxisSize: MainAxisSize.min, children: [
+                  for (final row in rows)
+                    if (_homeType(row) == 'album' && row['has_more'] == true)
+                      BrowseMoreButton(
+                          label: 'More ${row['title'] ?? 'albums'}',
+                          onPressed: busy ? null : () => moreHome(row)),
+                ])),
             Padding(
                 padding: const EdgeInsets.only(top: 12),
                 child: Wrap(spacing: 8, runSpacing: 6, children: [
@@ -1296,11 +1313,6 @@ class _CatalogScreenState extends State<CatalogScreen> {
               for (final row in rows)
                 if (_homeType(row) != 'album' && row['kind'] != 'todays_pick')
                   homeRow(row),
-              for (final row in rows)
-                if (_homeType(row) == 'album' && row['has_more'] == true)
-                  TextButton(
-                      onPressed: busy ? null : () => moreHome(row),
-                      child: Text('More ${row['title'] ?? 'albums'}')),
             ] else ...[
               homeRow({
                 'kind': 'discoveries',
@@ -1365,14 +1377,18 @@ class _CatalogScreenState extends State<CatalogScreen> {
                   identity(extra.type, extra.item) != leadKey &&
                   identity(extra.type, extra.item) != albumKey)
                 itemTile(extra.type, extra.item),
-            Wrap(children: [
-              for (final type in labels.keys)
-                if ((filter == 'all' || filter == type) &&
-                    (pagination[type] as Map?)?['has_more'] == true)
-                  TextButton(
-                      onPressed: busy ? null : () => more(type),
-                      child: Text('More ${labels[type]!.toLowerCase()}'))
-            ]),
+            Padding(
+                padding: const EdgeInsets.only(top: 24),
+                child: Wrap(spacing: 12, runSpacing: 12, children: [
+                  for (final type in labels.keys)
+                    if ((filter == 'all' || filter == type) &&
+                        (pagination[type] as Map?)?['has_more'] == true)
+                      OutlinedButton.icon(
+                          onPressed: busy ? null : () => more(type),
+                          icon:
+                              const Icon(Icons.arrow_forward_rounded, size: 18),
+                          label: Text('Browse ${labels[type]!.toLowerCase()}'))
+                ])),
           ],
         ]);
   }

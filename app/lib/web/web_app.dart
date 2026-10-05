@@ -19,7 +19,7 @@ import 'catalog_api.dart';
 import 'design_system.dart';
 import 'playback_dock.dart';
 
-const webBuild = '2026-10-05-editorial';
+const webBuild = '2026-10-05-refined';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -352,32 +352,40 @@ class _PlayerPageState extends State<_PlayerPage> {
         for (var i = 0; i < names.length; i++)
           Padding(
               padding: const EdgeInsets.only(bottom: 6),
-              child: Material(
-                  color: tab == i
-                      ? NeatieDesign.accent.withValues(alpha: .12)
-                      : Colors.transparent,
-                  borderRadius: BorderRadius.circular(14),
-                  child: InkWell(
+              child: AnimatedContainer(
+                  duration: MediaQuery.disableAnimationsOf(context)
+                      ? Duration.zero
+                      : const Duration(milliseconds: 220),
+                  curve: Curves.easeOutCubic,
+                  decoration: BoxDecoration(
+                      color: tab == i
+                          ? NeatieDesign.accent.withValues(alpha: .12)
+                          : Colors.transparent,
+                      borderRadius: BorderRadius.circular(14)),
+                  child: Material(
+                      color: Colors.transparent,
                       borderRadius: BorderRadius.circular(14),
-                      onTap: () => _navigate(i),
-                      child: Padding(
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 14, vertical: 14),
-                          child: Row(children: [
-                            Icon(icons[i],
-                                size: 21,
-                                color: tab == i
-                                    ? NeatieDesign.accent
-                                    : NeatieDesign.muted),
-                            const SizedBox(width: 14),
-                            Text(names[i],
-                                style: TextStyle(
-                                    fontSize: 13,
-                                    fontWeight: FontWeight.w600,
+                      child: InkWell(
+                          borderRadius: BorderRadius.circular(14),
+                          onTap: () => _navigate(i),
+                          child: Padding(
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 14, vertical: 14),
+                              child: Row(children: [
+                                Icon(icons[i],
+                                    size: 21,
                                     color: tab == i
                                         ? NeatieDesign.accent
-                                        : NeatieDesign.ink)),
-                          ]))))),
+                                        : NeatieDesign.muted),
+                                const SizedBox(width: 14),
+                                Text(names[i],
+                                    style: TextStyle(
+                                        fontSize: 13,
+                                        fontWeight: FontWeight.w600,
+                                        color: tab == i
+                                            ? NeatieDesign.accent
+                                            : NeatieDesign.ink)),
+                              ])))))),
         const Spacer(),
         const Divider(),
         TextButton.icon(
@@ -419,7 +427,7 @@ class _PlayerPageState extends State<_PlayerPage> {
       animation: player,
       builder: (context, _) {
         final wide = MediaQuery.sizeOf(context).width >= 850;
-        final pages = IndexedStack(index: tab, children: [
+        final pageChildren = <Widget>[
           CatalogScreen(
               key: ValueKey('home:$scope'),
               api: api,
@@ -445,6 +453,13 @@ class _PlayerPageState extends State<_PlayerPage> {
               library: library, player: player, onSignIn: () => _navigate(4)),
           _queue(),
           AccountScreen(auth: widget.auth),
+        ];
+        final pages = IndexedStack(index: tab, children: [
+          for (var i = 0; i < pageChildren.length; i++)
+            PageEntrance(
+                key: ValueKey('page:$scope:$i'),
+                active: tab == i,
+                child: pageChildren[i]),
         ]);
         return Scaffold(
             body: SafeArea(

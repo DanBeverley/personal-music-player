@@ -193,7 +193,11 @@ class _LibraryScreenState extends State<LibraryScreen> {
                       onPressed:
                           repo.loading ? null : () => unawaited(repo.refresh()),
                       icon: const Icon(Icons.refresh))),
-              if (repo.loading) const LinearProgressIndicator(),
+              if (repo.loading)
+                const Padding(
+                    padding: EdgeInsets.symmetric(vertical: 12),
+                    child: NeatieLoading(
+                        label: 'Opening your library', showLabel: true)),
               if (repo.error != null) ...[
                 Text(repo.error!,
                     style:

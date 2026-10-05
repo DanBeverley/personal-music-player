@@ -6,6 +6,12 @@ services:
     depends_on:
       browser-audio:
         condition: service_healthy
+  recommendation-worker:
+    environment:
+      AURALIS_BROWSER_AUDIO_URL: http://browser-audio:8020
+    depends_on:
+      browser-audio:
+        condition: service_healthy
   browser-audio:
     init: true
     build:

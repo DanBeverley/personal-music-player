@@ -12,7 +12,7 @@ import re
 import time
 from typing import Any, Dict, Iterable, List, Tuple
 
-from ..domain.catalog import normalize_album_title, normalize_artist_name, normalize_track_title
+from ..domain.catalog import catalog_thumbnail_url, normalized_track_payload, normalize_album_title, normalize_artist_name, normalize_track_title
 from ..recommend.feature_store import load_catalog_feature, store_catalog_feature
 from ..recommend.store_runtime import (
     open_recommendation_store_connection,
@@ -29,6 +29,7 @@ _YOUTUBE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 _PROVIDER_HEALTH_KEY = "youtube_stream_verification"
 _BLOCKED_TTL_SECONDS = 30 * 60
 _FORMAT_UNAVAILABLE_TTL_SECONDS = 5 * 60
+_TRANSIENT_RETRY_SECONDS = 15 * 60
 _VERIFIED_TTL_SECONDS = 14 * 24 * 60 * 60
 _LOOKUP_RETRY_SECONDS = 24 * 60 * 60
 _EMPTY_LOOKUP_RETRY_SECONDS = 30 * 60
@@ -312,10 +313,9 @@ def _store_sources(
                     sort_keys=True,
                 )
                 incoming_state = "verified"
-            terminal_unavailable = current_state == "unavailable"
+            terminal_unavailable = _source_is_terminal(current)
             blocked_until_retry = (
-                current_state == "temporarily_blocked"
-                and float(current.get("retry_at") or 0.0) > now
+                _source_retry_at(current) > now
             )
             if (
                 incoming_state in {"", "pending"}
@@ -370,6 +370,31 @@ def _verified_source(
     return max(verified, key=_source_rank) if verified else None
 
 
+def _source_retry_at(source: Dict[str, Any]) -> float:
+    retry_at = float(source.get("retry_at") or 0.0)
+    # Old generic resolver failures were incorrectly persisted as terminal.
+    if source.get("verification_state") == "unavailable" and source.get("failure_reason") in {
+        "stream_failed", "format_unavailable", "source_blocked",
+    }:
+        return retry_at or float(source.get("last_failure_at") or 0.0) + _TRANSIENT_RETRY_SECONDS
+    return retry_at
+
+
+def _source_is_terminal(source: Dict[str, Any]) -> bool:
+    return source.get("verification_state") == "unavailable" and source.get("failure_reason") not in {
+        "stream_failed", "format_unavailable", "source_blocked",
+    }
+
+
+def _source_can_verify(source: Dict[str, Any], *, now: float) -> bool:
+    state = source.get("verification_state")
+    return state == "pending" or (
+        state in {"temporarily_blocked", "unavailable"}
+        and not _source_is_terminal(source)
+        and _source_retry_at(source) <= now
+    )
+
+
 def _lookup_is_deferred(sources: Iterable[Dict[str, Any]], *, now: float) -> bool:
     return any(
         source.get("provider") == _LOOKUP_PROVIDER
@@ -395,9 +420,15 @@ def _lookup_no_match_is_deferred(
     # A source learned after an empty lookup must still reach verification.
     # Semantic rematching remains the responsibility of the verifier below.
     if any(source.get("provider") == "youtube"
-           and source.get("verification_state") == "pending"
+           and _source_can_verify(source, now=now)
            for source in rows):
         return False
+    youtube_sources = [source for source in rows if source.get("provider") == "youtube"]
+    if youtube_sources and all(
+        _source_is_terminal(source) or _source_retry_at(source) > now
+        for source in youtube_sources
+    ) and _lookup_is_deferred(rows, now=now):
+        return True
     return any(
         source.get("provider") == _LOOKUP_PROVIDER
         and source.get("source_id") == _LOOKUP_SOURCE_ID
@@ -918,10 +949,9 @@ def resolve_user_requested_playback_source(
     rejected_ids = {
         _text(source.get("source_id"))
         for source in known_sources
-        if source.get("verification_state") == "unavailable"
+        if _source_is_terminal(source)
         or (
-            source.get("verification_state") == "temporarily_blocked"
-            and float(source.get("retry_at") or 0.0) > time.time()
+            _source_retry_at(source) > time.time()
         )
     }
     for candidate in candidates[:4]:
@@ -950,7 +980,7 @@ def resolve_user_requested_playback_source(
 
 def _verify_source(server: Any, entity_key: str, source: Dict[str, Any]) -> Tuple[Dict[str, Any] | None, str]:
     from ..api.stream_cache import get_stream_cache
-    from ..api.stream_core_runtime import classify_stream_failure, get_stream_info
+    from ..api.stream_core_runtime import classify_stream_failure, get_stream_info, stream_failure_diagnostics
 
     source_id = _text(source.get("source_id"))
     now = time.time()
@@ -963,9 +993,13 @@ def _verify_source(server: Any, entity_key: str, source: Dict[str, Any]) -> Tupl
                 "verification_state": "verified",
                 "verified_at": now,
                 "verification_method": "stream_cache",
+                "failure_reason": "",
+                "failure_diagnostics": {},
+                "last_failure_at": 0.0,
+                "retry_at": 0.0,
             }
             return verified, "verified_cache"
-        info = get_stream_info(server, source_id)
+        info = get_stream_info(server, source_id, background=True)
         if not _text((info or {}).get("url")):
             raise RuntimeError("stream_url_missing")
         verified = {
@@ -973,17 +1007,26 @@ def _verify_source(server: Any, entity_key: str, source: Dict[str, Any]) -> Tupl
             "verification_state": "verified",
             "verified_at": now,
             "verification_method": "stream_resolver",
+            "failure_reason": "",
+            "failure_diagnostics": {},
+            "last_failure_at": 0.0,
+            "retry_at": 0.0,
         }
         return verified, "verified_resolver"
     except Exception as exc:
         failure = classify_stream_failure(exc)
-        blocked = failure.get("code") == "source_blocked"
+        code = failure.get("code") or "stream_failed"
+        blocked = code == "source_blocked"
+        transient = code != "video_unavailable"
         failed = {
             **source,
-            "verification_state": "temporarily_blocked" if blocked else "unavailable",
+            "verification_state": "temporarily_blocked" if transient else "unavailable",
             "last_failure_at": now,
             "failure_reason": failure.get("code") or "stream_failed",
-            "retry_at": now + _BLOCKED_TTL_SECONDS if blocked else 0.0,
+            "failure_diagnostics": stream_failure_diagnostics(exc),
+            "retry_at": now + (_BLOCKED_TTL_SECONDS if blocked else
+                               _FORMAT_UNAVAILABLE_TTL_SECONDS if code == "format_unavailable"
+                               else _TRANSIENT_RETRY_SECONDS) if transient else 0.0,
         }
         return failed, (
             "source_blocked"
@@ -1008,7 +1051,7 @@ def _apply_source(item: Dict[str, Any], source: Dict[str, Any]) -> Dict[str, Any
             else ""
         )
     )
-    return {
+    return normalized_track_payload({
         **dict(item),
         "id": source_id,
         "videoId": source_id,
@@ -1022,6 +1065,12 @@ def _apply_source(item: Dict[str, Any], source: Dict[str, Any]) -> Dict[str, Any
         "source_resolution_confidence": float(source.get("identity_confidence") or source.get("confidence") or 0.0),
         "thumbnail": _text(item.get("thumbnail") or source.get("thumbnail"))
         or f"https://i.ytimg.com/vi/{source_id}/hqdefault.jpg",
+        "artwork_source_urls": [
+            *(item.get("artwork_source_urls") or []),
+            item.get("thumbnail"),
+            source.get("thumbnail"),
+            *(source.get("thumbnails") or []),
+        ],
         "channel": _text(item.get("channel") or source.get("channel")),
         "artist_id": artist_id,
         "artist_thumbnail": _text(
@@ -1034,7 +1083,7 @@ def _apply_source(item: Dict[str, Any], source: Dict[str, Any]) -> Dict[str, Any
             "authority": authority,
             "verified_at": float(source.get("verified_at") or time.time()),
         },
-    }
+    })
 
 
 def _shortlist(
@@ -1379,7 +1428,7 @@ def verify_materialized_supply(
                     matched
                     for source in known_sources
                     if source.get("provider") == "youtube"
-                    and source.get("verification_state") == "pending"
+                    and _source_can_verify(source, now=now)
                     and _YOUTUBE_ID_RE.fullmatch(_text(source.get("source_id")))
                     and (matched := _rematch_pending_source(recording, source)) is not None
                 ],
@@ -1389,10 +1438,9 @@ def verify_materialized_supply(
             rejected_ids = {
                 _text(source.get("source_id"))
                 for source in known_sources
-                if source.get("verification_state") == "unavailable"
+                if _source_is_terminal(source)
                 or (
-                    source.get("verification_state") == "temporarily_blocked"
-                    and float(source.get("retry_at") or 0.0) > now
+                    _source_retry_at(source) > now
                 )
             }
             candidate = next(
@@ -1735,7 +1783,7 @@ def verify_materialized_supply(
                 if (source := verified_by_key.get(_recording_key(item))) is not None
             ]
             required = len(canonical_tracks) if len(canonical_tracks) < 6 else max(6, int(len(canonical_tracks) * 0.8 + 0.999))
-            album_thumbnail = _text(album.get("thumbnail") or album.get("image"))
+            album_thumbnail = catalog_thumbnail_url(album, entity_type="album")
             if not album_thumbnail:
                 album_thumbnail = next(
                     (

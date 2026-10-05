@@ -9,9 +9,11 @@ import re
 from threading import BoundedSemaphore
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, List, Optional
+from contextlib import contextmanager
 
 import yt_dlp
 import yt_dlp.plugins
+from yt_dlp.cookies import YoutubeDLCookieJar
 
 from .stream_cache import get_stream_cache, iter_and_store_full_stream
 
@@ -339,11 +341,54 @@ def _ytdlp_opts(server: Any) -> dict:
     return opts
 
 
+def _mark_failure_stage(exc: Exception, stage: str) -> None:
+    if not getattr(exc, "_auralis_failure_stage", None):
+        exc._auralis_failure_stage = stage
+
+
+def stream_failure_diagnostics(exc: Exception) -> dict:
+    """Retain operational facts without URLs, provider messages or cookies."""
+    stage = getattr(exc, "_auralis_failure_stage", "source_resolution")
+    if stage not in {"cookie_load", "extraction", "media_preflight", "source_resolution"}:
+        stage = "source_resolution"
+    diagnostics = {"stage": stage, "exception_type": type(exc).__name__}
+    errno = getattr(exc, "errno", None)
+    if isinstance(errno, int):
+        diagnostics["errno"] = errno
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if isinstance(status, int) and 400 <= status <= 599:
+        diagnostics["http_status"] = status
+    return diagnostics
+
+
+@contextmanager
+def _ytdlp_extractor(options: dict):
+    # cookiefile enables save-back on YoutubeDL.close. Deployment credentials
+    # are read-only; each extractor instead owns a fresh, memory-only jar.
+    options = dict(options)
+    cookie_path = options.pop("cookiefile", None)
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            if cookie_path:
+                try:
+                    cookies = YoutubeDLCookieJar(cookie_path)
+                    cookies.load(ignore_discard=True, ignore_expires=True)
+                    for cookie in cookies:
+                        ydl.cookiejar.set_cookie(cookie)
+                except Exception as exc:
+                    _mark_failure_stage(exc, "cookie_load")
+                    raise
+            yield ydl
+    except Exception as exc:
+        _mark_failure_stage(exc, "extraction")
+        raise
+
+
 def extract_stream_info(server: Any, video_id: str):
     url = f"https://www.youtube.com/watch?v={video_id}"
     ydl_opts = _ytdlp_opts(server)
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with _ytdlp_extractor(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as exc:
         if "requested format is not available" not in str(exc).casefold():
@@ -353,7 +398,7 @@ def extract_stream_info(server: Any, video_id: str):
         # URL instead of repeating the same failing format request.
         raw_opts = dict(ydl_opts)
         raw_opts.pop("format", None)
-        with yt_dlp.YoutubeDL(raw_opts) as ydl:
+        with _ytdlp_extractor(raw_opts) as ydl:
             raw_info = ydl.extract_info(url, download=False, process=False)
         formats = [
             dict(entry)
@@ -412,12 +457,16 @@ def validate_stream_info(server: Any, video_id: str, stream_info: dict) -> dict:
         raise RuntimeError("Requested format is not available: direct audio required")
     headers = dict(stream_info.get("headers") or {})
     headers["range"] = "bytes=0-0"
-    response = server.upstream_http.get(
-        stream_info["url"],
-        headers=headers,
-        stream=True,
-        timeout=(5, 20),
-    )
+    try:
+        response = server.upstream_http.get(
+            stream_info["url"],
+            headers=headers,
+            stream=True,
+            timeout=(5, 20),
+        )
+    except Exception as exc:
+        _mark_failure_stage(exc, "media_preflight")
+        raise
     try:
         response.raise_for_status()
         first_chunk = next(
@@ -435,6 +484,9 @@ def validate_stream_info(server: Any, video_id: str, stream_info: dict) -> dict:
         validated["validated_at"] = time.time()
         validated["validation_video_id"] = video_id
         return validated
+    except Exception as exc:
+        _mark_failure_stage(exc, "media_preflight")
+        raise
     finally:
         response.close()
 

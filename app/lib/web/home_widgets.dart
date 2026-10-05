@@ -2,6 +2,8 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'artwork_image.dart';
 import 'music_api.dart';
+import 'design_system.dart';
+import 'editorial_placeholder.dart';
 
 /// Presentation only: the backend owns recommendations, lanes and readiness.
 class HomeArtwork extends StatelessWidget {
@@ -55,6 +57,9 @@ class HomeArtwork extends StatelessWidget {
           urls: [...images, ...api.artworkUrls(item, kind)],
           width: size,
           height: size,
+          placeholder: EditorialPlaceholder(
+              label: '${item['title'] ?? item['name'] ?? ''}',
+              artist: kind == 'artist' || kind == 'radio'),
           icon: kind == 'artist' || kind == 'radio'
               ? Icons.person_outline
               : Icons.music_note);
@@ -81,40 +86,73 @@ class HomePickCard extends StatelessWidget {
   final Map<String, dynamic> track;
   final VoidCallback? onPlay;
   @override
-  Widget build(BuildContext context) => Card(
-      clipBehavior: Clip.antiAlias,
-      child: InkWell(
-        onTap: onPlay,
-        child: Padding(
-            padding: const EdgeInsets.all(14),
-            child: Row(children: [
-              HomeArtwork(api: api, item: track, kind: 'track', size: 78),
-              const SizedBox(width: 14),
-              Expanded(
-                  child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                    Text("Today's Pick",
-                        style: Theme.of(context)
-                            .textTheme
-                            .labelMedium
-                            ?.copyWith(
-                                color: Theme.of(context).colorScheme.primary)),
-                    const SizedBox(height: 5),
-                    Text('${track['title'] ?? ''}',
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
-                        style: Theme.of(context).textTheme.titleMedium),
-                    const SizedBox(height: 4),
-                    Text('${track['artist'] ?? track['channel'] ?? ''}',
-                        maxLines: 1, overflow: TextOverflow.ellipsis),
-                  ])),
-              IconButton.filled(
-                  tooltip: "Play Today's Pick",
-                  onPressed: onPlay,
-                  icon: const Icon(Icons.play_arrow)),
-            ])),
-      ));
+  Widget build(BuildContext context) =>
+      LayoutBuilder(builder: (context, bounds) {
+        final compact = bounds.maxWidth < 580;
+        final cover = HomeArtwork(
+            api: api, item: track, kind: 'track', size: compact ? 112 : 210);
+        final copy =
+            Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text("Today's Pick",
+              style: NeatieDesign.eyebrow.copyWith(color: NeatieDesign.accent)),
+          const SizedBox(height: 14),
+          Text('${track['title'] ?? ''}',
+              maxLines: compact ? 3 : 2,
+              overflow: TextOverflow.ellipsis,
+              style: NeatieDesign.display(compact ? 30 : 46)),
+          const SizedBox(height: 12),
+          Text('${track['artist'] ?? track['channel'] ?? ''}',
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(color: NeatieDesign.muted, fontSize: 14)),
+        ]);
+        final play = Tooltip(
+            message: "Play Today's Pick",
+            child: FilledButton.icon(
+                onPressed: onPlay,
+                icon: const Icon(Icons.play_arrow_rounded),
+                label: const Text('Press play')));
+        return Padding(
+            padding: const EdgeInsets.only(bottom: 12),
+            child: EditorialSurface(
+                radius: 26,
+                child: DecoratedBox(
+                    decoration: const BoxDecoration(
+                        gradient: LinearGradient(
+                            begin: Alignment.topLeft,
+                            end: Alignment.bottomRight,
+                            colors: [Color(0xff202723), Color(0xff171c1b)])),
+                    child: Padding(
+                        padding: EdgeInsets.all(compact ? 22 : 32),
+                        child: compact
+                            ? Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                    Row(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        children: [
+                                          cover,
+                                          const SizedBox(width: 18),
+                                          Expanded(child: copy)
+                                        ]),
+                                    const SizedBox(height: 22),
+                                    play,
+                                  ])
+                            : Row(children: [
+                                cover,
+                                const SizedBox(width: 36),
+                                Expanded(
+                                    child: Column(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        children: [
+                                      copy,
+                                      const SizedBox(height: 24),
+                                      play
+                                    ]))
+                              ])))));
+      });
 }
 
 class HomeAlbumHero extends StatefulWidget {
@@ -200,16 +238,16 @@ class _HomeAlbumHeroState extends State<HomeAlbumHero> {
     if (widget.albums.isEmpty) return const SizedBox.shrink();
     return LayoutBuilder(builder: (context, constraints) {
       final compact = constraints.maxWidth < 520;
-      final size = compact ? 104.0 : 160.0;
+      final size = compact ? 100.0 : 204.0;
       final extraScale = (MediaQuery.textScalerOf(context).scale(16) / 16 - 1)
           .clamp(0.0, double.infinity);
       return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         Padding(
-            padding: const EdgeInsets.only(top: 24, bottom: 10),
+            padding: const EdgeInsets.only(top: 32, bottom: 16),
             child: Text('Featured Albums',
                 style: Theme.of(context).textTheme.titleLarge)),
         SizedBox(
-            height: (compact ? 280 : 252) + extraScale * (compact ? 160 : 120),
+            height: (compact ? 306 : 300) + extraScale * (compact ? 180 : 150),
             child: Listener(
                 onPointerDown: (_) {
                   interacting = true;
@@ -233,65 +271,85 @@ class _HomeAlbumHeroState extends State<HomeAlbumHero> {
                     itemBuilder: (context, page) {
                       final album = widget.albums[page];
                       final title = '${album['title'] ?? album['name'] ?? ''}';
-                      return Card(
-                        clipBehavior: Clip.antiAlias,
-                        child: InkWell(
-                            onTap: () => widget.onOpen(album),
-                            child: Padding(
-                                padding: EdgeInsets.all(compact ? 14 : 24),
-                                child: Row(children: [
-                                  HomeArtwork(
-                                      api: widget.api,
-                                      item: album,
-                                      kind: 'album',
-                                      size: size),
-                                  const SizedBox(width: 18),
-                                  Expanded(
-                                      child: Column(
-                                          mainAxisAlignment:
-                                              MainAxisAlignment.center,
-                                          crossAxisAlignment:
-                                              CrossAxisAlignment.start,
-                                          children: [
-                                        Text(title,
-                                            maxLines: compact ? 2 : 3,
-                                            overflow: TextOverflow.ellipsis,
-                                            style: compact
-                                                ? Theme.of(context)
-                                                    .textTheme
-                                                    .titleLarge
-                                                : Theme.of(context)
-                                                    .textTheme
-                                                    .headlineSmall),
-                                        const SizedBox(height: 6),
-                                        Text(
-                                            '${album['artist'] ?? album['artist_name'] ?? album['channel'] ?? ''}',
-                                            maxLines: 2,
-                                            overflow: TextOverflow.ellipsis),
-                                        const SizedBox(height: 14),
-                                        Wrap(
-                                            spacing: 8,
-                                            runSpacing: 4,
-                                            children: [
-                                              FilledButton.icon(
-                                                  onPressed: () =>
-                                                      widget.onPlay(album),
-                                                  icon: const Icon(
-                                                      Icons.play_arrow),
-                                                  label: const Text('Play')),
-                                              TextButton(
-                                                  onPressed: () =>
-                                                      widget.onOpen(album),
-                                                  child:
-                                                      const Text('Open album')),
-                                            ]),
-                                      ])),
+                      return ClipRRect(
+                          borderRadius: BorderRadius.circular(26),
+                          child: Stack(fit: StackFit.expand, children: [
+                            ArtworkImage(
+                                urls: widget.api.artworkUrls(album, 'album'),
+                                width: constraints.maxWidth,
+                                height: 320,
+                                placeholder: const ColoredBox(
+                                    color: NeatieDesign.raised)),
+                            const DecoratedBox(
+                                decoration: BoxDecoration(
+                                    gradient: LinearGradient(
+                                        begin: Alignment.centerLeft,
+                                        end: Alignment.centerRight,
+                                        colors: [
+                                  Color(0xfa111916),
+                                  Color(0xe6111715),
+                                  Color(0x9c111916)
                                 ]))),
-                      );
+                            InkWell(
+                                onTap: () => widget.onOpen(album),
+                                child: Padding(
+                                    padding: EdgeInsets.all(compact ? 20 : 32),
+                                    child: Row(children: [
+                                      HomeArtwork(
+                                          api: widget.api,
+                                          item: album,
+                                          kind: 'album',
+                                          size: size),
+                                      const SizedBox(width: 18),
+                                      Expanded(
+                                          child: Column(
+                                              mainAxisAlignment:
+                                                  MainAxisAlignment.center,
+                                              crossAxisAlignment:
+                                                  CrossAxisAlignment.start,
+                                              children: [
+                                            Text('IN THE SPOTLIGHT',
+                                                style: NeatieDesign.eyebrow
+                                                    .copyWith(
+                                                        color: NeatieDesign
+                                                            .accent)),
+                                            const SizedBox(height: 12),
+                                            Text(title,
+                                                maxLines: compact ? 2 : 3,
+                                                overflow: TextOverflow.ellipsis,
+                                                style: NeatieDesign.display(
+                                                    compact ? 27 : 42)),
+                                            const SizedBox(height: 6),
+                                            Text(
+                                                '${album['artist'] ?? album['artist_name'] ?? album['channel'] ?? ''}',
+                                                maxLines: 2,
+                                                overflow:
+                                                    TextOverflow.ellipsis),
+                                            const SizedBox(height: 14),
+                                            Wrap(
+                                                spacing: 8,
+                                                runSpacing: 4,
+                                                children: [
+                                                  FilledButton.icon(
+                                                      onPressed: () =>
+                                                          widget.onPlay(album),
+                                                      icon: const Icon(
+                                                          Icons.play_arrow),
+                                                      label:
+                                                          const Text('Play')),
+                                                  TextButton(
+                                                      onPressed: () =>
+                                                          widget.onOpen(album),
+                                                      child: const Text(
+                                                          'Open album')),
+                                                ]),
+                                          ])),
+                                    ]))),
+                          ]));
                     }))),
         if (widget.albums.length > 1)
           SizedBox(
-              height: 38,
+              height: 44,
               child: ListView(
                   key: const PageStorageKey('home-album-indicators'),
                   scrollDirection: Axis.horizontal,
@@ -318,15 +376,21 @@ class HomeArtistCard extends StatelessWidget {
   final VoidCallback? onOpen;
   @override
   Widget build(BuildContext context) => SizedBox(
-      width: 136,
+      width: 154,
       child: InkWell(
           borderRadius: BorderRadius.circular(16),
           onTap: onOpen,
           child: Padding(
               padding: const EdgeInsets.all(8),
               child: Column(children: [
-                HomeArtwork(api: api, item: item, kind: 'artist', size: 108),
-                const SizedBox(height: 10),
+                Container(
+                    padding: const EdgeInsets.all(5),
+                    decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        border: Border.all(color: NeatieDesign.line)),
+                    child: HomeArtwork(
+                        api: api, item: item, kind: 'artist', size: 116)),
+                const SizedBox(height: 14),
                 Text(
                     '${item['name'] ?? item['artist_name'] ?? item['title'] ?? ''}',
                     textAlign: TextAlign.center,
@@ -352,43 +416,49 @@ class HomeCollectionCard extends StatelessWidget {
   final VoidCallback? onOpen, onPlay;
   @override
   Widget build(BuildContext context) => SizedBox(
-      width: kind == 'radio' ? 196 : 176,
-      child: Card(
-          clipBehavior: Clip.antiAlias,
-          child: InkWell(
-              onTap: onOpen,
-              child: Padding(
-                  padding: const EdgeInsets.all(12),
-                  child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Center(
-                            child: HomeArtwork(
-                                api: api,
-                                item: item,
-                                kind: kind,
-                                size: kind == 'radio' ? 154 : 134)),
-                        const SizedBox(height: 8),
-                        Text(title,
-                            maxLines: 2,
-                            overflow: TextOverflow.ellipsis,
-                            style: Theme.of(context).textTheme.titleSmall),
-                        const Spacer(),
-                        Row(children: [
-                          Expanded(
-                              child: Text(subtitle,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style:
-                                      Theme.of(context).textTheme.bodySmall)),
-                          IconButton(
-                              tooltip: 'Play $title',
-                              onPressed: onPlay,
-                              icon: Icon(kind == 'radio'
-                                  ? Icons.play_circle_outline
-                                  : Icons.play_circle_fill)),
-                        ]),
-                      ])))));
+      width: kind == 'radio' ? 224 : 204,
+      child: Padding(
+          padding: const EdgeInsets.only(right: 14, bottom: 4),
+          child: EditorialSurface(
+              child: InkWell(
+                  onTap: onOpen,
+                  child: Padding(
+                      padding: const EdgeInsets.all(12),
+                      child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Center(
+                                child: HomeArtwork(
+                                    api: api,
+                                    item: item,
+                                    kind: kind,
+                                    size: kind == 'radio' ? 182 : 162)),
+                            const SizedBox(height: 14),
+                            Text(kind == 'radio' ? 'RADIO' : 'MIX',
+                                style: NeatieDesign.eyebrow
+                                    .copyWith(fontSize: 9, letterSpacing: 1.6)),
+                            const SizedBox(height: 6),
+                            Text(title,
+                                maxLines: 2,
+                                overflow: TextOverflow.ellipsis,
+                                style: Theme.of(context).textTheme.titleSmall),
+                            const Spacer(),
+                            Row(children: [
+                              Expanded(
+                                  child: Text(subtitle,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: Theme.of(context)
+                                          .textTheme
+                                          .bodySmall)),
+                              IconButton(
+                                  tooltip: 'Play $title',
+                                  onPressed: onPlay,
+                                  icon: Icon(kind == 'radio'
+                                      ? Icons.play_circle_outline
+                                      : Icons.play_circle_fill)),
+                            ]),
+                          ]))))));
 }
 
 class HomeTrackStrip extends StatelessWidget {
@@ -407,7 +477,7 @@ class HomeTrackStrip extends StatelessWidget {
   final bool Function(Map<String, dynamic>) isLiked;
   @override
   Widget build(BuildContext context) => SizedBox(
-      height: 280 +
+      height: 264 +
           (MediaQuery.textScalerOf(context).scale(16) / 16 - 1)
                   .clamp(0.0, double.infinity) *
               70,
@@ -418,10 +488,11 @@ class HomeTrackStrip extends StatelessWidget {
             final track = tracks[index];
             final title = '${track['title'] ?? ''}';
             return SizedBox(
-                width: 164,
-                child: Card(
-                    clipBehavior: Clip.antiAlias,
+                width: 184,
+                child: Padding(
+                    padding: const EdgeInsets.only(right: 14),
                     child: InkWell(
+                        borderRadius: BorderRadius.circular(16),
                         onTap: track['playable'] == false
                             ? null
                             : () => onPlay(index),
@@ -434,8 +505,8 @@ class HomeTrackStrip extends StatelessWidget {
                                       api: api,
                                       item: track,
                                       kind: 'track',
-                                      size: 136),
-                                  const SizedBox(height: 8),
+                                      size: 148),
+                                  const SizedBox(height: 12),
                                   Text(title,
                                       maxLines: 1,
                                       overflow: TextOverflow.ellipsis,

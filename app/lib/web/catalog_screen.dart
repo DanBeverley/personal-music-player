@@ -6,6 +6,7 @@ import 'catalog_api.dart';
 import 'catalog_detail.dart';
 import 'artwork_image.dart';
 import 'home_widgets.dart';
+import 'design_system.dart';
 import 'music_api.dart';
 import 'web_player.dart';
 
@@ -982,7 +983,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
             child:
                 Text(rowTitle, style: Theme.of(context).textTheme.titleLarge)),
         SizedBox(
-            height: (kind == 'artist' ? 200 : 310) +
+            height: (kind == 'artist' ? 222 : 342) +
                 (MediaQuery.textScalerOf(context).scale(16) / 16 - 1)
                         .clamp(0.0, double.infinity) *
                     100,
@@ -1033,14 +1034,15 @@ class _CatalogScreenState extends State<CatalogScreen> {
                 api: widget.api,
                 item: _collectionDetailItem,
                 kind: _collectionDetailKind,
-                size: 112),
+                size: MediaQuery.sizeOf(context).width >= 850 ? 184 : 112),
             const SizedBox(width: 18),
             Expanded(
                 child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                   Text(selected.title,
-                      style: Theme.of(context).textTheme.titleLarge),
+                      style: NeatieDesign.display(
+                          MediaQuery.sizeOf(context).width >= 850 ? 40 : 28)),
                   const SizedBox(height: 6),
                   Text('${_collectionDetailTracks.length} songs'),
                   if ('${_collectionDetailItem['description'] ?? ''}'
@@ -1159,21 +1161,27 @@ class _CatalogScreenState extends State<CatalogScreen> {
     final artistName = lead?['name']?.toString() ?? '';
     return ListView(
         key: PageStorageKey(widget.home ? 'home' : 'search'),
-        padding: const EdgeInsets.all(20),
+        padding: EdgeInsets.fromLTRB(
+            MediaQuery.sizeOf(context).width >= 850 ? 36 : 20,
+            0,
+            MediaQuery.sizeOf(context).width >= 850 ? 36 : 20,
+            36),
         children: [
-          Row(children: [
-            Expanded(
-                child: Text(
-                    widget.home
-                        ? 'Made for your listening'
-                        : 'Find your next listen',
-                    style: Theme.of(context).textTheme.headlineSmall)),
-            if (widget.home)
-              IconButton(
-                  tooltip: 'Refresh Home',
-                  onPressed: busy ? null : () => load(refresh: true),
-                  icon: const Icon(Icons.refresh))
-          ]),
+          EditorialHeading(
+              title: widget.home
+                  ? 'Listening, made personal.'
+                  : 'Find your next favourite.',
+              eyebrow:
+                  widget.home ? 'MADE FOR YOUR LISTENING' : 'EXPLORE NEATIE',
+              subtitle: widget.home
+                  ? 'Familiar favourites and a few new directions.'
+                  : 'Songs, artists and albums. Follow your curiosity.',
+              action: widget.home
+                  ? IconButton.outlined(
+                      tooltip: 'Refresh Home',
+                      onPressed: busy ? null : () => load(refresh: true),
+                      icon: const Icon(Icons.refresh_rounded, size: 20))
+                  : null),
           if (!widget.home) ...[
             const SizedBox(height: 16),
             TextField(
@@ -1183,7 +1191,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
                 decoration: InputDecoration(
                     labelText: 'Search songs',
                     hintText: 'Songs, artists and albums',
-                    border: const OutlineInputBorder(),
+                    prefixIcon: const Icon(Icons.search_rounded),
                     suffixIcon: IconButton(
                         tooltip: 'Search',
                         onPressed: () => load(manualSearch: true),
@@ -1243,6 +1251,9 @@ class _CatalogScreenState extends State<CatalogScreen> {
               TextButton(
                   onPressed: busy ? null : () => load(refresh: true),
                   child: const Text('New recommendations are ready')),
+            if (selectedLane == 'all')
+              for (final row in rows)
+                if (row['kind'] == 'todays_pick') homeRow(row),
             HomeAlbumHero(
                 key: const ValueKey('home-album-hero'),
                 api: widget.api,
@@ -1283,7 +1294,8 @@ class _CatalogScreenState extends State<CatalogScreen> {
                   ])),
             if (selectedLane == 'all') ...[
               for (final row in rows)
-                if (_homeType(row) != 'album') homeRow(row),
+                if (_homeType(row) != 'album' && row['kind'] != 'todays_pick')
+                  homeRow(row),
               for (final row in rows)
                 if (_homeType(row) == 'album' && row['has_more'] == true)
                   TextButton(
@@ -1310,6 +1322,24 @@ class _CatalogScreenState extends State<CatalogScreen> {
                 }),
             ],
           ] else ...[
+            if (!submitted && !busy && !hasSearchResult)
+              Padding(
+                  padding: const EdgeInsets.only(top: 36),
+                  child: EditorialSurface(
+                      child: Padding(
+                          padding: const EdgeInsets.all(28),
+                          child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                const Icon(Icons.travel_explore_rounded,
+                                    color: NeatieDesign.accent, size: 36),
+                                const SizedBox(height: 22),
+                                Text('Every great listen starts somewhere.',
+                                    style: NeatieDesign.display(30)),
+                                const SizedBox(height: 12),
+                                const Text(
+                                    'Start with a song you love, an artist you miss, or an album you have been meaning to hear.'),
+                              ])))),
             if (submitted && !busy && error == null && !hasSearchResult)
               const Text('No results found.'),
             for (final type in labels.keys)

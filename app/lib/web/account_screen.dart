@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import 'web_auth.dart';
+import 'design_system.dart';
 
 class AccountScreen extends StatefulWidget {
   const AccountScreen({super.key, required this.auth});
@@ -95,7 +96,7 @@ class _AccountScreenState extends State<AccountScreen> {
         padding: const EdgeInsets.all(24),
         child: ConstrainedBox(
           constraints: const BoxConstraints(maxWidth: 420),
-          child: Card(
+          child: EditorialSurface(
             child: Padding(
               padding: const EdgeInsets.all(24),
               child: signedIn
@@ -113,25 +114,35 @@ class _AccountScreenState extends State<AccountScreen> {
   Widget _signedInView() => Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          const Text('Account', style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
+          Text('Your space.', style: NeatieDesign.display(36)),
           const SizedBox(height: 12),
           Text(auth.email!),
           const SizedBox(height: 24),
           _errorText(),
-          FilledButton(onPressed: auth.busy ? null : auth.signOut, child: const Text('Sign out')),
+          FilledButton(
+              onPressed: auth.busy ? null : auth.signOut,
+              child: const Text('Sign out')),
         ],
       );
 
   Widget _recoveryView() => Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          const Text('Set a new password', style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
+          const Text('Set a new password',
+              style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
           const SizedBox(height: 16),
-          TextFormField(controller: _newPassword, obscureText: true, enabled: !auth.busy, decoration: const InputDecoration(labelText: 'New password'), validator: _passwordError),
+          TextFormField(
+              controller: _newPassword,
+              obscureText: true,
+              enabled: !auth.busy,
+              decoration: const InputDecoration(labelText: 'New password'),
+              validator: _passwordError),
           const SizedBox(height: 16),
           _errorText(),
           _feedbackText(),
-          FilledButton(onPressed: auth.busy ? null : _updatePassword, child: const Text('Update password')),
+          FilledButton(
+              onPressed: auth.busy ? null : _updatePassword,
+              child: const Text('Update password')),
         ],
       );
 
@@ -140,31 +151,65 @@ class _AccountScreenState extends State<AccountScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            Text(_signUp ? 'Create account' : 'Sign in', style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
+            Text(_signUp ? 'Make it yours.' : 'Welcome back.',
+                style: NeatieDesign.display(36)),
+            const SizedBox(height: 10),
+            Text(_signUp
+                ? 'Create your Neatie account.'
+                : 'Sign in to your Neatie account.'),
             const SizedBox(height: 16),
-            TextFormField(controller: _email, enabled: !auth.busy, keyboardType: TextInputType.emailAddress, decoration: const InputDecoration(labelText: 'Email'), validator: _emailError),
+            TextFormField(
+                controller: _email,
+                enabled: !auth.busy,
+                keyboardType: TextInputType.emailAddress,
+                decoration: const InputDecoration(labelText: 'Email'),
+                validator: _emailError),
             const SizedBox(height: 12),
-            TextFormField(controller: _password, enabled: !auth.busy, obscureText: true, decoration: const InputDecoration(labelText: 'Password'), validator: _passwordError),
+            TextFormField(
+                controller: _password,
+                enabled: !auth.busy,
+                obscureText: true,
+                decoration: const InputDecoration(labelText: 'Password'),
+                validator: _passwordError),
             const SizedBox(height: 16),
             _errorText(),
             _feedbackText(),
-            FilledButton(onPressed: auth.busy ? null : _submit, child: Text(_signUp ? 'Sign up' : 'Sign in')),
-            TextButton(onPressed: auth.busy ? null : () => setState(() => _signUp = !_signUp), child: Text(_signUp ? 'Already have an account? Sign in' : 'Need an account? Sign up')),
-            TextButton(onPressed: auth.busy ? null : _resetPassword, child: const Text('Reset password')),
+            FilledButton(
+                onPressed: auth.busy ? null : _submit,
+                child: Text(_signUp ? 'Sign up' : 'Sign in')),
+            TextButton(
+                onPressed:
+                    auth.busy ? null : () => setState(() => _signUp = !_signUp),
+                child: Text(_signUp
+                    ? 'Already have an account? Sign in'
+                    : 'Need an account? Sign up')),
+            TextButton(
+                onPressed: auth.busy ? null : _resetPassword,
+                child: const Text('Reset password')),
             const Divider(height: 28),
-            OutlinedButton(onPressed: auth.busy ? null : auth.signInWithGoogle, child: const Text('Continue with Google')),
+            OutlinedButton(
+                onPressed: auth.busy ? null : auth.signInWithGoogle,
+                child: const Text('Continue with Google')),
             const SizedBox(height: 8),
             if (const bool.fromEnvironment('WEB_GITHUB_LOGIN'))
-              OutlinedButton(onPressed: auth.busy ? null : auth.signInWithGitHub, child: const Text('Continue with GitHub')),
+              OutlinedButton(
+                  onPressed: auth.busy ? null : auth.signInWithGitHub,
+                  child: const Text('Continue with GitHub')),
           ],
         ),
       );
 
   Widget _errorText() => auth.error == null
       ? const SizedBox.shrink()
-      : Padding(padding: const EdgeInsets.only(bottom: 12), child: Text(auth.error!, style: TextStyle(color: Theme.of(context).colorScheme.error)));
+      : Padding(
+          padding: const EdgeInsets.only(bottom: 12),
+          child: Text(auth.error!,
+              style: TextStyle(color: Theme.of(context).colorScheme.error)));
 
   Widget _feedbackText() => _feedback == null
       ? const SizedBox.shrink()
-      : Padding(padding: const EdgeInsets.only(bottom: 12), child: Text(_feedback!, style: TextStyle(color: Theme.of(context).colorScheme.primary)));
+      : Padding(
+          padding: const EdgeInsets.only(bottom: 12),
+          child: Text(_feedback!,
+              style: TextStyle(color: Theme.of(context).colorScheme.primary)));
 }

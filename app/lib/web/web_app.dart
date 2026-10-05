@@ -16,8 +16,10 @@ import 'catalog_screen.dart';
 import 'home_signals.dart';
 import 'guest_home_state.dart';
 import 'catalog_api.dart';
+import 'design_system.dart';
+import 'playback_dock.dart';
 
-const webBuild = '2026-10-04-home-presentation';
+const webBuild = '2026-10-05-editorial';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -32,10 +34,7 @@ class NeatieWebApp extends StatelessWidget {
   Widget build(BuildContext context) => MaterialApp(
       title: 'Neatie',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData.dark(useMaterial3: true).copyWith(
-          scaffoldBackgroundColor: const Color(0xff101114),
-          colorScheme: ColorScheme.fromSeed(
-              seedColor: const Color(0xffd7e8b6), brightness: Brightness.dark)),
+      theme: NeatieDesign.theme,
       home: _PlayerPage(auth: auth));
 }
 
@@ -60,7 +59,7 @@ class _PlayerPageState extends State<_PlayerPage> {
   int _guestHomeRevision = 0;
   int _homeForegroundRevision = 0;
   bool _foreground = true;
-  int tab = 1;
+  int tab = 0;
   static const names = ['Home', 'Search', 'Library', 'Queue', 'Account'];
   static const icons = [
     Icons.home_outlined,
@@ -289,7 +288,8 @@ class _PlayerPageState extends State<_PlayerPage> {
   }
 
   Widget _queue() => ListView(padding: const EdgeInsets.all(24), children: [
-        Text(player.title, style: Theme.of(context).textTheme.headlineSmall),
+        EditorialHeading(
+            title: 'Up next.', eyebrow: 'YOUR QUEUE', subtitle: player.title),
         if (player.queue.isEmpty)
           const Padding(
               padding: EdgeInsets.symmetric(vertical: 24),
@@ -337,66 +337,82 @@ class _PlayerPageState extends State<_PlayerPage> {
         ));
   }
 
-  Widget _controls() => Material(
-      color: const Color(0xff202226),
-      child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
-          child: Column(mainAxisSize: MainAxisSize.min, children: [
-            Row(children: [
-              Expanded(
-                  child: Text(player.current?['title']?.toString() ?? '',
-                      maxLines: 1, overflow: TextOverflow.ellipsis)),
-              IconButton(
-                  tooltip: 'Like current song',
-                  onPressed: () => _like(player.current!),
-                  icon: Icon(library?.likes.any((t) =>
-                              extractTrackId(t) ==
-                              extractTrackId(player.current)) ==
-                          true
-                      ? Icons.favorite
-                      : Icons.favorite_border))
-            ]),
-            if (player.error != null)
-              Text(player.error!,
-                  maxLines: 2,
-                  style: const TextStyle(color: Colors.orangeAccent)),
-            if (player.loading) const LinearProgressIndicator(),
-            Slider(
-                value: player.position
-                    .clamp(0, player.duration > 0 ? player.duration : 1),
-                max: player.duration > 0 ? player.duration : 1,
-                onChanged: player.duration > 0 ? player.seek : null),
-            Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-              IconButton(
-                  tooltip: 'Previous',
-                  onPressed: player.index > 0
-                      ? () => unawaited(player.previous())
-                      : null,
-                  icon: const Icon(Icons.skip_previous)),
-              IconButton(
-                  tooltip: audio.paused ? 'Play' : 'Pause',
-                  onPressed: () =>
-                      audio.paused ? unawaited(player.play()) : player.pause(),
-                  icon: Icon(audio.paused
-                      ? Icons.play_circle_fill
-                      : Icons.pause_circle_filled),
-                  iconSize: 40),
-              IconButton(
-                  tooltip: 'Next',
-                  onPressed: player.index + 1 < player.queue.length
-                      ? () => unawaited(player.next())
-                      : null,
-                  icon: const Icon(Icons.skip_next)),
-              Text('${player.position.toInt()} / ${player.duration.toInt()} s'),
-              IconButton(
-                  tooltip:
-                      audio.repeatOne ? 'Turn off repeat' : 'Repeat this song',
-                  isSelected: audio.repeatOne,
-                  onPressed: () =>
-                      setState(() => audio.repeatOne = !audio.repeatOne),
-                  icon: const Icon(Icons.repeat_one)),
-            ]),
-          ])));
+  Widget _sidebar() => Container(
+      width: 218,
+      decoration: const BoxDecoration(
+          color: NeatieDesign.surface,
+          border: Border(right: BorderSide(color: NeatieDesign.line))),
+      padding: const EdgeInsets.fromLTRB(20, 30, 20, 18),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const Padding(padding: EdgeInsets.only(left: 8), child: NeatieBrand()),
+        const SizedBox(height: 46),
+        Padding(
+            padding: const EdgeInsets.only(left: 12, bottom: 14),
+            child: Text('YOUR LISTENING ROOM', style: NeatieDesign.eyebrow)),
+        for (var i = 0; i < names.length; i++)
+          Padding(
+              padding: const EdgeInsets.only(bottom: 6),
+              child: Material(
+                  color: tab == i
+                      ? NeatieDesign.accent.withValues(alpha: .12)
+                      : Colors.transparent,
+                  borderRadius: BorderRadius.circular(14),
+                  child: InkWell(
+                      borderRadius: BorderRadius.circular(14),
+                      onTap: () => _navigate(i),
+                      child: Padding(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 14, vertical: 14),
+                          child: Row(children: [
+                            Icon(icons[i],
+                                size: 21,
+                                color: tab == i
+                                    ? NeatieDesign.accent
+                                    : NeatieDesign.muted),
+                            const SizedBox(width: 14),
+                            Text(names[i],
+                                style: TextStyle(
+                                    fontSize: 13,
+                                    fontWeight: FontWeight.w600,
+                                    color: tab == i
+                                        ? NeatieDesign.accent
+                                        : NeatieDesign.ink)),
+                          ]))))),
+        const Spacer(),
+        const Divider(),
+        TextButton.icon(
+            onPressed: showDiagnostics,
+            icon: const Icon(Icons.tune_rounded, size: 16),
+            label: const Text('Diagnostics')),
+        const SizedBox(height: 8),
+        const Text('Build $webBuild',
+            style: TextStyle(fontSize: 9, color: NeatieDesign.muted)),
+      ]));
+
+  Widget _header(bool wide) => Padding(
+      padding: EdgeInsets.symmetric(horizontal: wide ? 36 : 20, vertical: 14),
+      child: Row(children: [
+        if (!wide)
+          const NeatieBrand()
+        else
+          Text(names[tab].toUpperCase(), style: NeatieDesign.eyebrow),
+        const Spacer(),
+        if (wide && tab != 1)
+          TextButton.icon(
+              onPressed: () => _navigate(1),
+              icon: const Icon(Icons.search, size: 18),
+              label: const Text('Find a song')),
+        if (!wide)
+          IconButton(
+              tooltip: 'Diagnostics',
+              onPressed: showDiagnostics,
+              icon: const Icon(Icons.tune_rounded, size: 19)),
+        IconButton(
+            tooltip: widget.auth.email ?? 'Account',
+            onPressed: () => _navigate(4),
+            style: IconButton.styleFrom(backgroundColor: NeatieDesign.raised),
+            icon: const Icon(Icons.person_outline_rounded, size: 20)),
+      ]));
 
   @override
   Widget build(BuildContext context) => AnimatedBuilder(
@@ -431,47 +447,39 @@ class _PlayerPageState extends State<_PlayerPage> {
           AccountScreen(auth: widget.auth),
         ]);
         return Scaffold(
-            appBar: AppBar(title: const Text('neatie'), actions: [
-              TextButton(
-                  onPressed: showDiagnostics, child: const Text('Diagnostics')),
-              IconButton(
-                  tooltip: widget.auth.email ?? 'Account',
-                  onPressed: () => _navigate(4),
-                  icon: const Icon(Icons.account_circle_outlined))
-            ]),
-            body: Column(children: [
-              const Padding(
-                  padding: EdgeInsets.only(bottom: 4),
-                  child: Text('Build $webBuild',
-                      style: TextStyle(fontSize: 10, color: Colors.grey))),
-              Expanded(
-                  child: Row(children: [
-                if (wide)
-                  NavigationRail(
-                      selectedIndex: tab,
-                      onDestinationSelected: _navigate,
-                      labelType: NavigationRailLabelType.all,
-                      destinations: [
-                        for (var i = 0; i < names.length; i++)
-                          NavigationRailDestination(
-                              icon: Icon(icons[i]), label: Text(names[i]))
-                      ]),
-                Expanded(child: pages)
-              ])),
-            ]),
+            body: SafeArea(
+                bottom: false,
+                child: Row(children: [
+                  if (wide) _sidebar(),
+                  Expanded(
+                      child: Column(
+                          children: [_header(wide), Expanded(child: pages)])),
+                ])),
             bottomNavigationBar: SafeArea(
                 top: false,
                 child: Column(mainAxisSize: MainAxisSize.min, children: [
-                  if (player.current != null) _controls(),
+                  if (player.current != null)
+                    PlaybackDock(
+                        player: player,
+                        audio: audio,
+                        wide: wide,
+                        liked: library?.likes.any((t) =>
+                                extractTrackId(t) ==
+                                extractTrackId(player.current)) ==
+                            true,
+                        onLike: () => unawaited(_like(player.current!)),
+                        onRepeat: () =>
+                            setState(() => audio.repeatOne = !audio.repeatOne),
+                        onQueue: () => _navigate(3)),
                   if (!wide)
                     NavigationBar(
                         selectedIndex: tab,
                         onDestinationSelected: _navigate,
-                        height: 64,
+                        height: 68,
                         destinations: [
                           for (var i = 0; i < names.length; i++)
                             NavigationDestination(
-                                icon: Icon(icons[i]), label: names[i])
+                                icon: Icon(icons[i], size: 21), label: names[i])
                         ]),
                 ])));
       });

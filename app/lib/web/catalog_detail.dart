@@ -6,6 +6,8 @@ import 'catalog_api.dart';
 import 'artwork_image.dart';
 import 'music_api.dart';
 import 'web_player.dart';
+import 'design_system.dart';
+import 'editorial_placeholder.dart';
 
 class CatalogDetail extends StatefulWidget {
   const CatalogDetail({
@@ -154,6 +156,7 @@ class _CatalogDetailState extends State<CatalogDetail> {
       padding: const EdgeInsets.all(20),
       children: [
         _Header(
+          isArtist: _isArtist,
           title: _title,
           artist: _artist,
           thumbnail: widget.api.api
@@ -264,32 +267,46 @@ class _Header extends StatelessWidget {
     required this.title,
     required this.artist,
     required this.thumbnail,
+    required this.isArtist,
   });
 
   final String title;
   final String artist;
   final List<String> thumbnail;
+  final bool isArtist;
 
   @override
-  Widget build(BuildContext context) => Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          _Cover(urls: thumbnail, size: 112),
-          const SizedBox(width: 16),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(title, style: Theme.of(context).textTheme.headlineSmall),
-                if (artist.isNotEmpty) ...[
-                  const SizedBox(height: 6),
-                  Text(artist, style: Theme.of(context).textTheme.titleMedium),
-                ],
-              ],
-            ),
-          ),
-        ],
-      );
+  Widget build(BuildContext context) =>
+      LayoutBuilder(builder: (context, bounds) {
+        final compact = bounds.maxWidth < 600;
+        final size = compact ? 124.0 : 208.0;
+        final cover = ClipRRect(
+            borderRadius: BorderRadius.circular(isArtist ? size / 2 : 18),
+            child: ArtworkImage(
+                urls: thumbnail,
+                width: size,
+                height: size,
+                placeholder:
+                    EditorialPlaceholder(label: title, artist: isArtist)));
+        final copy =
+            Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(isArtist ? 'ARTIST' : 'ALBUM', style: NeatieDesign.eyebrow),
+          const SizedBox(height: 16),
+          Text(title, style: NeatieDesign.display(compact ? 34 : 48)),
+          if (artist.isNotEmpty) ...[const SizedBox(height: 12), Text(artist)],
+        ]);
+        return Padding(
+            padding: const EdgeInsets.symmetric(vertical: 20),
+            child: compact
+                ? Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [cover, const SizedBox(height: 24), copy])
+                : Row(children: [
+                    cover,
+                    const SizedBox(width: 32),
+                    Expanded(child: copy)
+                  ]));
+      });
 }
 
 class _Cover extends StatelessWidget {

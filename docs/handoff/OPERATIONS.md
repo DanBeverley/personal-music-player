@@ -10,10 +10,10 @@ Reconciled October 4, 2026. AWS is the serving host; Oracle is stopped. This fil
 | Shape / OS | m7i-flex.large, 2 vCPUs / 8 GiB, Ubuntu 24.04.4 x86_64 |
 | Disk | approximately 40 GiB gp3 |
 | IPv4 | 13.236.9.131; Elastic IP association unverified |
-| Web | https://preview.13.236.9.131.sslip.io/ |
+| Web | https://neatie.duckdns.org/; https://preview.13.236.9.131.sslip.io/ retained |
 | API | https://13-236-9-131.sslip.io/ |
-| Build | 2026-10-05-editorial |
-| Public main.dart.js SHA-256 | 580d9058a3bd68bb80ec0b5614ccf2f6948e2ef75a20149ad44187acafc1a893 |
+| Build | 2026-10-05-refined |
+| Public main.dart.js SHA-256 | e20059394b46f753ef3e21f38e95f0ecbe6455e4c22cd27b771cdaf696e51b1a |
 | Release / symlink | /opt/neatie/releases/aws-20261003-oct1 / /opt/neatie/current |
 | Environments | /opt/neatie/shared/backend.env and /opt/neatie/shared/deploy.env |
 | Runtime / downloads | /var/lib/neatie/runtime / /var/lib/neatie/downloads |
@@ -23,6 +23,22 @@ Public ports are 80/443; SSH host UFW allows 22 and the user's EC2 security grou
 A reboot ordinarily preserves an automatically assigned public IP; stop/start may not. Before resizing/stopping, verify stable IP or plan bundle-origin/API/Supabase callback changes. Current displayed compute rate was $0.1197/hour (~$87.38/730 hours), before disk/IPv4: $100 is finite credit, not six months of this VM. About 2.6 GiB host use was observed during playback/worker activity. A 4 GiB instance is a test candidate; 2 GiB fit is not established. Offer/pricing research must be refreshed before a future decision.
 
 ## Worktrees and private local files
+
+October 5 refinement: local stage C:/Users/ADMIN/AppData/Local/Temp/neatie-refined-20261005; remote /home/ubuntu/neatie-refined-20261005. `refined.tgz` SHA-256 is 88968edc89f9dc862aa6154fc025838a1d44ddcd52eb80160380197501a67056. All 61 frontend source/assets/bundle manifest hashes and both public web bundle hashes matched. Promotion completed 2026-10-05T02:57:35Z; only web-preview was recreated and all six services run. API/worker/runtime stayed intact, and no backend or private files were packaged.
+
+Current web rollback retains 2026-10-05-editorial at `/opt/neatie/releases/aws-20261003-oct1/app/build/web.pre-refinement-20261005` and prior frontend source at `/var/backups/neatie/pre-refinement-20261005/source.tgz`. Git tag `neatie-web-before-refinement-20261005` points to df38921. Run on the VM:
+
+```bash
+sudo bash /var/backups/neatie/pre-refinement-20261005/rollback-web.sh
+```
+
+This guarded script verifies current/previous bundle hashes and release path, preserves the withdrawn bundle, restores previous frontend source/static files and recreates only web-preview. It leaves runtime and hostname aliases unchanged. It was syntax checked; actual rollback was not performed. The earlier online runtime backup below remains retained; no second runtime backup was needed for this frontend-only promotion. Public Chromium verified both hostname hashes, the icon, desktop Home/Search/account controls and 390px account layout, with one audio element and zero page errors; this does not establish completed sign-in or real iPhone playback.
+
+The user registered `neatie.duckdns.org` and set its IPv4 to 13.236.9.131. DNS and HTTPS for both new/old web addresses passed. `AURALIS_WEB_HOST` in protected deploy.env now contains both hostnames separated by a comma; Caddy's existing placeholder accepts that host list. Caddy was validated then recreated separately for the alias, with the previous private deploy.env and gateway config retained under `/var/backups/neatie/domain-duckdns-20261005/`. No DuckDNS token was read or committed and no updater was installed. [DuckDNS](https://www.duckdns.org/about.jsp) provides the free hostname mapping; its account remains user-managed.
+
+The API and compiled API origin remain https://13-236-9-131.sslip.io/. The user confirmed Supabase redirect URLs `https://neatie.duckdns.org` and `https://neatie.duckdns.org/**`, retaining existing entries. New-origin login must be tested; old-origin guest/history/queue/session storage remains on the previous address. Do not silently redirect the old address or claim local state migration. DNS branding does not establish a stable EC2 public IP: after an IP change, update the DuckDNS record and assess the IP-based API origin, gateway, bundle and callbacks before resuming. Router IP changes still require only the SSH security-group source update.
+
+### Earlier quiet minimal checkpoint
 
 October 5 quiet minimal release: local stage C:/Users/ADMIN/AppData/Local/Temp/neatie-editorial-20261005; remote /home/ubuntu/neatie-editorial-20261005. `editorial.tgz` SHA-256 is 348b8bf887c20b4e0ca0087871e5dad122332cef18d7ddc8ee8397c36117327c. The manifest has 56 frontend source/assets/bundle hashes; tests, runtime, docs and private files were excluded. Promotion completed 2026-10-05T01:52:48Z after an online runtime backup. Only web-preview was recreated; API/worker uptimes were preserved and all six services run. Public HTTPS main.dart.js matches the current table hash.
 
@@ -35,7 +51,7 @@ sudo bash /var/backups/neatie/pre-editorial-20261005/rollback-web.sh
 The script checks the expected current/previous bundle hashes and release path, preserves the withdrawn bundle, restores prior frontend source/static assets, recreates only web-preview and verifies the old public hash. It leaves current runtime data untouched. It was syntax checked; an actual rollback was not performed. Reassess the guard before using it after a later release.
 
 Main/Android: C:/Users/ADMIN/Documents/GitHub/personal-music-player, develop, committed e720709.
-Web/backend source: C:/Users/ADMIN/Documents/GitHub/personal-music-player-web, codex/web-app, application checkpoint e4e7529. H01–H14, album transport and the quiet minimal frontend are committed; tests/runtime/private files remain excluded. The October 4 hash manifests identify their targeted releases independently of later commits. H09–H14 and the October 5 redesign are web-only releases; no API/worker rebuild or restart, runtime replacement or cloud-plan change.
+Web/backend source: C:/Users/ADMIN/Documents/GitHub/personal-music-player-web, codex/web-app, application checkpoint 7553f5b. H01–H14, album transport and the quiet minimal frontend/refinement are committed; tests/runtime/private files remain excluded. The October 4 hash manifests identify their targeted releases independently of later commits. H09–H14 and the October 5 redesign/refinement are web-only releases; no API/worker rebuild or restart, runtime replacement or cloud-plan change. The separate hostname alias change recreated only Caddy.
 
 Main-only unreleased playlist files: app/lib/logic/playlist_provider.dart, playlist_sync_delta.dart and app/test/playlist_sync_delta_test.dart. Neither branch HEAD captures all current work; choose the owning tree and preserve unrelated changes.
 

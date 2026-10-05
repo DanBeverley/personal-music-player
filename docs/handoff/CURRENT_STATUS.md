@@ -7,20 +7,30 @@ Reconciled October 5, 2026. This is the deployment/verification record; [NEXT_ST
 | Purpose | Directory | Branch / application checkpoint |
 | --- | --- | --- |
 | Android/main | C:/Users/ADMIN/Documents/GitHub/personal-music-player | develop / e720709 |
-| Web/backend source | C:/Users/ADMIN/Documents/GitHub/personal-music-player-web | codex/web-app / e4e7529; application changes committed, tests/runtime/private excluded |
+| Web/backend source | C:/Users/ADMIN/Documents/GitHub/personal-music-player-web | codex/web-app / 7553f5b; application changes committed, tests/runtime/private excluded |
 
 The worktrees differ. Main-only playlist delta-sync changes are not released and are not assumed integrated into web. No reset/clean, unrelated revert, commit or push is implied by documentation work.
 
-- Serving build: `2026-10-05-editorial`.
-- Web: https://preview.13.236.9.131.sslip.io/
+- Serving build: `2026-10-05-refined`.
+- Web: https://neatie.duckdns.org/; the previous https://preview.13.236.9.131.sslip.io/ address remains available.
 - API: https://13-236-9-131.sslip.io/
-- Public main.dart.js SHA-256: `580d9058a3bd68bb80ec0b5614ccf2f6948e2ef75a20149ad44187acafc1a893`.
+- Public main.dart.js SHA-256: `e20059394b46f753ef3e21f38e95f0ecbe6455e4c22cd27b771cdaf696e51b1a`.
 - Host: user-created AWS Sydney EC2, m7i-flex.large, Ubuntu 24.04.4 x86_64, 2 vCPUs / 8 GiB / approximately 40 GiB gp3. Oracle is stopped; no A1 has been allocated.
 - September 20 runtime restored on AWS; both SQLite databases passed integrity checks. This does not recover later Oracle runtime activity.
 - All six services, HTTPS/public bundle, history gateway routes, actual desktop Chromium playback/seek/reload and API/worker restart persistence were verified. Stable IP association is unverified.
 - The downloaded October 3 AWS archive is hash/SQLite verified and predates the latest history/Search changes. Its full restore is untested; on-host daily backup timer is active. Paths and exclusions are in OPERATIONS.
 
 ## Implemented behavior
+
+### October 5 motion, controls and hostname refinement
+
+- Application commits: 48dc6c6 (motion, continuous forward album loop, paging controls and Search alignment), 7553f5b (local browser/Apple icons, manifest metadata and branded startup equalizer). Tests, runtime, private files and generated builds remain excluded; nothing was pushed. Source rollback tag neatie-web-before-refinement-20261005 retains df38921.
+- AWS promotion completed 2026-10-05T02:57:35Z. All 61 source/assets/bundle hashes matched, and both public web hostnames served the exact new bundle. Only web-preview was recreated for this promotion; API/worker and runtime remained intact. All six services run; API/browser-audio/token services are healthy. The prior editorial static bundle/source and a guarded rollback script are retained in OPERATIONS; no rollback was needed.
+- Public Chromium over HTTP/1.1 checked the new hostname, both exact bundle hashes, retained API origin and served SVG icon. Desktop Home/Search and configured email/Google sign-in controls rendered; the 390px account layout retained one audio element with zero page errors. This verifies public unauthenticated navigation, not completed sign-in, account feed content or real iPhone behavior.
+- Tab entrances retain mounted account-scoped pages, request state and scroll. Artwork fades, navigation/card states transition and hidden page tickers stop. A reduced-motion-aware equalizer replaces straight loading bars in Home/Search, details, library and playback; the startup screen uses the existing Neatie mark. Home row paging is a header arrow; Search paging uses labelled outlined arrow buttons. Search has a stable accessible input name without a floating label, more spacing before filters/results, and ready-feed availability appears as a dot on Refresh rather than duplicate text.
+- Featured Albums advances after seven seconds at rest, swipes forward through a duplicate first card and resets physical page position after settling. Logical indicators and open/play actions remain aligned. Manual interactions, inactive Home/browser and reduced motion retain their existing pause rules. Qualified supply is still required; this pass does not admit albums or close H04/H05/H07.
+- Verification: 31 focused Flutter tests passed; release compilation/WebAssembly dry run passed with the existing Cupertino font warning. Fixture Chromium at 1440px verified normal-motion repeated carousel wraps, album detail/return, submitted Search results and spacing, playback/pause and native canvas play/pause/seek. Responsive 390px player/repeat and 320px queue/navigation passed, with one audio element and no page/console errors. Evidence is local at C:/Users/ADMIN/AppData/Local/Temp/neatie-refined-20261005/. Device, real-account and fresh supply acceptance remain open.
+- The user registered neatie.duckdns.org pointing to 13.236.9.131 and confirmed both new Supabase redirect entries while retaining old ones. Caddy enables HTTPS for both web hostnames; the API origin stays https://13-236-9-131.sslip.io/. New-origin sign-in and guest/browser storage do not automatically migrate. OPERATIONS owns the private configuration and web rollback checkpoints.
 
 ### October 5 quiet minimal frontend
 

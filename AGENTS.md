@@ -12,7 +12,7 @@ For hosting, backup or migration work, also read `docs/handoff/OPERATIONS.md`. P
 
 ## Working Rules
 
-- This worktree uses `codex/web-app`. Main develop remains committed `e720709`; the web application checkpoint is `e4e7529`, including committed H01–H14, album transport and the quiet minimal frontend. Read CURRENT_STATUS for the verified serving build. The pre-redesign source tag is `neatie-web-before-editorial-20261005` at `f94103d`. Tests/runtime/private files remain excluded from commits. Inspect current Git status before editing or committing; never reset, clean or revert unrelated files.
+- This worktree uses `codex/web-app`. Main develop remains committed `e720709`; the web application checkpoint is `7553f5b`, including committed H01–H14, album transport and the quiet minimal frontend/refinement. Read CURRENT_STATUS for the verified serving build at neatie.duckdns.org. Source rollback tags retain f94103d before the redesign and df38921 before refinement. Tests/runtime/private files remain excluded from commits. Inspect current Git status before editing or committing; never reset, clean or revert unrelated files.
 - Inspect the implementation before adding a new subsystem. The project has previously accumulated overlapping recommendation paths and defensive fallbacks.
 - Prefer root fixes over fallback-only patches. Do not make a weak feed look successful, and do not add another artifact quality state.
 - Do not add hardcoded language, artist, title, or song blocklists as product logic. Home admission must use canonical identity, relationship evidence, source authority, and profile compatibility.

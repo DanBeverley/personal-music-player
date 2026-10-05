@@ -276,6 +276,16 @@ class RadioSupplyService:
             allow_profile_mismatch=True,
             allow_expired=True,
         )
+        if existing is not None:
+            # Cover the fresh-reservoir reuse path as well as acquisition.
+            if not merge_store_artist_radio_inventory(self._server, existing):
+                return RadioSupplyOutcome(reason="radio_source_revalidation_failed", retryable=True)
+            existing = load_artist_radio_inventory(
+                self._server,
+                taste.user_scope_id,
+                allow_profile_mismatch=True,
+                allow_expired=True,
+            )
         if existing is not None and existing.profile_fingerprint != taste.profile_key:
             # Radio supply is account-owned like general candidates. Preserve
             # the qualified reservoir while moving legacy request-profile
@@ -434,7 +444,7 @@ class RadioSupplyService:
             allowed_pools={"radio_artist_catalog"},
             radio_discovery_artist_seeds=discovery_seeds,
             radio_discovery_deficit=max(
-                RADIO_VISIBLE_DISCOVERY_TARGET - discovery_count,
+                RADIO_DISCOVERY_RESERVE_TARGET_CARDS - discovery_count,
                 exposure_deficit,
                 0,
             ),

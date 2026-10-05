@@ -26,11 +26,13 @@ RADIO_CATALOG_INDEX_MAX_TRACKS = 96
 RADIO_RESERVOIR_TARGET_CARDS = 36
 RADIO_RESERVOIR_MAX_CARDS = 36
 RADIO_WORKING_RESERVOIR_TARGET_CARDS = 15
-RADIO_DISCOVERY_RESERVE_TARGET_CARDS = 12
 RADIO_VISIBLE_DISCOVERY_MINIMUM = 4
 # A feed slice aims for six genuinely related/exploratory seeds. Four truly
 # unexposed identities remain the minimum freshness admission threshold.
 RADIO_VISIBLE_DISCOVERY_TARGET = 6
+# One active rotation and its two queued successors must have independent
+# discovery supply. A two-row reserve exhausted itself on the third rotation.
+RADIO_DISCOVERY_RESERVE_TARGET_CARDS = RADIO_VISIBLE_DISCOVERY_TARGET * 3
 RADIO_UNEXPOSED_TARGET_CARDS = RADIO_VISIBLE_DISCOVERY_TARGET * 2
 RADIO_EXPOSURE_LEDGER_MAX_ENTRIES = 128  # five 20-card feeds, plus bounded margin
 ACQUISITION_JOB_NAMESPACE = "discovery_acquisition_job"
@@ -215,6 +217,63 @@ def _merge_radio_tracks(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if previous is None or playable_source_rank(item) > playable_source_rank(previous):
             canonical[identity] = item
     return list(canonical.values())
+
+
+def _revalidate_radio_sources(
+    connection: Any,
+    items: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Reproject retained tracks from current persisted source proofs only."""
+    from .source_registry import _apply_source, _recording_key, _verified_source
+
+    keys = list(dict.fromkeys(
+        key for item in items if isinstance(item, dict)
+        for key in (_recording_key(item), _track_key(item), catalog_entity_key("track", item))
+        if key
+    ))
+    source_ids = list(dict.fromkeys(
+        _radio_source_key(item) for item in items if isinstance(item, dict)
+        and _is_playable_radio_record(item)
+    ))
+    by_key: Dict[str, List[Dict[str, Any]]] = {}
+    by_source: Dict[str, List[Dict[str, Any]]] = {}
+    seen: set[tuple[str, str, str]] = set()
+    for column, values in (("entity_key", keys), ("source_key", source_ids)):
+        for offset in range(0, len(values), 400):
+            batch = values[offset:offset + 400]
+            placeholders = ",".join("?" for _ in batch)
+            rows = connection.execute(
+                "SELECT entity_key,source_provider,source_key,payload_json "
+                "FROM catalog_entity_sources WHERE entity_type='track' AND source_provider='youtube' "
+                f"AND {column} IN ({placeholders})",
+                batch,
+            ).fetchall()
+            for row in rows:
+                signature = (row["entity_key"], row["source_provider"], row["source_key"])
+                if signature in seen:
+                    continue
+                seen.add(signature)
+                source = {
+                    **json.loads(row["payload_json"] or "{}"),
+                    "provider": row["source_provider"],
+                    "source_id": row["source_key"],
+                }
+                by_key.setdefault(row["entity_key"], []).append(source)
+                by_source.setdefault(row["source_key"], []).append(source)
+    verified = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        sources = [
+            *by_key.get(_recording_key(item), []),
+            *by_key.get(_track_key(item), []),
+            *by_key.get(catalog_entity_key("track", item), []),
+            *by_source.get(_radio_source_key(item), []),
+        ]
+        matched = _verified_source(sources, item)
+        if matched is not None:
+            verified.append(_apply_source(item, matched))
+    return _merge_radio_tracks(verified)
 
 
 def _radio_seed_keys(item: Dict[str, Any], fallback: str = "") -> List[str]:
@@ -608,7 +667,13 @@ def _merge_radio_catalog_index(
                     ]
                 except Exception:
                     indexed = []
-            combined = _merge_radio_tracks([*indexed, *merged.get(seed_key, []), *touched.get(seed_key, [])])[:RADIO_CATALOG_INDEX_MAX_TRACKS]
+            # Cached "playable" flags are not source proofs. This includes
+            # old index rows and already-playable acquisition results, which
+            # previously bypassed the edition matcher on every later build.
+            combined = _revalidate_radio_sources(
+                connection,
+                [*indexed, *merged.get(seed_key, []), *touched.get(seed_key, [])],
+            )[:RADIO_CATALOG_INDEX_MAX_TRACKS]
             if cache_key.startswith("global:"):
                 combined = [
                     _sanitize_global_catalog_item(item) for item in combined
@@ -898,6 +963,12 @@ def merge_store_artist_radio_inventory(
                     for card in incoming.reservoir_cards or incoming.cards or []
                 ],
             )
+            for card in merged.reservoir_cards:
+                verified = _revalidate_radio_sources(
+                    connection, card.get("tracks") or card.get("items") or [],
+                )
+                card["tracks"] = verified
+                card["items"] = verified
         else:
             by_id: Dict[str, Dict[str, Any]] = {}
             order: List[str] = []
@@ -946,7 +1017,9 @@ def merge_store_artist_radio_inventory(
                 if not card_id:
                     continue
                 candidate = dict(card)
-                tracks = _merge_radio_tracks(candidate.get("tracks") or candidate.get("items") or [])
+                tracks = _revalidate_radio_sources(
+                    connection, candidate.get("tracks") or candidate.get("items") or [],
+                )
                 if len(tracks) < POPULAR_RADIO_CARD_MIN_TRACKS:
                     continue
                 candidate["tracks"] = tracks
@@ -964,7 +1037,10 @@ def merge_store_artist_radio_inventory(
                         float(previous.get("last_verified_at") or 0.0),
                         float(candidate.get("last_verified_at") or 0.0),
                     )
-                    if len(tracks) > len(previous.get("tracks") or []):
+                    if (
+                        float(candidate.get("last_verified_at") or 0.0)
+                        >= float(previous.get("last_verified_at") or 0.0)
+                    ):
                         by_id[card_id] = candidate
                     by_id[card_id]["first_verified_at"] = first_verified_at
                     by_id[card_id]["last_verified_at"] = max(

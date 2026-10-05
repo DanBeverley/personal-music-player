@@ -159,7 +159,26 @@ def candidate_inventory_content_identities(
 def candidate_inventory_content_hash(
     inventory: CandidateInventory | None,
 ) -> str:
-    encoded = "\n".join(sorted(candidate_inventory_content_identities(inventory)))
+    # An album identity may stay constant while its usable detail changes.
+    # Source corrections/removals need a new immutable supply revision too;
+    # verification timestamps and acquisition counters do not.
+    album_details = sorted(
+        (
+            _candidate_identity(candidate),
+            int(candidate.item.get("canonical_track_count") or 0),
+            [
+                [canonical_item_identity(track, item_type="track"),
+                 str((track.get("playback") or {}).get("source_id")
+                     or track.get("playable_source_id") or track.get("videoId") or track.get("id") or ""),
+                 str(track.get("title") or ""), str(track.get("artist") or track.get("channel") or "")]
+                for track in candidate.item.get("tracks") or candidate.item.get("canonical_tracks") or []
+                if isinstance(track, dict)
+            ],
+        )
+        for candidate in (inventory.pools.get("album") or [] if inventory else [])
+        if candidate.item_type == "album"
+    )
+    encoded = json.dumps([sorted(candidate_inventory_content_identities(inventory)), album_details], ensure_ascii=False)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
@@ -812,6 +831,16 @@ def _candidate_is_retained(candidate: DiscoveryCandidate) -> bool:
         or int(item.get("track_count") or 0) < 2
     ):
         return False
+    if candidate.item_type == "album":
+        tracks = item.get("tracks") or item.get("canonical_tracks") or []
+        source_ids = [
+            str((track.get("playback") or {}).get("source_id")
+                or track.get("playable_source_id") or track.get("videoId")
+                or track.get("id") or "").strip()
+            for track in tracks if isinstance(track, dict)
+        ]
+        if len(source_ids) != len(set(source_ids)):
+            return False
     return str(item.get("negative_feedback_state") or "none").strip().lower() not in {
         "hidden",
         "removed",

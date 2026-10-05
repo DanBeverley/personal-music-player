@@ -1782,7 +1782,18 @@ def verify_materialized_supply(
                 for item in canonical_tracks
                 if (source := verified_by_key.get(_recording_key(item))) is not None
             ]
-            required = len(canonical_tracks) if len(canonical_tracks) < 6 else max(6, int(len(canonical_tracks) * 0.8 + 0.999))
+            # Different canonical rows can resolve to the same physical song.
+            # Keep the strongest match in track-list order; repeated bytes
+            # cannot inflate an album's verified coverage.
+            by_source: Dict[str, Tuple[int, Dict[str, Any]]] = {}
+            for index, track in enumerate(playable_tracks):
+                source_id = _text(track.get("playable_source_id"))
+                previous = by_source.get(source_id)
+                if previous is None or float(track.get("source_resolution_confidence") or 0) > float(previous[1].get("source_resolution_confidence") or 0):
+                    by_source[source_id] = (index, track)
+            playable_tracks = [track for _, track in sorted(by_source.values(), key=lambda value: value[0])]
+            canonical_count = max(len(canonical_tracks), int(album.get("canonical_track_count") or 0))
+            required = canonical_count if canonical_count < 6 else max(6, int(canonical_count * 0.8 + 0.999))
             album_thumbnail = catalog_thumbnail_url(album, entity_type="album")
             if not album_thumbnail:
                 album_thumbnail = next(
@@ -1799,8 +1810,8 @@ def verify_materialized_supply(
                     "canonical_tracks": playable_tracks,
                     "tracks": playable_tracks,
                     "track_count": len(playable_tracks),
-                    "canonical_track_count": len(canonical_tracks),
-                    "playable_coverage": round(len(playable_tracks) / max(len(canonical_tracks), 1), 4),
+                    "canonical_track_count": canonical_count,
+                    "playable_coverage": round(len(playable_tracks) / max(canonical_count, 1), 4),
                     "playable": bool(canonical_tracks and len(playable_tracks) >= required),
                     "thumbnail": album_thumbnail,
                     "image": album_thumbnail,

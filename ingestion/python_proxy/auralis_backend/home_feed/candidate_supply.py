@@ -6,6 +6,7 @@ import time
 import uuid
 
 from ..discovery.enrichment import (
+    MaterializedCandidateSupply,
     build_enrichment_plan,
     complete_inventory_release_metadata,
     materialize_enrichment_plan,
@@ -248,7 +249,7 @@ def exposure_aware_candidate_supply_status(
     return _exposure_aware_supply_status(evaluated)
 
 
-def _general_candidate_content_hash(inventory: CandidateInventory) -> str:
+def _general_candidate_content_hash(inventory: CandidateInventory | None) -> str:
     """Hash only supply owned by the general candidate worker.
 
     Older snapshots may still contain radio pools. Revalidation deliberately
@@ -256,6 +257,8 @@ def _general_candidate_content_hash(inventory: CandidateInventory) -> str:
     cleanup is not a rewrite of the immutable general-candidate generation.
     """
 
+    if inventory is None:
+        return candidate_inventory_content_hash(None)
     general_pools = {
         name: list(values or [])
         for name, values in (inventory.pools or {}).items()
@@ -325,6 +328,21 @@ class CandidateSupplyService:
                 consolidated,
                 replace(fragment, profile_fingerprint=stable_profile),
             )
+        albums = list(consolidated.pools.get("album") or [])
+        if albums:
+            # Reuse the source verifier with no acquisition or artwork work.
+            # Retained flags cannot bypass current edition/source proofs.
+            verified = verify_materialized_supply(
+                self._server,
+                MaterializedCandidateSupply(pools={"album": [candidate.item for candidate in albums]}),
+                taste,
+                max_new_verifications=0,
+                hydrate_artist_artwork=False,
+            )
+            consolidated = replace(consolidated, pools={
+                **consolidated.pools,
+                "album": [replace(candidate, item=item) for candidate, item in zip(albums, verified.pools.get("album") or []) if item.get("playable") is True],
+            })
         consolidated = refresh_candidate_inventory_coverage(
             consolidated,
             taste=with_home_supply_profile(taste),
@@ -335,6 +353,7 @@ class CandidateSupplyService:
             current is None
             or current.profile_fingerprint != stable_profile
             or current_ids != consolidated_ids
+            or _general_candidate_content_hash(current) != _general_candidate_content_hash(consolidated)
         )
         if not migration_required:
             return current, False
@@ -512,7 +531,7 @@ class CandidateSupplyService:
             )
             after_ids = candidate_inventory_content_identities(candidate)
             added_ids = after_ids - before_ids
-            content_changed = after_ids != before_ids
+            content_changed = _general_candidate_content_hash(candidate) != _general_candidate_content_hash(built)
             prior_no_progress = int(
                 (built.acquisition_ledger if built is not None else {}).get(
                     "consecutive_no_progress_batches"

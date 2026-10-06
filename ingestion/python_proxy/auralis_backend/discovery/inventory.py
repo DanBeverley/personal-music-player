@@ -9,6 +9,7 @@ import time
 import uuid
 
 from ..storage.session_store import get_session_store
+from ..storage.inventory_codec import decode_inventory_payload, encode_inventory_payload
 from .candidates import build_candidate_pools
 from .schema import DiscoveryCandidate, TasteProfile
 
@@ -454,7 +455,7 @@ def _persistent_get(server: Any, key: str) -> Dict[str, Any] | None:
         ).fetchone()
         if row is None:
             return None
-        decoded = json.loads(row["payload_json"] or "{}")
+        decoded = decode_inventory_payload(json.loads(row["payload_json"] or "{}"), "candidate")
         return dict(decoded) if isinstance(decoded, dict) else None
     except Exception:
         return None
@@ -490,7 +491,7 @@ def store_candidate_inventory(
                 ).fetchone()
                 current_generation = ""
                 if row is not None:
-                    decoded = json.loads(row["payload_json"] or "{}")
+                    decoded = decode_inventory_payload(json.loads(row["payload_json"] or "{}"), "candidate")
                     if (
                         isinstance(decoded, dict)
                         and str(decoded.get("inventory_version") or "")
@@ -518,7 +519,7 @@ def store_candidate_inventory(
                 INVENTORY_NAMESPACE,
                 key,
                 INVENTORY_MODEL_VERSION,
-                json.dumps(payload, ensure_ascii=False),
+                json.dumps(encode_inventory_payload(payload, "candidate"), ensure_ascii=False),
                 time.time(),
             ],
                 )

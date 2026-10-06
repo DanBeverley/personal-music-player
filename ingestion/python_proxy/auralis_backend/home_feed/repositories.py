@@ -23,6 +23,7 @@ from .contracts import (
     retry_delay_seconds,
 )
 from .bundles import is_complete_feed_bundle_payload
+from ..storage.inventory_codec import decode_inventory_payload, encode_inventory_payload
 
 
 ConnectionFactory = Callable[[], sqlite3.Connection]
@@ -1426,7 +1427,8 @@ class _SnapshotRepository(_Repository):
             "payload": dict(record.payload),
         }
         digest = _content_hash(envelope)
-        encoded = _canonical_json(dict(record.payload))
+        kind = "candidate" if self.table_name == "home_candidate_snapshots" else "radio"
+        encoded = _canonical_json(encode_inventory_payload(dict(record.payload), kind))
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -1507,7 +1509,8 @@ class _SnapshotRepository(_Repository):
             connection.close()
 
     def _from_row(self, row: sqlite3.Row) -> CandidateSnapshotRecord | RadioSnapshotRecord:
-        payload = json.loads(row["payload_json"] or "{}")
+        kind = "candidate" if self.table_name == "home_candidate_snapshots" else "radio"
+        payload = decode_inventory_payload(json.loads(row["payload_json"] or "{}"), kind)
         return self.record_type(
             snapshot_id=str(row["snapshot_id"]),
             user_scope_id=str(row["user_scope_id"]),

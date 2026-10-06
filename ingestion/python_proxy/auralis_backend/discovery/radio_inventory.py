@@ -13,6 +13,11 @@ from .candidates import artist_name
 from .config import POPULAR_RADIO_CARD_MIN_TRACKS, POPULAR_RADIO_CARD_TARGET_TRACKS
 from .inventory import canonical_item_identity, playable_source_rank
 from .schema import DiscoveryCandidate, TasteProfile
+from ..storage.inventory_codec import (
+    InventoryStorageError,
+    decode_inventory_payload,
+    encode_inventory_payload,
+)
 
 
 RADIO_INVENTORY_NAMESPACE = "discovery_artist_radio_inventory"
@@ -621,7 +626,7 @@ def load_artist_radio_inventory(
     if row is None:
         return None
     try:
-        inventory = _from_payload(json.loads(row["payload_json"] or "{}"))
+        inventory = _from_payload(decode_inventory_payload(json.loads(row["payload_json"] or "{}"), "radio"))
     except Exception:
         return None
     if inventory is None or (
@@ -651,7 +656,7 @@ def store_artist_radio_inventory(server: Any, inventory: ArtistRadioInventory) -
                 RADIO_INVENTORY_NAMESPACE,
                 _key(inventory.user_scope_id),
                 RADIO_INVENTORY_VERSION,
-                json.dumps(_payload(inventory), ensure_ascii=False),
+                json.dumps(encode_inventory_payload(_payload(inventory), "radio"), ensure_ascii=False),
                 time.time(),
             ],
         )
@@ -690,7 +695,7 @@ def merge_radio_exposure(
         if row is None:
             connection.rollback()
             return False
-        inventory = _from_payload(json.loads(row["payload_json"] or "{}"))
+        inventory = _from_payload(decode_inventory_payload(json.loads(row["payload_json"] or "{}"), "radio"))
         if inventory is None:
             connection.rollback()
             return False
@@ -710,7 +715,7 @@ def merge_radio_exposure(
                WHERE namespace = ? AND entity_id = ?""",
             [
                 RADIO_INVENTORY_VERSION,
-                json.dumps(_payload(updated), ensure_ascii=False),
+                json.dumps(encode_inventory_payload(_payload(updated), "radio"), ensure_ascii=False),
                 time.time(),
                 RADIO_INVENTORY_NAMESPACE,
                 _key(user_scope_id),
@@ -766,7 +771,11 @@ def merge_store_artist_radio_inventory(
         current = None
         if row is not None:
             try:
-                current = _from_payload(json.loads(row["payload_json"] or "{}"))
+                current = _from_payload(decode_inventory_payload(json.loads(row["payload_json"] or "{}"), "radio"))
+            except InventoryStorageError:
+                # Corrupt compact state is not an empty reservoir. Preserve it
+                # for recovery instead of overwriting cursors/exposure on merge.
+                raise
             except Exception:
                 current = None
         if current is not None and current.profile_fingerprint != incoming.profile_fingerprint:
@@ -995,7 +1004,7 @@ def merge_store_artist_radio_inventory(
                 RADIO_INVENTORY_NAMESPACE,
                 _key(merged.user_scope_id),
                 RADIO_INVENTORY_VERSION,
-                json.dumps(_payload(merged), ensure_ascii=False),
+                json.dumps(encode_inventory_payload(_payload(merged), "radio"), ensure_ascii=False),
                 time.time(),
             ],
         )

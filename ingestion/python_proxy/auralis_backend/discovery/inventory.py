@@ -24,8 +24,6 @@ INVENTORY_TTL_SECONDS = 60 * 60 * 8
 INVENTORY_REFRESH_WINDOW_SECONDS = 30 * 60
 # Candidate facts are durable.  This interval controls cache refresh and
 # background revalidation; it must never make verified supply unusable.
-INVENTORY_INTENT_NAMESPACE = "discovery_candidate_inventory_intent"
-INVENTORY_INTENT_TTL_SECONDS = 60 * 60 * 2
 
 ESTABLISHED_MIN_UNIQUE_TRACKS = 120
 ESTABLISHED_MIN_UNPLAYED_TRACKS = 48
@@ -264,9 +262,6 @@ def _key(user_scope_id: str) -> str:
     return f"candidate-inventory:{scope}"
 
 
-def _intent_key(user_scope_id: str) -> str:
-    scope = str(user_scope_id or "guest").strip() or "guest"
-    return f"candidate-inventory-intent:{scope}"
 
 
 def _inventory_lock(user_scope_id: str) -> threading.RLock:
@@ -1185,202 +1180,16 @@ def merge_candidate_inventories(
     )
 
 
-def _intent_payload_get(server: Any, user_scope_id: str) -> Dict[str, Any] | None:
-    key = _intent_key(user_scope_id)
-    cached = None
-    try:
-        cached = get_session_store().get(key)
-    except Exception:
-        cached = None
-    if isinstance(cached, dict):
-        return dict(cached)
-    from ..recommend.store_runtime import open_recommendation_store_connection
-
-    try:
-        connection = open_recommendation_store_connection(server)
-    except Exception:
-        return None
-    try:
-        row = connection.execute(
-            "SELECT payload_json FROM recommendation_feature_store WHERE namespace = ? AND entity_id = ?",
-            [INVENTORY_INTENT_NAMESPACE, key],
-        ).fetchone()
-        if row is None:
-            return None
-        decoded = json.loads(row["payload_json"] or "{}")
-        return dict(decoded) if isinstance(decoded, dict) else None
-    except Exception:
-        return None
-    finally:
-        connection.close()
 
 
-def _intent_payload_set(server: Any, user_scope_id: str, payload: Dict[str, Any]) -> bool:
-    key = _intent_key(user_scope_id)
-    from ..recommend.store_runtime import open_recommendation_store_connection
-
-    persisted = False
-    try:
-        connection = open_recommendation_store_connection(server)
-    except Exception:
-        connection = None
-    if connection is not None:
-        try:
-            connection.execute(
-                """
-                INSERT INTO recommendation_feature_store(namespace, entity_id, model_id, payload_json, updated_at)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(namespace, entity_id) DO UPDATE SET
-                    model_id = excluded.model_id,
-                    payload_json = excluded.payload_json,
-                    updated_at = excluded.updated_at
-                """,
-                [
-                    INVENTORY_INTENT_NAMESPACE,
-                    key,
-                    INVENTORY_MODEL_VERSION,
-                    json.dumps(payload, ensure_ascii=False),
-                    time.time(),
-                ],
-            )
-            connection.commit()
-            persisted = True
-        except Exception:
-            persisted = False
-        finally:
-            connection.close()
-    try:
-        get_session_store().set(key, payload, INVENTORY_INTENT_TTL_SECONDS)
-        return True
-    except Exception:
-        return persisted
 
 
-def append_inventory_intent_delta(
-    server: Any,
-    *,
-    user_scope_id: str,
-    item: Dict[str, Any],
-    entity_type: str = "track",
-    query: str = "",
-) -> int:
-    if not isinstance(item, dict) or not item:
-        return 0
-    with _inventory_lock(user_scope_id):
-        current = _intent_payload_get(server, user_scope_id) or {}
-        version = max(int(current.get("version") or 0), 0) + 1
-        entries = [entry for entry in current.get("entries") or [] if isinstance(entry, dict)]
-        entries.append(
-            {
-                "version": version,
-                "entity_type": str(entity_type or "track"),
-                "query": str(query or ""),
-                "item": dict(item),
-                "created_at": time.time(),
-            }
-        )
-        payload = {
-            "version": version,
-            "entries": entries[-12:],
-            "expires_at": time.time() + INVENTORY_INTENT_TTL_SECONDS,
-        }
-        return version if _intent_payload_set(server, user_scope_id, payload) else 0
 
 
-def load_inventory_intent_delta(server: Any, user_scope_id: str) -> Dict[str, Any]:
-    payload = _intent_payload_get(server, user_scope_id) or {}
-    if float(payload.get("expires_at") or 0.0) <= time.time():
-        return {}
-    return payload
 
 
-def apply_inventory_intent_delta(
-    inventory: CandidateInventory,
-    payload: Dict[str, Any] | None,
-) -> CandidateInventory:
-    if not isinstance(payload, dict):
-        return inventory
-    version = max(int(payload.get("version") or 0), 0)
-    if version <= 0:
-        return inventory
-    candidates: List[DiscoveryCandidate] = []
-    for entry in payload.get("entries") or []:
-        if not isinstance(entry, dict) or not isinstance(entry.get("item"), dict):
-            continue
-        item = dict(entry["item"])
-        item.update(
-            {
-                "source_authority": str(item.get("source_authority") or "canonical"),
-                "source_provenance": "search_intent_delta",
-                "recommendation_path": "direct_history",
-                "relation_type": "direct_history",
-                "relation_strength": max(float(item.get("relation_strength") or 0.0), 0.95),
-                "session_intent_version": version,
-            }
-        )
-        candidates.append(
-            DiscoveryCandidate(
-                item=item,
-                source="search_intent_delta",
-                score=10.0,
-                reasons=["search_intent"],
-                item_type=str(entry.get("entity_type") or "track"),
-            )
-        )
-        for key in ("similar_tracks", "artist_tracks", "tracks"):
-            for neighbor in item.get(key) or []:
-                if not isinstance(neighbor, dict):
-                    continue
-                neighbors_item = dict(neighbor)
-                neighbors_item.update(
-                    {
-                        "source_provenance": "search_intent_neighbor",
-                        "recommendation_path": "artist_neighbor",
-                        "relation_type": "artist_neighbor",
-                        "relation_strength": max(float(neighbors_item.get("relation_strength") or 0.0), 0.82),
-                        "session_intent_version": version,
-                    }
-                )
-                candidates.append(
-                    DiscoveryCandidate(
-                        item=neighbors_item,
-                        source="search_intent_delta",
-                        score=8.0,
-                        reasons=["artist_neighbor"],
-                    )
-                )
-    if not candidates:
-        return inventory
-    pools = {name: list(values or []) for name, values in inventory.pools.items()}
-    pools["profile_spine"] = [*candidates, *pools.get("profile_spine", [])]
-    pools["similarity"] = [*candidates, *pools.get("similarity", [])]
-    pools["search_intent_delta"] = candidates
-    album_candidates = [candidate for candidate in candidates if candidate.item_type == "album"]
-    artist_candidates = [candidate for candidate in candidates if candidate.item_type == "artist"]
-    if album_candidates:
-        pools["album"] = [*album_candidates, *pools.get("album", [])]
-    if artist_candidates:
-        pools["artist_graph"] = [*artist_candidates, *pools.get("artist_graph", [])]
-    counts = dict(inventory.candidate_counts or {})
-    counts["search_intent_delta"] = len(candidates)
-    return replace(inventory, pools=pools, candidate_counts=counts, intent_version=version)
 
 
-def clear_inventory_intent_delta(
-    server: Any,
-    user_scope_id: str,
-    *,
-    consumed_version: int,
-) -> bool:
-    with _inventory_lock(user_scope_id):
-        current = _intent_payload_get(server, user_scope_id) or {}
-        if max(int(current.get("version") or 0), 0) != max(int(consumed_version or 0), 0):
-            return False
-        return _intent_payload_set(
-            server,
-            user_scope_id,
-            {"version": 0, "entries": [], "expires_at": 0.0},
-        )
 
 
 def build_candidate_inventory(

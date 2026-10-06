@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import pathlib
-import threading
-import time
 from typing import Any, Dict, Iterable, List
 
 from ..domain.catalog import (
@@ -15,17 +12,10 @@ from ..domain.catalog import (
 from ..recommend.store_runtime import open_recommendation_store_connection
 from .intelligence import (
     backfill_canonical_catalog,
-    enrich_query_with_musicbrainz,
     load_catalog_entity_memories,
     remember_catalog_entity,
     remember_source_identity,
 )
-from .server_adapter import SearchServerAdapter
-
-_INFLIGHT: set[str] = set()
-_LAST_RUN: dict[str, float] = {}
-_INFLIGHT_EVENTS: dict[str, threading.Event] = {}
-_LOCK = threading.Lock()
 DEFAULT_ACCEPTANCE_FIXTURE_PATH = (
     pathlib.Path(__file__).resolve().parents[2] / "catalog_acceptance_fixtures.json"
 )
@@ -136,15 +126,6 @@ def _track_album(track: Dict[str, Any]) -> str:
     return _text(album or track.get("album_name"))
 
 
-def _catalog_seed_key(provider: str, query: str, seed_type: str) -> str:
-    payload = {
-        "provider": _text(provider).lower() or "musicbrainz",
-        "query": normalize_track_title(query),
-        "seed_type": _text(seed_type).lower() or "query",
-    }
-    return hashlib.sha1(
-        json.dumps(payload, ensure_ascii=True, sort_keys=True).encode("utf-8")
-    ).hexdigest()
 
 
 def _seed_dict(value: Any, *, seed_type: str = "query", priority: float = 0.0) -> Dict[str, Any]:
@@ -237,59 +218,6 @@ def _query_variants_for_track(track: Dict[str, Any]) -> List[str]:
     return deduped
 
 
-def _query_variants_for_catalog_entity(
-    *,
-    title: str,
-    artist: str,
-    album: str = "",
-    aliases: Iterable[Any] | None = None,
-) -> List[str]:
-    values: List[str] = []
-
-    def add(value: Any) -> None:
-        text = _text(value)
-        if text:
-            values.append(text)
-
-    add(title)
-    if title and artist:
-        add(f"{title} {artist}")
-        add(f"{artist} {title}")
-    if title and album:
-        add(f"{title} {album}")
-    if album and artist:
-        add(f"{album} {artist}")
-    artist_key = normalize_artist_name(artist)
-    title_key = normalize_track_title(title)
-    if title_key and artist_key:
-        compact_artist = " ".join(
-            token
-            for token in artist_key.split()
-            if token not in {"the", "and", "n", "of", "a", "an"}
-        )
-        initials = "".join(
-            token[0]
-            for token in artist_key.split()
-            if token and token not in {"the", "and", "of", "a", "an"}
-        )
-        if compact_artist and compact_artist != artist_key:
-            add(f"{title} {compact_artist}")
-            add(f"{compact_artist} {title}")
-        if len(initials) >= 2:
-            add(f"{initials} {title}")
-            add(f"{title} {initials}")
-    for alias in aliases or []:
-        add(alias)
-
-    deduped: List[str] = []
-    seen: set[str] = set()
-    for value in values:
-        key = normalize_track_title(value)
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        deduped.append(_text(value))
-    return deduped
 
 
 def external_catalog_import_progress(server: Any) -> Dict[str, Any]:
@@ -455,76 +383,6 @@ def catalog_import_coverage_report(
     }
 
 
-def enqueue_external_catalog_seeds(
-    server: Any,
-    seeds: Iterable[Any],
-    *,
-    user_scope_id: str,
-    provider: str = "musicbrainz",
-    source: str = "catalog_backfill",
-) -> Dict[str, Any]:
-    scope = _text(user_scope_id) or "guest"
-    normalized_provider = _text(provider).lower() or "musicbrainz"
-    now = time.time()
-    rows: List[tuple[Any, ...]] = []
-    seen: set[str] = set()
-    for raw_seed in seeds:
-        seed = _seed_dict(raw_seed, seed_type=source, priority=0.5)
-        query = _text(seed.get("query"))
-        query_key = normalize_track_title(query)
-        if not query_key or query_key in seen:
-            continue
-        seen.add(query_key)
-        seed_type = _text(seed.get("seed_type")) or source
-        seed_key = _catalog_seed_key(normalized_provider, query, seed_type)
-        rows.append(
-            (
-                seed_key,
-                normalized_provider,
-                query,
-                seed_type,
-                scope,
-                float(seed.get("priority") or 0.0),
-                "pending",
-                now,
-                now,
-            )
-        )
-    result = {"queued": 0, "deduped": len(seen), "error": ""}
-    if not rows:
-        return result
-    try:
-        connection = open_recommendation_store_connection(server)
-    except Exception as exc:
-        result["error"] = str(exc)[:240]
-        return result
-    try:
-        connection.executemany(
-            """
-            INSERT INTO external_catalog_import_queue(
-                seed_key, provider, query, seed_type, user_scope_id,
-                priority, status, created_at, updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(seed_key) DO UPDATE SET
-                user_scope_id = excluded.user_scope_id,
-                priority = max(external_catalog_import_queue.priority, excluded.priority),
-                status = CASE
-                    WHEN external_catalog_import_queue.status IN ('completed', 'no_results')
-                    THEN external_catalog_import_queue.status
-                    ELSE 'pending'
-                END,
-                updated_at = excluded.updated_at
-            """,
-            rows,
-        )
-        connection.commit()
-        result["queued"] = len(rows)
-    except Exception as exc:
-        result["error"] = str(exc)[:240]
-    finally:
-        connection.close()
-    return result
 
 
 def _append_catalog_backfill_seed(
@@ -549,271 +407,12 @@ def _append_catalog_backfill_seed(
     )
 
 
-def collect_external_catalog_backfill_seeds(
-    server: Any,
-    *,
-    user_scope_id: str = "guest",
-    limit: int = 160,
-) -> List[Dict[str, Any]]:
-    """Collect import seeds from real app evidence, not a hand-written song list."""
-    max_limit = max(int(limit or 0), 0)
-    if max_limit <= 0:
-        return []
-    scope = _text(user_scope_id) or "guest"
-    seeds: List[Dict[str, Any]] = []
-    seen: set[str] = set()
-    try:
-        connection = open_recommendation_store_connection(server)
-    except Exception:
-        return []
-    try:
-        search_rows = connection.execute(
-            """
-            SELECT query,
-                   COUNT(*) AS event_count,
-                   MAX(occurred_at) AS latest_at
-            FROM recommendation_search_events
-            WHERE TRIM(query) <> ''
-              AND (? IN ('catalog', 'global', 'guest') OR user_scope_id IN (?, 'catalog', 'global'))
-            GROUP BY query
-            ORDER BY event_count DESC, latest_at DESC
-            LIMIT ?
-            """,
-            [scope.lower(), scope, max_limit],
-        ).fetchall()
-        for row in search_rows:
-            count = int(row["event_count"] or 0)
-            _append_catalog_backfill_seed(
-                seeds,
-                seen,
-                row["query"],
-                seed_type="stored_search_query",
-                priority=min(1.58, 1.42 + (count * 0.035)),
-            )
-            if len(seeds) >= max_limit:
-                return seeds
-
-        alias_rows = connection.execute(
-            """
-            SELECT alias_key, title_key, artist_key, score, confidence, event_count
-            FROM search_query_aliases
-            WHERE alias_key <> ''
-            ORDER BY score DESC, confidence DESC, event_count DESC, updated_at DESC
-            LIMIT ?
-            """,
-            [max_limit * 2],
-        ).fetchall()
-        for row in alias_rows:
-            title = _text(row["title_key"]).replace("  ", " ")
-            artist = _text(row["artist_key"]).replace("  ", " ")
-            query = " ".join(part for part in [title, artist] if part).strip()
-            if not query:
-                query = _text(row["alias_key"])
-            confidence = float(row["confidence"] or 0.0)
-            score = float(row["score"] or 0.0)
-            _append_catalog_backfill_seed(
-                seeds,
-                seen,
-                query,
-                seed_type="stored_query_alias",
-                priority=min(1.50, 1.12 + (confidence * 0.24) + (score * 0.08)),
-            )
-            if len(seeds) >= max_limit:
-                return seeds
-
-        entity_rows = connection.execute(
-            """
-            SELECT display_title, display_artist, display_album,
-                   confidence, popularity, learned_popularity
-            FROM catalog_entities
-            WHERE entity_type = 'track'
-              AND display_title <> ''
-            ORDER BY learned_popularity DESC, popularity DESC, confidence DESC, updated_at DESC
-            LIMIT ?
-            """,
-            [max_limit * 2],
-        ).fetchall()
-        for row in entity_rows:
-            title = _text(row["display_title"])
-            artist = _text(row["display_artist"])
-            album = _text(row["display_album"])
-            query = " ".join(part for part in [title, artist] if part).strip()
-            if not query and album and artist:
-                query = f"{album} {artist}"
-            confidence = float(row["confidence"] or 0.0)
-            popularity = max(float(row["popularity"] or 0.0), float(row["learned_popularity"] or 0.0))
-            _append_catalog_backfill_seed(
-                seeds,
-                seen,
-                query,
-                seed_type="stored_catalog_entity",
-                priority=min(1.08, 0.78 + (confidence * 0.18) + (popularity * 0.08)),
-            )
-            if len(seeds) >= max_limit:
-                return seeds
-    except Exception:
-        return seeds
-    finally:
-        connection.close()
-    return seeds
 
 
-def _next_external_catalog_imports(
-    server: Any,
-    *,
-    provider: str,
-    batch_size: int,
-    max_attempts: int,
-) -> List[Dict[str, Any]]:
-    try:
-        connection = open_recommendation_store_connection(server)
-    except Exception:
-        return []
-    try:
-        rows = connection.execute(
-            """
-            SELECT seed_key, provider, query, seed_type, user_scope_id,
-                   priority, attempt_count
-            FROM external_catalog_import_queue
-            WHERE provider = ?
-              AND status IN ('pending', 'retry')
-              AND attempt_count < ?
-            ORDER BY priority DESC, attempt_count ASC, updated_at ASC
-            LIMIT ?
-            """,
-            [
-                _text(provider).lower() or "musicbrainz",
-                max(int(max_attempts or 0), 1),
-                max(int(batch_size or 0), 1),
-            ],
-        ).fetchall()
-        return [dict(row) for row in rows]
-    except Exception:
-        return []
-    finally:
-        connection.close()
 
 
-def _mark_external_catalog_import(
-    server: Any,
-    *,
-    seed_key: str,
-    status: str,
-    imported_count: int = 0,
-    error: str = "",
-) -> None:
-    try:
-        connection = open_recommendation_store_connection(server)
-    except Exception:
-        return
-    now = time.time()
-    try:
-        connection.execute(
-            """
-            UPDATE external_catalog_import_queue
-            SET status = ?,
-                attempt_count = attempt_count + 1,
-                imported_count = ?,
-                last_error = ?,
-                updated_at = ?,
-                processed_at = CASE
-                    WHEN ? IN ('completed', 'no_results', 'failed')
-                    THEN ?
-                    ELSE processed_at
-                END
-            WHERE seed_key = ?
-            """,
-            [
-                _text(status) or "pending",
-                max(int(imported_count or 0), 0),
-                _text(error)[:240],
-                now,
-                _text(status) or "pending",
-                now,
-                _text(seed_key),
-            ],
-        )
-        connection.commit()
-    except Exception:
-        pass
-    finally:
-        connection.close()
 
 
-def run_external_catalog_import(
-    server: Any,
-    *,
-    user_scope_id: str = "guest",
-    provider: str = "musicbrainz",
-    batch_size: int = 6,
-    max_attempts: int = 3,
-    musicbrainz_client: Any | None = None,
-) -> Dict[str, Any]:
-    normalized_provider = _text(provider).lower() or "musicbrainz"
-    result = {
-        "provider": normalized_provider,
-        "processed": 0,
-        "imported": 0,
-        "completed": 0,
-        "no_results": 0,
-        "failed": 0,
-        "retry": 0,
-        "error": "",
-    }
-    if normalized_provider != "musicbrainz":
-        result["error"] = "unsupported_provider"
-        return result
-    rows = _next_external_catalog_imports(
-        server,
-        provider=normalized_provider,
-        batch_size=batch_size,
-        max_attempts=max_attempts,
-    )
-    for row in rows:
-        query = _text(row.get("query"))
-        seed_key = _text(row.get("seed_key"))
-        scope = _text(row.get("user_scope_id")) or _text(user_scope_id) or "guest"
-        if not query or not seed_key:
-            continue
-        result["processed"] += 1
-        enrichment = enrich_query_with_musicbrainz(
-            server,
-            user_scope_id=scope,
-            query=query,
-            limit=6,
-            client=musicbrainz_client,
-        )
-        imported = int(enrichment.get("imported") or 0)
-        result["imported"] += imported
-        if enrichment.get("error"):
-            attempts = int(row.get("attempt_count") or 0) + 1
-            status = "failed" if attempts >= max(int(max_attempts or 0), 1) else "retry"
-            result[status] += 1
-            _mark_external_catalog_import(
-                server,
-                seed_key=seed_key,
-                status=status,
-                imported_count=imported,
-                error=_text(enrichment.get("error")),
-            )
-            continue
-        if imported > 0 or int(enrichment.get("candidate_count") or 0) > 0:
-            result["completed"] += 1
-            _mark_external_catalog_import(
-                server,
-                seed_key=seed_key,
-                status="completed",
-                imported_count=imported,
-            )
-        else:
-            result["no_results"] += 1
-            _mark_external_catalog_import(
-                server,
-                seed_key=seed_key,
-                status="no_results",
-                imported_count=0,
-            )
-    return result
 
 
 def populate_catalog_from_user_signals(
@@ -884,69 +483,6 @@ def populate_catalog_from_user_signals(
     return result
 
 
-def catalog_playable_tracks_for_query(
-    server: Any,
-    *,
-    user_scope_id: str,
-    query: str,
-    limit: int = 4,
-) -> List[Dict[str, Any]]:
-    scope = _text(user_scope_id) or "guest"
-    if scope.lower() in {"guest", "public", "anonymous"}:
-        return []
-    search = SearchServerAdapter(server)
-    memories = load_catalog_entity_memories(
-        server,
-        query=query,
-        entity_type="track",
-        limit=max(int(limit or 0), 1) * 3,
-    )
-    output: List[Dict[str, Any]] = []
-    seen: set[str] = set()
-    query_key = normalize_track_title(query)
-    for memory in memories:
-        payload = _mapping(memory.get("payload"))
-        if not payload:
-            continue
-        track_id = _track_id(payload)
-        if not track_id:
-            continue
-        if not _catalog_payload_is_playable(payload):
-            continue
-        identity = track_id or f"{normalize_track_title(_track_title(payload))}|{normalize_artist_name(_track_artist(payload))}"
-        if not identity or identity in seen:
-            continue
-        title_key = normalize_track_title(_track_title(payload))
-        artist_key = normalize_artist_name(_track_artist(payload))
-        if query_key and title_key and query_key not in {title_key, f"{title_key} {artist_key}".strip(), f"{artist_key} {title_key}".strip()}:
-            tokens = set(search.query_tokens(query))
-            title_tokens = set(search.query_tokens(_track_title(payload)))
-            artist_tokens = set(search.query_tokens(_track_artist(payload)))
-            if tokens and len(tokens & (title_tokens | artist_tokens)) < max(1, min(2, len(tokens))):
-                continue
-        seen.add(identity)
-        item = dict(payload)
-        item["catalog_memory_match"] = True
-        item["catalog_entity_confidence"] = max(
-            float(memory.get("confidence") or 0.0),
-            float(item.get("catalog_entity_confidence") or 0.0),
-        )
-        item["learned_popularity"] = max(
-            float(memory.get("learned_popularity") or 0.0),
-            float(item.get("learned_popularity") or 0.0),
-        )
-        if not item.get("source_authority"):
-            item["source_authority"] = memory.get("source_authority") or "catalog_memory"
-        output.append(item)
-    output.sort(
-        key=lambda item: (
-            float(item.get("catalog_entity_confidence") or 0.0),
-            float(item.get("learned_popularity") or 0.0),
-            float(item.get("source_quality_score") or 0.0),
-        ),
-        reverse=True,
-    )
-    return output[: max(int(limit or 0), 1)]
 
 
 def _catalog_payload_is_playable(payload: Dict[str, Any]) -> bool:
@@ -1245,94 +781,3 @@ def catalog_playable_backbone_tracks(
         if len(output) >= max(int(limit or 0), 1):
             break
     return output
-
-
-def schedule_catalog_population(
-    server: Any,
-    *,
-    user_scope_id: str,
-    req: Any | None = None,
-    profile: Any | None = None,
-    taste: Any | None = None,
-    reason: str = "background",
-    min_interval_seconds: float = 60.0,
-    wait_for_completion: bool = False,
-    wait_timeout_seconds: float = 80.0,
-) -> Dict[str, Any]:
-    tracks = collect_catalog_seed_tracks(req=req, profile=profile, taste=taste, limit=24)
-    fingerprint_payload = {
-        "scope": _text(user_scope_id) or "guest",
-        "tracks": [
-            _track_id(track) or f"{normalize_track_title(_track_title(track))}|{normalize_artist_name(_track_artist(track))}"
-            for track in tracks[:12]
-        ],
-    }
-    fingerprint = hashlib.sha1(
-        json.dumps(fingerprint_payload, ensure_ascii=True, sort_keys=True).encode("utf-8")
-    ).hexdigest()
-    now = time.time()
-    wait_event: threading.Event | None = None
-    created_population = False
-    with _LOCK:
-        if fingerprint in _INFLIGHT:
-            wait_event = _INFLIGHT_EVENTS.get(fingerprint)
-            if not wait_for_completion:
-                return {"scheduled": False, "reason": "inflight", "fingerprint": fingerprint}
-        if now - _LAST_RUN.get(fingerprint, 0.0) < max(float(min_interval_seconds or 0.0), 0.0):
-            return {"scheduled": False, "reason": "recent", "fingerprint": fingerprint}
-        if wait_event is None:
-            _INFLIGHT.add(fingerprint)
-            wait_event = threading.Event()
-            _INFLIGHT_EVENTS[fingerprint] = wait_event
-            created_population = True
-
-    if not created_population and wait_for_completion and wait_event is not None:
-        completed = wait_event.wait(timeout=max(float(wait_timeout_seconds or 0.0), 0.1))
-        return {
-            "scheduled": False,
-            "reason": "inflight_completed" if completed else "inflight_timeout",
-            "fingerprint": fingerprint,
-            "completed": completed,
-        }
-
-    def worker() -> None:
-        try:
-            populate_catalog_from_user_signals(
-                server,
-                user_scope_id=user_scope_id,
-                req=req,
-                profile=profile,
-                taste=taste,
-                source=f"{reason}_catalog_seed",
-            )
-        finally:
-            with _LOCK:
-                _INFLIGHT.discard(fingerprint)
-                _LAST_RUN[fingerprint] = time.time()
-                completed_event = _INFLIGHT_EVENTS.pop(fingerprint, None)
-                if completed_event is not None:
-                    completed_event.set()
-
-    if wait_for_completion:
-        worker()
-        return {
-            "scheduled": False,
-            "reason": "completed_inline",
-            "fingerprint": fingerprint,
-            "completed": True,
-        }
-
-    executor = (
-        getattr(server, "search_executor", None)
-        or getattr(server, "recommendation_executor", None)
-    )
-    if executor is None:
-        worker()
-        return {"scheduled": False, "reason": "ran_inline", "fingerprint": fingerprint}
-    try:
-        executor.submit(worker)
-        return {"scheduled": True, "reason": reason, "fingerprint": fingerprint}
-    except Exception as exc:
-        with _LOCK:
-            _INFLIGHT.discard(fingerprint)
-        return {"scheduled": False, "reason": "submit_failed", "error": str(exc)[:160]}

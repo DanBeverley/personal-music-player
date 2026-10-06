@@ -886,20 +886,6 @@ def _recommendation_store_search_event(req: RecommendationSearchEventRequest):
             )
         except Exception:
             pass
-        try:
-            from ..discovery.inventory import append_inventory_intent_delta
-
-            intent_version = append_inventory_intent_delta(
-                resolve_server(),
-                user_scope_id=user_scope_id,
-                item=selected_item,
-                entity_type=selected_type or "track",
-                query=query,
-            )
-            if intent_version > 0:
-                payload["inventory_intent_version"] = intent_version
-        except Exception:
-            pass
     _recommendation_invalidate_collaborative_cache()
     try:
         from ..home_feed.scheduler import HomeJobScheduler
@@ -1176,22 +1162,6 @@ def _recommendation_store_interaction_event(req: RecommendationInteractionEventR
     except Exception:
         pass
     _recommendation_invalidate_collaborative_cache()
-    if event_type in {"play", "complete", "save", "playlist_add"} and (
-        "search" in _recommendation_trim_text(req.source).lower()
-        or "search" in _recommendation_trim_text(payload.get("recommendation_origin")).lower()
-    ):
-        try:
-            from ..discovery.inventory import append_inventory_intent_delta
-
-            append_inventory_intent_delta(
-                resolve_server(),
-                user_scope_id=user_scope_id,
-                item={**payload, "id": track_id, "artist": artist_name},
-                entity_type="track",
-                query=_recommendation_trim_text(payload.get("search_query")),
-            )
-        except Exception:
-            pass
     try:
         from ..home_feed.scheduler import HomeJobScheduler
 

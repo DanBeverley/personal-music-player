@@ -1,0 +1,14 @@
+# Build from runtime source only. Private state is supplied by mounts/env.
+**
+!requirements.txt
+!api_app.py
+!server.py
+!worker_main.py
+!trainer_main.py
+!langgraph_assistant.py
+!catalog_acceptance_fixtures.json
+!auralis_backend/
+!auralis_backend/**
+**/__pycache__/**
+**/*.pyc
+**/*.pyo

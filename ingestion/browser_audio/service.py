@@ -33,11 +33,15 @@ CAPTURE = r"""(() => {
 STATE = """() => {
  const v=document.querySelector('video'),p=document.querySelector('#movie_player');
  if(!v)return {}; v.muted=true;v.playbackRate=8;
- return {group:window.__audioGroups[v.currentSrc],id:p?.getVideoData?.()?.video_id,
+ const id=p?.getVideoData?.()?.video_id;
+ let active;try{active=p?.getPlayerResponse?.()}catch(_){}
+ const response=[active,window.ytInitialPlayerResponse].find(r=>
+   r?.videoDetails?.videoId===id && r?.streamingData?.adaptiveFormats?.length);
+ return {group:window.__audioGroups[v.currentSrc],id,
    ad:p?.classList.contains('ad-showing'),duration:v.duration,ended:v.ended,
-   expected:Number(window.ytInitialPlayerResponse?.videoDetails?.lengthSeconds),
+   expected:Number(response?.videoDetails?.lengthSeconds),
    codecs:p?.getStatsForNerds?.()?.codecs,
-   formats:window.ytInitialPlayerResponse?.streamingData?.adaptiveFormats?.filter(f=>f.mimeType.startsWith('audio/')).map(f=>({itag:f.itag,mime:f.mimeType,length:f.contentLength,index:f.indexRange}))};
+   formats:response?.streamingData?.adaptiveFormats?.filter(f=>f.mimeType?.startsWith('audio/')).map(f=>({itag:f.itag,mime:f.mimeType,length:f.contentLength,index:f.indexRange}))};
 }"""
 
 @dataclass
@@ -106,16 +110,24 @@ def captured_length(state, mime):
     match = re.search(r'/\s*opus\s*\((\d+)\)', state.get('codecs') or '')
     if mime != 'audio/webm' or not match:
         return None
+    lengths = set()
     for fmt in state.get('formats') or []:
         if str(fmt.get('itag')) != match[1]:
             continue
         try:
             index = fmt['index']
-            total = int(fmt['length']) - (int(index['end'])-int(index['start'])+1)
-            return total if 0 < total <= 32*1024*1024 else None
+            length, start, end = int(fmt['length']), int(index['start']), int(index['end'])
+            if not 0 <= start <= end < length:
+                return None
+            if fmt.get('mime') and not re.fullmatch(r'audio/webm;\s*codecs="opus"', fmt['mime']):
+                return None
+            total = length - (end-start+1)
+            if not 0 < total <= 32*1024*1024:
+                return None
+            lengths.add(total)
         except (KeyError, TypeError, ValueError):
             return None
-    return None
+    return lengths.pop() if len(lengths) == 1 else None
 
 async def capture(job):
     context = None

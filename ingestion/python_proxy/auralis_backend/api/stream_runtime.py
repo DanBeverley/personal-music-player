@@ -22,6 +22,8 @@ from .stream_core_runtime import (
     classify_stream_failure,
     extract_total_length,
     get_cached_stream_chunk,
+    cached_object_key,
+    PlaybackSourceExpired,
     stream_chunk_matches,
     get_stream_info,
     selected_stream_info,
@@ -420,7 +422,7 @@ def _proxy_stream(server: Any, video_id: str, request: Request):
         # Legacy resolver/preparation entries must not bypass completed audio.
         selected = selected_stream_info(server, video_id, session) if session else None
         stream_cache = get_stream_cache(server)
-        stream_cache_meta = None if selected is not None else stream_cache.head(video_id)
+        stream_cache_meta = selected.get('cached_object') if selected else stream_cache.head(video_id)
         if stream_cache_meta:
             total_length = int(stream_cache_meta.get("content_length") or 0) or None
             parsed_range = parse_byte_range(range_header, total_length)
@@ -442,12 +444,51 @@ def _proxy_stream(server: Any, video_id: str, request: Request):
                 f"video={video_id} event=hit backend={stream_cache.backend_name} "
                 f"bytes={total_length or 0} range={range_header or 'full'}"
             )
-            return StreamingResponse(
-                stream_cache.iter_object(video_id, start=start, end=end),
-                status_code=status_code,
-                headers=headers,
-                media_type=stream_cache_meta.get("content_type") or "audio/mp4",
-            )
+            prefix = get_cached_stream_chunk(server, video_id) if hasattr(server, 'stream_chunk_lock') else None
+            key = cached_object_key(stream_cache_meta)
+            prefix = prefix if key and prefix and prefix.get('representation_key') == key else None
+            if stream_cache.backend_name != 'r2':
+                chunks = stream_cache.iter_object(video_id, start=start, end=end)
+            elif prefix and start < len(prefix['bytes']):
+                last = min(end if end is not None else total_length-1, total_length-1)
+                stop = min(last+1, len(prefix['bytes']))
+                def cached_then_object():
+                    yield prefix['bytes'][start:stop]
+                    if stop <= last:
+                        yield from stream_cache.iter_object(video_id, start=stop, end=last, expected=stream_cache_meta)
+                chunks = cached_then_object()
+                headers['X-Auralis-Stream-Cache'] = 'r2-prefix'
+            else:
+                try:
+                    chunks = iter(stream_cache.iter_object(video_id, start=start, end=end, expected=stream_cache_meta))
+                    first = next(chunks)
+                except Exception:
+                    # Choose a different transport only before this new resource
+                    # has emitted any bytes. Existing object sessions stay pinned.
+                    if selected is not None:
+                        raise PlaybackSourceExpired('Cached playback resource is unavailable')
+                    stream_cache.invalidate(video_id)
+                    stream_cache_meta = None
+                else:
+                    from itertools import chain
+                    chunks = chain((first,), chunks)
+            if stream_cache_meta:
+                if session and selected is None and hasattr(server, 'stream_info_lock'):
+                    with server.stream_info_lock:
+                        session_key = f'selected:{session}:{video_id}'
+                        existing = server.stream_info_cache.get(session_key)
+                        if existing and (existing['expires_at'] <= time.time() or
+                                existing['payload'].get('cached_object') != stream_cache_meta):
+                            raise PlaybackSourceExpired('Playback representation changed')
+                        keys = [k for k in server.stream_info_cache if k.startswith('selected:')]
+                        for old in keys[:-255]:
+                            server.stream_info_cache.pop(old, None)
+                        if existing is None:
+                            server.stream_info_cache[session_key] = {
+                                'expires_at': time.time()+1200,
+                                'payload': {'cached_object': dict(stream_cache_meta), 'pinned': True}}
+                return StreamingResponse(chunks, status_code=status_code, headers=headers,
+                                         media_type=stream_cache_meta.get("content_type") or "audio/mp4")
         if stream_cache.enabled and os.environ.get('AURALIS_PLAYBACK_VERBOSE') == '1':
             print(
                 "[EBB:stream-cache] "
@@ -595,6 +636,8 @@ def _proxy_stream(server: Any, video_id: str, request: Request):
                 or stream_info.get("mime_type", "audio/mp4")
             ),
         )
+    except PlaybackSourceExpired:
+        raise HTTPException(status_code=410, detail={'code': 'playback_source_expired'})
     except HTTPException:
         raise
     except Exception as exc:

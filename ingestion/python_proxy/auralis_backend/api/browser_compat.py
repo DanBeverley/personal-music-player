@@ -27,17 +27,22 @@ def race_primary(primary, alternate, delay=1.0):
     """Bounded hedge: return the first validated source, never queue extra work."""
     first = _submit(primary)
     if first is None:
-        return primary()
+        try:
+            return primary()
+        except Exception:
+            return alternate()
+    deadline = time.monotonic() + 80
+    error = None
     try:
         return first.result(timeout=delay)
     except TimeoutError:
         pass
+    except Exception as exc:
+        error = exc
     second = _submit(alternate)
     if second is None:
         return first.result(timeout=80)
     pending = {first, second}
-    deadline = time.monotonic() + 80
-    error = None
     try:
         while pending:
             done, pending = wait(pending, timeout=max(0, deadline-time.monotonic()),

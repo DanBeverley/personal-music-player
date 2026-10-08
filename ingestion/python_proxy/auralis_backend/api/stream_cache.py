@@ -6,6 +6,7 @@ import tempfile
 import time
 from pathlib import Path
 from threading import Lock
+from concurrent.futures import Future
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 try:
@@ -118,6 +119,7 @@ class R2StreamCache(StreamCacheBackend):
         self.prefix = _clean(getattr(server, "AURALIS_STREAM_CACHE_PREFIX", "streams")) or "streams"
         self._head_cache: Dict[str, Tuple[float, Optional[Dict[str, Any]]]] = {}
         self._head_cache_lock = Lock()
+        self._head_inflight = {}
         self._head_hit_ttl = max(
             float(getattr(server, "STREAM_CACHE_HEAD_HIT_TTL_SECONDS", 45) or 45),
             1.0,
@@ -132,7 +134,8 @@ class R2StreamCache(StreamCacheBackend):
             aws_access_key_id=access_key,
             aws_secret_access_key=secret_key,
             region_name="auto",
-            config=Config(signature_version="s3v4", retries={"max_attempts": 2}),
+            config=Config(signature_version="s3v4", retries={"max_attempts": 2},
+                          connect_timeout=5, read_timeout=10, max_pool_connections=12),
         )
 
     def _key(self, video_id: str) -> str:
@@ -148,6 +151,39 @@ class R2StreamCache(StreamCacheBackend):
                 return dict(cached[1]) if cached[1] is not None else None
             if cached is not None:
                 self._head_cache.pop(safe_id, None)
+            pending = self._head_inflight.get(safe_id)
+            owner = pending is None
+            if owner:
+                pending = Future()
+                self._head_inflight[safe_id] = pending
+        if not owner:
+            result = pending.result(timeout=30)
+            return dict(result) if result else None
+        try:
+            result = self._fetch_head(video_id)
+            with self._head_cache_lock:
+                # Upload/invalidation may retire this lookup while it is running.
+                if self._head_inflight.get(safe_id) is pending:
+                    ttl = self._head_hit_ttl if result is not None else self._head_miss_ttl
+                    if len(self._head_cache) >= 512:
+                        self._head_cache.pop(next(iter(self._head_cache)), None)
+                    self._head_cache[safe_id] = (time.monotonic() + ttl, dict(result) if result else None)
+            pending.set_result(result)
+            return dict(result) if result else None
+        except BaseException as exc:
+            pending.set_exception(exc)
+            raise
+        finally:
+            with self._head_cache_lock:
+                if self._head_inflight.get(safe_id) is pending:
+                    self._head_inflight.pop(safe_id, None)
+
+    def invalidate(self, video_id):
+        with self._head_cache_lock:
+            self._head_cache.pop(_safe_video_id(video_id), None)
+            self._head_inflight.pop(_safe_video_id(video_id), None)
+
+    def _fetch_head(self, video_id):
         metadata: Optional[Dict[str, Any]] = None
         try:
             response = self._client.head_object(Bucket=self.bucket, Key=self._key(video_id))
@@ -168,9 +204,6 @@ class R2StreamCache(StreamCacheBackend):
         except Exception as exc:
             _log("head_failed", video_id, reason=type(exc).__name__)
             metadata = None
-        ttl = self._head_hit_ttl if metadata is not None else self._head_miss_ttl
-        with self._head_cache_lock:
-            self._head_cache[safe_id] = (now + ttl, dict(metadata) if metadata else None)
         return dict(metadata) if metadata is not None else None
 
     def iter_object(
@@ -179,20 +212,46 @@ class R2StreamCache(StreamCacheBackend):
         *,
         start: int = 0,
         end: Optional[int] = None,
+        expected: Optional[Dict[str, Any]] = None,
     ) -> Iterable[bytes]:
         params = {
             "Bucket": self.bucket,
             "Key": self._key(video_id),
             "Range": _range_header(start, end),
         }
-        response = self._client.get_object(**params)
+        if expected and expected.get('etag'):
+            params['IfMatch'] = '"' + expected['etag'].strip('"') + '"'
+        try:
+            response = self._client.get_object(**params)
+        except ClientError:
+            self.invalidate(video_id)
+            raise
         body = response["Body"]
         try:
+            if expected:
+                import re
+                match = re.fullmatch(r'bytes (\d+)-(\d+)/(\d+)', response.get('ContentRange', ''))
+                total = int(expected.get('content_length') or 0)
+                last = min(end if end is not None else total-1, total-1)
+                if (not match or tuple(map(int, match.groups())) != (start, last, total)
+                        or int(response.get('ContentLength') or 0) != last-start+1
+                        or _content_type(response.get('ContentType')) != _content_type(expected.get('content_type'))
+                        or expected.get('etag') and str(response.get('ETag') or '').strip('"') != expected['etag'].strip('"')):
+                    self.invalidate(video_id)
+                    raise ValueError('Cached audio representation changed')
+            size = 32 * 1024
+            received = 0
             while True:
-                chunk = body.read(1024 * 128)
+                chunk = body.read(size)
                 if not chunk:
                     break
+                received += len(chunk)
+                if expected and received > last-start+1:
+                    raise ValueError('Cached audio exceeded range')
                 yield chunk
+                size = 128 * 1024
+            if expected and received != last-start+1:
+                raise IOError('Incomplete cached audio range')
         finally:
             body.close()
 
@@ -214,19 +273,9 @@ class R2StreamCache(StreamCacheBackend):
                     "Metadata": metadata or {},
                 },
             )
-            metadata_payload = {
-                "backend": self.backend_name,
-                "key": self._key(video_id),
-                "content_length": os.path.getsize(path),
-                "content_type": _content_type(content_type),
-                "etag": "",
-                "metadata": dict(metadata or {}),
-            }
-            with self._head_cache_lock:
-                self._head_cache[_safe_video_id(video_id)] = (
-                    time.monotonic() + self._head_hit_ttl,
-                    metadata_payload,
-                )
+            # A fresh HEAD provides the real object validator. Never warm/join
+            # prefixes against guessed upload metadata with an empty ETag.
+            self.invalidate(video_id)
             return True
         except (BotoCoreError, ClientError, OSError):
             return False

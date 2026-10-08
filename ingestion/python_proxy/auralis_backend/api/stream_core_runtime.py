@@ -21,6 +21,10 @@ from .stream_cache import get_stream_cache, iter_and_store_full_stream
 _capture_cache_slots = BoundedSemaphore(2)
 
 
+class PlaybackSourceExpired(RuntimeError):
+    pass
+
+
 def cache_prepared_track(server, video_id):
     cache = get_stream_cache(server)
     if not cache.enabled:
@@ -528,10 +532,59 @@ def get_cached_stream_chunk(server: Any, video_id: str, min_bytes: int = 0):
 
 def store_stream_chunk(server: Any, video_id: str, payload):
     with server.stream_chunk_lock:
+        server.stream_chunk_cache.pop(video_id, None)
+        while server.stream_chunk_cache and (len(server.stream_chunk_cache) >= 128 or
+                sum(len(entry['payload'].get('bytes') or b'') for entry in server.stream_chunk_cache.values())
+                + len(payload.get('bytes') or b'') > 32 * 1024 * 1024):
+            server.stream_chunk_cache.pop(next(iter(server.stream_chunk_cache)))
         server.stream_chunk_cache[video_id] = {
             "payload": payload,
             "expires_at": time.time() + server.STREAM_CHUNK_TTL_SECONDS,
         }
+
+
+def cached_object_key(metadata):
+    if not metadata.get('etag'):
+        return ''
+    value = ['r2', metadata.get('key'), metadata['etag'],
+             metadata.get('content_length'), metadata.get('content_type')]
+    return hashlib.sha256(json.dumps(value, separators=(',', ':')).encode()).hexdigest()
+
+
+def warm_cached_object_prefix(server, video_id, cache, metadata, target_bytes=65536):
+    key = cached_object_key(metadata)
+    if not key:
+        return None
+    target = min(65536, target_bytes, int(metadata['content_length']))
+    while True:
+        existing = get_cached_stream_chunk(server, video_id)
+        if existing and existing.get('representation_key') == key and len(existing['bytes']) >= target:
+            return existing
+        with server.stream_chunk_inflight_lock:
+            pending = server.stream_chunk_inflight.get(video_id)
+            owner = pending is None
+            if owner:
+                pending = Future()
+                server.stream_chunk_inflight[video_id] = pending
+        if not owner:
+            pending.result(timeout=30)
+            continue
+        try:
+            data = b''.join(cache.iter_object(video_id, start=0, end=target-1, expected=metadata))
+            if len(data) != target:
+                raise ValueError('Invalid cached startup prefix')
+            result = {'bytes': data, 'representation_key': key, 'total_length': metadata['content_length'],
+                      'content_type': metadata['content_type'], 'etag': metadata['etag']}
+            store_stream_chunk(server, video_id, result)
+            pending.set_result(result)
+            return result
+        except BaseException as exc:
+            pending.set_exception(exc)
+            raise
+        finally:
+            with server.stream_chunk_inflight_lock:
+                if server.stream_chunk_inflight.get(video_id) is pending:
+                    server.stream_chunk_inflight.pop(video_id, None)
 
 
 def stream_representation_key(stream_info: dict) -> str:
@@ -816,6 +869,13 @@ def prepare_stream_track(
     stream_cache_meta = stream_cache.head(video_id)
     stream_cache_head_ms = int((time.perf_counter() - stream_cache_head_start) * 1000)
     if stream_cache_meta:
+        prefix = None
+        prefix_started = time.perf_counter()
+        if stream_cache.backend_name == 'r2':
+            try:
+                prefix = warm_cached_object_prefix(server, video_id, stream_cache, stream_cache_meta)
+            except Exception:
+                pass  # A prefix miss is not proof that startup bytes exist.
         content_length = int(stream_cache_meta.get("content_length") or 0)
         metrics = {
             "prepared": True,
@@ -826,16 +886,16 @@ def prepare_stream_track(
             "mime_type": stream_cache_meta.get("content_type") or "audio/mp4",
             "content_length": content_length,
             "range_supported": True,
-            "expires_at": time.time() + (60 * 60),
+            "expires_at": time.time() + min(getattr(server, 'STREAM_CHUNK_TTL_SECONDS', 300), 300),
             "r2_cache_hit": bool(stream_cache.backend_name == "r2"),
             "resolve_cache_hit": False,
-            "chunk_cache_hit": True,
-            "chunk_deferred": False,
+            "chunk_cache_hit": prefix is not None,
+            "chunk_deferred": prefix is None,
             "resolve_ms": 0,
-            "chunk_ms": 0,
+            "chunk_ms": int((time.perf_counter()-prefix_started)*1000),
             "stream_cache_head_ms": stream_cache_head_ms,
             "target_chunk_bytes": target_chunk_bytes,
-            "cached_prefix_bytes": min(content_length, target_chunk_bytes) if content_length else target_chunk_bytes,
+            "cached_prefix_bytes": len(prefix['bytes']) if prefix else 0,
             "duration": 0,
             "active_queue": active_queue,
             "server_ms": int((time.perf_counter() - total_start) * 1000),
@@ -1032,10 +1092,10 @@ def selected_stream_info(server: Any, video_id: str, session: str = ''):
         return None
     with server.stream_info_lock:
         entry = server.stream_info_cache.get(f'selected:{session}:{video_id}')
-        if entry and entry['expires_at'] > time.time():
+        if entry and entry['expires_at'] > time.time() + (0 if session else 90):
             return entry['payload']
         if entry and session:
-            raise RuntimeError('Playback source expired; start playback again')
+            raise PlaybackSourceExpired('Playback source expired; start playback again')
     return None
 
 
@@ -1098,11 +1158,17 @@ def get_stream_info(server: Any, video_id: str, *, background=False, session='')
 
 
 def _resolve_stream_info(server: Any, video_id: str, *, background=False, priority=0):
+    if not background and os.environ.get('AURALIS_BROWSER_AUDIO_URL', '').strip():
+        from .browser_compat import race_primary, resolve_browser_audio
+        failure = _get_stream_failure(server, video_id)
+        if failure and failure.get('code') in {'source_blocked', 'format_unavailable'}:
+            fallback = resolve_browser_audio(video_id, failure['code'], priority=priority)
+            if fallback is None:
+                raise RuntimeError(failure['code'])
+            return fallback
+        return race_primary(lambda: _get_primary_stream_info(server, video_id),
+                            lambda: resolve_browser_audio(video_id, 'slow_primary', priority=priority))
     try:
-        if not background and os.environ.get('AURALIS_BROWSER_AUDIO_URL', '').strip():
-            from .browser_compat import race_primary, resolve_browser_audio
-            return race_primary(lambda: _get_primary_stream_info(server, video_id),
-                                lambda: resolve_browser_audio(video_id, 'slow_primary', priority=priority))
         return _get_primary_stream_info(server, video_id)
     except Exception as exc:
         from .browser_compat import resolve_browser_audio
@@ -1121,7 +1187,7 @@ def _get_primary_stream_info(server: Any, video_id: str):
         raise RuntimeError(cached_failure.get("message") or cached_failure.get("code") or "stream_failed")
     with server.stream_info_lock:
         cached = server.stream_info_cache.get(video_id)
-        if cached and cached["expires_at"] > now:
+        if cached and cached["expires_at"] > now + 90:
             return cached["payload"]
 
         pending = server.stream_info_inflight.get(video_id)

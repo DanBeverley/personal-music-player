@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:js_interop';
 import 'dart:math';
 import 'package:flutter/material.dart';
@@ -18,8 +19,9 @@ import 'guest_home_state.dart';
 import 'catalog_api.dart';
 import 'design_system.dart';
 import 'playback_dock.dart';
+import 'playback_diagnostics.dart';
 
-const webBuild = '2026-10-05-refined';
+const webBuild = '2026-10-08-playback-reports';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -100,10 +102,16 @@ class _PlayerPageState extends State<_PlayerPage> {
     audio.onNext = () => unawaited(player.next());
     audio.onPrevious = () => unawaited(player.previous());
     _lifecycle = ((web.Event event) {
+      final visible =
+          event.type != 'pagehide' && web.document.visibilityState == 'visible';
+      if (visible) {
+        audio.foreground();
+      } else {
+        audio.background();
+      }
       audio.record('lifecycle', {'kind': event.type});
-      player.lifecycle(event.type,
-          visible: web.document.visibilityState == 'visible');
-      if (web.document.visibilityState == 'visible') {
+      player.lifecycle(event.type, visible: visible);
+      if (visible) {
         if (mounted)
           setState(() {
             _foreground = true;
@@ -147,9 +155,9 @@ class _PlayerPageState extends State<_PlayerPage> {
     if (next != scope) {
       scope = next;
       api.userScopeId = next;
-      audio.setDiagnosticScope(api.base.toString(), next);
       player
           .changeAccount(BrowserSessionStore(api.base.toString(), scope: next));
+      audio.setDiagnosticScope(api.base.toString(), next);
       _historyTracker.reset();
       _listeningHistory = _loadListeningHistory();
       _guestHomeRevision++;
@@ -166,22 +174,66 @@ class _PlayerPageState extends State<_PlayerPage> {
   }
 
   void showDiagnostics() {
-    audio.record('user-report', {'build': webBuild});
-    final report = audio.diagnostics;
+    audio.record('user-report-open', {'build': webBuild});
+    var report = audio.diagnosticReport();
     showDialog<void>(
         context: context,
-        builder: (context) => AlertDialog(
-                title: const Text('Playback diagnostics'),
-                content: SingleChildScrollView(child: SelectableText(report)),
-                actions: [
-                  TextButton(
-                      onPressed: () =>
-                          Clipboard.setData(ClipboardData(text: report)),
-                      child: const Text('Copy')),
-                  TextButton(
-                      onPressed: () => Navigator.pop(context),
-                      child: const Text('Close'))
-                ]));
+        builder: (context) => StatefulBuilder(
+            builder: (context, update) => AlertDialog(
+                    title: const Text('Playback diagnostics'),
+                    content: SizedBox(
+                        width: 460,
+                        child: SingleChildScrollView(
+                            child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                              SelectableText(
+                                  PlaybackDiagnostics.summary(report)),
+                              const SizedBox(height: 14),
+                              const Text(
+                                  'Share the small report file here. It contains device details and playback IDs, without account IDs or tokens.'),
+                              TextButton.icon(
+                                  onPressed: () => update(() => report =
+                                      audio.diagnosticReport(current: true)),
+                                  icon: const Icon(Icons.refresh),
+                                  label: const Text('Capture current state')),
+                              ExpansionTile(
+                                  title: const Text('Event details'),
+                                  children: [
+                                    SelectableText(
+                                        const JsonEncoder.withIndent('  ')
+                                            .convert(report)),
+                                  ]),
+                            ]))),
+                    actions: [
+                      if (audio.canShareReport(report))
+                        TextButton.icon(
+                            onPressed: () async {
+                              try {
+                                await audio.shareReport(report);
+                              } catch (_) {
+                                if (context.mounted)
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                      const SnackBar(
+                                          content: Text(
+                                              'Report was not shared. You can use Download instead.')));
+                              }
+                            },
+                            icon: const Icon(Icons.ios_share),
+                            label: const Text('Share report')),
+                      TextButton.icon(
+                          onPressed: () => audio.downloadReport(report),
+                          icon: const Icon(Icons.download),
+                          label: const Text('Download report')),
+                      TextButton(
+                          onPressed: () => Clipboard.setData(ClipboardData(
+                              text: PlaybackDiagnostics.summary(report))),
+                          child: const Text('Copy summary')),
+                      TextButton(
+                          onPressed: () => Navigator.pop(context),
+                          child: const Text('Close'))
+                    ])));
   }
 
   Future<void> _like(Map<String, dynamic> track) async {

@@ -24,24 +24,25 @@ class PlaybackDock extends StatelessWidget {
   String _time(double value) =>
       '${value.toInt() ~/ 60}:${(value.toInt() % 60).toString().padLeft(2, '0')}';
   Widget _play({double size = 44}) => IconButton.filled(
-      tooltip: audio.paused ? 'Play' : 'Pause',
-      onPressed: () => audio.paused ? unawaited(player.play()) : player.pause(),
+      tooltip: player.canPause ? 'Pause' : 'Play',
+      onPressed: () =>
+          player.canPause ? player.pause() : unawaited(player.play()),
       icon: Builder(
           builder: (context) => AnimatedSwitcher(
               duration: MediaQuery.disableAnimationsOf(context)
                   ? Duration.zero
                   : const Duration(milliseconds: 180),
-              child: player.loading
+              child: player.busy
                   ? const NeatieLoading(
                       key: ValueKey('loading'),
                       label: 'Loading song',
                       size: 22,
                       color: NeatieDesign.background)
                   : Icon(
-                      audio.paused
-                          ? Icons.play_arrow_rounded
-                          : Icons.pause_rounded,
-                      key: ValueKey(audio.paused)))),
+                      player.playing
+                          ? Icons.pause_rounded
+                          : Icons.play_arrow_rounded,
+                      key: ValueKey(player.playing)))),
       constraints: BoxConstraints.tightFor(width: size, height: size));
   Widget _transport() =>
       Row(mainAxisAlignment: MainAxisAlignment.center, children: [

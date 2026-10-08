@@ -7,6 +7,7 @@ class MusicApi {
   final http.Client client;
   DateTime Function() clock = DateTime.now;
   String _userScopeId = 'guest';
+  int _scopeRevision = 0;
   /// Optional feed-only scope. Search and playback discovery keep userScopeId.
   String? homeScopeId;
   String get homeRequestScopeId => userScopeId.toLowerCase() == 'guest'
@@ -15,7 +16,10 @@ class MusicApi {
   String get userScopeId => _userScopeId;
   set userScopeId(String value) {
     final next = value.trim().isEmpty ? 'guest' : value.trim();
-    if (next != _userScopeId) clearSearchContext();
+    if (next != _userScopeId) {
+      _scopeRevision++;
+      clearSearchContext();
+    }
     _userScopeId = next;
   }
   String? _searchContextQuery;
@@ -150,6 +154,7 @@ class MusicApi {
       String path, Map<String, dynamic> body,
       {Duration timeout = const Duration(seconds: 30)}) async {
     final timer = Stopwatch()..start();
+    final revision = _scopeRevision;
     late http.Response response;
     try {
       response = await client
@@ -159,13 +164,17 @@ class MusicApi {
             body: jsonEncode(body))
         .timeout(timeout);
     } catch (e) {
-      onDiagnostic?.call('api-failure', {'path': path, 'ms': timer.elapsedMilliseconds,
-        'requestedTrack': body['current_track_key'], 'errorType': e.runtimeType.toString()});
+      if (revision == _scopeRevision) {
+        onDiagnostic?.call('api-failure', {'path': path, 'ms': timer.elapsedMilliseconds,
+          'requestedTrack': body['current_track_key'], 'errorType': e.runtimeType.toString()});
+      }
       rethrow;
     }
-    onDiagnostic?.call('api-response', {
-      'path': path, 'status': response.statusCode, 'ms': timer.elapsedMilliseconds,
-    });
+    if (revision == _scopeRevision) {
+      onDiagnostic?.call('api-response', {
+        'path': path, 'status': response.statusCode, 'ms': timer.elapsedMilliseconds,
+      });
+    }
     if (response.statusCode != 200) {
       throw StateError(
           'Music service returned ${response.statusCode}. Please retry.');
@@ -219,15 +228,18 @@ class MusicApi {
 
   Future<Uri> prepare(Map<String, dynamic> track, {bool activeQueue = false, bool cacheFull = false}) async {
     final id = extractTrackId(track)!;
+    final revision = _scopeRevision;
     final result = await post('/prepare_session', {
       'track_keys': [id], 'current_track_key': id,
       'active_queue': activeQueue, 'lookahead': 1,
       'cache_full': cacheFull,
     }, timeout: const Duration(seconds: 90));
-    onDiagnostic?.call('prepare-result', {'requestedTrack': id,
-      'prepared': (result['prepared'] as Map?)?[id] != null,
-      'fullyCached': ((result['prepared'] as Map?)?[id] as Map?)?['fully_cached'] == true,
-      'failed': (result['failed_ids'] as List?)?.contains(id) == true});
+    if (revision == _scopeRevision) {
+      onDiagnostic?.call('prepare-result', {'requestedTrack': id,
+        'prepared': (result['prepared'] as Map?)?[id] != null,
+        'fullyCached': ((result['prepared'] as Map?)?[id] as Map?)?['fully_cached'] == true,
+        'failed': (result['failed_ids'] as List?)?.contains(id) == true});
+    }
     if ((result['prepared'] as Map?)?[id] == null) {
       throw StateError('Next track is not prepared yet.');
     }

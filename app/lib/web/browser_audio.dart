@@ -4,6 +4,7 @@ import 'dart:js_interop';
 import 'dart:js_interop_unsafe';
 import 'package:web/web.dart' as web;
 import 'playback_port.dart';
+import 'playback_diagnostics.dart';
 import '../logic/track_metadata.dart';
 
 extension type _MediaAction(JSObject _) implements JSObject {
@@ -23,7 +24,8 @@ extension type _AudioSession(JSObject _) implements JSObject {
 
 class BrowserSessionStore implements SessionStore {
   final String key;
-  BrowserSessionStore(String backend, {String scope = 'guest'}) : key = 'neatie:$scope:session:$backend';
+  BrowserSessionStore(String backend, {String scope = 'guest'})
+      : key = 'neatie:$scope:session:$backend';
   @override
   String? read() => web.window.localStorage.getItem(key);
   @override
@@ -32,13 +34,22 @@ class BrowserSessionStore implements SessionStore {
 
 /// One persistent media element owns playback across page rebuilds and tracks.
 /// No Web Audio context or background timer is needed for queue advancement.
-class BrowserAudio implements PlaybackPort {
+class BrowserAudio extends PlaybackPort {
   final web.HTMLAudioElement element = web.HTMLAudioElement();
   final _events = StreamController<String>.broadcast(sync: true);
   final Map<String, JSFunction> _listeners = {};
   final List<String> _actions = [];
-  final List<Map<String, dynamic>> _diagnostics = [];
-  final List<List<Map<String, dynamic>>> _failures = [];
+  final _progress = PlaybackProgress();
+  late final _reports = PlaybackDiagnostics({
+    'userAgent': web.window.navigator.userAgent,
+    'platform': web.window.navigator.platform,
+    'language': web.window.navigator.language,
+  });
+  Timer? _watchdog;
+  DateTime? _loadedAt, _pausedAt, _lastProgressAt, _deadline;
+  bool _everAdvanced = false, _resume = false, _renewSource = false;
+  bool _foreground = !web.document.hidden;
+  int _attempt = 0, _pauseDurationMs = 0;
   String _diagnosticKey = '';
   _AudioSession? _audioSession;
   String _track = '';
@@ -49,84 +60,98 @@ class BrowserAudio implements PlaybackPort {
   @override
   String? get loadedTrackId => _track.isEmpty ? null : _track;
   @override
-  bool get sourceMatches => _expectedSource.isNotEmpty &&
+  bool get sourceMatches =>
+      _expectedSource.isNotEmpty &&
       element.src == _expectedSource &&
       (element.currentSrc.isEmpty || element.currentSrc == _expectedSource);
-  String get diagnostics {
-    _restoreFailures();
-    return [
-    for (final failure in _failures) ...failure,
-    ..._diagnostics,
-  ].map(jsonEncode).toSet().join('\n');
+  @override
+  PlaybackPhase get phase => _progress.phase;
+  @override
+  bool get needsNewSource => _renewSource;
+  Map<String, dynamic> diagnosticReport({bool current = false}) {
+    final report = _reports.report(current: current);
+    _persistFailures();
+    return report;
   }
 
   void setDiagnosticScope(String backend, String scope) {
-    _diagnosticKey = 'neatie:$scope:playback-failures:$backend';
-    _diagnostics.clear();
-    _failures.clear();
-    _restoreFailures();
-  }
-
-  void _restoreFailures() {
-    if (_diagnosticKey.isEmpty || _failures.isNotEmpty) return;
+    final next = 'neatie:$scope:playback-failures:$backend';
+    if (_diagnosticKey.isNotEmpty && _diagnosticKey != next) {
+      pause();
+      _track = _session = _expectedSource = '';
+      _loadedAt = _pausedAt = _lastProgressAt = _deadline = null;
+      _everAdvanced = _resume = _renewSource = false;
+      _pauseDurationMs = 0;
+      _progress.stop(PlaybackPhase.idle);
+      element.removeAttribute('src');
+      element.load();
+      try {
+        web.window.navigator.mediaSession.metadata = null;
+        web.window.navigator.mediaSession.setPositionState();
+      } catch (_) {}
+      _updateSession();
+    }
+    _diagnosticKey = next;
     try {
-      final saved = web.window.localStorage.getItem(_diagnosticKey);
-      if (saved == null || saved.length > 65536) return;
-      final decoded = jsonDecode(saved) as List;
-      for (final item in decoded.take(8)) {
-        _failures.add((item as List).cast<Map>().map((e) =>
-            Map<String, dynamic>.from(e)).toList());
-      }
-    } catch (_) { /* Storage may be disabled or full. */ }
+      _reports.restore(web.window.localStorage.getItem(_diagnosticKey));
+    } catch (_) {
+      _reports.restore(null);
+    }
+    record('device');
   }
 
   void record(String event, [Map<String, dynamic> extra = const {}]) {
-    _diagnostics.add({
-      'at': DateTime.now().toUtc().toIso8601String(), 'event': event,
-      'track': _track, 'session': _session, 'time': position,
-      'paused': paused, 'muted': element.muted, 'volume': element.volume,
-      'ready': element.readyState, 'network': element.networkState,
+    _reports.record({
+      'at': DateTime.now().toUtc().toIso8601String(),
+      'event': event,
+      'track': _track,
+      'session': _session,
+      'time': position,
+      'paused': paused,
+      'muted': element.muted,
+      'volume': element.volume,
+      'ready': element.readyState,
+      'network': element.networkState,
       'mediaCode': element.error?.code,
       'mediaMessage': _safeErrorText(element.error?.message ?? ''),
-      'bufferedEnd': element.buffered.length > 0 ? element.buffered.end(element.buffered.length - 1) : 0,
-      'visibility': web.document.visibilityState,
-      'audioSession': _audioSession?.state, ...extra,
+      'bufferedEnd': element.buffered.length > 0
+          ? element.buffered.end(element.buffered.length - 1)
+          : 0,
+      'visibility': _foreground && !web.document.hidden ? 'visible' : 'hidden',
+      'audioSession': _audioSession?.state,
+      ...extra,
+      'phase': phase.name,
+      'playRequested': _progress.requested,
+      'resume': _resume,
+      'pauseMs': _pausedAt == null
+          ? null
+          : phase == PlaybackPhase.paused
+              ? DateTime.now().difference(_pausedAt!).inMilliseconds
+              : _pauseDurationMs,
+      'sourceAgeSeconds': _loadedAt == null
+          ? null
+          : DateTime.now().difference(_loadedAt!).inSeconds,
+      'secondsSinceProgress': _lastProgressAt == null
+          ? null
+          : DateTime.now().difference(_lastProgressAt!).inSeconds,
       'repeatOne': element.loop,
       'sourceMatches': sourceMatches,
-      'elementSession': Uri.tryParse(element.currentSrc)?.queryParameters['playback_session'],
+      'elementSession': sourceMatches
+          ? Uri.tryParse(element.currentSrc)
+              ?.queryParameters['playback_session']
+          : null,
       ...?diagnosticContext?.call(),
     });
-    if (event == 'error' || event.contains('failed') || event.contains('rejected') ||
-        event == 'api-failure' || extra['failed'] == true || (extra['status'] is int && (extra['status'] as int) >= 400)) {
-      _failures.add(_diagnostics.skip((_diagnostics.length - 12).clamp(0, _diagnostics.length)).toList());
-      if (_failures.length > 10) _failures.removeAt(0);
-      _persistFailures();
-    }
-    if (_diagnostics.length > 100) _diagnostics.removeAt(0);
+    _persistFailures();
   }
 
   void _persistFailures() {
     if (_diagnosticKey.isEmpty) return;
     try {
-      const allowed = {'at', 'event', 'track', 'session', 'time', 'paused',
-        'muted', 'volume', 'ready', 'network', 'mediaCode', 'mediaMessage', 'bufferedEnd',
-        'visibility', 'audioSession', 'repeatOne', 'sourceMatches',
-        'elementSession', 'selectedTrack', 'loadedTrack', 'queueIndex',
-        'operation', 'loading', 'startupInterrupted', 'cause', 'errorType',
-        'exceptionName', 'exceptionMessage', 'awaitingFirstPlayback', 'hiddenDuringStartup',
-        'path', 'ms', 'requestedTrack', 'status', 'action', 'kind', 'reason',
-        'error', 'failed', 'prepared', 'fullyCached', 'build'};
-      final bounded = _failures.skip((_failures.length - 8).clamp(0, _failures.length)).map((snapshot) => snapshot.take(12).map(
-          (row) => Map<String, dynamic>.fromEntries(row.entries.where(
-              (entry) => allowed.contains(entry.key)))).toList()).toList();
-      var encoded = jsonEncode(bounded);
-      while (encoded.length > 65536 && bounded.length > 1) {
-        bounded.removeAt(0);
-        encoded = jsonEncode(bounded);
-      }
-      if (encoded.length <= 65536) web.window.localStorage.setItem(_diagnosticKey, encoded);
-    } catch (_) { /* Failure history is best effort. */ }
+      web.window.localStorage.setItem(_diagnosticKey, _reports.encodeSaved());
+    } catch (_) {/* Failure history is best effort. */}
   }
+
   void Function()? onPlay;
   void Function()? onPause;
   void Function()? onNext;
@@ -140,9 +165,20 @@ class BrowserAudio implements PlaybackPort {
     try {
       _audioSession = _AudioNavigator(web.window.navigator).audioSession;
       _audioSession?.type = 'playback';
-      _audioSession?.onstatechange = ((web.Event _) => record('audio-session')).toJS;
-    } catch (_) { /* Audio Session is optional. */ }
-    record('device', {'agent': web.window.navigator.userAgent});
+      _audioSession?.onstatechange = ((web.Event _) {
+        if (_audioSession?.state == 'interrupted' && _progress.requested) {
+          _progress.interrupt();
+          record('audio-session-interrupted');
+          _reports.capture('audio-session-interrupted');
+          _persistFailures();
+          _events.add('interrupted');
+        } else {
+          record('audio-session');
+          _sampleProgress();
+        }
+        _updateSession();
+      }).toJS;
+    } catch (_) {/* Audio Session is optional. */}
     for (final event in [
       'playing',
       'pause',
@@ -155,18 +191,56 @@ class BrowserAudio implements PlaybackPort {
       'seeking',
       'seeked',
       'volumechange',
-      'error'
+      'error',
+      'abort',
+      'emptied',
+      'loadstart',
+      'suspend',
+      'canplay',
+      'progress'
     ]) {
       final callback = ((web.Event _) {
         if (!sourceMatches) {
           if (event != 'timeupdate') record('ignored-event', {'kind': event});
           return;
         }
+        var forwarded = event;
+        if (event == 'seeking' ||
+            event == 'seeked' ||
+            event == 'loadedmetadata') {
+          _progress.rebase(position);
+          if (event == 'seeking') _progress.buffer();
+        } else if (event == 'waiting' || event == 'stalled') {
+          _progress.buffer();
+        } else if (event == 'pause' && paused) {
+          if (_progress.requested) _pausedAt = DateTime.now();
+          if (_progress.requested &&
+              (!_foreground ||
+                  web.document.hidden ||
+                  _audioSession?.state == 'interrupted')) {
+            _progress.interrupt();
+            forwarded = 'interrupted';
+          } else {
+            _progress.stop(PlaybackPhase.paused);
+          }
+          _pausedAt ??= DateTime.now();
+        } else if (event == 'ended' && element.ended) {
+          _progress.stop(PlaybackPhase.ended);
+        } else if (event == 'error') {
+          if (element.error?.code == 1) {
+            _progress.interrupt();
+          } else {
+            _progress.stop(PlaybackPhase.failed);
+            _renewSource = true;
+          }
+        }
+        _sampleProgress();
         _updateSession();
-        if (event != 'timeupdate') record(event);
+        if (event != 'timeupdate' && event != 'progress') record(event);
         // An explicit media abort is different from a network/decode failure.
         _events.add(event == 'error' && element.error?.code == 1
-            ? 'media-aborted' : event);
+            ? 'media-aborted'
+            : forwarded);
       }).toJS;
       _listeners[event] = callback;
       element.addEventListener(event, callback);
@@ -184,24 +258,39 @@ class BrowserAudio implements PlaybackPort {
 
   void _action(String action, void Function(_MediaAction) callback) {
     try {
-      web.window.navigator.mediaSession.setActionHandler(action, ((_MediaAction details) {
-        record('media-action', {'action': action});
-        onReconcile?.call('media-action:$action');
-        callback(details);
-      }).toJS);
+      web.window.navigator.mediaSession.setActionHandler(
+          action,
+          ((_MediaAction details) {
+            record('media-action', {'action': action});
+            if (action == 'play' && (!_foreground || web.document.hidden)) {
+              // Keep the remote command even if the browser suspends timers
+              // and never resolves play(). It is a request, not proof of audio.
+              _reports.capture('background-resume-request');
+              _persistFailures();
+            }
+            onReconcile?.call('media-action:$action');
+            callback(details);
+          }).toJS);
       _actions.add(action);
-    } catch (_) { record('media-action-unavailable', {'action': action}); }
+    } catch (_) {
+      record('media-action-unavailable', {'action': action});
+    }
   }
 
   void _updateSession() {
     try {
       final session = web.window.navigator.mediaSession;
-      session.playbackState = paused ? 'paused' : 'playing';
+      session.playbackState = phase == PlaybackPhase.idle
+          ? 'none'
+          : phase == PlaybackPhase.playing
+              ? 'playing'
+              : 'paused';
       if (duration > 0)
         session.setPositionState(web.MediaPositionState(
             duration: duration,
             position: position.clamp(0, duration),
-            playbackRate: 1));
+            playbackRate:
+                element.playbackRate == 0 ? 1 : element.playbackRate));
     } catch (_) {/* Some browsers omit position reporting. */}
   }
 
@@ -219,6 +308,14 @@ class BrowserAudio implements PlaybackPort {
 
   @override
   void load(Uri uri, Map<String, dynamic> track) {
+    _attempt++;
+    _watchdog?.cancel();
+    _progress.stop(PlaybackPhase.idle);
+    _loadedAt = DateTime.now();
+    _lastProgressAt = null;
+    _pausedAt = null;
+    _pauseDurationMs = 0;
+    _everAdvanced = _resume = _renewSource = false;
     _track = extractTrackId(track) ?? '';
     _session = uri.queryParameters['playback_session'] ?? '';
     element.src = uri.toString();
@@ -247,6 +344,21 @@ class BrowserAudio implements PlaybackPort {
 
   @override
   Future<void> play() async {
+    final attempt = ++_attempt;
+    _pauseDurationMs = _pausedAt == null
+        ? 0
+        : DateTime.now().difference(_pausedAt!).inMilliseconds;
+    _resume = _everAdvanced;
+    _progress.begin(position);
+    _deadline = DateTime.now().add(Duration(seconds: _resume ? 12 : 90));
+    try {
+      _audioSession?.type = 'playback';
+    } catch (_) {}
+    _watchdog?.cancel();
+    // Observation only: this timer does not keep a background page alive.
+    _watchdog =
+        Timer.periodic(const Duration(seconds: 1), (_) => _checkProgress());
+    _updateSession();
     // A terminal MEDIA_ERR_ABORTED cannot be restarted by play() alone.
     // Reload the same selected URL; do not resolve a different source.
     if (sourceMatches && element.error?.code == 1) {
@@ -256,15 +368,34 @@ class BrowserAudio implements PlaybackPort {
     record('play-call');
     try {
       await element.play().toDart;
+      if (attempt != _attempt) return;
       record('play-accepted');
+      _sampleProgress();
     } catch (error) {
+      if (attempt != _attempt) return;
       final name = _domExceptionName(error);
-      final cause = name == 'NotAllowedError' ? 'permission' :
-          name == 'AbortError' ? 'abort' : 'unknown';
+      final cause = name == 'NotAllowedError'
+          ? 'permission'
+          : name == 'AbortError'
+              ? 'abort'
+              : 'unknown';
       final kind = cause == 'permission' || cause == 'abort'
-          ? PlaybackStartFailure.interrupted : PlaybackStartFailure.failed;
-      record('play-rejected', {'cause': cause, 'errorType': error.runtimeType.toString(),
-        'exceptionName': name, 'exceptionMessage': _safeErrorText(_domExceptionField(error, 'message'))});
+          ? PlaybackStartFailure.interrupted
+          : PlaybackStartFailure.failed;
+      if (kind == PlaybackStartFailure.interrupted) {
+        _progress.interrupt();
+      } else {
+        _progress.stop(PlaybackPhase.failed);
+        _renewSource = true;
+      }
+      _watchdog?.cancel();
+      _updateSession();
+      record('play-rejected', {
+        'cause': cause,
+        'errorType': error.runtimeType.toString(),
+        'exceptionName': name,
+        'exceptionMessage': _safeErrorText(_domExceptionField(error, 'message'))
+      });
       throw PlaybackStartException(kind, cause);
     }
   }
@@ -274,8 +405,106 @@ class BrowserAudio implements PlaybackPort {
   }
 
   String _safeErrorText(String value) {
-    final cleaned = value.replaceAll(RegExp(r'https?://[^\s]+'), '[url]');
-    return cleaned.substring(0, cleaned.length.clamp(0, 240));
+    return PlaybackDiagnostics.safeText(value);
+  }
+
+  void _sampleProgress() {
+    final previous = phase;
+    if (_progress.observe(position,
+        paused: paused ||
+            element.error != null ||
+            element.readyState < 3 ||
+            _audioSession?.state == 'interrupted',
+        seeking: element.seeking)) {
+      _lastProgressAt = DateTime.now();
+      _deadline = _lastProgressAt!.add(const Duration(seconds: 20));
+      _everAdvanced = true;
+    }
+    if (phase != previous) {
+      _updateSession();
+      record('playback-state');
+      _events.add('playback-state');
+    }
+  }
+
+  void _checkProgress() {
+    if (!_progress.requested || !sourceMatches) return;
+    _sampleProgress();
+    final now = DateTime.now();
+    if (phase == PlaybackPhase.playing &&
+        _lastProgressAt != null &&
+        now.difference(_lastProgressAt!).inSeconds >= 4 &&
+        !element.seeking) {
+      _progress.buffer();
+      _updateSession();
+      record('playback-stalled');
+      _events.add('playback-state');
+    }
+    // Suspension pauses the observation budget; foreground samples first.
+    if (!_foreground ||
+        web.document.hidden ||
+        _audioSession?.state == 'interrupted' ||
+        element.seeking) return;
+    if (_deadline != null && now.isAfter(_deadline!)) {
+      _renewSource = true;
+      _progress.interrupt();
+      _watchdog?.cancel();
+      final reason = _resume
+          ? 'resume-stalled'
+          : _everAdvanced
+              ? 'playback-stalled-timeout'
+              : 'startup-stalled';
+      _updateSession();
+      record(reason, {'failed': true});
+      _events.add(reason);
+    }
+  }
+
+  @override
+  void foreground() {
+    _foreground = true;
+    if (!_progress.requested) return;
+    _sampleProgress();
+    _deadline = DateTime.now().add(Duration(seconds: _everAdvanced ? 12 : 90));
+    _updateSession();
+    record('foreground-check');
+  }
+
+  void background() => _foreground = false;
+
+  web.File _reportFile(Map<String, dynamic> report) => web.File(
+      [const JsonEncoder.withIndent('  ').convert(report).toJS].toJS,
+      'neatie-playback-${report['reportId']}.txt',
+      web.FilePropertyBag(type: 'text/plain;charset=utf-8'));
+
+  bool canShareReport(Map<String, dynamic> report) {
+    try {
+      return web.window.navigator
+          .canShare(web.ShareData(files: [_reportFile(report)].toJS));
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<void> shareReport(Map<String, dynamic> report) async {
+    // Invoke share directly within the user's tap, before any await.
+    await web.window.navigator
+        .share(web.ShareData(
+            title: 'Neatie playback report', files: [_reportFile(report)].toJS))
+        .toDart;
+  }
+
+  void downloadReport(Map<String, dynamic> report) {
+    final file = _reportFile(report);
+    final url = web.URL.createObjectURL(file);
+    final anchor = web.HTMLAnchorElement()
+      ..href = url
+      ..download = file.name;
+    anchor.style.display = 'none';
+    web.document.body?.append(anchor);
+    anchor.click();
+    anchor.remove();
+    Timer(const Duration(seconds: 60), () => web.URL.revokeObjectURL(url));
   }
 
   String _domExceptionField(Object error, String field) {
@@ -288,16 +517,30 @@ class BrowserAudio implements PlaybackPort {
       return '';
     }
   }
+
   @override
-  void pause() => element.pause();
+  void pause() {
+    _attempt++;
+    _pausedAt = DateTime.now();
+    _progress.stop(PlaybackPhase.paused);
+    _watchdog?.cancel();
+    element.pause();
+    _updateSession();
+  }
+
   @override
   void seek(double seconds) {
-    if (duration > 0) element.currentTime = seconds.clamp(0, duration);
+    if (duration > 0) {
+      element.currentTime = seconds.clamp(0, duration);
+      _progress.rebase(element.currentTime);
+    }
     _updateSession();
   }
 
   @override
   void dispose() {
+    _attempt++;
+    _watchdog?.cancel();
     _audioSession?.onstatechange = null;
     for (final entry in _listeners.entries)
       element.removeEventListener(entry.key, entry.value);

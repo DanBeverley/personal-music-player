@@ -21,6 +21,8 @@ class WebPlayer extends ChangeNotifier {
   bool startupInterrupted = false;
   bool _hiddenDuringStartup = false;
   bool _awaitingFirstPlayback = false;
+  bool _wantsPlayback = false, _visible = true, _resuming = false;
+  int _resumeRecoveries = 0;
   bool hasMore = true;
   int _session = 0;
   int _operation = 0;
@@ -38,10 +40,13 @@ class WebPlayer extends ChangeNotifier {
 
   void preloadSearch(List<Map<String, dynamic>> tracks) {
     final seen = <String>{};
-    _searchPreparation = tracks.where((track) {
-      final id = extractTrackId(track);
-      return id != null && seen.add(id);
-    }).take(5).toList();
+    _searchPreparation = tracks
+        .where((track) {
+          final id = extractTrackId(track);
+          return id != null && seen.add(id);
+        })
+        .take(5)
+        .toList();
     unawaited(_drainSearchPreparation());
   }
 
@@ -49,7 +54,10 @@ class WebPlayer extends ChangeNotifier {
     if (_preparingSearch || _disposed) return;
     _preparingSearch = true;
     try {
-      while (!_disposed && !loading && !_preparingQueue && _searchPreparation.isNotEmpty) {
+      while (!_disposed &&
+          !busy &&
+          !_preparingQueue &&
+          _searchPreparation.isNotEmpty) {
         final track = _searchPreparation.removeAt(0);
         try {
           await _prepare(track);
@@ -61,6 +69,7 @@ class WebPlayer extends ChangeNotifier {
       _preparingSearch = false;
     }
   }
+
   double _restoredPosition = 0;
   double _knownDuration = 0;
   bool _metadataReady = false;
@@ -85,7 +94,9 @@ class WebPlayer extends ChangeNotifier {
             index = savedIndex;
             title = saved['title']?.toString() ?? title;
             _restoredPosition = (saved['position'] as num? ?? 0).toDouble();
-            _knownDuration = (saved['duration'] as num? ?? trackDurationSeconds(current!)).toDouble();
+            _knownDuration =
+                (saved['duration'] as num? ?? trackDurationSeconds(current!))
+                    .toDouble();
             hasMore = saved['hasMore'] != false;
             _discoverySession = saved['discoverySession']?.toString() ?? '';
             final savedRecent = saved['recentPlayed'] is List
@@ -93,7 +104,8 @@ class WebPlayer extends ChangeNotifier {
                 : const <String>[];
             _recentPlayed
               ..clear()
-              ..addAll(savedRecent.toList().reversed.take(40).toList().reversed);
+              ..addAll(
+                  savedRecent.toList().reversed.take(40).toList().reversed);
           } else {
             queue = [];
           }
@@ -122,6 +134,8 @@ class WebPlayer extends ChangeNotifier {
     startupInterrupted = false;
     _hiddenDuringStartup = false;
     _awaitingFirstPlayback = false;
+    _wantsPlayback = _resuming = false;
+    _resumeRecoveries = 0;
     _searchPreparation = [];
     _ready.clear();
     _queueCacheAttempts.clear();
@@ -133,7 +147,8 @@ class WebPlayer extends ChangeNotifier {
     _notify();
   }
 
-  Future<void> startQueue(List<Map<String, dynamic>> tracks, int selected, String label) async {
+  Future<void> startQueue(
+      List<Map<String, dynamic>> tracks, int selected, String label) async {
     if (selected < 0 || selected >= tracks.length) return;
     _session++;
     _queueCacheAttempts.clear();
@@ -145,32 +160,54 @@ class WebPlayer extends ChangeNotifier {
     relatedError = null;
     hasMore = false;
     final playback = playIndex(selected);
-    unawaited(api.recordExplicitSearchSelection(tracks[selected]).catchError((_) {}));
+    unawaited(
+        api.recordExplicitSearchSelection(tracks[selected]).catchError((_) {}));
     await playback;
   }
 
   Map<String, dynamic>? get current => queue.isEmpty ? null : queue[index];
   double get position => !_metadataReady ? _restoredPosition : audio.position;
-  double get duration => _metadataReady && audio.duration > 0
-      ? audio.duration : _knownDuration;
+  double get duration =>
+      _metadataReady && audio.duration > 0 ? audio.duration : _knownDuration;
+  PlaybackPhase get phase => current == null
+      ? PlaybackPhase.idle
+      : startupInterrupted
+          ? PlaybackPhase.interrupted
+          : error != null
+              ? PlaybackPhase.failed
+              : audio.phase;
+  bool get playing => phase == PlaybackPhase.playing;
+  bool get busy =>
+      loading ||
+      phase == PlaybackPhase.starting ||
+      phase == PlaybackPhase.buffering;
+  bool get canPause => playing || busy;
 
   void _notify() {
     if (!_disposed) notifyListeners();
   }
 
   Map<String, dynamic> get diagnostics => {
-    'selectedTrack': extractTrackId(current), 'loadedTrack': _loadedId,
-    'queueIndex': index, 'operation': _operation, 'loading': loading,
-    'error': error,
-    'startupInterrupted': startupInterrupted,
-    'awaitingFirstPlayback': _awaitingFirstPlayback,
-    'hiddenDuringStartup': _hiddenDuringStartup,
-  };
+        'selectedTrack': extractTrackId(current),
+        'loadedTrack': _loadedId,
+        'queueIndex': index,
+        'operation': _operation,
+        'loading': loading,
+        'error': error,
+        'startupInterrupted': startupInterrupted,
+        'awaitingFirstPlayback': _awaitingFirstPlayback,
+        'hiddenDuringStartup': _hiddenDuringStartup,
+        'playRequested': _wantsPlayback,
+        'phase': phase.name,
+        'recoveryAttempts': _resumeRecoveries,
+      };
 
   void reconcile() {
     if (_disposed || current == null) return;
-    if (_loadedId != null && (_loadedId != audio.loadedTrackId ||
-        _loadedId != extractTrackId(current) || !audio.sourceMatches)) {
+    if (_loadedId != null &&
+        (_loadedId != audio.loadedTrackId ||
+            _loadedId != extractTrackId(current) ||
+            !audio.sourceMatches)) {
       _operation++;
       _loadedId = null;
       _metadataReady = false;
@@ -199,25 +236,29 @@ class WebPlayer extends ChangeNotifier {
   void _primeNext() => unawaited(_cacheQueue());
 
   Future<void> _cacheQueue() async {
-    if (_preparingQueue || _disposed || loading) return;
+    if (_preparingQueue || _disposed || busy) return;
     _preparingQueue = true;
     try {
       // Finish an existing speculative request before starting queue work.
       if (_pending.isNotEmpty) {
         await Future.wait(_pending.values.toList()).catchError((_) => <Uri>[]);
       }
-      while (!_disposed && !loading) {
-        final upcoming = queue.skip(index + 1).take(5).where((t) =>
-            !_queueCacheAttempts.contains(extractTrackId(t))).toList();
+      while (!_disposed && !busy) {
+        final upcoming = queue
+            .skip(index + 1)
+            .take(5)
+            .where((t) => !_queueCacheAttempts.contains(extractTrackId(t)))
+            .toList();
         if (upcoming.isEmpty) break;
         final track = upcoming.first;
         final id = extractTrackId(track)!;
         final session = _session;
         _queueCacheAttempts.add(id);
         try {
-          final uri = await api.prepare(track, activeQueue: true, cacheFull: true);
+          final uri =
+              await api.prepare(track, activeQueue: true, cacheFull: true);
           if (!_disposed && session == _session) _ready[id] = uri;
-        } catch (_) { /* Explicit playback can retry a failed preparation. */ }
+        } catch (_) {/* Explicit playback can retry a failed preparation. */}
       }
     } finally {
       _preparingQueue = false;
@@ -226,7 +267,8 @@ class WebPlayer extends ChangeNotifier {
 
   Future<void> start(Map<String, dynamic> track) async {
     _session++;
-    _discoverySession = '${DateTime.now().microsecondsSinceEpoch}-${_session.toRadixString(36)}';
+    _discoverySession =
+        '${DateTime.now().microsecondsSinceEpoch}-${_session.toRadixString(36)}';
     _queueCacheAttempts.clear();
     loadingRelated = false;
     relatedError = null;
@@ -245,11 +287,19 @@ class WebPlayer extends ChangeNotifier {
     if (hasMore) unawaited(replenish());
   }
 
-  Future<void> playIndex(int target, {bool resume = false}) async {
+  Future<void> playIndex(int target,
+      {bool resume = false, bool recovery = false}) async {
     if (target < 0 || target >= queue.length) return;
     // Stop speculative requests; the selected song and queue now take priority.
     _searchPreparation = [];
+    if (!recovery) _resumeRecoveries = 0;
+    _wantsPlayback = true;
+    _resuming = false;
     final operation = ++_operation;
+    if (resume && index == target && _metadataReady) {
+      _restoredPosition = audio.position;
+      if (audio.duration > 0) _knownDuration = audio.duration;
+    }
     audio.pause();
     final track = queue[target];
     final id = extractTrackId(track)!;
@@ -273,7 +323,8 @@ class WebPlayer extends ChangeNotifier {
       final source = _ready[id] ?? api.streamUri(track);
       final uri = source.replace(queryParameters: {
         ...source.queryParameters,
-        'playback_session': '${DateTime.now().microsecondsSinceEpoch}-$operation',
+        'playback_session':
+            '${DateTime.now().microsecondsSinceEpoch}-$operation',
       });
       if (_disposed || operation != _operation) return;
       _loadedId = id;
@@ -283,20 +334,23 @@ class WebPlayer extends ChangeNotifier {
       if (_loadedId != id || startupInterrupted) return;
       startupInterrupted = false;
       _markPlayed(id);
-      _primeNext();
+      if (playing) _primeNext();
       if (queue.length - index <= 3 && hasMore) unawaited(replenish());
     } catch (e) {
       if (operation != _operation || _disposed) return;
       // A media error event may have already invalidated this loaded source.
       if (_loadedId != id) return;
-      if (e is PlaybackStartException && e.kind == PlaybackStartFailure.interrupted &&
+      if (e is PlaybackStartException &&
+          e.kind == PlaybackStartFailure.interrupted &&
           (e.cause == 'permission' || e.cause == 'abort')) {
         startupInterrupted = true;
+        if (e.cause == 'permission') _wantsPlayback = false;
         error = e.cause == 'permission'
             ? 'Browser playback permission was interrupted. Tap Play to resume this track.'
             : 'Playback was interrupted while starting. Tap Play to resume this track.';
       } else {
         _ready.remove(id);
+        _wantsPlayback = false;
         _loadedId = null;
         _metadataReady = false;
         audio.pause();
@@ -307,16 +361,24 @@ class WebPlayer extends ChangeNotifier {
     } finally {
       if (!_disposed && operation == _operation) {
         loading = false;
-        if (error == null) _primeNext();
+        if (playing) _primeNext();
         save();
         _notify();
       }
     }
   }
 
-  Future<void> play() async {
+  Future<void> play({bool automatic = false}) async {
     if (current == null) return;
     reconcile();
+    if (!automatic) _resumeRecoveries = 0;
+    _wantsPlayback = true;
+    if (playing && !audio.paused) return;
+    if (audio.needsNewSource) {
+      audio.record('resume-new-session', {'reason': 'source-invalidated'});
+      await playIndex(index, resume: true, recovery: automatic);
+      return;
+    }
     if (_loadedId == extractTrackId(current)) {
       final operation = ++_operation;
       final session = _session;
@@ -326,19 +388,27 @@ class WebPlayer extends ChangeNotifier {
       _hiddenDuringStartup = false;
       _awaitingFirstPlayback = true;
       loading = true;
+      _resuming = true;
+      _notify();
       try {
         await audio.play();
       } catch (e) {
-        if (_disposed || operation != _operation || session != _session ||
-            id != extractTrackId(current) || _loadedId != id) return;
-        if (e is PlaybackStartException && e.kind == PlaybackStartFailure.interrupted &&
+        if (_disposed ||
+            operation != _operation ||
+            session != _session ||
+            id != extractTrackId(current) ||
+            _loadedId != id) return;
+        if (e is PlaybackStartException &&
+            e.kind == PlaybackStartFailure.interrupted &&
             (e.cause == 'permission' || e.cause == 'abort')) {
           startupInterrupted = true;
+          if (e.cause == 'permission') _wantsPlayback = false;
           error = e.cause == 'permission'
               ? 'Browser playback permission was interrupted. Tap Play to resume this track.'
               : 'Playback was interrupted while starting. Tap Play to resume this track.';
         } else {
           startupInterrupted = false;
+          _wantsPlayback = false;
           _loadedId = null;
           _metadataReady = false;
           audio.pause();
@@ -346,18 +416,22 @@ class WebPlayer extends ChangeNotifier {
         }
       }
       if (!_disposed && operation == _operation) {
-        loading = false;
+        loading = audio.phase == PlaybackPhase.starting ||
+            audio.phase == PlaybackPhase.buffering;
         save();
         _notify();
       }
     } else {
-      await playIndex(index, resume: true);
+      await playIndex(index, resume: true, recovery: automatic);
     }
   }
 
   void pause() {
     _operation++;
+    _wantsPlayback = _resuming = false;
+    _awaitingFirstPlayback = false;
     loading = false;
+    audio.record('pause-request');
     audio.pause();
     save();
     _notify();
@@ -365,9 +439,46 @@ class WebPlayer extends ChangeNotifier {
 
   /// Records browser lifecycle evidence without changing the selected track.
   void lifecycle(String kind, {required bool visible}) {
-    if (!visible && (loading || _awaitingFirstPlayback)) _hiddenDuringStartup = true;
+    _visible = visible;
+    if (!visible && (loading || _awaitingFirstPlayback))
+      _hiddenDuringStartup = true;
     if (visible && startupInterrupted && !loading) {
-      error = 'Playback was interrupted while starting. Tap Play to resume this track.';
+      error =
+          'Playback was interrupted while starting. Tap Play to resume this track.';
+      _notify();
+    }
+    if (visible &&
+        _wantsPlayback &&
+        !loading &&
+        _loadedId != null &&
+        (audio.phase == PlaybackPhase.interrupted || audio.paused)) {
+      audio.record('foreground-resume', {'kind': kind});
+      unawaited(play(automatic: true));
+    }
+  }
+
+  void _recoverResume(String reason) {
+    if (_metadataReady) {
+      _restoredPosition = audio.position;
+      if (audio.duration > 0) _knownDuration = audio.duration;
+    }
+    _operation++; // Fence any older Promise before renewing the media resource.
+    _ready.remove(_loadedId);
+    _metadataReady = false;
+    loading = false;
+    startupInterrupted = true;
+    audio.pause();
+    error = 'Audio did not resume. Tap Play to retry from this position.';
+    if (_visible && _wantsPlayback && _resumeRecoveries == 0) {
+      _resumeRecoveries++;
+      audio.record('resume-source-renewal',
+          {'reason': reason, 'recoveryAttempts': _resumeRecoveries});
+      unawaited(playIndex(index, resume: true, recovery: true));
+    } else {
+      _loadedId = null;
+      _wantsPlayback = false;
+      audio.record('resume-recovery-failed', {'reason': reason});
+      save();
       _notify();
     }
   }
@@ -426,11 +537,49 @@ class WebPlayer extends ChangeNotifier {
 
   void _onEvent(String event) {
     if (_loadedId == null && event != 'pause') return;
-    if (event != 'pause' && (_loadedId != audio.loadedTrackId ||
-        _loadedId != extractTrackId(current) || !audio.sourceMatches)) return;
-    if (event == 'playing') {
+    if (event != 'pause' &&
+        (_loadedId != audio.loadedTrackId ||
+            _loadedId != extractTrackId(current) ||
+            !audio.sourceMatches)) return;
+    if (event == 'resume-stalled' ||
+        event == 'playback-stalled-timeout' ||
+        event == 'error' && _resuming && _wantsPlayback) {
+      _recoverResume(event);
+      return;
+    }
+    if (event == 'startup-stalled') {
+      _operation++;
+      _ready.remove(_loadedId);
+      _loadedId = null;
+      _wantsPlayback = false;
+      loading = false;
+      startupInterrupted = true;
+      audio.pause();
+      error = 'This track has not started. Tap Play to retry.';
+      save();
+      _notify();
+      return;
+    }
+    if (event == 'pause' &&
+        audio.paused &&
+        audio.phase == PlaybackPhase.paused &&
+        !startupInterrupted) {
+      _wantsPlayback = false;
+    }
+    if (audio.phase == PlaybackPhase.playing) {
       _awaitingFirstPlayback = false;
       _hiddenDuringStartup = false;
+      _resuming = false;
+      startupInterrupted = false;
+      error = null;
+      loading = false;
+      _primeNext();
+    }
+    if (event == 'interrupted') {
+      startupInterrupted = true;
+      loading = false;
+      error = 'Audio was interrupted. Tap Play to resume.';
+      audio.record('playback-interrupted');
     }
     if (event == 'ended') {
       unawaited(next());
@@ -441,20 +590,24 @@ class WebPlayer extends ChangeNotifier {
       if (_restoredPosition > 0) audio.seek(_restoredPosition);
     }
     if (event == 'media-aborted') {
-      if (_metadataReady && audio.position > 0) _restoredPosition = audio.position;
+      if (_metadataReady && audio.position > 0)
+        _restoredPosition = audio.position;
       _metadataReady = false;
       startupInterrupted = true;
-      error = 'Playback was interrupted while starting. Tap Play to resume this track.';
+      error =
+          'Playback was interrupted while starting. Tap Play to resume this track.';
       loading = false;
       audio.pause();
       if (current != null) audio.syncMetadata(current!);
       save();
     } else if (event == 'error') {
-      if (_metadataReady && audio.position > 0) _restoredPosition = audio.position;
+      if (_metadataReady && audio.position > 0)
+        _restoredPosition = audio.position;
       _metadataReady = false;
       _ready.remove(_loadedId);
       _loadedId = null;
       startupInterrupted = false;
+      _wantsPlayback = false;
       error = 'The audio stream failed. Tap Play to retry.';
       loading = false;
       audio.pause();
@@ -463,8 +616,7 @@ class WebPlayer extends ChangeNotifier {
     }
     if (event == 'pause' ||
         event == 'ended' ||
-        (event == 'timeupdate' && position.toInt() != _lastSavedSecond))
-      save();
+        (event == 'timeupdate' && position.toInt() != _lastSavedSecond)) save();
     _notify();
   }
 

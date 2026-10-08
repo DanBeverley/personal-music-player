@@ -33,7 +33,12 @@ class WebPlayer extends ChangeNotifier {
   final Map<String, Future<Uri>> _pending = {};
   List<Map<String, dynamic>> _searchPreparation = [];
   bool _preparingSearch = false;
-  bool _preparingQueue = false;
+  int _queuePreparations = 0;
+  int _preparationScope = 0;
+  bool _cachingFullTrack = false;
+  final Map<String, DateTime> _prepareRetryAfter = {};
+  Timer? _prepareRetryTimer;
+  Stopwatch? _startupWatch, _transitionWatch;
   final Set<String> _queueCacheAttempts = {};
   String _discoverySession = '';
   final List<String> _recentPlayed = [];
@@ -56,7 +61,7 @@ class WebPlayer extends ChangeNotifier {
     try {
       while (!_disposed &&
           !busy &&
-          !_preparingQueue &&
+          _queuePreparations == 0 &&
           _searchPreparation.isNotEmpty) {
         final track = _searchPreparation.removeAt(0);
         try {
@@ -67,6 +72,7 @@ class WebPlayer extends ChangeNotifier {
       }
     } finally {
       _preparingSearch = false;
+      _primeNext();
     }
   }
 
@@ -137,6 +143,11 @@ class WebPlayer extends ChangeNotifier {
     _wantsPlayback = _resuming = false;
     _resumeRecoveries = 0;
     _searchPreparation = [];
+    _preparationScope++;
+    _pending.clear();
+    _prepareRetryAfter.clear();
+    _prepareRetryTimer?.cancel();
+    _startupWatch = _transitionWatch = null;
     _ready.clear();
     _queueCacheAttempts.clear();
     _discoverySession = '';
@@ -152,6 +163,7 @@ class WebPlayer extends ChangeNotifier {
     if (selected < 0 || selected >= tracks.length) return;
     _session++;
     _queueCacheAttempts.clear();
+    _transitionWatch = null;
     queue = List.of(tracks);
     index = selected;
     title = label;
@@ -222,51 +234,87 @@ class WebPlayer extends ChangeNotifier {
 
   Future<Uri> _prepare(Map<String, dynamic> track, {bool activeQueue = false}) {
     final id = extractTrackId(track)!;
-    final session = _session;
-    return _pending.putIfAbsent(
-        id,
-        () => api.prepare(track, activeQueue: activeQueue).then((uri) {
-              if (!_disposed && session == _session) _ready[id] = uri;
-              return uri;
-            }).whenComplete(() {
-              _pending.remove(id);
-            }));
+    final existing = _pending[id];
+    if (existing != null) return existing;
+    final scope = _preparationScope;
+    late final Future<Uri> pending;
+    pending = api.prepare(track, activeQueue: activeQueue).then((uri) {
+      if (!_disposed && scope == _preparationScope) _ready[id] = uri;
+      return uri;
+    }).whenComplete(() {
+      if (identical(_pending[id], pending)) _pending.remove(id);
+    });
+    _pending[id] = pending;
+    return pending;
   }
 
-  void _primeNext() => unawaited(_cacheQueue());
+  void _primeNext() {
+    if (_disposed || busy) return;
+    final upcoming = queue.skip(index + 1).take(2).toList();
+    for (final track in upcoming) {
+      final id = extractTrackId(track)!;
+      if (_ready.containsKey(id) ||
+          _queuePreparingIds[id] == _preparationScope ||
+          (_prepareRetryAfter[id]?.isAfter(DateTime.now()) ?? false)) continue;
+      if (_queuePreparations >= 2) break;
+      _queuePreparingIds[id] = _preparationScope;
+      _queuePreparations++;
+      unawaited(_prepareQueueTrack(track));
+    }
+    // Startup buffers have priority. Full downloads use a separate, single
+    // background request, so they cannot hold the queue preparation pump.
+    if (_queuePreparations == 0 &&
+        upcoming.every((t) => _ready.containsKey(extractTrackId(t)))) {
+      unawaited(_cacheQueue(upcoming));
+    }
+    if (_queuePreparations == 0 && _searchPreparation.isNotEmpty) {
+      unawaited(_drainSearchPreparation());
+    }
+  }
 
-  Future<void> _cacheQueue() async {
-    if (_preparingQueue || _disposed || busy) return;
-    _preparingQueue = true;
+  final Map<String, int> _queuePreparingIds = {};
+
+  Future<void> _prepareQueueTrack(Map<String, dynamic> track) async {
+    final id = extractTrackId(track)!;
+    final scope = _preparationScope;
     try {
-      // Finish an existing speculative request before starting queue work.
-      if (_pending.isNotEmpty) {
-        await Future.wait(_pending.values.toList()).catchError((_) => <Uri>[]);
-      }
-      while (!_disposed && !busy) {
-        final upcoming = queue
-            .skip(index + 1)
-            .take(5)
-            .where((t) => !_queueCacheAttempts.contains(extractTrackId(t)))
-            .toList();
-        if (upcoming.isEmpty) break;
-        final track = upcoming.first;
-        final id = extractTrackId(track)!;
-        final session = _session;
-        _queueCacheAttempts.add(id);
-        try {
-          final uri =
-              await api.prepare(track, activeQueue: true, cacheFull: true);
-          if (!_disposed && session == _session) _ready[id] = uri;
-        } catch (_) {/* Explicit playback can retry a failed preparation. */}
+      await _prepare(track, activeQueue: true);
+    } catch (_) {
+      if (scope == _preparationScope && !_disposed) {
+        _prepareRetryAfter[id] =
+            DateTime.now().add(const Duration(seconds: 30));
+        _prepareRetryTimer?.cancel();
+        _prepareRetryTimer = Timer(const Duration(seconds: 30), _primeNext);
       }
     } finally {
-      _preparingQueue = false;
+      if (_queuePreparingIds[id] == scope) _queuePreparingIds.remove(id);
+      _queuePreparations--;
+      _primeNext();
+    }
+  }
+
+  Future<void> _cacheQueue(List<Map<String, dynamic>> upcoming) async {
+    if (_cachingFullTrack || _disposed || busy) return;
+    final candidates = upcoming
+        .where((track) => !_queueCacheAttempts.contains(extractTrackId(track)));
+    if (candidates.isEmpty) return;
+    final track = candidates.first;
+    final id = extractTrackId(track)!;
+    _queueCacheAttempts.add(id);
+    _cachingFullTrack = true;
+    try {
+      await api.prepare(track, cacheFull: true);
+    } catch (_) {
+      /* A background cache failure must not invalidate the prefix. */
+    } finally {
+      _cachingFullTrack = false;
+      _primeNext();
     }
   }
 
   Future<void> start(Map<String, dynamic> track) async {
     _session++;
+    _transitionWatch = null;
     _discoverySession =
         '${DateTime.now().microsecondsSinceEpoch}-${_session.toRadixString(36)}';
     _queueCacheAttempts.clear();
@@ -301,6 +349,7 @@ class WebPlayer extends ChangeNotifier {
       if (audio.duration > 0) _knownDuration = audio.duration;
     }
     audio.pause();
+    _startupWatch = Stopwatch()..start();
     final track = queue[target];
     final id = extractTrackId(track)!;
     if (!resume || index != target) {
@@ -428,6 +477,7 @@ class WebPlayer extends ChangeNotifier {
 
   void pause() {
     _operation++;
+    _startupWatch = _transitionWatch = null;
     _wantsPlayback = _resuming = false;
     _awaitingFirstPlayback = false;
     loading = false;
@@ -567,6 +617,15 @@ class WebPlayer extends ChangeNotifier {
       _wantsPlayback = false;
     }
     if (audio.phase == PlaybackPhase.playing) {
+      if (_startupWatch != null) {
+        audio.record('playback-startup', {
+          'startupMs': _startupWatch!.elapsedMilliseconds,
+          if (_transitionWatch != null)
+            'nextGapMs': _transitionWatch!.elapsedMilliseconds,
+          'prepared': _ready.containsKey(_loadedId),
+        });
+        _startupWatch = _transitionWatch = null;
+      }
       _awaitingFirstPlayback = false;
       _hiddenDuringStartup = false;
       _resuming = false;
@@ -582,6 +641,7 @@ class WebPlayer extends ChangeNotifier {
       audio.record('playback-interrupted');
     }
     if (event == 'ended') {
+      if (index + 1 < queue.length) _transitionWatch = Stopwatch()..start();
       unawaited(next());
     }
     if (event == 'loadedmetadata' && _loadedId != null) {
@@ -647,6 +707,7 @@ class WebPlayer extends ChangeNotifier {
   void dispose() {
     save();
     _disposed = true;
+    _prepareRetryTimer?.cancel();
     _operation++;
     _session++;
     _subscription.cancel();

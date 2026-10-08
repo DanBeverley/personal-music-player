@@ -8,6 +8,7 @@ class MusicApi {
   DateTime Function() clock = DateTime.now;
   String _userScopeId = 'guest';
   int _scopeRevision = 0;
+
   /// Optional feed-only scope. Search and playback discovery keep userScopeId.
   String? homeScopeId;
   String get homeRequestScopeId => userScopeId.toLowerCase() == 'guest'
@@ -22,6 +23,7 @@ class MusicApi {
     }
     _userScopeId = next;
   }
+
   String? _searchContextQuery;
   String? _searchContextScope;
   DateTime? _searchContextAt;
@@ -55,7 +57,8 @@ class MusicApi {
     final query = _searchContextQuery?.trim() ?? '';
     final createdAt = _searchContextAt;
     final sameScope = _searchContextScope == userScopeId;
-    final fresh = createdAt != null && clock().difference(createdAt) <= searchContextLifetime;
+    final fresh = createdAt != null &&
+        clock().difference(createdAt) <= searchContextLifetime;
     // A context represents one recent search session and is consumed by the
     // next explicit selection, including a selection that fails relevance.
     clearSearchContext();
@@ -63,11 +66,24 @@ class MusicApi {
       return;
     }
     final title = (track['title'] ?? '').toString().trim();
-    final artist = (track['artist'] ?? track['channel'] ?? track['author'] ?? '').toString().trim();
-    final id = (track['id'] ?? track['videoId'] ?? track['track_key'] ?? '').toString().trim();
-    final recordingId = (track['canonical_recording_id'] ?? track['recording_id'] ?? track['musicbrainz_recording_id'] ?? '').toString().trim();
-    if (userScopeId.toLowerCase() == 'guest' || title.isEmpty || artist.isEmpty ||
-        (id.isEmpty && recordingId.isEmpty) || !_queryRelatesToTrack(query, title, artist)) return;
+    final artist =
+        (track['artist'] ?? track['channel'] ?? track['author'] ?? '')
+            .toString()
+            .trim();
+    final id = (track['id'] ?? track['videoId'] ?? track['track_key'] ?? '')
+        .toString()
+        .trim();
+    final recordingId = (track['canonical_recording_id'] ??
+            track['recording_id'] ??
+            track['musicbrainz_recording_id'] ??
+            '')
+        .toString()
+        .trim();
+    if (userScopeId.toLowerCase() == 'guest' ||
+        title.isEmpty ||
+        artist.isEmpty ||
+        (id.isEmpty && recordingId.isEmpty) ||
+        !_queryRelatesToTrack(query, title, artist)) return;
     await post('/search_interaction', {
       'query': query,
       'user_scope_id': userScopeId,
@@ -86,14 +102,19 @@ class MusicApi {
   }
 
   bool _queryRelatesToTrack(String query, String title, String artist) {
-    String normalize(String value) => value.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]+'), ' ').trim();
+    String normalize(String value) =>
+        value.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]+'), ' ').trim();
     final normalizedQuery = normalize(query);
     final normalizedItem = normalize('$title $artist');
     if (normalizedQuery.isEmpty || normalizedItem.isEmpty) return false;
     // Require a meaningful shared word; this suppresses obviously unrelated
     // Home/artist picks while allowing either a song-title or artist query.
-    final tokens = normalizedQuery.split(RegExp(r'\s+')).where((token) => token.length > 1).toSet();
-    return tokens.any((token) => normalizedItem.split(RegExp(r'\s+')).contains(token));
+    final tokens = normalizedQuery
+        .split(RegExp(r'\s+'))
+        .where((token) => token.length > 1)
+        .toSet();
+    return tokens
+        .any((token) => normalizedItem.split(RegExp(r'\s+')).contains(token));
   }
 
   /// Backend artwork may be a gateway-relative path. Resolve it against the
@@ -123,12 +144,20 @@ class MusicApi {
   List<String> artworkUrls(Map<String, dynamic> item, String type) {
     final track = type == 'track' || type == 'tracks';
     final source = track ? extractPlaybackSourceId(item) : null;
-    final youtube = source != null && extractPlaybackProvider(item) == 'youtube' &&
-        item['playable'] != false && RegExp(r'^[A-Za-z0-9_-]{11}$').hasMatch(source);
-    final values = <dynamic>[item['thumbnail'], item['thumbnail_url'],
+    final youtube = source != null &&
+        extractPlaybackProvider(item) == 'youtube' &&
+        item['playable'] != false &&
+        RegExp(r'^[A-Za-z0-9_-]{11}$').hasMatch(source);
+    final values = <dynamic>[
+      item['thumbnail'],
+      item['thumbnail_url'],
       if (type == 'artist' || type == 'artists') item['artist_thumbnail'],
-      item['artwork_url'], item['artwork'], item['cover_url'], item['image_url'],
-      if (item['artwork_source_urls'] is List) ...item['artwork_source_urls'] as List,
+      item['artwork_url'],
+      item['artwork'],
+      item['cover_url'],
+      item['image_url'],
+      if (item['artwork_source_urls'] is List)
+        ...item['artwork_source_urls'] as List,
       item['artwork_source_url'],
       if (item['thumbnails'] is List) ...(item['thumbnails'] as List).reversed,
       if (item['images'] is List) ...(item['images'] as List).reversed,
@@ -141,7 +170,8 @@ class MusicApi {
       final uri = artworkUri(value);
       if (uri == null) continue;
       final videoImage = RegExp(r'/vi(?:_webp)?/([^/]+)/').firstMatch(uri.path);
-      if (track && videoImage != null &&
+      if (track &&
+          videoImage != null &&
           (!youtube || videoImage.group(1) != source)) continue;
       if (track && value == item['artist_thumbnail']) continue;
       final url = uri.toString();
@@ -150,29 +180,37 @@ class MusicApi {
     return urls;
   }
 
-  Future<Map<String, dynamic>> post(
-      String path, Map<String, dynamic> body,
+  Future<Map<String, dynamic>> post(String path, Map<String, dynamic> body,
       {Duration timeout = const Duration(seconds: 30)}) async {
     final timer = Stopwatch()..start();
     final revision = _scopeRevision;
     late http.Response response;
     try {
       response = await client
-        .post(endpoint(path),
-            headers: {'Content-Type': 'application/json',
-              if (accessToken?.call() case final String token) 'Authorization': 'Bearer $token'},
-            body: jsonEncode(body))
-        .timeout(timeout);
+          .post(endpoint(path),
+              headers: {
+                'Content-Type': 'application/json',
+                if (accessToken?.call() case final String token)
+                  'Authorization': 'Bearer $token'
+              },
+              body: jsonEncode(body))
+          .timeout(timeout);
     } catch (e) {
       if (revision == _scopeRevision) {
-        onDiagnostic?.call('api-failure', {'path': path, 'ms': timer.elapsedMilliseconds,
-          'requestedTrack': body['current_track_key'], 'errorType': e.runtimeType.toString()});
+        onDiagnostic?.call('api-failure', {
+          'path': path,
+          'ms': timer.elapsedMilliseconds,
+          'requestedTrack': body['current_track_key'],
+          'errorType': e.runtimeType.toString()
+        });
       }
       rethrow;
     }
     if (revision == _scopeRevision) {
       onDiagnostic?.call('api-response', {
-        'path': path, 'status': response.statusCode, 'ms': timer.elapsedMilliseconds,
+        'path': path,
+        'status': response.statusCode,
+        'ms': timer.elapsedMilliseconds,
       });
     }
     if (response.statusCode != 200) {
@@ -183,7 +221,8 @@ class MusicApi {
   }
 
   Map<String, dynamic>? queryCorrection;
-  Future<List<Map<String, dynamic>>> search(String query, {bool autoCorrect = true}) async {
+  Future<List<Map<String, dynamic>>> search(String query,
+      {bool autoCorrect = true}) async {
     final result = await post('/search', {
       'query': query,
       'auto_correct': autoCorrect,
@@ -193,7 +232,8 @@ class MusicApi {
       'context_surface': 'interactive_search',
     });
     queryCorrection = result['query_correction'] is Map
-        ? Map<String, dynamic>.from(result['query_correction']) : null;
+        ? Map<String, dynamic>.from(result['query_correction'])
+        : null;
     return tracks(result['results']);
   }
 
@@ -221,24 +261,42 @@ class MusicApi {
   Uri streamUri(Map<String, dynamic> track) {
     final data = identity(track);
     final id = data.remove('track_key') as String;
-    return endpoint('/playback/stream/${Uri.encodeComponent(id)}').replace(
-        queryParameters: {'resolve': '1',
-          for (final entry in data.entries) entry.key: entry.value.toString()});
+    return endpoint('/playback/stream/${Uri.encodeComponent(id)}')
+        .replace(queryParameters: {
+      'resolve': '1',
+      for (final entry in data.entries) entry.key: entry.value.toString()
+    });
   }
 
-  Future<Uri> prepare(Map<String, dynamic> track, {bool activeQueue = false, bool cacheFull = false}) async {
+  Future<Uri> prepare(Map<String, dynamic> track,
+      {bool activeQueue = false, bool cacheFull = false}) async {
     final id = extractTrackId(track)!;
     final revision = _scopeRevision;
-    final result = await post('/prepare_session', {
-      'track_keys': [id], 'current_track_key': id,
-      'active_queue': activeQueue, 'lookahead': 1,
-      'cache_full': cacheFull,
-    }, timeout: const Duration(seconds: 90));
+    final result = await post(
+        '/prepare_session',
+        {
+          'track_keys': [id],
+          'current_track_key': id,
+          'active_queue': activeQueue,
+          'lookahead': 1,
+          'cache_full': cacheFull,
+          'background': cacheFull,
+        },
+        timeout: const Duration(seconds: 90));
     if (revision == _scopeRevision) {
-      onDiagnostic?.call('prepare-result', {'requestedTrack': id,
+      onDiagnostic?.call('prepare-result', {
+        'requestedTrack': id,
+        'serverMs': result['server_ms'],
+        'cachedPrefixBytes':
+            ((result['prepared'] as Map?)?[id] as Map?)?['cached_prefix_bytes'],
+        'chunkDeferred':
+            ((result['prepared'] as Map?)?[id] as Map?)?['chunk_deferred'],
         'prepared': (result['prepared'] as Map?)?[id] != null,
-        'fullyCached': ((result['prepared'] as Map?)?[id] as Map?)?['fully_cached'] == true,
-        'failed': (result['failed_ids'] as List?)?.contains(id) == true});
+        'fullyCached':
+            ((result['prepared'] as Map?)?[id] as Map?)?['fully_cached'] ==
+                true,
+        'failed': (result['failed_ids'] as List?)?.contains(id) == true
+      });
     }
     if ((result['prepared'] as Map?)?[id] == null) {
       throw StateError('Next track is not prepared yet.');
@@ -247,8 +305,8 @@ class MusicApi {
   }
 
   Future<({List<Map<String, dynamic>> tracks, bool hasMore})> related(
-      Map<String, dynamic> seed, List<Map<String, dynamic>> queue, {
-      String discoverySession = '', List<String> recentIds = const []}) async {
+      Map<String, dynamic> seed, List<Map<String, dynamic>> queue,
+      {String discoverySession = '', List<String> recentIds = const []}) async {
     final result = await post('/related_tracks', {
       ...identity(seed),
       'avoid_ids': queue.map(extractTrackId).whereType<String>().toList(),

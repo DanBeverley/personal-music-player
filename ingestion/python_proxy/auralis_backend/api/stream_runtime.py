@@ -22,6 +22,7 @@ from .stream_core_runtime import (
     classify_stream_failure,
     extract_total_length,
     get_cached_stream_chunk,
+    stream_chunk_matches,
     get_stream_info,
     selected_stream_info,
     iter_upstream_stream,
@@ -456,9 +457,11 @@ def _proxy_stream(server: Any, video_id: str, request: Request):
 
         stream_info = selected or (get_stream_info(server, video_id, session=session)
                                    if session else get_stream_info(server, video_id))
-        cached_chunk = None if stream_info.get('pinned') else get_cached_stream_chunk(server, video_id)
+        cached_chunk = get_cached_stream_chunk(server, video_id)
+        if not stream_chunk_matches(cached_chunk, stream_info):
+            cached_chunk = None
 
-        if cached_chunk and not stream_info.get('compatibility') and not cached_chunk.get('compatibility'):
+        if cached_chunk and int(cached_chunk.get('total_length') or 0) >= len(cached_chunk.get('bytes') or b'') > 0:
             cached_bytes = cached_chunk.get("bytes") or b""
             content_type = cached_chunk.get("content_type") or stream_info.get("mime_type") or "audio/mp4"
             total_length = cached_chunk.get("total_length")
@@ -481,32 +484,25 @@ def _proxy_stream(server: Any, video_id: str, request: Request):
                             and upstream_start >= total_length
                         )
                     )
-                    upstream_response = None
-                    if needs_upstream:
-                        upstream_response, stream_info = open_upstream_stream(
-                            server,
-                            video_id,
-                            stream_info,
-                            start=upstream_start,
-                            end=end,
-                        )
-
                     def generate_cached_then_upstream():
                         if cached_slice:
                             yield cached_slice
-                        if upstream_response is None:
+                        if not needs_upstream:
                             return
-
+                        # Yield the proven prefix before waiting for a network
+                        # continuation. Every later range keeps this resource.
                         yield from iter_upstream_stream(
                             server,
                             video_id,
-                            stream_info,
+                            {**stream_info, 'pinned': True},
                             start=upstream_start,
                             end=end,
-                            initial_response=upstream_response,
+                            expected_total_length=total_length,
+                            expected_content_type=str(content_type).split(';')[0],
+                            expected_etag=str(cached_chunk.get('etag') or ''),
                         )
 
-                    resp_headers = {"Accept-Ranges": "bytes"}
+                    resp_headers = {"Accept-Ranges": "bytes", "X-Auralis-Stream-Cache": "prefix"}
                     status_code = 206 if range_header else 200
                     if total_length is not None:
                         response_end = end if end is not None else total_length - 1
@@ -529,6 +525,7 @@ def _proxy_stream(server: Any, video_id: str, request: Request):
                             video_id,
                             response_iter,
                             content_type=content_type,
+                            capture_duration=stream_info.get('duration', 0) if stream_info.get('compatibility') else None,
                         )
 
                     return StreamingResponse(

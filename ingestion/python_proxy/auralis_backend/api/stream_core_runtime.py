@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shutil
 import time
@@ -533,6 +534,32 @@ def store_stream_chunk(server: Any, video_id: str, payload):
         }
 
 
+def stream_representation_key(stream_info: dict) -> str:
+    """Bind a prefix to one resource without retaining credentials in its key."""
+    url = str(stream_info.get("url") or "")
+    if not url:
+        return ""
+    if stream_info.get("compatibility"):
+        parts = urllib.parse.urlsplit(url)
+        query = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+        if not any(key == "capture" and value for key, value in query):
+            return ""  # Legacy captures lack a stable byte-representation identity.
+        url = urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(
+            [(key, value) for key, value in query if key not in {"background", "priority"}]
+        )))
+    headers = sorted((str(key).lower(), str(value))
+                     for key, value in (stream_info.get("headers") or {}).items()
+                     if str(key).lower() not in {"range", "if-range"})
+    value = [url, headers, str(stream_info.get("mime_type") or "").split(";")[0],
+             bool(stream_info.get("compatibility"))]
+    return hashlib.sha256(json.dumps(value, separators=(",", ":")).encode()).hexdigest()
+
+
+def stream_chunk_matches(chunk: dict | None, stream_info: dict) -> bool:
+    key = stream_representation_key(stream_info)
+    return bool(chunk and key and chunk.get("representation_key") == key)
+
+
 def chunk_target_bytes(server: Any, position: int, active_queue: bool):
     if active_queue:
         if position <= 0:
@@ -654,7 +681,7 @@ def warm_initial_stream_chunk(server: Any, video_id: str, stream_info: dict, tar
     target_bytes = max(int(target_bytes or 0), 64 * 1024)
     while True:
         cached = get_cached_stream_chunk(server, video_id, min_bytes=target_bytes)
-        if cached is not None and cached.get("compatibility") == stream_info.get("compatibility"):
+        if stream_chunk_matches(cached, stream_info):
             return cached
 
         with server.stream_chunk_inflight_lock:
@@ -675,7 +702,7 @@ def warm_initial_stream_chunk(server: Any, video_id: str, stream_info: dict, tar
 
         try:
             existing = get_cached_stream_chunk(server, video_id)
-            if existing and existing.get("compatibility") != stream_info.get("compatibility"):
+            if not stream_chunk_matches(existing, stream_info):
                 existing = None
             existing_bytes = existing.get("bytes") if existing else b""
             total_length = existing.get("total_length") if existing else None
@@ -694,6 +721,24 @@ def warm_initial_stream_chunk(server: Any, video_id: str, stream_info: dict, tar
             )
             try:
                 req.raise_for_status()
+                content_range = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)",
+                                             req.headers.get("content-range", ""))
+                if content_range:
+                    if (req.status_code != 206 or int(content_range[1]) != start_offset
+                            or int(content_range[2]) < start_offset
+                            or int(content_range[2]) >= int(content_range[3])):
+                        raise ValueError("Invalid preparation byte range")
+                    if total_length is not None and int(content_range[3]) != total_length:
+                        raise ValueError("Audio representation length changed")
+                elif start_offset or stream_info.get("compatibility") or req.status_code != 200:
+                    raise ValueError("Preparation did not honor the byte range")
+                response_type = str(req.headers.get("content-type") or "").split(";")[0]
+                expected_type = str(stream_info.get("mime_type") or "").split(";")[0]
+                if existing and existing.get('etag') and req.headers.get('etag') != existing['etag']:
+                    raise ValueError("Audio representation validator changed")
+                if (response_type.startswith(("text/", "application/json"))
+                        or response_type and expected_type and response_type != expected_type):
+                    raise ValueError("Audio representation content type changed")
                 chunks = [existing_bytes] if existing_bytes else []
                 total_bytes = len(existing_bytes)
                 for chunk in req.iter_content(chunk_size=1024 * 64):
@@ -709,14 +754,19 @@ def warm_initial_stream_chunk(server: Any, video_id: str, stream_info: dict, tar
                     if total_bytes >= target_bytes:
                         break
 
+                declared_total = extract_total_length(req.headers) or total_length
+                if declared_total is not None and total_bytes > declared_total:
+                    raise ValueError("Preparation exceeded audio length")
                 payload = {
                     "bytes": b"".join(chunks),
                     "content_type": req.headers.get(
                         "content-type",
                         stream_info.get("mime_type") or "audio/mp4",
                     ),
-                    "total_length": extract_total_length(req.headers) or total_length,
+                    "total_length": declared_total,
                     "compatibility": stream_info.get("compatibility"),
+                    "representation_key": stream_representation_key(stream_info),
+                    "etag": req.headers.get("etag") or (existing or {}).get("etag"),
                 }
                 store_stream_chunk(server, video_id, payload)
                 pending.set_result(payload)
@@ -797,11 +847,11 @@ def prepare_stream_track(
     stream_info = get_stream_info(server, video_id, background=not active_queue)
     resolve_ms = int((time.perf_counter() - resolve_start) * 1000)
 
-    chunk_cache_hit = get_cached_stream_chunk(
+    chunk_cache_hit = stream_chunk_matches(get_cached_stream_chunk(
         server,
         video_id,
         min_bytes=target_chunk_bytes,
-    ) is not None
+    ), stream_info)
     chunk_start = time.perf_counter()
     chunk_payload = None
     if defer_chunk and not chunk_cache_hit:
@@ -1188,11 +1238,14 @@ def iter_upstream_stream(
     start: int = 0,
     end: Optional[int] = None,
     initial_response: Any = None,
+    expected_total_length: Optional[int] = None,
+    expected_content_type: str = "",
+    expected_etag: str = "",
 ):
     if stream_info.get('pinned') or stream_info.get('compatibility'):
         offset = start
         response = initial_response
-        total = None
+        total = expected_total_length
         failures = 0
         while True:
             try:
@@ -1202,8 +1255,15 @@ def iter_upstream_stream(
                 if response.status_code != 206 or not match or int(match[1]) != offset:
                     raise ValueError('Upstream did not honor the byte range')
                 response_end, length = int(match[2]), int(match[3])
+                if response_end < offset or response_end >= length:
+                    raise ValueError('Invalid audio byte range')
                 if total is not None and total != length:
                     raise ValueError('Audio representation length changed')
+                content_type = str(response.headers.get('content-type') or '').split(';')[0]
+                if expected_content_type and content_type != expected_content_type:
+                    raise ValueError('Audio representation content type changed')
+                if expected_etag and response.headers.get('etag') != expected_etag:
+                    raise ValueError('Audio representation validator changed')
                 total = length
                 target = min(end if end is not None else total-1, total-1)
                 for chunk in response.iter_content(chunk_size=65536):

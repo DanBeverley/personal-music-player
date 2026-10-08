@@ -30,6 +30,9 @@ class WebPlayer extends ChangeNotifier {
   int get listeningEpoch => _listeningEpoch;
   bool _disposed = false;
   final Map<String, Uri> _ready = {};
+  final Map<String, DateTime> _readyUntil = {};
+  DateTime? _loadedUntil;
+  int? _lastStartupMs, _lastNextGapMs;
   final Map<String, Future<Uri>> _pending = {};
   List<Map<String, dynamic>> _searchPreparation = [];
   bool _preparingSearch = false;
@@ -149,6 +152,9 @@ class WebPlayer extends ChangeNotifier {
     _prepareRetryTimer?.cancel();
     _startupWatch = _transitionWatch = null;
     _ready.clear();
+    _readyUntil.clear();
+    _loadedUntil = null;
+    _lastStartupMs = _lastNextGapMs = null;
     _queueCacheAttempts.clear();
     _discoverySession = '';
     _recentPlayed.clear();
@@ -200,6 +206,8 @@ class WebPlayer extends ChangeNotifier {
   }
 
   Map<String, dynamic> get diagnostics => {
+        'startupMs': _lastStartupMs,
+        'nextGapMs': _lastNextGapMs,
         'selectedTrack': extractTrackId(current),
         'loadedTrack': _loadedId,
         'queueIndex': index,
@@ -239,7 +247,18 @@ class WebPlayer extends ChangeNotifier {
     final scope = _preparationScope;
     late final Future<Uri> pending;
     pending = api.prepare(track, activeQueue: activeQueue).then((uri) {
-      if (!_disposed && scope == _preparationScope) _ready[id] = uri;
+      if (!_disposed && scope == _preparationScope) {
+        final until = api.preparedUntil(id) ??
+            api.clock().add(const Duration(minutes: 5));
+        if (until.isAfter(api.clock().add(const Duration(seconds: 60)))) {
+          _ready[id] = uri;
+          _readyUntil[id] = until;
+        } else {
+          _prepareRetryAfter[id] = api.clock().add(const Duration(seconds: 30));
+          _prepareRetryTimer?.cancel();
+          _prepareRetryTimer = Timer(const Duration(seconds: 30), _primeNext);
+        }
+      }
       return uri;
     }).whenComplete(() {
       if (identical(_pending[id], pending)) _pending.remove(id);
@@ -249,13 +268,20 @@ class WebPlayer extends ChangeNotifier {
   }
 
   void _primeNext() {
-    if (_disposed || busy) return;
+    if (_disposed || busy || !_visible) return;
     final upcoming = queue.skip(index + 1).take(2).toList();
     for (final track in upcoming) {
       final id = extractTrackId(track)!;
+      if (!(_readyUntil[id]
+              ?.isAfter(api.clock().add(const Duration(seconds: 60))) ??
+          false)) {
+        _ready.remove(id);
+        _readyUntil.remove(id);
+        _queueCacheAttempts.remove(id);
+      }
       if (_ready.containsKey(id) ||
           _queuePreparingIds[id] == _preparationScope ||
-          (_prepareRetryAfter[id]?.isAfter(DateTime.now()) ?? false)) continue;
+          (_prepareRetryAfter[id]?.isAfter(api.clock()) ?? false)) continue;
       if (_queuePreparations >= 2) break;
       _queuePreparingIds[id] = _preparationScope;
       _queuePreparations++;
@@ -281,8 +307,7 @@ class WebPlayer extends ChangeNotifier {
       await _prepare(track, activeQueue: true);
     } catch (_) {
       if (scope == _preparationScope && !_disposed) {
-        _prepareRetryAfter[id] =
-            DateTime.now().add(const Duration(seconds: 30));
+        _prepareRetryAfter[id] = api.clock().add(const Duration(seconds: 30));
         _prepareRetryTimer?.cancel();
         _prepareRetryTimer = Timer(const Duration(seconds: 30), _primeNext);
       }
@@ -350,6 +375,7 @@ class WebPlayer extends ChangeNotifier {
     }
     audio.pause();
     _startupWatch = Stopwatch()..start();
+    _lastStartupMs = _lastNextGapMs = null;
     final track = queue[target];
     final id = extractTrackId(track)!;
     if (!resume || index != target) {
@@ -369,7 +395,15 @@ class WebPlayer extends ChangeNotifier {
     try {
       // Call play within the tap. The stream endpoint resolves/prepares audio;
       // awaiting an HTTP request here loses iPhone's first-play permission.
-      final source = _ready[id] ?? api.streamUri(track);
+      final prepared = _readyUntil[id]
+              ?.isAfter(api.clock().add(const Duration(seconds: 60))) ??
+          false;
+      final source =
+          prepared ? _ready[id] ?? api.streamUri(track) : api.streamUri(track);
+      final sessionUntil = api.clock().add(const Duration(minutes: 20));
+      _loadedUntil = prepared && _readyUntil[id]!.isBefore(sessionUntil)
+          ? _readyUntil[id]
+          : sessionUntil;
       final uri = source.replace(queryParameters: {
         ...source.queryParameters,
         'playback_session':
@@ -423,8 +457,13 @@ class WebPlayer extends ChangeNotifier {
     if (!automatic) _resumeRecoveries = 0;
     _wantsPlayback = true;
     if (playing && !audio.paused) return;
-    if (audio.needsNewSource) {
-      audio.record('resume-new-session', {'reason': 'source-invalidated'});
+    if (audio.needsNewSource ||
+        (_loadedUntil != null &&
+            !_loadedUntil!
+                .isAfter(api.clock().add(const Duration(seconds: 30))))) {
+      audio.record('resume-new-session', {
+        'reason': audio.needsNewSource ? 'source-invalidated' : 'lease-expired'
+      });
       await playIndex(index, resume: true, recovery: automatic);
       return;
     }
@@ -490,6 +529,7 @@ class WebPlayer extends ChangeNotifier {
   /// Records browser lifecycle evidence without changing the selected track.
   void lifecycle(String kind, {required bool visible}) {
     _visible = visible;
+    if (visible) _primeNext();
     if (!visible && (loading || _awaitingFirstPlayback))
       _hiddenDuringStartup = true;
     if (visible && startupInterrupted && !loading) {
@@ -618,10 +658,11 @@ class WebPlayer extends ChangeNotifier {
     }
     if (audio.phase == PlaybackPhase.playing) {
       if (_startupWatch != null) {
+        _lastStartupMs = _startupWatch!.elapsedMilliseconds;
+        _lastNextGapMs = _transitionWatch?.elapsedMilliseconds;
         audio.record('playback-startup', {
-          'startupMs': _startupWatch!.elapsedMilliseconds,
-          if (_transitionWatch != null)
-            'nextGapMs': _transitionWatch!.elapsedMilliseconds,
+          'startupMs': _lastStartupMs,
+          if (_transitionWatch != null) 'nextGapMs': _lastNextGapMs,
           'prepared': _ready.containsKey(_loadedId),
         });
         _startupWatch = _transitionWatch = null;
@@ -674,6 +715,8 @@ class WebPlayer extends ChangeNotifier {
       if (current != null) audio.syncMetadata(current!);
       save();
     }
+    if (event == 'timeupdate' && position.toInt() != _lastSavedSecond)
+      _primeNext();
     if (event == 'pause' ||
         event == 'ended' ||
         (event == 'timeupdate' && position.toInt() != _lastSavedSecond)) save();

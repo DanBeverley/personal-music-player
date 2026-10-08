@@ -8,6 +8,8 @@ class MusicApi {
   DateTime Function() clock = DateTime.now;
   String _userScopeId = 'guest';
   int _scopeRevision = 0;
+  final Map<String, DateTime> _preparationExpiry = {};
+  DateTime? preparedUntil(String id) => _preparationExpiry[id];
 
   /// Optional feed-only scope. Search and playback discovery keep userScopeId.
   String? homeScopeId;
@@ -19,6 +21,7 @@ class MusicApi {
     final next = value.trim().isEmpty ? 'guest' : value.trim();
     if (next != _userScopeId) {
       _scopeRevision++;
+      _preparationExpiry.clear();
       clearSearchContext();
     }
     _userScopeId = next;
@@ -284,6 +287,20 @@ class MusicApi {
         },
         timeout: const Duration(seconds: 90));
     if (revision == _scopeRevision) {
+      final expiry = ((result['prepared'] as Map?)?[id] as Map?)?['expires_at'];
+      _preparationExpiry.remove(id);
+      if (expiry is num &&
+          expiry.isFinite &&
+          expiry > 0 &&
+          expiry <
+              clock().add(const Duration(days: 1)).millisecondsSinceEpoch /
+                  1000) {
+        if (_preparationExpiry.length >= 256) {
+          _preparationExpiry.remove(_preparationExpiry.keys.first);
+        }
+        _preparationExpiry[id] =
+            DateTime.fromMillisecondsSinceEpoch((expiry * 1000).round(), isUtc: true);
+      }
       onDiagnostic?.call('prepare-result', {
         'requestedTrack': id,
         'serverMs': result['server_ms'],

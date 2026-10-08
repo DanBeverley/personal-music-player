@@ -21,7 +21,7 @@ import 'design_system.dart';
 import 'playback_dock.dart';
 import 'playback_diagnostics.dart';
 
-const webBuild = '2026-10-08-queue-latency';
+const webBuild = '2026-10-08-cache-cold-latency';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();

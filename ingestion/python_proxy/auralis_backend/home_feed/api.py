@@ -44,6 +44,8 @@ class HomeFeedApi:
         self._scheduler = HomeJobScheduler(server)
         self._impressed_artifact_ids: set[str] = set()
         self._impression_lock = threading.Lock()
+        self._replenishment_lock = threading.Lock()
+        self._replenishing_scopes: set[str] = set()
 
     def recommend(
         self,
@@ -51,6 +53,7 @@ class HomeFeedApi:
         *,
         request_mode: str,
         trace: Mapping[str, Any] | None = None,
+        background_tasks: Any = None,
     ) -> dict[str, Any]:
         request_id = str((trace or {}).get("request_id") or uuid.uuid4())
         scope = str(getattr(request, "user_scope_id", "") or "guest").strip() or "guest"
@@ -93,7 +96,8 @@ class HomeFeedApi:
             artifact = artifact_from_record(self._repositories.artifacts.get(promoted))
             if artifact is not None:
                 self._record_radio_exposure(artifact)
-            self._ensure_successors(request, state, reason="post_promotion")
+            self._replenish_after_delivery(request, state, reason="post_promotion",
+                                          background_tasks=background_tasks)
             return self._serve_or_prepare(
                 request,
                 state,
@@ -117,7 +121,8 @@ class HomeFeedApi:
                         )
                         if artifact is not None:
                             self._record_radio_exposure(artifact)
-                        self._ensure_successors(request, state, reason="post_promotion")
+                        self._replenish_after_delivery(request, state, reason="post_promotion",
+                                                      background_tasks=background_tasks)
                         return self._serve_or_prepare(
                             request,
                             state,
@@ -128,10 +133,11 @@ class HomeFeedApi:
                         )
             action = "unchanged_no_rotation"
 
-        self._ensure_successors(
+        self._replenish_after_delivery(
             request,
             state,
             reason=("launch_missing_successor" if launch else "serve_replenish"),
+            background_tasks=background_tasks,
         )
         return self._serve_or_prepare(
             request,
@@ -141,6 +147,35 @@ class HomeFeedApi:
             changed=False,
             reason=("refresh_preparing_timeout" if force else ""),
         )
+
+    def _replenish_after_delivery(
+        self, request: Any, state: HomeStateRecord, *, reason: str,
+        background_tasks: Any = None,
+    ) -> None:
+        # Only accepted, persisted Home may bypass inventory decoding before
+        # delivery. Initial supply and explicit preparation remain synchronous.
+        if background_tasks is None or not state.active_artifact_id:
+            self._ensure_successors(request, state, reason=reason)
+            return
+        background_tasks.add_task(self._replenish_delivered, request, state.user_scope_id, reason)
+
+    def _replenish_delivered(self, request: Any, scope: str, reason: str) -> None:
+        with self._replenishment_lock:
+            if scope in self._replenishing_scopes:
+                return
+            self._replenishing_scopes.add(scope)
+        try:
+            state = self._repositories.state.reconcile(scope)
+            from ..recommend.feature_store import request_store_runtime
+            with request_store_runtime(allow_persistent_reads=False):
+                self._ensure_successors(request, state, reason=reason)
+        except Exception:
+            # Existing durable jobs and the next request can recover this work.
+            # Never include profile data or external error text in this warning.
+            print("[home] delivered_feed_replenishment_failed", flush=True)
+        finally:
+            with self._replenishment_lock:
+                self._replenishing_scopes.discard(scope)
 
     def _ensure_successors(
         self,

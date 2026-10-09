@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Request, Response
+from fastapi import APIRouter, BackgroundTasks, Request, Response
 
 from .media_runtime import (
     MediaService,
@@ -239,8 +239,8 @@ def new_releases(limit: int = 30, refresh: bool = False):
 
 
 @router.post("/recommend")
-def recommend(req: SearchRequest):
-    return _require_recommendation_service().recommend(req)
+def recommend(req: SearchRequest, background_tasks: BackgroundTasks):
+    return _require_recommendation_service().recommend(req, background_tasks=background_tasks)
 
 
 @router.post("/interaction_event")

@@ -65,7 +65,7 @@ class RecommendationService:
         self._server = server
         self._home = HomeFeedApi(server)
 
-    def recommend(self, req: Any) -> Dict[str, Any]:
+    def recommend(self, req: Any, *, background_tasks: Any = None) -> Dict[str, Any]:
         server = self._server
         trace = server._trace_start(
             "recommend",
@@ -114,6 +114,7 @@ class RecommendationService:
                     req,
                     request_mode=request_mode,
                     trace=trace,
+                    background_tasks=background_tasks,
                 )
 
             serialize_started_at = time.perf_counter()

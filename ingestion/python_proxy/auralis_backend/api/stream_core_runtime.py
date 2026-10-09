@@ -882,6 +882,7 @@ def prepare_stream_track(
             "playback_path": "",
             "playback_url": "",
             "source_kind": f"{stream_cache.backend_name}_proxy",
+            "cache_tier": "r2_full" if stream_cache.backend_name == "r2" else "local_full",
             "headers": {},
             "mime_type": stream_cache_meta.get("content_type") or "audio/mp4",
             "content_length": content_length,
@@ -952,6 +953,7 @@ def prepare_stream_track(
         "playback_path": playback_path,
         "playback_url": playback_url,
         "source_kind": source_kind,
+        "cache_tier": "prefix" if chunk_payload or chunk_cache_hit else "resolved" if resolve_cache_hit else "cold",
         "headers": playback_headers,
         "mime_type": mime_type,
         "content_length": content_length,
@@ -983,6 +985,9 @@ def prepare_stream_track_safely(server: Any, video_id: str, target_chunk_bytes: 
 
 
 def classify_stream_failure(exc: Exception):
+    if isinstance(exc, TimeoutError):
+        return {"code": "preparation_timeout", "message": "Audio preparation timed out",
+                "status_code": 504}
     message = str(exc or "").strip()
     lowered = message.lower()
     response = getattr(exc, "response", None)
@@ -1064,7 +1069,9 @@ def prepare_streams_with_failures(
         }
         for future, video_id in future_map.items():
             try:
-                prepared[video_id] = future.result(timeout=25)
+                # Browser resolution may validly wait 75 seconds, bounded by
+                # the resolver's 80-second budget. Do not fail it at 25 seconds.
+                prepared[video_id] = future.result(timeout=85)
             except Exception as exc:
                 failed[video_id] = classify_stream_failure(exc)
     return prepared, failed

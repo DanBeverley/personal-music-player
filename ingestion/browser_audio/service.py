@@ -61,6 +61,9 @@ class Job:
     running: bool = False
     started: float = 0
     priority: int = 0
+    published: bool = False
+    preempted: bool = False
+    context: object | None = None
 
     @property
     def audio(self):
@@ -75,6 +78,17 @@ class Job:
             await asyncio.wait_for(self.changed.wait_for(lambda: predicate() or self.error), timeout)
         if self.error:
             raise HTTPException(502, 'Browser source unavailable')
+
+    async def pin(self, predicate, timeout):
+        # Publication and readiness are one event-loop operation. A request
+        # arriving during preemption must wait for the replacement capture.
+        async with self.changed:
+            async with asyncio.timeout(timeout):
+                await self.changed.wait_for(lambda: self.error or
+                                            not self.preempted and predicate())
+            if self.error:
+                raise HTTPException(502, 'Browser source unavailable')
+            self.published = True
 
 jobs = {}
 slots = asyncio.Condition()
@@ -92,17 +106,35 @@ async def capture_slot(job):
     async with slots:
         def rank(j):
             return j.priority if j.foreground else 2
-        await slots.wait_for(lambda: sum(j.running for j in jobs.values()) < 2 and
-            not any(not j.running and not j.done and not j.error and rank(j) < rank(job)
-                    for j in jobs.values() if j is not job) and
-            (rank(job) == 0 or not any(j.running and rank(j) > 0 for j in jobs.values())))
+        # Reclaim only an unpublished speculative capture. Once a URL or
+        # bytes have escaped, its representation remains pinned to completion.
+        def available():
+            if (sum(j.running for j in jobs.values()) >= 2 and rank(job) < 2
+                    and not any(j.running and j.preempted for j in jobs.values())):
+                victims = [j for j in jobs.values() if j.running and
+                           rank(j) > rank(job) and not j.published and
+                           not j.readers and j.task and not j.preempted]
+                if victims:
+                    victim = max(victims, key=rank)
+                    victim.preempted = True
+                    victim.task.cancel()
+            return (sum(j.running for j in jobs.values()) < 2 and
+                not any(not j.running and not j.done and not j.error and rank(j) < rank(job)
+                        for j in jobs.values() if j is not job) and
+                (rank(job) < 2 or not any(j.running and rank(j) == 2 for j in jobs.values())))
+        await slots.wait_for(available)
         job.running = True
         job.started = time.monotonic()
     try:
         yield
     finally:
-        job.running = False
-        await wake_slots()
+        try:
+            if job.context is not None:
+                await job.context.close()
+        finally:
+            job.context = None
+            job.running = False
+            await wake_slots()
 
 def captured_length(state, mime):
     # MSE receives the WebM initialization and clusters, excluding the source's
@@ -130,11 +162,32 @@ def captured_length(state, mime):
     return lengths.pop() if len(lengths) == 1 else None
 
 async def capture(job):
+    while True:
+        try:
+            await _capture(job)
+            return
+        except asyncio.CancelledError:
+            if not job.preempted or job.published or job.readers:
+                raise
+            # No external consumer has this capture. Discard its partial
+            # representation before retrying the same coalesced job.
+            for file in job.directory.iterdir():
+                file.unlink()
+            job.groups.clear()
+            job.selected = None
+            job.duration = 0
+            job.started = 0
+            job.preempted = False
+            await job.signal()
+
+
+async def _capture(job):
     context = None
     try:
         async with capture_slot(job):
             async with asyncio.timeout(200):
                 context = await browser.new_context(locale='en-US')
+                job.context = context
                 jar = http.cookiejar.MozillaCookieJar(os.environ['BROWSER_AUDIO_COOKIES'])
                 jar.load(ignore_discard=True, ignore_expires=False)
                 await context.add_cookies([dict(name=c.name, value=c.value, domain=c.domain,
@@ -192,13 +245,11 @@ async def capture(job):
                             await job.signal()
                             break
     except BaseException as exc:
+        if isinstance(exc, asyncio.CancelledError) and job.preempted:
+            raise
         job.error = True
         print(f'browser_audio failed video={job.video} error={type(exc).__name__}', flush=True)
         await job.signal()
-    finally:
-        if context:
-            await context.close()
-
 def capture_complete(job, ended=False):
     return ended or bool(job.audio and job.audio.get('total') and
                          job.audio['size'] == job.audio['total'])
@@ -240,6 +291,7 @@ async def lifespan(app):
             yield
             for job in jobs.values():
                 if job.task:
+                    job.preempted = False
                     job.task.cancel()
             await asyncio.gather(*(j.task for j in jobs.values()), return_exceptions=True)
             await browser.close()
@@ -256,7 +308,7 @@ async def resolve(video: str, background: bool = False, priority: int = 0):
     started = time.monotonic()
     job = get_job(video, background=True) if background else (get_job(video, priority=priority) if priority else get_job(video))
     try:
-        await job.wait(lambda: job.audio and job.audio['size'] >= 65536
+        await job.pin(lambda: job.audio and job.audio['size'] >= 65536
                        and (job.audio.get('total') or job.done), timeout=75)
     except TimeoutError:
         raise HTTPException(504, 'Browser preparation timed out')
@@ -282,7 +334,7 @@ async def stream(video: str, request: Request):
     start = int(match[1]) if match else 0
     end = int(match[2]) if match and match[2] else None
     try:
-        await job.wait(lambda: job.audio and (job.audio['size'] > start or job.done
+        await job.pin(lambda: job.audio and (job.audio['size'] > start or job.done
                        or job.audio.get('total') is not None and start >= job.audio['total']), timeout=60)
         if end is not None and not job.audio.get('total'):
             await job.wait(lambda: job.done or job.audio['size'] > end, timeout=60)

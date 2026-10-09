@@ -453,7 +453,15 @@ class WebPlayer extends ChangeNotifier {
 
   Future<void> play({bool automatic = false}) async {
     if (current == null) return;
-    reconcile();
+    // Only identity validation belongs before native play. Reconciliation
+    // also writes storage and metadata, which delays remote iOS commands.
+    if (_loadedId != null &&
+        (_loadedId != audio.loadedTrackId || !audio.sourceMatches)) {
+      _operation++;
+      _loadedId = null;
+      _metadataReady = false;
+      audio.pause();
+    }
     if (!automatic) _resumeRecoveries = 0;
     _wantsPlayback = true;
     if (playing && !audio.paused) return;
@@ -477,9 +485,10 @@ class WebPlayer extends ChangeNotifier {
       _awaitingFirstPlayback = true;
       loading = true;
       _resuming = true;
-      _notify();
       try {
-        await audio.play();
+        final pending = audio.play();
+        _notify();
+        await pending;
       } catch (e) {
         if (_disposed ||
             operation != _operation ||
@@ -553,17 +562,26 @@ class WebPlayer extends ChangeNotifier {
       if (audio.duration > 0) _knownDuration = audio.duration;
     }
     _operation++; // Fence any older Promise before renewing the media resource.
-    _ready.remove(_loadedId);
-    _metadataReady = false;
     loading = false;
     startupInterrupted = true;
     audio.pause();
     error = 'Audio did not resume. Tap Play to retry from this position.';
-    if (_visible && _wantsPlayback && _resumeRecoveries == 0) {
+    if (_visible && _wantsPlayback && _resumeRecoveries < 2) {
       _resumeRecoveries++;
-      audio.record('resume-source-renewal',
-          {'reason': reason, 'recoveryAttempts': _resumeRecoveries});
-      unawaited(playIndex(index, resume: true, recovery: true));
+      final validLease = _loadedUntil == null ||
+          _loadedUntil!.isAfter(api.clock().add(const Duration(seconds: 30)));
+      if (_resumeRecoveries == 1 && !audio.needsNewSource && validLease) {
+        _metadataReady = false;
+        audio.record('resume-same-session', {'reason': reason});
+        audio.reloadSource();
+        unawaited(play(automatic: true));
+      } else {
+        _ready.remove(_loadedId);
+        _metadataReady = false;
+        audio.record('resume-source-renewal',
+            {'reason': reason, 'recoveryAttempts': _resumeRecoveries});
+        unawaited(playIndex(index, resume: true, recovery: true));
+      }
     } else {
       _loadedId = null;
       _wantsPlayback = false;
@@ -631,6 +649,17 @@ class WebPlayer extends ChangeNotifier {
         (_loadedId != audio.loadedTrackId ||
             _loadedId != extractTrackId(current) ||
             !audio.sourceMatches)) return;
+    if ((event == 'session-active' || event == 'canplay') &&
+        _wantsPlayback &&
+        startupInterrupted &&
+        !loading &&
+        !_nativeResumeAttempted &&
+        !audio.needsNewSource) {
+      _nativeResumeAttempted = true;
+      audio.record('native-interruption-resume', {'kind': event});
+      unawaited(play(automatic: true));
+      return;
+    }
     if (event == 'resume-stalled' ||
         event == 'playback-stalled-timeout' ||
         event == 'error' && _resuming && _wantsPlayback) {
@@ -670,6 +699,7 @@ class WebPlayer extends ChangeNotifier {
       _awaitingFirstPlayback = false;
       _hiddenDuringStartup = false;
       _resuming = false;
+      _nativeResumeAttempted = false;
       startupInterrupted = false;
       error = null;
       loading = false;
@@ -722,6 +752,8 @@ class WebPlayer extends ChangeNotifier {
         (event == 'timeupdate' && position.toInt() != _lastSavedSecond)) save();
     _notify();
   }
+
+  bool _nativeResumeAttempted = false;
 
   void save() {
     if (queue.isEmpty) return;

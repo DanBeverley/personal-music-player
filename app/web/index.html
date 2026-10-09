@@ -14,8 +14,10 @@
   <title>Neatie</title>
   <style>
     html, body { margin: 0; background: #0d1010; }
-    #welcome { position: fixed; inset: 0; display: grid; place-content: center;
+    #welcome { position: fixed; inset: 0; z-index: 10000; background: #0d1010;
+      display: grid; place-content: center; opacity: 1;
       color: #f3f0e8; text-align: center; font-family: Georgia, serif; }
+    #welcome.leaving { opacity: 0; pointer-events: none; }
     #welcome strong { font-size: 44px; font-weight: 400; letter-spacing: -1px; }
     #welcome .brand { display: flex; align-items: center; justify-content: center; gap: 14px; }
     #welcome img { width: 42px; height: 42px; }
@@ -24,6 +26,7 @@
     #welcome i { width: 3px; height: 12px; border-radius: 3px; background: #ceddbb; }
     @media (prefers-reduced-motion: no-preference) {
       #welcome { animation: appear .7s ease-out; }
+      #welcome.leaving { animation: none; transition: opacity .8s ease-in-out; }
       #welcome i { animation: listen 1.4s ease-in-out infinite alternate; }
       #welcome i:nth-child(2) { animation-delay: -.7s; }
       #welcome i:nth-child(3) { animation-delay: -.3s; }
@@ -40,7 +43,27 @@
     <span>SETTLE IN. PRESS PLAY.</span>
     <div class="pulse" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>
   </div>
-  <script>window.addEventListener('flutter-first-frame', () => document.getElementById('welcome')?.remove());</script>
+  <script>
+    (() => {
+      let released = false, escape;
+      function reveal(reason) {
+        if (released) return;
+        released = true;
+        clearTimeout(escape);
+        const welcome = document.getElementById('welcome');
+        if (!welcome) return;
+        welcome.dataset.release = reason;
+        welcome.classList.add('leaving');
+        setTimeout(() => welcome.remove(),
+          matchMedia('(prefers-reduced-motion: reduce)').matches ? 0 : 850);
+      }
+      window.addEventListener('neatie-home-painted', () => reveal('home-painted'));
+      window.addEventListener('flutter-first-frame', () => {
+        // A missing/offline feed must leave Search, account and Retry usable.
+        if (!released) escape = setTimeout(() => reveal('feed-unavailable'), 12000);
+      }, {once: true});
+    })();
+  </script>
   <script src="flutter_bootstrap.js" async></script>
 </body>
 </html>

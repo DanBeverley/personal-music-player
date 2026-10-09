@@ -184,26 +184,57 @@ class MusicApi {
   }
 
   Future<Map<String, dynamic>> post(String path, Map<String, dynamic> body,
-      {Duration timeout = const Duration(seconds: 30)}) async {
+          {Duration timeout = const Duration(seconds: 30)}) =>
+      _request(path, body: body, timeout: timeout);
+
+  Future<Map<String, dynamic>> get(String path,
+          {Duration timeout = const Duration(seconds: 30)}) =>
+      _request(path, timeout: timeout);
+
+  Future<Map<String, dynamic>> _request(String path,
+      {Map<String, dynamic>? body,
+      Duration timeout = const Duration(seconds: 30)}) async {
     final timer = Stopwatch()..start();
     final revision = _scopeRevision;
+    var purpose = body == null ? 'detail' : 'interactive';
+    if (path == '/recommend') {
+      purpose = 'full_feed';
+      if (body?['feed_queue_status_only'] == true) {
+        purpose = 'queue_status';
+      } else if (body?['prepare_next_session'] == true) {
+        purpose = 'background_prepare';
+      } else if (body?['row_id'] != null) {
+        purpose = 'row_page';
+      }
+    } else if (path == '/prepare_session') {
+      purpose = (body?['background'] == true) ? 'background_cache' : 'upcoming';
+    }
+    final details = <String, dynamic>{
+      'path': path.startsWith('/artist/')
+          ? '/artist/*'
+          : path.startsWith('/album/')
+              ? '/album/*'
+              : path,
+      'requestedTrack': body?['current_track_key'],
+      'requestPurpose': purpose,
+    };
     late http.Response response;
     try {
-      response = await client
-          .post(endpoint(path),
-              headers: {
-                'Content-Type': 'application/json',
-                if (accessToken?.call() case final String token)
-                  'Authorization': 'Bearer $token'
-              },
-              body: jsonEncode(body))
+      final headers = {
+        if (body != null) 'Content-Type': 'application/json',
+        if (accessToken?.call() case final String token)
+          'Authorization': 'Bearer $token'
+      };
+      response = await (body == null
+              ? client.get(endpoint(path), headers: headers)
+              : client.post(endpoint(path),
+                  headers: headers, body: jsonEncode(body)))
           .timeout(timeout);
     } catch (e) {
       if (revision == _scopeRevision) {
         onDiagnostic?.call('api-failure', {
-          'path': path,
+          ...details,
           'ms': timer.elapsedMilliseconds,
-          'requestedTrack': body['current_track_key'],
           'errorType': e.runtimeType.toString()
         });
       }
@@ -211,7 +242,7 @@ class MusicApi {
     }
     if (revision == _scopeRevision) {
       onDiagnostic?.call('api-response', {
-        'path': path,
+        ...details,
         'status': response.statusCode,
         'ms': timer.elapsedMilliseconds,
       });
@@ -220,7 +251,20 @@ class MusicApi {
       throw StateError(
           'Music service returned ${response.statusCode}. Please retry.');
     }
-    return Map<String, dynamic>.from(jsonDecode(response.body) as Map);
+    try {
+      final decoded = jsonDecode(response.body);
+      if (decoded is! Map) throw const FormatException('Invalid payload');
+      return Map<String, dynamic>.from(decoded);
+    } on FormatException {
+      if (revision == _scopeRevision) {
+        onDiagnostic?.call('api-failure', {
+          ...details,
+          'ms': timer.elapsedMilliseconds,
+          'errorType': 'FormatException'
+        });
+      }
+      throw const FormatException('Music service returned an invalid payload.');
+    }
   }
 
   Map<String, dynamic>? queryCorrection;
@@ -298,11 +342,17 @@ class MusicApi {
         if (_preparationExpiry.length >= 256) {
           _preparationExpiry.remove(_preparationExpiry.keys.first);
         }
-        _preparationExpiry[id] =
-            DateTime.fromMillisecondsSinceEpoch((expiry * 1000).round(), isUtc: true);
+        _preparationExpiry[id] = DateTime.fromMillisecondsSinceEpoch(
+            (expiry * 1000).round(),
+            isUtc: true);
       }
       onDiagnostic?.call('prepare-result', {
         'requestedTrack': id,
+        'requestPurpose': cacheFull ? 'background_cache' : 'upcoming',
+        'failureCode': _failureCode(
+            ((result['failed'] as Map?)?[id] as Map?)?['code'] ??
+                result['skip_reason']),
+        'cacheTier': _cacheTier((result['prepared'] as Map?)?[id]),
         'serverMs': result['server_ms'],
         'cachedPrefixBytes':
             ((result['prepared'] as Map?)?[id] as Map?)?['cached_prefix_bytes'],
@@ -319,6 +369,38 @@ class MusicApi {
       throw StateError('Next track is not prepared yet.');
     }
     return streamUri(track);
+  }
+
+  static String? _failureCode(dynamic value) => const {
+        'video_unavailable',
+        'format_unavailable',
+        'source_blocked',
+        'stream_failed',
+        'playback_source_missing',
+        'playback_source_failed',
+        'playback_sources_failed',
+        'preparation_timeout',
+        'youtube_temporarily_blocked'
+      }.contains(value)
+          ? value as String
+          : value == null
+              ? null
+              : 'other';
+
+  static String _cacheTier(dynamic value) {
+    if (value is! Map) return 'unprepared';
+    if (value['cache_tier'] is String &&
+        const {
+          'r2_full',
+          'local_full',
+          'prefix',
+          'resolved',
+          'cold'
+        }.contains(value['cache_tier'])) return value['cache_tier'] as String;
+    if (value['source_kind'] == 'r2_proxy') return 'r2_full';
+    if (value['source_kind'] == 'local_proxy') return 'local_full';
+    if ((value['cached_prefix_bytes'] as num? ?? 0) > 0) return 'prefix';
+    return value['resolve_cache_hit'] == true ? 'resolved' : 'cold';
   }
 
   Future<({List<Map<String, dynamic>> tracks, bool hasMore})> related(

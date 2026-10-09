@@ -70,6 +70,9 @@ abstract class PlaybackPort {
   bool get sourceMatches;
   void syncMetadata(Map<String, dynamic> track);
   void load(Uri uri, Map<String, dynamic> track);
+
+  /// Reload the selected resource without changing its playback session.
+  void reloadSource();
   Future<void> play();
   void pause();
   void seek(double seconds);

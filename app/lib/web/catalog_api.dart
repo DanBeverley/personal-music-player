@@ -1,5 +1,3 @@
-import 'dart:convert';
-
 import '../logic/search_semantics.dart';
 import '../logic/track_metadata.dart';
 import 'music_api.dart';
@@ -154,19 +152,7 @@ class CatalogApi {
       });
 
   Future<Map<String, dynamic>> _get(String path) async {
-    final response = await api.client.get(api.endpoint(path), headers: {
-      if (api.accessToken?.call() case final String token)
-        'Authorization': 'Bearer $token',
-    }).timeout(const Duration(seconds: 30));
-    if (response.statusCode != 200) {
-      throw StateError(
-          'Music service returned ${response.statusCode}. Please retry.');
-    }
-    final decoded = jsonDecode(response.body);
-    if (decoded is! Map) {
-      throw const FormatException('Music service returned an invalid payload.');
-    }
-    return _withNormalizedTrackLists(Map<String, dynamic>.from(decoded));
+    return _withNormalizedTrackLists(await api.get(path));
   }
 
   static Map<String, dynamic> _withNormalizedTrackLists(

@@ -21,6 +21,7 @@ class CatalogScreen extends StatefulWidget {
   final List<Map<String, dynamic>> likedTracks;
   final Future<void> Function(Map<String, dynamic>) onLike;
   final Map<String, dynamic> Function()? homeSignals;
+  final VoidCallback? onHomePainted;
   const CatalogScreen(
       {super.key,
       required this.api,
@@ -29,6 +30,7 @@ class CatalogScreen extends StatefulWidget {
       required this.active,
       required this.onLike,
       this.homeSignals,
+      this.onHomePainted,
       this.homeSignalsReady = true,
       this.homeSignalRevision = 0,
       this.foregroundRevision = 0,
@@ -59,6 +61,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
   DateTime? lastPreparedAt;
   bool prepareInFlight = false, prepareAgain = false, launchedHome = false;
   bool homeStatusInFlight = false, homeAwaitingPreparation = false;
+  bool homePaintReported = false;
   DateTime? lastHomeRevalidatedAt;
   String homeLane = 'all';
   bool get homeActive => widget.active && widget.foreground;
@@ -83,7 +86,9 @@ class _CatalogScreenState extends State<CatalogScreen> {
   @override
   void initState() {
     super.initState();
-    if (widget.home && homeActive && widget.homeSignalsReady) unawaited(load());
+    // Persisted Home can arrive independently of cloud library hydration.
+    // Updated signals prepare successors without replacing the active feed.
+    if (widget.home && homeActive) unawaited(load());
   }
 
   @override
@@ -94,18 +99,10 @@ class _CatalogScreenState extends State<CatalogScreen> {
         (!old.active ||
             !old.foreground ||
             widget.foregroundRevision != old.foregroundRevision)) {
-      if (maps(data['rows']).isEmpty && widget.homeSignalsReady && !busy)
+      if (maps(data['rows']).isEmpty && !busy)
         unawaited(load());
       else
         _revalidateHome();
-    }
-    if (widget.home &&
-        homeActive &&
-        !old.homeSignalsReady &&
-        widget.homeSignalsReady &&
-        maps(data['rows']).isEmpty &&
-        !busy) {
-      unawaited(load());
     }
     if (!homeActive) homePoll?.cancel();
     if (widget.home &&
@@ -1082,6 +1079,18 @@ class _CatalogScreenState extends State<CatalogScreen> {
           onBack: _closeDetail);
     final correction = data['query_correction'] as Map?;
     final rows = maps(data['rows']);
+    if (widget.home &&
+        !homePaintReported &&
+        (rows.isNotEmpty ||
+            error != null ||
+            (submitted && !busy && !_homePreparing(data)))) {
+      final version = generation;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || version != generation || homePaintReported) return;
+        homePaintReported = true;
+        widget.onHomePainted?.call();
+      });
+    }
     final albumKeys = <String>{};
     final heroAlbums = [
       for (final row in rows)
@@ -1159,238 +1168,249 @@ class _CatalogScreenState extends State<CatalogScreen> {
                         identity('tracks', track) == identity('tracks', item)))
             .toList();
     final artistName = lead?['name']?.toString() ?? '';
-    return ListView(
-        key: PageStorageKey(widget.home ? 'home' : 'search'),
-        padding: EdgeInsets.fromLTRB(
-            MediaQuery.sizeOf(context).width >= 850 ? 36 : 20,
-            0,
-            MediaQuery.sizeOf(context).width >= 850 ? 36 : 20,
-            36),
-        children: [
-          EditorialHeading(
-              title: widget.home
-                  ? 'Listening, made personal.'
-                  : 'Find your next favourite.',
-              eyebrow:
-                  widget.home ? 'MADE FOR YOUR LISTENING' : 'EXPLORE NEATIE',
-              subtitle: widget.home
-                  ? 'Familiar favourites and a few new directions.'
-                  : 'Songs, artists and albums. Follow your curiosity.',
-              action: widget.home
-                  ? IconButton.outlined(
-                      tooltip: 'Refresh Home',
-                      onPressed: busy ? null : () => load(refresh: true),
-                      icon: busy
-                          ? const NeatieLoading(
-                              label: 'Refreshing Home', size: 20)
-                          : Badge(
-                              isLabelVisible: readyCount > 0,
-                              smallSize: 6,
-                              backgroundColor: NeatieDesign.accent,
-                              child:
-                                  const Icon(Icons.refresh_rounded, size: 20)))
-                  : null),
-          if (!widget.home) ...[
-            Semantics(
-                label: 'Search songs',
-                child: TextField(
-                    controller: query,
-                    textInputAction: TextInputAction.search,
-                    onSubmitted: (_) => load(manualSearch: true),
-                    decoration: InputDecoration(
-                        hint: const ExcludeSemantics(
-                            child: Text('Songs, artists and albums')),
-                        contentPadding: const EdgeInsets.symmetric(
-                            horizontal: 20, vertical: 24),
-                        prefixIcon: const Icon(Icons.search_rounded),
-                        suffixIcon: IconButton(
-                            tooltip: 'Search',
-                            onPressed: () => load(manualSearch: true),
-                            icon: const Icon(Icons.arrow_forward_rounded))))),
-            const SizedBox(height: 18),
-            Wrap(spacing: 8, runSpacing: 8, children: [
-              for (final type in ['all', ...labels.keys])
-                ChoiceChip(
-                    label: Text(type == 'all' ? 'Top' : labels[type]!),
-                    selected: filter == type,
-                    onSelected: (_) => setState(() => filter = type))
-            ]),
-          ],
-          if (busy && !widget.home)
-            const Padding(
-                padding: EdgeInsets.only(top: 18),
-                child: NeatieLoading(
-                    label: 'Finding your music', showLabel: true)),
-          if (error != null) ...[
-            Text(error!),
-            TextButton(onPressed: () => load(), child: const Text('Retry'))
-          ],
-          if (correction != null) ...[
-            Text('Showing results for ${correction['corrected']}'),
-            TextButton(
-                onPressed: () {
-                  query.text = '${correction['original']}';
-                  unawaited(load(autoCorrect: false));
-                },
-                child: Text('Search instead for ${correction['original']}'))
-          ],
-          if (!widget.home && data['search_preference'] is Map)
-            const Padding(
-                padding: EdgeInsets.only(top: 8),
-                child: Text('Based on your previous selection')),
-          if (!widget.home &&
-              topItem != null &&
-              (filter == 'all' || filter == topSurface)) ...[
-            Builder(builder: (context) {
-              return Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const SectionHeading(title: 'Top result'),
-                    itemTile(topSurface, topItem!),
-                  ]);
-            }),
-          ],
-          if (!widget.home &&
-              lead != null &&
-              leadKey != topKey &&
-              (filter == 'all' || filter == 'artists'))
-            itemTile('artists', lead),
-          if (!widget.home &&
-              containingAlbum != null &&
-              albumKey != topKey &&
-              (filter == 'all' || filter == 'albums'))
-            itemTile('albums', containingAlbum),
-          if (widget.home) ...[
-            if (selectedLane == 'all')
-              for (final row in rows)
-                if (row['kind'] == 'todays_pick') homeRow(row),
-            HomeAlbumHero(
-                key: const ValueKey('home-album-hero'),
-                api: widget.api,
-                albums: heroAlbums,
-                active: homeActive,
-                onOpen: (album) => _openHomeItem('album', album),
-                onPlay: _playHomeAlbum,
-                action: Row(mainAxisSize: MainAxisSize.min, children: [
-                  for (final row in rows)
-                    if (_homeType(row) == 'album' && row['has_more'] == true)
-                      BrowseMoreButton(
-                          label: 'More ${row['title'] ?? 'albums'}',
-                          onPressed: busy ? null : () => moreHome(row)),
-                ])),
-            Padding(
-                padding: const EdgeInsets.only(top: 12),
-                child: Wrap(spacing: 8, runSpacing: 6, children: [
-                  for (final lane in _availableLanes)
+    return PageEntrance(
+        active: !widget.home || rows.isNotEmpty || (submitted && !busy),
+        duration: Duration(milliseconds: widget.home ? 900 : 420),
+        child: ListView(
+            key: PageStorageKey(widget.home ? 'home' : 'search'),
+            padding: EdgeInsets.fromLTRB(
+                MediaQuery.sizeOf(context).width >= 850 ? 36 : 20,
+                0,
+                MediaQuery.sizeOf(context).width >= 850 ? 36 : 20,
+                36),
+            children: [
+              EditorialHeading(
+                  title: widget.home
+                      ? 'Listening, made personal.'
+                      : 'Find your next favourite.',
+                  eyebrow: widget.home
+                      ? 'MADE FOR YOUR LISTENING'
+                      : 'EXPLORE NEATIE',
+                  subtitle: widget.home
+                      ? 'Familiar favourites and a few new directions.'
+                      : 'Songs, artists and albums. Follow your curiosity.',
+                  action: widget.home
+                      ? IconButton.outlined(
+                          tooltip: 'Refresh Home',
+                          onPressed: busy ? null : () => load(refresh: true),
+                          icon: busy
+                              ? const NeatieLoading(
+                                  label: 'Refreshing Home', size: 20)
+                              : Badge(
+                                  isLabelVisible: readyCount > 0,
+                                  smallSize: 6,
+                                  backgroundColor: NeatieDesign.accent,
+                                  child: const Icon(Icons.refresh_rounded,
+                                      size: 20)))
+                      : null),
+              if (!widget.home) ...[
+                Semantics(
+                    label: 'Search songs',
+                    child: TextField(
+                        controller: query,
+                        textInputAction: TextInputAction.search,
+                        onSubmitted: (_) => load(manualSearch: true),
+                        decoration: InputDecoration(
+                            hint: const ExcludeSemantics(
+                                child: Text('Songs, artists and albums')),
+                            contentPadding: const EdgeInsets.symmetric(
+                                horizontal: 20, vertical: 24),
+                            prefixIcon: const Icon(Icons.search_rounded),
+                            suffixIcon: IconButton(
+                                tooltip: 'Search',
+                                onPressed: () => load(manualSearch: true),
+                                icon:
+                                    const Icon(Icons.arrow_forward_rounded))))),
+                const SizedBox(height: 18),
+                Wrap(spacing: 8, runSpacing: 8, children: [
+                  for (final type in ['all', ...labels.keys])
                     ChoiceChip(
-                        label: Text(lane == 'all'
-                            ? 'All'
-                            : '${lane[0].toUpperCase()}${lane.substring(1)}'),
-                        selected: selectedLane == lane,
-                        onSelected: (_) => setState(() => homeLane = lane)),
-                ])),
-            if (selectedLane == 'all' && widget.likedTracks.isNotEmpty)
-              _trackStrip('Your likes', widget.likedTracks),
-            if (selectedLane == 'all' &&
-                recent.isNotEmpty &&
-                !rows.any((row) => row['kind'] == 'last_played'))
-              _trackStrip('Listening history', recent.take(12).toList()),
-            if (selectedLane == 'all' &&
-                frequent.isNotEmpty &&
-                !rows.any((row) => row['kind'] == 'frequently_listened'))
-              _trackStrip('Frequently listened', frequent.take(12).toList()),
-            if (!busy && error == null && rows.isEmpty)
-              Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 24),
-                  child: Column(children: [
-                    Text(_homeEmptyMessage(), textAlign: TextAlign.center),
-                    const SizedBox(height: 8),
-                    TextButton(
-                        onPressed: () => load(refresh: true),
-                        child: const Text('Retry Home')),
-                  ])),
-            if (selectedLane == 'all') ...[
-              for (final row in rows)
-                if (_homeType(row) != 'album' && row['kind'] != 'todays_pick')
-                  homeRow(row),
-            ] else ...[
-              homeRow({
-                'kind': 'discoveries',
-                'item_type': 'track',
-                'title': 'Discoveries',
-                'items': _laneItems(selectedLane, 'tracks')
-              }),
-              if (_laneItems(selectedLane, 'albums').isNotEmpty)
-                homeRow({
-                  'item_type': 'album',
-                  'title': 'Albums',
-                  'items': _laneItems(selectedLane, 'albums')
+                        label: Text(type == 'all' ? 'Top' : labels[type]!),
+                        selected: filter == type,
+                        onSelected: (_) => setState(() => filter = type))
+                ]),
+              ],
+              if (busy && !widget.home)
+                const Padding(
+                    padding: EdgeInsets.only(top: 18),
+                    child: NeatieLoading(
+                        label: 'Finding your music', showLabel: true)),
+              if (error != null) ...[
+                Text(error!),
+                TextButton(onPressed: () => load(), child: const Text('Retry'))
+              ],
+              if (correction != null) ...[
+                Text('Showing results for ${correction['corrected']}'),
+                TextButton(
+                    onPressed: () {
+                      query.text = '${correction['original']}';
+                      unawaited(load(autoCorrect: false));
+                    },
+                    child: Text('Search instead for ${correction['original']}'))
+              ],
+              if (!widget.home && data['search_preference'] is Map)
+                const Padding(
+                    padding: EdgeInsets.only(top: 8),
+                    child: Text('Based on your previous selection')),
+              if (!widget.home &&
+                  topItem != null &&
+                  (filter == 'all' || filter == topSurface)) ...[
+                Builder(builder: (context) {
+                  return Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const SectionHeading(title: 'Top result'),
+                        itemTile(topSurface, topItem!),
+                      ]);
                 }),
-              if (_laneItems(selectedLane, 'artists').isNotEmpty)
-                homeRow({
-                  'item_type': 'artist',
-                  'title': 'Artists to explore',
-                  'items': _laneItems(selectedLane, 'artists')
-                }),
-            ],
-          ] else ...[
-            if (!submitted && !busy && !hasSearchResult)
-              Padding(
-                  padding: const EdgeInsets.only(top: 36),
-                  child: EditorialSurface(
-                      child: Padding(
-                          padding: const EdgeInsets.all(28),
-                          child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                const Icon(Icons.travel_explore_rounded,
-                                    color: NeatieDesign.accent, size: 36),
-                                const SizedBox(height: 22),
-                                Text('Every great listen starts somewhere.',
-                                    style: NeatieDesign.display(30)),
-                                const SizedBox(height: 12),
-                                const Text(
-                                    'Start with a song you love, an artist you miss, or an album you have been meaning to hear.'),
-                              ])))),
-            if (submitted && !busy && error == null && !hasSearchResult)
-              const Text('No results found.'),
-            for (final type in labels.keys)
-              if ((filter == 'all' || filter == type) &&
-                  (initial[type]?.isNotEmpty ?? false))
-                section(labels[type]!, type, initial[type]!),
-            if (additionalArtistTracks.isNotEmpty &&
-                (filter == 'all' || filter == 'tracks' || filter == 'artists'))
-              section(
-                  filter == 'artists'
-                      ? (artistName.isEmpty
-                          ? 'Works by this artist'
-                          : 'Works by $artistName')
-                      : (artistName.isEmpty
-                          ? 'Top songs by this artist'
-                          : 'Top songs by $artistName'),
-                  'tracks',
-                  additionalArtistTracks),
-            // Separately fetched pages follow the current ranked first page.
-            for (final extra in extras)
-              if ((filter == 'all' || filter == extra.type) &&
-                  identity(extra.type, extra.item) != topKey &&
-                  identity(extra.type, extra.item) != leadKey &&
-                  identity(extra.type, extra.item) != albumKey)
-                itemTile(extra.type, extra.item),
-            Padding(
-                padding: const EdgeInsets.only(top: 24),
-                child: Wrap(spacing: 12, runSpacing: 12, children: [
-                  for (final type in labels.keys)
-                    if ((filter == 'all' || filter == type) &&
-                        (pagination[type] as Map?)?['has_more'] == true)
-                      OutlinedButton.icon(
-                          onPressed: busy ? null : () => more(type),
-                          icon:
-                              const Icon(Icons.arrow_forward_rounded, size: 18),
-                          label: Text('Browse ${labels[type]!.toLowerCase()}'))
-                ])),
-          ],
-        ]);
+              ],
+              if (!widget.home &&
+                  lead != null &&
+                  leadKey != topKey &&
+                  (filter == 'all' || filter == 'artists'))
+                itemTile('artists', lead),
+              if (!widget.home &&
+                  containingAlbum != null &&
+                  albumKey != topKey &&
+                  (filter == 'all' || filter == 'albums'))
+                itemTile('albums', containingAlbum),
+              if (widget.home) ...[
+                if (selectedLane == 'all')
+                  for (final row in rows)
+                    if (row['kind'] == 'todays_pick') homeRow(row),
+                HomeAlbumHero(
+                    key: const ValueKey('home-album-hero'),
+                    api: widget.api,
+                    albums: heroAlbums,
+                    active: homeActive,
+                    onOpen: (album) => _openHomeItem('album', album),
+                    onPlay: _playHomeAlbum,
+                    action: Row(mainAxisSize: MainAxisSize.min, children: [
+                      for (final row in rows)
+                        if (_homeType(row) == 'album' &&
+                            row['has_more'] == true)
+                          BrowseMoreButton(
+                              label: 'More ${row['title'] ?? 'albums'}',
+                              onPressed: busy ? null : () => moreHome(row)),
+                    ])),
+                Padding(
+                    padding: const EdgeInsets.only(top: 12),
+                    child: Wrap(spacing: 8, runSpacing: 6, children: [
+                      for (final lane in _availableLanes)
+                        ChoiceChip(
+                            label: Text(lane == 'all'
+                                ? 'All'
+                                : '${lane[0].toUpperCase()}${lane.substring(1)}'),
+                            selected: selectedLane == lane,
+                            onSelected: (_) => setState(() => homeLane = lane)),
+                    ])),
+                if (selectedLane == 'all' && widget.likedTracks.isNotEmpty)
+                  _trackStrip('Your likes', widget.likedTracks),
+                if (selectedLane == 'all' &&
+                    recent.isNotEmpty &&
+                    !rows.any((row) => row['kind'] == 'last_played'))
+                  _trackStrip('Listening history', recent.take(12).toList()),
+                if (selectedLane == 'all' &&
+                    frequent.isNotEmpty &&
+                    !rows.any((row) => row['kind'] == 'frequently_listened'))
+                  _trackStrip(
+                      'Frequently listened', frequent.take(12).toList()),
+                if (!busy && error == null && rows.isEmpty)
+                  Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 24),
+                      child: Column(children: [
+                        Text(_homeEmptyMessage(), textAlign: TextAlign.center),
+                        const SizedBox(height: 8),
+                        TextButton(
+                            onPressed: () => load(refresh: true),
+                            child: const Text('Retry Home')),
+                      ])),
+                if (selectedLane == 'all') ...[
+                  for (final row in rows)
+                    if (_homeType(row) != 'album' &&
+                        row['kind'] != 'todays_pick')
+                      homeRow(row),
+                ] else ...[
+                  homeRow({
+                    'kind': 'discoveries',
+                    'item_type': 'track',
+                    'title': 'Discoveries',
+                    'items': _laneItems(selectedLane, 'tracks')
+                  }),
+                  if (_laneItems(selectedLane, 'albums').isNotEmpty)
+                    homeRow({
+                      'item_type': 'album',
+                      'title': 'Albums',
+                      'items': _laneItems(selectedLane, 'albums')
+                    }),
+                  if (_laneItems(selectedLane, 'artists').isNotEmpty)
+                    homeRow({
+                      'item_type': 'artist',
+                      'title': 'Artists to explore',
+                      'items': _laneItems(selectedLane, 'artists')
+                    }),
+                ],
+              ] else ...[
+                if (!submitted && !busy && !hasSearchResult)
+                  Padding(
+                      padding: const EdgeInsets.only(top: 36),
+                      child: EditorialSurface(
+                          child: Padding(
+                              padding: const EdgeInsets.all(28),
+                              child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    const Icon(Icons.travel_explore_rounded,
+                                        color: NeatieDesign.accent, size: 36),
+                                    const SizedBox(height: 22),
+                                    Text('Every great listen starts somewhere.',
+                                        style: NeatieDesign.display(30)),
+                                    const SizedBox(height: 12),
+                                    const Text(
+                                        'Start with a song you love, an artist you miss, or an album you have been meaning to hear.'),
+                                  ])))),
+                if (submitted && !busy && error == null && !hasSearchResult)
+                  const Text('No results found.'),
+                for (final type in labels.keys)
+                  if ((filter == 'all' || filter == type) &&
+                      (initial[type]?.isNotEmpty ?? false))
+                    section(labels[type]!, type, initial[type]!),
+                if (additionalArtistTracks.isNotEmpty &&
+                    (filter == 'all' ||
+                        filter == 'tracks' ||
+                        filter == 'artists'))
+                  section(
+                      filter == 'artists'
+                          ? (artistName.isEmpty
+                              ? 'Works by this artist'
+                              : 'Works by $artistName')
+                          : (artistName.isEmpty
+                              ? 'Top songs by this artist'
+                              : 'Top songs by $artistName'),
+                      'tracks',
+                      additionalArtistTracks),
+                // Separately fetched pages follow the current ranked first page.
+                for (final extra in extras)
+                  if ((filter == 'all' || filter == extra.type) &&
+                      identity(extra.type, extra.item) != topKey &&
+                      identity(extra.type, extra.item) != leadKey &&
+                      identity(extra.type, extra.item) != albumKey)
+                    itemTile(extra.type, extra.item),
+                Padding(
+                    padding: const EdgeInsets.only(top: 24),
+                    child: Wrap(spacing: 12, runSpacing: 12, children: [
+                      for (final type in labels.keys)
+                        if ((filter == 'all' || filter == type) &&
+                            (pagination[type] as Map?)?['has_more'] == true)
+                          OutlinedButton.icon(
+                              onPressed: busy ? null : () => more(type),
+                              icon: const Icon(Icons.arrow_forward_rounded,
+                                  size: 18),
+                              label:
+                                  Text('Browse ${labels[type]!.toLowerCase()}'))
+                    ])),
+              ],
+            ]));
   }
 
   String _homeEmptyMessage() {

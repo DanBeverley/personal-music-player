@@ -18,6 +18,7 @@ extension type _AudioNavigator(JSObject _) implements JSObject {
 
 extension type _AudioSession(JSObject _) implements JSObject {
   external set type(String value);
+  external String get type;
   external String get state;
   external set onstatechange(JSFunction? value);
 }
@@ -175,6 +176,7 @@ class BrowserAudio extends PlaybackPort {
         } else {
           record('audio-session');
           _sampleProgress();
+          if (_audioSession?.state == 'active') _events.add('session-active');
         }
         _updateSession();
       }).toJS;
@@ -261,6 +263,9 @@ class BrowserAudio extends PlaybackPort {
       web.window.navigator.mediaSession.setActionHandler(
           action,
           ((_MediaAction details) {
+            // Reach the native element within the remote command callback,
+            // before synchronous reporting, storage or Flutter work.
+            callback(details);
             record('media-action', {'action': action});
             if (action == 'play' && (!_foreground || web.document.hidden)) {
               // Keep the remote command even if the browser suspends timers
@@ -269,7 +274,6 @@ class BrowserAudio extends PlaybackPort {
               _persistFailures();
             }
             onReconcile?.call('media-action:$action');
-            callback(details);
           }).toJS);
       _actions.add(action);
     } catch (_) {
@@ -343,6 +347,16 @@ class BrowserAudio extends PlaybackPort {
   }
 
   @override
+  void reloadSource() {
+    _attempt++;
+    _watchdog?.cancel();
+    _renewSource = false;
+    _progress.interrupt();
+    element.load();
+    record('resume-source-reload');
+  }
+
+  @override
   Future<void> play() async {
     final attempt = ++_attempt;
     _pauseDurationMs = _pausedAt == null
@@ -352,22 +366,22 @@ class BrowserAudio extends PlaybackPort {
     _progress.begin(position);
     _deadline = DateTime.now().add(Duration(seconds: _resume ? 12 : 90));
     try {
-      _audioSession?.type = 'playback';
+      if (_audioSession?.type != 'playback') _audioSession?.type = 'playback';
     } catch (_) {}
-    _watchdog?.cancel();
-    // Observation only: this timer does not keep a background page alive.
-    _watchdog =
-        Timer.periodic(const Duration(seconds: 1), (_) => _checkProgress());
-    _updateSession();
     // A terminal MEDIA_ERR_ABORTED cannot be restarted by play() alone.
     // Reload the same selected URL; do not resolve a different source.
     if (sourceMatches && element.error?.code == 1) {
       element.load();
       record('aborted-source-reload');
     }
-    record('play-call');
     try {
-      await element.play().toDart;
+      final pending = element.play().toDart;
+      _watchdog?.cancel();
+      // Observation only: this timer does not keep a background page alive.
+      _watchdog =
+          Timer.periodic(const Duration(seconds: 1), (_) => _checkProgress());
+      record('play-call');
+      await pending;
       if (attempt != _attempt) return;
       record('play-accepted');
       _sampleProgress();
@@ -446,7 +460,8 @@ class BrowserAudio extends PlaybackPort {
         _audioSession?.state == 'interrupted' ||
         element.seeking) return;
     if (_deadline != null && now.isAfter(_deadline!)) {
-      _renewSource = true;
+      // A lack of progress does not prove that the selected URL is invalid.
+      // The controller first reloads that resource, then bounds renewal.
       _progress.interrupt();
       _watchdog?.cancel();
       final reason = _resume

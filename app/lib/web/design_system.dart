@@ -338,17 +338,22 @@ class BrowseMoreButton extends StatelessWidget {
 
 /// Animate tab entry while keeping the page subtree, scroll and requests alive.
 class PageEntrance extends StatefulWidget {
-  const PageEntrance({super.key, required this.active, required this.child});
+  const PageEntrance(
+      {super.key,
+      required this.active,
+      required this.child,
+      this.duration = const Duration(milliseconds: 420)});
   final bool active;
   final Widget child;
+  final Duration duration;
   @override
   State<PageEntrance> createState() => _PageEntranceState();
 }
 
 class _PageEntranceState extends State<PageEntrance>
     with SingleTickerProviderStateMixin {
-  late final animation = AnimationController(
-      vsync: this, duration: const Duration(milliseconds: 420));
+  late final animation =
+      AnimationController(vsync: this, duration: widget.duration);
   bool reduced = false;
   @override
   void didChangeDependencies() {

@@ -51,21 +51,26 @@ class WebLibrary extends ChangeNotifier {
     notifyListeners();
 
     try {
-      final likedRows = await _client
-          .from('library_tracks')
-          .select('track_id,track_data,added_at')
-          .eq('user_id', _userId)
-          .order('added_at', ascending: false);
-      final playlistRows = await _client
-          .from('playlists')
-          .select('id,name,created_at')
-          .eq('user_id', _userId)
-          .order('created_at');
-      final playlistTrackRows = await _client
-          .from('playlist_tracks')
-          .select('playlist_id,position,track_id,track_data')
-          .eq('user_id', _userId)
-          .order('position');
+      final reads = await Future.wait([
+        _client
+            .from('library_tracks')
+            .select('track_id,track_data,added_at')
+            .eq('user_id', _userId)
+            .order('added_at', ascending: false),
+        _client
+            .from('playlists')
+            .select('id,name,created_at')
+            .eq('user_id', _userId)
+            .order('created_at'),
+        _client
+            .from('playlist_tracks')
+            .select('playlist_id,position,track_id,track_data')
+            .eq('user_id', _userId)
+            .order('position'),
+      ]);
+      final likedRows = reads[0];
+      final playlistRows = reads[1];
+      final playlistTrackRows = reads[2];
 
       final nextLikes = _decodeLikes(likedRows);
       final nextPlaylists = _decodePlaylists(playlistRows, playlistTrackRows);
@@ -178,7 +183,8 @@ class WebLibrary extends ChangeNotifier {
           lastCollision = error;
         }
       }
-      throw StateError('Could not allocate a playlist position: $lastCollision');
+      throw StateError(
+          'Could not allocate a playlist position: $lastCollision');
     });
   }
 
@@ -249,7 +255,8 @@ class WebLibrary extends ChangeNotifier {
   String _newPlaylistId() =>
       'web-${DateTime.now().toUtc().microsecondsSinceEpoch}-${_random.nextInt(1 << 32)}';
 
-  bool _isCurrent(int generation) => !_disposed && generation == _refreshGeneration;
+  bool _isCurrent(int generation) =>
+      !_disposed && generation == _refreshGeneration;
 
   void _recordError(Object error) {
     if (_disposed) return;
@@ -257,9 +264,11 @@ class WebLibrary extends ChangeNotifier {
     notifyListeners();
   }
 
-  String _messageFor(Object error) => error is StateError ? error.message.toString()
-      : error is ArgumentError ? 'Check the name or track and retry.'
-      : 'Could not update your library. Check the connection and retry.';
+  String _messageFor(Object error) => error is StateError
+      ? error.message.toString()
+      : error is ArgumentError
+          ? 'Check the name or track and retry.'
+          : 'Could not update your library. Check the connection and retry.';
 
   bool _isPositionCollision(Object error) =>
       error.toString().contains('23505') ||
@@ -267,18 +276,22 @@ class WebLibrary extends ChangeNotifier {
 
   List<Map<String, dynamic>> _decodeLikes(dynamic rawRows) {
     if (rawRows is! List) return const [];
-    return rawRows.whereType<Map>().map((rawRow) {
-      final row = Map<String, dynamic>.from(rawRow);
-      final rawTrack = row['track_data'];
-      if (rawTrack is! Map) return <String, dynamic>{};
-      final track = normalizeTrack(Map<String, dynamic>.from(rawTrack));
-      final trackId = row['track_id']?.toString().trim();
-      return {
-        ...track,
-        if (trackId != null && trackId.isNotEmpty) 'id': trackId,
-        if (trackId != null && trackId.isNotEmpty) 'track_key': trackId,
-      };
-    }).where((track) => extractTrackId(track)?.isNotEmpty ?? false).toList(growable: false);
+    return rawRows
+        .whereType<Map>()
+        .map((rawRow) {
+          final row = Map<String, dynamic>.from(rawRow);
+          final rawTrack = row['track_data'];
+          if (rawTrack is! Map) return <String, dynamic>{};
+          final track = normalizeTrack(Map<String, dynamic>.from(rawTrack));
+          final trackId = row['track_id']?.toString().trim();
+          return {
+            ...track,
+            if (trackId != null && trackId.isNotEmpty) 'id': trackId,
+            if (trackId != null && trackId.isNotEmpty) 'track_key': trackId,
+          };
+        })
+        .where((track) => extractTrackId(track)?.isNotEmpty ?? false)
+        .toList(growable: false);
   }
 
   List<Map<String, dynamic>> _decodePlaylists(
@@ -291,7 +304,8 @@ class WebLibrary extends ChangeNotifier {
         final row = Map<String, dynamic>.from(rawRow);
         final playlistId = row['playlist_id']?.toString().trim();
         final rawTrack = row['track_data'];
-        if (playlistId == null || playlistId.isEmpty || rawTrack is! Map) continue;
+        if (playlistId == null || playlistId.isEmpty || rawTrack is! Map)
+          continue;
         final track = normalizeTrack(Map<String, dynamic>.from(rawTrack));
         final trackId = row['track_id']?.toString().trim();
         tracksByPlaylist.putIfAbsent(playlistId, () => []).add({
@@ -302,14 +316,19 @@ class WebLibrary extends ChangeNotifier {
       }
     }
     if (rawPlaylists is! List) return const [];
-    return rawPlaylists.whereType<Map>().map((rawRow) {
-      final row = Map<String, dynamic>.from(rawRow);
-      final id = row['id']?.toString().trim() ?? '';
-      return <String, dynamic>{
-        'id': id,
-        'name': row['name']?.toString() ?? 'Untitled Playlist',
-        'tracks': List<Map<String, dynamic>>.unmodifiable(tracksByPlaylist[id] ?? const []),
-      };
-    }).where((playlist) => (playlist['id'] as String).isNotEmpty).toList(growable: false);
+    return rawPlaylists
+        .whereType<Map>()
+        .map((rawRow) {
+          final row = Map<String, dynamic>.from(rawRow);
+          final id = row['id']?.toString().trim() ?? '';
+          return <String, dynamic>{
+            'id': id,
+            'name': row['name']?.toString() ?? 'Untitled Playlist',
+            'tracks': List<Map<String, dynamic>>.unmodifiable(
+                tracksByPlaylist[id] ?? const []),
+          };
+        })
+        .where((playlist) => (playlist['id'] as String).isNotEmpty)
+        .toList(growable: false);
   }
 }

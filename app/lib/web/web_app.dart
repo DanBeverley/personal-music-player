@@ -21,7 +21,7 @@ import 'design_system.dart';
 import 'playback_dock.dart';
 import 'playback_diagnostics.dart';
 
-const webBuild = '2026-10-08-cache-cold-latency';
+const webBuild = '2026-10-09-resume-home';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -128,7 +128,12 @@ class _PlayerPageState extends State<_PlayerPage> {
     web.window.addEventListener('pageshow', _lifecycle);
     web.document.addEventListener('visibilitychange', _lifecycle);
     widget.auth.addListener(_accountChanged);
-    if (widget.auth.passwordRecovery) tab = 4;
+    if (widget.auth.passwordRecovery) {
+      tab = 4;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _releaseWelcome();
+      });
+    }
     _openLibrary();
     unawaited(_hydrateHistory());
   }
@@ -169,9 +174,13 @@ class _PlayerPageState extends State<_PlayerPage> {
   }
 
   void _navigate(int value) {
+    if (value != 0) _releaseWelcome();
     setState(() => tab = value);
     if (value == 2) unawaited(library?.refresh());
   }
+
+  void _releaseWelcome() =>
+      web.window.dispatchEvent(web.Event('neatie-home-painted'));
 
   void showDiagnostics() {
     audio.record('user-report-open', {'build': webBuild});
@@ -488,6 +497,7 @@ class _PlayerPageState extends State<_PlayerPage> {
               player: player,
               onLike: _like,
               homeSignals: _homeSignals,
+              onHomePainted: _releaseWelcome,
               homeSignalRevision: _guestHomeRevision,
               foreground: _foreground,
               foregroundRevision: _homeForegroundRevision,

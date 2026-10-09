@@ -41,6 +41,9 @@ class PlaybackDiagnostics {
     'cachedPrefixBytes',
     'chunkDeferred',
     'requestedTrack',
+    'requestPurpose',
+    'failureCode',
+    'cacheTier',
     'status',
     'action',
     'kind',
@@ -62,6 +65,25 @@ class PlaybackDiagnostics {
   final List<Map<String, dynamic>> _incidents = [];
   final Map<String, dynamic> device;
   int _serial = 0;
+
+  // Actual player failures and remote commands outrank speculative API work.
+  static int _priority(String reason) =>
+      reason.startsWith('api-') || reason == 'prepare-result' ? 0 : 2;
+
+  static int _auxiliaryIndex(List events) => events.indexWhere((row) =>
+      '${row['event']}'.startsWith('api-') || row['event'] == 'prepare-result');
+
+  void _trimIncidents() {
+    while (_incidents.length > 4) {
+      var oldestLowest = 0;
+      for (var i = 1; i < _incidents.length; i++) {
+        if (_priority('${_incidents[i]['reason']}') <
+            _priority('${_incidents[oldestLowest]['reason']}'))
+          oldestLowest = i;
+      }
+      _incidents.removeAt(oldestLowest);
+    }
+  }
 
   PlaybackDiagnostics(this.device);
 
@@ -147,9 +169,14 @@ class PlaybackDiagnostics {
     if (_incidents.isNotEmpty) {
       final latest = _incidents.last;
       final events = latest['events'] as List;
-      if (events.length < 24 &&
-          latest['session'] == safe['session'] &&
-          latest['track'] == safe['track']) events.add(safe);
+      if (latest['session'] == safe['session'] &&
+          latest['track'] == safe['track']) {
+        if (events.length >= 24 && _priority('${safe['event']}') > 0) {
+          final auxiliary = _auxiliaryIndex(events);
+          if (auxiliary >= 0) events.removeAt(auxiliary);
+        }
+        if (events.length < 24) events.add(safe);
+      }
     }
     final event = '${safe['event']}';
     final failure = event == 'error' ||
@@ -182,18 +209,16 @@ class PlaybackDiagnostics {
       'context': last,
       'device': _device(device)
     });
-    while (_incidents.length > 4) {
-      final api = _incidents
-          .indexWhere((item) => '${item['reason']}'.startsWith('api-'));
-      _incidents.removeAt(api < 0 ? 0 : api);
-    }
+    _trimIncidents();
   }
 
   String encodeSaved() {
     var encoded = jsonEncode({'version': 2, 'incidents': _incidents});
     while (utf8.encode(encoded).length > 65536) {
       if (_incidents.length > 1) {
-        _incidents.removeAt(0);
+        final auxiliary = _incidents
+            .indexWhere((item) => _priority('${item['reason']}') == 0);
+        _incidents.removeAt(auxiliary < 0 ? 0 : auxiliary);
       } else {
         final events = _incidents.first['events'] as List;
         if (events.length <= 1) break;
@@ -206,11 +231,13 @@ class PlaybackDiagnostics {
 
   Map<String, dynamic> report({bool current = false}) {
     if (current || _incidents.isEmpty) capture('user-report');
-    final incident = current
-        ? _incidents.last
-        : _incidents.reversed.firstWhere(
-            (item) => !'${item['reason']}'.startsWith('api-'),
-            orElse: () => _incidents.last);
+    var incident = _incidents.last;
+    if (!current) {
+      for (final item in _incidents.reversed) {
+        if (_priority('${item['reason']}') > _priority('${incident['reason']}'))
+          incident = item;
+      }
+    }
     final events = incident['events'] as List;
     final last = incident['context'] as Map? ??
         (events.isEmpty ? <String, dynamic>{} : events.last as Map);
@@ -228,7 +255,11 @@ class PlaybackDiagnostics {
         'visibility': last['visibility'],
         'audioSession': last['audioSession'],
         'track': incident['track'],
-        'session': incident['session']
+        'session': incident['session'],
+        'requestedTrack': last['requestedTrack'],
+        'failureCode': last['failureCode'],
+        'cacheTier': last['cacheTier'],
+        'requestPurpose': last['requestPurpose']
       },
       'events': events
     })) as Map<String, dynamic>;
@@ -237,7 +268,8 @@ class PlaybackDiagnostics {
         utf8.encode(const JsonEncoder.withIndent('  ').convert(output)).length >
                 32768 &&
             exported.length > 1) {
-      exported.removeAt(0);
+      final auxiliary = _auxiliaryIndex(exported);
+      exported.removeAt(auxiliary < 0 ? 0 : auxiliary);
     }
     return output;
   }

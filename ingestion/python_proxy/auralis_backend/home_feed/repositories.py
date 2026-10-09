@@ -7,6 +7,8 @@ import json
 import sqlite3
 import time
 import uuid
+import os
+from threading import Lock
 
 from .contracts import (
     QUEUE_TARGET_DEPTH,
@@ -28,6 +30,7 @@ from ..storage.inventory_codec import decode_inventory_payload, encode_inventory
 
 ConnectionFactory = Callable[[], sqlite3.Connection]
 HOME_FEED_SCHEMA_VERSION = 7
+_repository_set_lock = Lock()
 
 
 class HomeRepositoryConflict(RuntimeError):
@@ -934,6 +937,7 @@ class HomeJobRepository(_Repository):
         max_attempts: int = 5,
         run_after: float | None = None,
         now: float | None = None,
+        connection: sqlite3.Connection | None = None,
     ) -> HomeJobRecord:
         scope = _scope(user_scope_id)
         generation = str(generation_key or "").strip()
@@ -942,9 +946,11 @@ class HomeJobRepository(_Repository):
         timestamp = time.time() if now is None else float(now)
         due_at = timestamp if run_after is None else float(run_after)
         encoded_payload = _canonical_json(dict(payload or {}))
-        connection = self._connect()
+        owns_connection = connection is None
+        connection = connection if connection is not None else self._connect()
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            if owns_connection:
+                connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
                 """
                 SELECT * FROM home_feed_jobs
@@ -955,7 +961,8 @@ class HomeJobRepository(_Repository):
             if existing is not None:
                 if str(existing["payload_json"] or "{}") != encoded_payload:
                     raise ImmutableRecordConflict("job key was reused with different payload")
-                connection.rollback()
+                if owns_connection:
+                    connection.rollback()
                 return _job_from_row(existing)
             job_id = str(uuid.uuid4())
             connection.execute(
@@ -980,13 +987,18 @@ class HomeJobRepository(_Repository):
                     timestamp,
                 ],
             )
-            connection.commit()
-            return self.get(job_id)  # type: ignore[return-value]
+            if owns_connection:
+                connection.commit()
+            return _job_from_row(connection.execute(
+                "SELECT * FROM home_feed_jobs WHERE job_id = ?", [job_id]
+            ).fetchone())
         except Exception:
-            connection.rollback()
+            if owns_connection:
+                connection.rollback()
             raise
         finally:
-            connection.close()
+            if owns_connection:
+                connection.close()
 
     def claim_next(
         self,
@@ -2020,7 +2032,14 @@ class HomeRepositorySet:
 
     @classmethod
     def from_server(cls, server: Any) -> "HomeRepositorySet":
-        return cls(recommendation_store_connection_factory(server))
+        path = getattr(server, "RECOMMENDATION_STORE_DB_PATH", None)
+        key = (os.getpid(), os.path.realpath(str(path)) if path else id(server))
+        with _repository_set_lock:
+            cached = getattr(server, "_home_repository_set", None)
+            if cached is None or cached[0] != key:
+                cached = (key, cls(recommendation_store_connection_factory(server)))
+                server._home_repository_set = cached
+            return cached[1]
 
     def delete_scope(self, user_scope_id: str) -> dict[str, int]:
         """Delete all durable Home state for an explicit account reset."""

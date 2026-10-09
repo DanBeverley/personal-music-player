@@ -1,4 +1,5 @@
 from __future__ import annotations
+from functools import wraps
 
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Mapping
@@ -671,6 +672,23 @@ def store_artist_radio_inventory(server: Any, inventory: ArtistRadioInventory) -
             pass
 
 
+class _ConcurrentRadioMerge(RuntimeError):
+    pass
+
+
+def _retry_radio_merge(fn):
+    @wraps(fn)
+    def run(*args, **kwargs):
+        for _ in range(3):
+            try:
+                return fn(*args, **kwargs)
+            except _ConcurrentRadioMerge:
+                continue
+        return False
+    return run
+
+
+@_retry_radio_merge
 def merge_radio_exposure(
     server: Any,
     user_scope_id: str,
@@ -686,7 +704,6 @@ def merge_radio_exposure(
     connection = None
     try:
         connection = open_recommendation_store_connection(server)
-        connection.execute("BEGIN IMMEDIATE")
         row = connection.execute(
             "SELECT payload_json FROM recommendation_feature_store "
             "WHERE namespace = ? AND entity_id = ?",
@@ -709,20 +726,28 @@ def merge_radio_exposure(
         diagnostics["popular_radio_exposure_ledger"] = merged
         diagnostics["popular_radio_last_exposure_at"] = time.time()
         updated = replace(inventory, diagnostics=diagnostics)
-        connection.execute(
+        encoded = json.dumps(encode_inventory_payload(_payload(updated), "radio"), ensure_ascii=False)
+        connection.execute("BEGIN IMMEDIATE")
+        cursor = connection.execute(
             """UPDATE recommendation_feature_store
                SET model_id = ?, payload_json = ?, updated_at = ?
-               WHERE namespace = ? AND entity_id = ?""",
+               WHERE namespace = ? AND entity_id = ? AND payload_json IS ?""",
             [
                 RADIO_INVENTORY_VERSION,
-                json.dumps(encode_inventory_payload(_payload(updated), "radio"), ensure_ascii=False),
+                encoded,
                 time.time(),
                 RADIO_INVENTORY_NAMESPACE,
                 _key(user_scope_id),
+                row["payload_json"],
             ],
         )
+        if cursor.rowcount != 1:
+            connection.rollback()
+            raise _ConcurrentRadioMerge()
         connection.commit()
         return True
+    except _ConcurrentRadioMerge:
+        raise
     except Exception:
         try:
             connection.rollback()
@@ -736,6 +761,7 @@ def merge_radio_exposure(
             pass
 
 
+@_retry_radio_merge
 def merge_store_artist_radio_inventory(
     server: Any,
     incoming: ArtistRadioInventory,
@@ -743,8 +769,8 @@ def merge_store_artist_radio_inventory(
     """Atomically merge qualified reservoir supply without clobbering state.
 
     Expansion workers may finish after another reservoir update. The
-    transaction merges qualified cards under ``BEGIN IMMEDIATE`` and derives a
-    complete visible rotation from that immutable reservoir before commit.
+    merge derives a complete visible rotation outside the writer transaction,
+    then commits by compare-and-set; competing updates re-run the merge.
     Profile and expiry mismatches are treated as a no-op.
     """
     connection = None
@@ -762,7 +788,6 @@ def merge_store_artist_radio_inventory(
             return value
 
         connection = open_recommendation_store_connection(server)
-        connection.execute("BEGIN IMMEDIATE")
         row = connection.execute(
             "SELECT payload_json FROM recommendation_feature_store "
             "WHERE namespace = ? AND entity_id = ?",
@@ -994,22 +1019,31 @@ def merge_store_artist_radio_inventory(
         )
         if selected is not None and selected.is_ready:
             merged = selected
-        connection.execute(
+        encoded = json.dumps(encode_inventory_payload(_payload(merged), "radio"), ensure_ascii=False)
+        connection.execute("BEGIN IMMEDIATE")
+        cursor = connection.execute(
             """INSERT INTO recommendation_feature_store(namespace, entity_id, model_id, payload_json, updated_at)
             VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(namespace, entity_id) DO UPDATE SET
                 model_id=excluded.model_id, payload_json=excluded.payload_json,
-                updated_at=excluded.updated_at""",
+                updated_at=excluded.updated_at
+            WHERE recommendation_feature_store.payload_json IS ?""",
             [
                 RADIO_INVENTORY_NAMESPACE,
                 _key(merged.user_scope_id),
                 RADIO_INVENTORY_VERSION,
-                json.dumps(encode_inventory_payload(_payload(merged), "radio"), ensure_ascii=False),
+                encoded,
                 time.time(),
+                row["payload_json"] if row is not None else None,
             ],
         )
+        if cursor.rowcount != 1:
+            connection.rollback()
+            raise _ConcurrentRadioMerge()
         connection.commit()
         return True
+    except _ConcurrentRadioMerge:
+        raise
     except Exception:
         try:
             connection.rollback()

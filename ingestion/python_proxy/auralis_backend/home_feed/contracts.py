@@ -120,6 +120,7 @@ class RowRequirement(str, Enum):
 
 
 class HomeJobType(str, Enum):
+    RECONCILE_INTERACTION = "reconcile_interaction"
     REFRESH_CANDIDATES = "refresh_candidates"
     REFRESH_RADIO = "refresh_radio"
     REPAIR_ARTWORK = "repair_artwork"

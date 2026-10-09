@@ -9,4 +9,5 @@ langgraph
 langchain-core
 ddgs
 psycopg[binary]
+psycopg_pool>=3.2,<4
 boto3

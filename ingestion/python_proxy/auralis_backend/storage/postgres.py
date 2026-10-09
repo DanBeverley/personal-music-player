@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from threading import Lock
+from threading import Lock, Condition, Thread
+from collections import deque
+import atexit
+import logging
 from typing import Any, Dict, Iterable, List, Optional
 import json
 import os
@@ -13,6 +16,71 @@ try:
     import psycopg
 except Exception:
     psycopg = None
+
+try:
+    from psycopg_pool import ConnectionPool
+except ImportError:
+    ConnectionPool = None
+
+_pool_lock = Lock()
+_pool = None
+_pool_key = None
+_log_condition = Condition()
+_log_pending = deque()
+_log_thread = None
+_log_stopping = False
+_log_stats = {"queued": 0, "written": 0, "dropped": 0, "failed": 0}
+_logger = logging.getLogger(__name__)
+
+
+def _connection_pool(dsn):
+    global _pool, _pool_key
+    key = (os.getpid(), dsn)
+    with _pool_lock:
+        if _pool_key != key:
+            if _pool is not None:
+                _pool.close()
+            _pool = ConnectionPool(
+                dsn, min_size=0, max_size=4, max_waiting=16,
+                timeout=_PG_CONNECT_TIMEOUT_SECONDS,
+                max_idle=60, max_lifetime=300, open=True,
+                kwargs={"connect_timeout": _PG_CONNECT_TIMEOUT_SECONDS,
+                        "prepare_threshold": None},
+                check=ConnectionPool.check_connection,
+            )
+            _pool_key = key
+        return _pool
+
+
+def request_log_stats():
+    with _log_condition:
+        return {**_log_stats, "pending": len(_log_pending)}
+
+
+def _drain_request_logs():
+    while True:
+        with _log_condition:
+            _log_condition.wait_for(lambda: _log_pending or _log_stopping)
+            if not _log_pending:
+                return
+            _, values = _log_pending.popleft()
+        written = _write_request_log(values)
+        with _log_condition:
+            _log_stats["written" if written else "failed"] += 1
+
+
+def _shutdown_storage():
+    global _log_stopping
+    with _log_condition:
+        _log_stopping = True
+        _log_condition.notify_all()
+    if _log_thread is not None:
+        _log_thread.join(timeout=1)
+    if _pool is not None:
+        _pool.close(timeout=1)
+
+
+atexit.register(_shutdown_storage)
 
 
 _SCHEMA_SQL_FALLBACK = """
@@ -270,6 +338,10 @@ def get_connection():
     if psycopg is None or not config.postgres_dsn:
         yield None
         return
+    if ConnectionPool is not None:
+        with _connection_pool(config.postgres_dsn).connection() as connection:
+            yield connection
+        return
     connection = psycopg.connect(
         config.postgres_dsn,
         connect_timeout=_PG_CONNECT_TIMEOUT_SECONDS,
@@ -277,6 +349,9 @@ def get_connection():
     try:
         yield connection
         connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
     finally:
         connection.close()
 
@@ -315,12 +390,46 @@ def log_request(
     model_version: str = "",
     diagnostics: Optional[Dict[str, Any]] = None,
 ) -> None:
+    """Bounded best-effort diagnostics; never wait for remote SQL on a reply."""
+    global _log_thread
     if not db_available():
         return
     try:
+        values = [request_id, request_type, user_scope_id or "guest",
+                  session_id or "", model_version or "", _json(diagnostics or {})]
+        priority = bool((diagnostics or {}).get("error")) or float(
+            (diagnostics or {}).get("total_ms") or 0) >= 5000
+    except (TypeError, ValueError):
+        with _log_condition:
+            _log_stats["failed"] += 1
+        _logger.warning("request_diagnostic_encode_failed")
+        return
+    with _log_condition:
+        if _log_stopping:
+            _log_stats["dropped"] += 1
+            return
+        if len(_log_pending) >= 256:
+            ordinary = next((i for i, (important, _) in enumerate(_log_pending)
+                             if not important), None)
+            if ordinary is None:
+                _log_stats["dropped"] += 1
+                return
+            del _log_pending[ordinary]
+            _log_stats["dropped"] += 1
+        _log_pending.append((priority, values))
+        _log_stats["queued"] += 1
+        if _log_thread is None or not _log_thread.is_alive():
+            _log_thread = Thread(target=_drain_request_logs,
+                                 name="request-diagnostics", daemon=True)
+            _log_thread.start()
+        _log_condition.notify()
+
+
+def _write_request_log(values) -> bool:
+    try:
         with get_connection() as connection:
             if connection is None:
-                return
+                return False
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -328,17 +437,12 @@ def log_request(
                       (request_id, request_type, user_scope_id, session_id, model_version, diagnostics)
                     values (%s, %s, %s, %s, %s, %s::jsonb)
                     """,
-                    [
-                        request_id,
-                        request_type,
-                        user_scope_id or "guest",
-                        session_id or "",
-                        model_version or "",
-                        _json(diagnostics or {}),
-                    ],
+                    values,
                 )
+        return True
     except Exception:
-        return
+        _logger.warning("request_diagnostic_write_failed")
+        return False
 
 
 def record_impressions(

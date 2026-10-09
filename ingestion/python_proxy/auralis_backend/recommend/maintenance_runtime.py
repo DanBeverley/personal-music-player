@@ -1114,9 +1114,18 @@ def _recommendation_store_interaction_event(req: RecommendationInteractionEventR
         ).encode("utf-8")
     ).hexdigest()
 
+    # The event and its leased follow-up are committed together. A restart
+    # cannot lose feedback after returning stored=true to the client.
+    from ..home_feed.repositories import HomeRepositorySet
+    from ..home_feed.contracts import HomeJobType
+    repositories = HomeRepositorySet.from_server(resolve_server())
+    deferred = (os.environ.get("NEATIE_ASYNC_LISTENING_FEEDBACK", "true").lower() == "true"
+                and event_type in {"play", "complete", "replay"}
+                and payload.get("reason") != "history_delete")
     connection = _recommendation_store_connection()
     try:
-        connection.execute(
+        connection.execute("BEGIN IMMEDIATE")
+        inserted = connection.execute(
             """
             INSERT OR IGNORE INTO recommendation_events(
                 id, user_scope_id, track_id, artist_name, event_type, source, weight, metadata_json, occurred_at
@@ -1135,6 +1144,16 @@ def _recommendation_store_interaction_event(req: RecommendationInteractionEventR
                 occurred_at,
             ],
         )
+        if deferred and inserted.rowcount == 1:
+            request = req.model_dump(mode="json")
+            request.update(user_scope_id=user_scope_id, occurred_at=occurred_at)
+            repositories.jobs.enqueue(
+                user_scope_id, HomeJobType.RECONCILE_INTERACTION,
+                f"interaction:{event_id}",
+                payload={"request": request, "event_id": event_id,
+                         "reason": "interaction_followup"},
+                priority=100, max_attempts=8, connection=connection,
+            )
         connection.commit()
     finally:
         connection.close()
@@ -1144,6 +1163,24 @@ def _recommendation_store_interaction_event(req: RecommendationInteractionEventR
         schedule_history_seed_snapshot_refresh(resolve_server(), user_scope_id)
     except Exception:
         pass
+    if deferred or inserted.rowcount == 0:
+        # In-memory invalidation is cheap; cloud feedback and scheduling are
+        # owned by the durable worker. Explicit hide/save remains synchronous.
+        from .profile_runtime import invalidate_profile_cache
+        invalidate_profile_cache()
+        _recommendation_invalidate_collaborative_cache()
+        return True
+    _apply_interaction_followup(req, event_id)
+    return True
+
+
+@_with_server_globals
+def _apply_interaction_followup(req, event_id, *, retry_errors=False):
+    user_scope_id = _assistant_safe_scope_id(req.user_scope_id or "guest")
+    track_id = _recommendation_trim_text(req.track_id)
+    event_type = (req.event_type or "play").strip().lower()
+    occurred_at = float(req.occurred_at or time.time())
+    payload = dict(req.metadata or {})
     _recommendation_attribute_interaction_event(
         event_id,
         user_scope_id=user_scope_id,
@@ -1157,9 +1194,15 @@ def _recommendation_store_interaction_event(req: RecommendationInteractionEventR
         from auralis_backend.recommend.profile_runtime import invalidate_profile_cache
         from auralis_backend.recommend.taste_runtime import apply_interaction_feedback
 
-        apply_interaction_feedback(sys.modules[__name__], req)
+        # Internal idempotency token is derived from the durable event, never
+        # accepted from a caller's metadata.
+        feedback_req = req.model_copy(update={"metadata": {
+            **payload, "_feedback_event_id": event_id}})
+        apply_interaction_feedback(resolve_server(), feedback_req)
         invalidate_profile_cache()
     except Exception:
+        if retry_errors:
+            raise
         pass
     _recommendation_invalidate_collaborative_cache()
     try:
@@ -1171,6 +1214,8 @@ def _recommendation_store_interaction_event(req: RecommendationInteractionEventR
             generation_hint=f"interaction:{event_id}",
         )
     except Exception:
+        if retry_errors:
+            raise
         pass
     return True
 

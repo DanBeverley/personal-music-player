@@ -157,11 +157,13 @@ def prepare_session(server: Any, req: Any):
 
 
 def latency_summary(server: Any):
+    from ..storage.postgres import request_log_stats
     return {
         "status": "success",
         "summary": summarize_prepare_metrics(server),
         "stream_info_cache_size": len(server.stream_info_cache),
         "stream_chunk_cache_size": len(server.stream_chunk_cache),
+        "request_diagnostics": request_log_stats(),
     }
 
 

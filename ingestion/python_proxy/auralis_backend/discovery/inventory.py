@@ -473,6 +473,12 @@ def store_candidate_inventory(
 
     payload = _to_payload(inventory)
     key = _key(inventory.user_scope_id)
+    # Large codec/catalog work must not occupy SQLite's single writer slot.
+    try:
+        encoded_payload = json.dumps(encode_inventory_payload(payload, "candidate"), ensure_ascii=False)
+        album_rows = _playable_album_catalog_rows(inventory, updated_at=time.time())
+    except Exception:
+        return False
     with _inventory_lock(inventory.user_scope_id):
         try:
             connection = open_recommendation_store_connection(server)
@@ -480,7 +486,6 @@ def store_candidate_inventory(
             connection = None
         if connection is not None:
             try:
-                connection.execute("BEGIN IMMEDIATE")
                 row = connection.execute(
                     """
                     SELECT payload_json
@@ -506,7 +511,9 @@ def store_candidate_inventory(
                 ):
                     connection.rollback()
                     return False
-                connection.execute(
+                previous_payload = row["payload_json"] if row is not None else None
+                connection.execute("BEGIN IMMEDIATE")
+                cursor = connection.execute(
             """
             INSERT INTO recommendation_feature_store(namespace, entity_id, model_id, payload_json, updated_at)
             VALUES (?, ?, ?, ?, ?)
@@ -514,19 +521,20 @@ def store_candidate_inventory(
                 model_id = excluded.model_id,
                 payload_json = excluded.payload_json,
                 updated_at = excluded.updated_at
+            WHERE recommendation_feature_store.payload_json IS ?
             """,
             [
                 INVENTORY_NAMESPACE,
                 key,
                 INVENTORY_MODEL_VERSION,
-                json.dumps(encode_inventory_payload(payload, "candidate"), ensure_ascii=False),
+                encoded_payload,
                 time.time(),
+                previous_payload,
             ],
                 )
-                album_rows = _playable_album_catalog_rows(
-                    inventory,
-                    updated_at=time.time(),
-                )
+                if cursor.rowcount != 1:
+                    connection.rollback()
+                    return False
                 if album_rows:
                     connection.executemany(
                         """

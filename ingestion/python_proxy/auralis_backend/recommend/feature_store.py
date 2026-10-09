@@ -1653,6 +1653,10 @@ def _store_pg_feedback(
                         expires_at = EXCLUDED.expires_at,
                         metadata = EXCLUDED.metadata,
                         updated_at = now()
+                    WHERE COALESCE((recommendation_negative_feedback.metadata->>'feedback_event_at')::double precision,
+                                   EXTRACT(EPOCH FROM recommendation_negative_feedback.updated_at))
+                       <= COALESCE((EXCLUDED.metadata->>'feedback_event_at')::double precision,
+                                   EXTRACT(EPOCH FROM EXCLUDED.updated_at))
                     """,
                     [
                         user_scope_id,
@@ -1692,6 +1696,9 @@ def _store_sqlite_feedback(
                 expires_at = excluded.expires_at,
                 metadata_json = excluded.metadata_json,
                 updated_at = excluded.updated_at
+            WHERE COALESCE(json_extract(recommendation_negative_feedback.metadata_json, '$.feedback_event_at'),
+                           recommendation_negative_feedback.updated_at)
+               <= COALESCE(json_extract(excluded.metadata_json, '$.feedback_event_at'), excluded.updated_at)
             """,
             [
                 user_scope_id,
@@ -1763,6 +1770,7 @@ def clear_negative_feedback(
     user_scope_id: str,
     feedback_type: str,
     feedback_key: str,
+    event_at: float | None = None,
 ) -> None:
     normalized_scope = str(user_scope_id or "").strip()
     normalized_type = str(feedback_type or "").strip()
@@ -1779,8 +1787,11 @@ def clear_negative_feedback(
                             """
                             DELETE FROM recommendation_negative_feedback
                             WHERE user_scope_id = %s AND feedback_type = %s AND feedback_key = %s
+                              AND (%s::double precision IS NULL OR
+                                   COALESCE((metadata->>'feedback_event_at')::double precision,
+                                            EXTRACT(EPOCH FROM updated_at)) <= %s)
                             """,
-                            [normalized_scope, normalized_type, normalized_key],
+                            [normalized_scope, normalized_type, normalized_key, event_at, event_at],
                         )
         except Exception:
             pass
@@ -1790,8 +1801,9 @@ def clear_negative_feedback(
             """
             DELETE FROM recommendation_negative_feedback
             WHERE user_scope_id = ? AND feedback_type = ? AND feedback_key = ?
+              AND (? IS NULL OR COALESCE(json_extract(metadata_json, '$.feedback_event_at'), updated_at) <= ?)
             """,
-            [normalized_scope, normalized_type, normalized_key],
+            [normalized_scope, normalized_type, normalized_key, event_at, event_at],
         )
         connection.commit()
     finally:
@@ -1808,11 +1820,20 @@ def attenuate_negative_feedback(
     feedback_key: str,
     factor: float,
     floor: float = 0.12,
+    event_id: str = "",
+    event_at: float | None = None,
 ) -> None:
     rows = load_negative_feedback(server, user_scope_id=user_scope_id)
     entry = dict((rows.get(feedback_type) or {}).get(feedback_key) or {})
     if not entry:
         return
+    metadata = dict(entry.get("metadata") or {})
+    if event_id and metadata.get("feedback_event_id") == event_id:
+        return
+    if event_at is not None and float(metadata.get("feedback_event_at") or 0) > event_at:
+        return
+    if event_id:
+        metadata.update(feedback_event_id=event_id, feedback_event_at=event_at)
     updated_strength = float(entry.get("strength") or 0.0) * max(min(float(factor or 1.0), 1.0), 0.0)
     if updated_strength <= float(floor or 0.0):
         clear_negative_feedback(
@@ -1820,6 +1841,7 @@ def attenuate_negative_feedback(
             user_scope_id=user_scope_id,
             feedback_type=feedback_type,
             feedback_key=feedback_key,
+            event_at=event_at,
         )
         return
     remaining_ttl = max(float(entry.get("expires_at") or 0.0) - float(time.time()), 60.0)
@@ -1830,7 +1852,7 @@ def attenuate_negative_feedback(
         feedback_key=feedback_key,
         strength=updated_strength,
         ttl_seconds=remaining_ttl,
-        metadata=dict(entry.get("metadata") or {}),
+        metadata=metadata,
     )
 
 

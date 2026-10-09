@@ -50,6 +50,7 @@ class HomeWorkerResult:
 
 
 HOME_WORKER_LANES: tuple[tuple[str, tuple[HomeJobType, ...]], ...] = (
+    ("interactions", (HomeJobType.RECONCILE_INTERACTION,)),
     ("compose", (HomeJobType.COMPOSE_FEED,)),
     ("candidates", (HomeJobType.REFRESH_CANDIDATES,)),
     ("radio", (HomeJobType.REFRESH_RADIO,)),
@@ -79,6 +80,7 @@ class HomeFeedWorker:
         )
         self._job_types = tuple(job_types)
         self._handlers: dict[HomeJobType, Callable[[HomeJobRecord], None]] = {
+            HomeJobType.RECONCILE_INTERACTION: self._reconcile_interaction,
             HomeJobType.REFRESH_CANDIDATES: self._refresh_candidates,
             HomeJobType.REFRESH_RADIO: self._refresh_radio,
             HomeJobType.REPAIR_ARTWORK: self._repair_artwork,
@@ -222,6 +224,16 @@ class HomeFeedWorker:
         request = dict(payload.get("request") or {})
         request["user_scope_id"] = job.user_scope_id
         return SearchRequest(**request)
+
+    def _reconcile_interaction(self, job: HomeJobRecord) -> None:
+        from ..contracts import RecommendationInteractionEventRequest
+        from ..recommend.maintenance_runtime import _apply_interaction_followup
+        request = dict(job.payload.get("request") or {})
+        request["user_scope_id"] = job.user_scope_id
+        _apply_interaction_followup(
+            RecommendationInteractionEventRequest(**request),
+            str(job.payload["event_id"]), retry_errors=True,
+        )
 
     def _refresh_candidates(self, job: HomeJobRecord) -> Any:
         started = time.perf_counter()

@@ -728,6 +728,10 @@ def apply_interaction_feedback(server: Any, req) -> Dict[str, Any]:
     feature = get_track_feature(server, track_payload)
     duplicate_key = _duplicate_feedback_key(feature)
     action = _feedback_action(req)
+    event_id = str((getattr(req, "metadata", {}) or {}).get("_feedback_event_id") or "")
+    event_at = float(getattr(req, "occurred_at", 0) or time.time())
+    feedback_metadata = {"event": action, "feedback_event_at": event_at,
+                         "feedback_event_id": event_id}
     applied_keys: List[str] = []
     negative_feedback_applied = False
 
@@ -739,7 +743,7 @@ def apply_interaction_feedback(server: Any, req) -> Dict[str, Any]:
             feedback_key=track_id,
             strength=1.0,
             ttl_seconds=_HARD_HIDE_TTL_SECONDS,
-            metadata={"event": action},
+            metadata=feedback_metadata,
         )
         applied_keys.append(f"exact_track:{track_id}")
         if duplicate_key:
@@ -750,7 +754,7 @@ def apply_interaction_feedback(server: Any, req) -> Dict[str, Any]:
                 feedback_key=duplicate_key,
                 strength=0.95,
                 ttl_seconds=_DUPLICATE_HIDE_TTL_SECONDS,
-                metadata={"event": action},
+                metadata=feedback_metadata,
             )
             applied_keys.append(f"duplicate_track:{duplicate_key}")
         for feedback_type, feedback_key, strength in _scene_feedback_keys(feature):
@@ -761,7 +765,7 @@ def apply_interaction_feedback(server: Any, req) -> Dict[str, Any]:
                 feedback_key=feedback_key,
                 strength=strength,
                 ttl_seconds=_SOFT_CLUSTER_TTL_SECONDS,
-                metadata={"event": action},
+                metadata=feedback_metadata,
             )
             applied_keys.append(f"{feedback_type}:{feedback_key}")
         negative_feedback_applied = True
@@ -773,7 +777,7 @@ def apply_interaction_feedback(server: Any, req) -> Dict[str, Any]:
             feedback_key=track_id,
             strength=0.42,
             ttl_seconds=_SKIP_TTL_SECONDS,
-            metadata={"event": action},
+            metadata=feedback_metadata,
         )
         applied_keys.append(f"exact_track:{track_id}")
         if duplicate_key:
@@ -784,7 +788,7 @@ def apply_interaction_feedback(server: Any, req) -> Dict[str, Any]:
                 feedback_key=duplicate_key,
                 strength=0.28,
                 ttl_seconds=_SKIP_TTL_SECONDS,
-                metadata={"event": action},
+                metadata=feedback_metadata,
             )
             applied_keys.append(f"duplicate_track:{duplicate_key}")
         for feedback_type, feedback_key, strength in _scene_feedback_keys(feature):
@@ -795,7 +799,7 @@ def apply_interaction_feedback(server: Any, req) -> Dict[str, Any]:
                 feedback_key=feedback_key,
                 strength=max(strength * 0.35, 0.12),
                 ttl_seconds=_SKIP_TTL_SECONDS,
-                metadata={"event": action},
+                metadata=feedback_metadata,
             )
             applied_keys.append(f"{feedback_type}:{feedback_key}")
         negative_feedback_applied = True
@@ -805,6 +809,7 @@ def apply_interaction_feedback(server: Any, req) -> Dict[str, Any]:
             user_scope_id=user_scope_id,
             feedback_type="exact_track",
             feedback_key=track_id,
+            event_at=event_at,
         )
         if duplicate_key:
             if action == "positive_save":
@@ -813,6 +818,7 @@ def apply_interaction_feedback(server: Any, req) -> Dict[str, Any]:
                     user_scope_id=user_scope_id,
                     feedback_type="duplicate_track",
                     feedback_key=duplicate_key,
+                    event_at=event_at,
                 )
             else:
                 attenuate_negative_feedback(
@@ -821,6 +827,7 @@ def apply_interaction_feedback(server: Any, req) -> Dict[str, Any]:
                     feedback_type="duplicate_track",
                     feedback_key=duplicate_key,
                     factor=0.45,
+                    event_id=event_id, event_at=event_at,
                 )
         for feedback_type, feedback_key, _strength in _scene_feedback_keys(feature):
             attenuate_negative_feedback(
@@ -829,6 +836,7 @@ def apply_interaction_feedback(server: Any, req) -> Dict[str, Any]:
                 feedback_type=feedback_type,
                 feedback_key=feedback_key,
                 factor=0.55 if action == "positive_save" else 0.72,
+                event_id=event_id, event_at=event_at,
             )
         applied_keys.append(f"positive:{track_id}")
 

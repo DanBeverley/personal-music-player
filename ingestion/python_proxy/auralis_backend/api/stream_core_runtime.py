@@ -7,10 +7,11 @@ import shutil
 import time
 import urllib.parse
 import re
-from threading import BoundedSemaphore
+from threading import BoundedSemaphore, Lock, Timer, Thread, Event
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, List, Optional
 from contextlib import contextmanager
+from contextvars import ContextVar
 
 import yt_dlp
 import yt_dlp.plugins
@@ -19,96 +20,305 @@ from yt_dlp.cookies import YoutubeDLCookieJar
 from .stream_cache import get_stream_cache, iter_and_store_full_stream
 
 _capture_cache_slots = BoundedSemaphore(2)
+_stream_store_slots = BoundedSemaphore(2)
+_direct_extraction_slots = BoundedSemaphore(2)
+_direct_background_slots = BoundedSemaphore(1)
+_background_acquisition = ContextVar('background_acquisition', default=False)
+_startup_tools_lock = Lock()
+_startup_tools_thread = None
+_startup_tools_stop = Event()
+
+
+def start_playback_tools(server):
+    """One best-effort startup task, sharing the existing bounded extractor pool."""
+    global _startup_tools_thread
+    if (os.environ.get('NEATIE_PLAYBACK_STARTUP', '0') != '1'
+            or os.environ.get('NEATIE_DIRECT_POOL', '0') != '1'
+            or not _ytdlp_opts(server).get('neatie_fast_acquisition')):
+        return False
+    with _startup_tools_lock:
+        if _startup_tools_thread is not None:
+            return False
+        _startup_tools_stop.clear()
+        def work():
+            started = time.perf_counter()
+            result = 'unavailable'
+            token = _background_acquisition.set(True)
+            try:
+                from .youtube_acquisition import warm_generic_session
+                with _ytdlp_extractor(_ytdlp_opts(server)) as ydl:
+                    if not _startup_tools_stop.is_set():
+                        result = 'ready' if warm_generic_session(ydl) else 'unavailable'
+            except Exception as error:
+                result = type(error).__name__
+            finally:
+                _background_acquisition.reset(token)
+                if _startup_tools_stop.is_set():
+                    from .youtube_acquisition import close_idle_extractors
+                    close_idle_extractors()
+                print(f'[EBB:playback-tools] result={result} ms={int((time.perf_counter()-started)*1000)}', flush=True)
+        _startup_tools_thread = Thread(target=work, name='playback-startup', daemon=True)
+        _startup_tools_thread.start()
+        return True
+
+
+def stop_playback_tools():
+    _startup_tools_stop.set()
+    from .youtube_acquisition import close_idle_extractors
+    close_idle_extractors()
+
+_initial_reads = {}
+_initial_reads_lock = Lock()
+
+
+def _close_initial_read(entry):
+    timer = entry.get('timer')
+    if timer is not None:
+        timer.cancel()
+    entry['response'].close()
+
+
+def _expire_initial_read(key, entry):
+    with _initial_reads_lock:
+        owned = _initial_reads.get(key) is entry
+        if owned:
+            _initial_reads.pop(key)
+    if owned:
+        _close_initial_read(entry)
+
+
+def _keep_initial_read(server, video_id, info, response, chunks, offset, last, total, mime, etag):
+    key = (id(server.stream_chunk_cache), video_id, stream_representation_key(info))
+    entry = dict(response=response, chunks=chunks, offset=offset, last=last,
+                 total=total, mime=mime, etag=etag, until=time.monotonic()+5)
+    timer = Timer(5, _expire_initial_read, args=(key, entry))
+    timer.daemon = True
+    entry['timer'] = timer
+    retired = []
+    with _initial_reads_lock:
+        previous = _initial_reads.pop(key, None)
+        if previous:
+            retired.append(previous)
+        while len(_initial_reads) >= 2:
+            retired.append(_initial_reads.pop(next(iter(_initial_reads))))
+        _initial_reads[key] = entry
+    for old in retired:
+        _close_initial_read(old)
+    timer.start()
+
+
+def _take_initial_read(server, video_id, info, chunk, start):
+    key = (id(server.stream_chunk_cache), video_id, stream_representation_key(info))
+    with _initial_reads_lock:
+        entry = _initial_reads.pop(key, None)
+    if entry is None:
+        return None
+    if (time.monotonic() >= entry['until'] or entry['offset'] > start
+            or start > entry['last'] or entry['total'] != chunk.get('total_length')
+            or entry['mime'] != chunk.get('content_type') or entry['etag'] != chunk.get('etag')):
+        _close_initial_read(entry)
+        return None
+    entry['timer'].cancel()
+    return entry
+
+
+def iter_initial_read(server, video_id, info, chunk, start, end=None):
+    """Claim one already validated connection, or continue the exact pinned source."""
+    entry = _take_initial_read(server, video_id, info, chunk, start)
+    offset = start
+    target = min(end if end is not None else chunk['total_length']-1, chunk['total_length']-1)
+    if entry is not None:
+        position = entry['offset']
+        try:
+            try:
+                for block in entry['chunks']:
+                    if not block:
+                        continue
+                    next_position = position+len(block)
+                    if next_position > entry['last']+1:
+                        raise ValueError('Initial audio read exceeded its range')
+                    left, right = max(offset-position, 0), min(target-position+1, len(block))
+                    position = next_position
+                    if right > left:
+                        offset += right-left
+                        yield block[left:right]
+                    if offset > target:
+                        return
+                if position != entry['last']+1:
+                    raise IOError('Initial audio read ended early')
+            except ValueError:
+                raise
+            except Exception:
+                # Recovery stays on the same URI/representation after emission.
+                pass
+        finally:
+            _close_initial_read(entry)
+    if offset <= target:
+        yield from iter_upstream_stream(server, video_id, {**info, 'pinned': True},
+            start=offset, end=end, expected_total_length=chunk['total_length'],
+            expected_content_type=chunk['content_type'], expected_etag=chunk.get('etag') or '')
+
+
+def _defer_stream_store(server, work, *args, **kwargs):
+    """Resolution persistence must not delay the first playback bytes."""
+    if not hasattr(server, 'stream_warm_executor') or not _stream_store_slots.acquire(blocking=False):
+        return
+    try:
+        future = server.stream_warm_executor.submit(work, server, *args, **kwargs)
+        future.add_done_callback(lambda _: _stream_store_slots.release())
+    except Exception:
+        _stream_store_slots.release()
 
 
 class PlaybackSourceExpired(RuntimeError):
     pass
 
 
-def cache_prepared_track(server, video_id):
+def cache_prepared_track(server, video_id, *, max_bytes=None):
     cache = get_stream_cache(server)
     if not cache.enabled:
         return False
-    if cache.head(video_id):
+    head = cache.head(video_id)
+    if head and int(head.get('content_length') or 0) <= 0:
+        return False
+    if head and head.get('metadata', {}).get('validated') == 'capture-v1' and head.get('metadata', {}).get('seek_index') == 'v1':
         return True
+    key = f'cache:{video_id}'
     with server.stream_info_lock:
-        pending = server.stream_info_inflight.get(f'cache:{video_id}')
-    if pending is not None:
+        pending = server.stream_info_inflight.get(key)
+        owner = pending is None
+        if owner:
+            pending = Future()
+            server.stream_info_inflight[key] = pending
+    if not owner:
         try:
             return bool(pending.result(timeout=75))
         except Exception:
             return False
-    if not _capture_cache_slots.acquire(blocking=False):
-        return False
+    acquired = _capture_cache_slots.acquire(blocking=False)
+    stored = False
     try:
+        if not acquired:
+            return False
+        if head:
+            stored = validate_cached_track(server, video_id)
+            return stored
         info = selected_stream_info(server, video_id)
         if not info:
             return False
         for _ in iter_and_store_full_stream(server, video_id,
                 iter_upstream_stream(server, video_id, {**info, 'pinned': True}),
                 content_type=info.get('mime_type', 'audio/mp4'),
-                capture_duration=info.get('duration', 0) if info.get('compatibility') else None):
+                capture_duration=info.get('duration') or None,
+                max_bytes_override=max_bytes, independent=True):
             pass
-        return bool(cache.head(video_id))
+        stored = bool(cache.head(video_id))
+        return stored
     except Exception as exc:
         print(f'[EBB:stream] video={video_id} event=queue_cache_failed error={type(exc).__name__}')
         return False
     finally:
-        _capture_cache_slots.release()
-
-
-def _cache_capture(server, video_id, info):
-    if not info.get('compatibility') or not hasattr(server, 'stream_warm_executor'):
-        return
-    retry_key = f'capture_retry:{video_id}'
-    with server.stream_info_lock:
-        retry = server.stream_info_cache.get(retry_key)
-        if retry and retry['expires_at'] > time.time():
-            return
-    if not _capture_cache_slots.acquire(blocking=False):
-        return
-    key = f'cache:{video_id}'
-    with server.stream_info_lock:
-        if key in server.stream_info_inflight:
+        if acquired:
             _capture_cache_slots.release()
+        pending.set_result(stored)
+        with server.stream_info_lock:
+            if server.stream_info_inflight.get(key) is pending:
+                server.stream_info_inflight.pop(key)
+
+
+def validate_cached_track(server, video_id):
+    """Check old full objects without replacing bytes used by active players."""
+    import tempfile
+    import subprocess
+    from pathlib import Path
+    from .stream_cache import validate_capture_file
+    cache = get_stream_cache(server)
+    head = cache.head(video_id)
+    if not head:
+        return False
+    if head.get('metadata', {}).get('validated') == 'capture-v1' and head.get('metadata', {}).get('seek_index') == 'v1':
+        return True
+    proof_key = f"validated-cache:{video_id}:{head.get('etag', '')}"
+    if head.get('etag'):
+        with server.stream_info_lock:
+            proof = server.stream_info_cache.get(proof_key)
+            if proof and proof['expires_at'] > time.time():
+                return proof.get('payload', {}).get('valid', True)
+    length = int(head.get('content_length') or 0)
+    if not 0 < length <= int(getattr(server, 'AURALIS_STREAM_CACHE_MAX_BYTES', 80*1024*1024)):
+        return False
+    with tempfile.TemporaryDirectory(prefix='queue-audio-validate-') as directory:
+        path = str(Path(directory) / 'audio.bin')
+        try:
+            total = 0
+            with open(path, 'wb') as file:
+                for chunk in cache.iter_object(video_id, expected=head):
+                    total += len(chunk)
+                    if total > length:
+                        return False
+                    file.write(chunk)
+            if total != length:
+                return False
+            probe = subprocess.run(['ffprobe', '-v', 'error', '-show_entries',
+                'format=duration', '-of', 'json', path], capture_output=True, timeout=30)
+            duration = float(json.loads(probe.stdout)['format']['duration'])
+            if cache.backend_name != 'r2':
+                validate_capture_file(path, duration, head['content_type'], remux=False)
+                return True
+            normalized = validate_capture_file(path, duration, head['content_type'])
+            # The derivative key is immutable; selected sessions retain their
+            # original key/ETag/length. Preparation/new sessions pick this copy.
+            if not cache.put_file(video_id, normalized, content_type=head['content_type'],
+                                  metadata={'validated': 'capture-v1', 'seek_index': 'v1'}):
+                return False
+            if head.get('etag'):
+                with server.stream_info_lock:
+                    keys = [k for k in server.stream_info_cache if k.startswith('validated-cache:')]
+                    for key in keys[:-127]:
+                        server.stream_info_cache.pop(key, None)
+                    server.stream_info_cache[proof_key] = {'expires_at': time.time()+3600, 'payload': {'valid':True}}
+            return True
+        except Exception:
+            if head.get('etag'):
+                with server.stream_info_lock:
+                    keys = [k for k in server.stream_info_cache if k.startswith('validated-cache:')]
+                    for key in keys[:-127]:
+                        server.stream_info_cache.pop(key, None)
+                    server.stream_info_cache[proof_key] = {
+                        'expires_at':time.time()+30,'payload':{'valid':False}}
+            return False
+
+
+def schedule_cached_audio_repair(server, video_id, head):
+    """Repair legacy objects off playback's response path using the warm owner."""
+    if (head.get('metadata', {}).get('validated') == 'capture-v1' and head.get('metadata', {}).get('seek_index') == 'v1'
+            or not hasattr(server, 'stream_warm_executor')
+            or not hasattr(server, 'stream_info_inflight')):
+        return
+    key = f'cache-repair:{video_id}'
+    with server.stream_info_lock:
+        proof = server.stream_info_cache.get(f"validated-cache:{video_id}:{head.get('etag', '')}")
+        if proof and proof['expires_at'] > time.time() and proof.get('payload', {}).get('valid') is False:
+            return
+        if key in server.stream_info_inflight or sum(
+                k.startswith('cache-repair:') for k in server.stream_info_inflight) >= 2:
             return
         pending = Future()
         server.stream_info_inflight[key] = pending
-    def store():
-        stored = False
+    def repair():
         try:
-            cache = get_stream_cache(server)
-            if cache.enabled and not cache.head(video_id):
-                for _ in iter_and_store_full_stream(server, video_id,
-                        iter_upstream_stream(server, video_id, info),
-                        content_type=info['mime_type'],
-                        capture_duration=info.get('duration', 0)):
-                    pass
-            stored = bool(cache.head(video_id)) if cache.enabled else False
-        except Exception as exc:
-            print(f'[EBB:stream] video={video_id} event=capture_cache_failed error={type(exc).__name__}')
+            pending.set_result(cache_prepared_track(server, video_id))
+        except Exception:
+            pending.set_result(False)
         finally:
-            pending.set_result(stored)
             with server.stream_info_lock:
                 server.stream_info_inflight.pop(key, None)
-                # Avoid retry storms, but do not permanently lose capture
-                # persistence after a transient upload/transport failure.
-                server.stream_info_cache[retry_key] = {
-                    'expires_at': time.time() + (300 if stored else 30),
-                    'payload': {},
-                }
-                for old in list(server.stream_info_cache):
-                    if (old.startswith('capture_retry:')
-                            and server.stream_info_cache[old]['expires_at'] <= time.time()):
-                        server.stream_info_cache.pop(old, None)
-            _capture_cache_slots.release()
     try:
-        server.stream_warm_executor.submit(store)
+        server.stream_warm_executor.submit(repair)
     except Exception:
-        pending.set_result(False)
         with server.stream_info_lock:
             server.stream_info_inflight.pop(key, None)
-        _capture_cache_slots.release()
+
 
 _STREAM_RESOLUTION_NAMESPACE = "playback_stream_resolution"
 _STREAM_RESOLUTION_MODEL = "youtube"
@@ -170,16 +380,11 @@ def _load_persisted_stream_info(server: Any, video_id: str):
         if (
             expires_at <= time.time() + _STREAM_RESOLUTION_EXPIRY_MARGIN_SECONDS
             or not isinstance(stream_info, dict)
+            or stream_info.get('compatibility')
             or not str(stream_info.get("url") or "").startswith(("http://", "https://"))
         ):
-            connection.execute(
-                """
-                DELETE FROM recommendation_feature_store
-                WHERE namespace = ? AND entity_id = ?
-                """,
-                (_STREAM_RESOLUTION_NAMESPACE, video_id),
-            )
-            connection.commit()
+            # Expired records are ignored on reads. A successful asynchronous
+            # upsert replaces them; a cache miss must never acquire the writer.
             return None
         payload = dict(stream_info)
         payload["expires_at"] = expires_at
@@ -196,6 +401,8 @@ def _persist_stream_info(
     video_id: str,
     payload: dict,
     expires_at: float,
+    *,
+    resolved_at: float | None = None,
 ) -> None:
     from ..recommend.store_runtime import (
         open_recommendation_store_connection_without_init,
@@ -218,6 +425,7 @@ def _persist_stream_info(
                 model_id = excluded.model_id,
                 payload_json = excluded.payload_json,
                 updated_at = excluded.updated_at
+            WHERE recommendation_feature_store.updated_at <= excluded.updated_at
             """,
             (
                 _STREAM_RESOLUTION_NAMESPACE,
@@ -231,7 +439,7 @@ def _persist_stream_info(
                     ensure_ascii=True,
                     separators=(",", ":"),
                 ),
-                time.time(),
+                time.time() if resolved_at is None else resolved_at,
             ),
         )
         connection.commit()
@@ -243,6 +451,10 @@ def _persist_stream_info(
 
 
 def _delete_persisted_stream_info(server: Any, video_id: str) -> None:
+    _defer_stream_store(server, _delete_stream_info_before, video_id, time.time())
+
+
+def _delete_stream_info_before(server: Any, video_id: str, cutoff: float) -> None:
     from ..recommend.store_runtime import (
         open_recommendation_store_connection_without_init,
     )
@@ -253,9 +465,9 @@ def _delete_persisted_stream_info(server: Any, video_id: str) -> None:
         connection.execute(
             """
             DELETE FROM recommendation_feature_store
-            WHERE namespace = ? AND entity_id = ?
+            WHERE namespace = ? AND entity_id = ? AND updated_at < ?
             """,
-            (_STREAM_RESOLUTION_NAMESPACE, video_id),
+            (_STREAM_RESOLUTION_NAMESPACE, video_id, cutoff),
         )
         connection.commit()
     except Exception:
@@ -287,6 +499,8 @@ def _get_stream_failure(server: Any, video_id: str):
 
 def _store_stream_failure(server: Any, video_id: str, exc: Exception) -> dict:
     payload = _stream_failure_payload(exc)
+    if payload['code'] == 'preparation_busy':
+        return payload  # Capacity pressure is not a bad source or a cooldown.
     with server.stream_failure_lock:
         server.stream_failure_cache[video_id] = payload
     return payload
@@ -298,24 +512,51 @@ def _clear_stream_failure(server: Any, video_id: str) -> None:
 
 
 class _QuietYtDlpLogger:
-    """yt-dlp failures are summarized by the caller, not printed per video."""
+    """Keep fixed failure categories, never provider messages or credentials."""
 
-    def debug(self, _message: str) -> None:
-        return None
+    def __init__(self):
+        self.flags = set()
+        self.request_headers_ms = {}
+        self.stages_ms = {}
 
-    def warning(self, _message: str) -> None:
-        return None
+    def debug(self, message: str) -> None:
+        self.warning(message)
 
-    def error(self, _message: str) -> None:
-        return None
+    def warning(self, message: str) -> None:
+        text = str(message).casefold()
+        for code, phrases in {
+            'signature_failure': ('signature extraction failed', 'signature solving failed'),
+            'n_challenge_failure': ('n challenge solving failed', 'nsig extraction failed'),
+            'cookies_invalid': ('cookies are no longer valid', 'cookies have been invalidated'),
+            'sign_in_required': ('sign in to confirm', 'login required'),
+            'token_missing': ('po token is not provided', 'missing a po token'),
+            'token_failed': ('failed to fetch po token', 'failed to generate po token'),
+        }.items():
+            if any(phrase in text for phrase in phrases):
+                self.flags.add(code)
+
+    def error(self, message: str) -> None:
+        self.warning(message)
 
 
 def _ytdlp_opts(server: Any) -> dict:
+    client = os.environ.get('NEATIE_DIRECT_CLIENT', 'web_music').lower()
+    if client not in {'web_music', 'mweb'}:
+        client = 'web_music'
     opts = {
-        "format": "bestaudio[acodec!=none]/best[acodec!=none]/best",
+        "format": "bestaudio[ext=m4a][protocol=https]/bestaudio[protocol=https]",
         "quiet": True,
         "no_warnings": True,
         "logger": _QuietYtDlpLogger(),
+        "socket_timeout": 8,
+        "extractor_retries": 1,
+        "neatie_fast_acquisition": str(getattr(server, 'NEATIE_FAST_ACQUISITION',
+            os.environ.get('NEATIE_FAST_ACQUISITION', '0'))).lower() in {'1', 'true'},
+        "extractor_args": {"youtube": {
+            "player_client": [client],
+            "skip": ["hls", "dash", "translated_subs"],
+            "player_skip": ["configs", "initial_data"],
+        }},
     }
     js_runtime = str(
         getattr(server, "AURALIS_YTDLP_JS_RUNTIME", "node") or "node"
@@ -336,10 +577,6 @@ def _ytdlp_opts(server: Any) -> dict:
     ).strip().rstrip("/")
     if provider_url:
         extractor_args = opts.setdefault("extractor_args", {})
-        extractor_args.setdefault("youtube", {})["player_client"] = [
-            "mweb",
-            "web_safari",
-        ]
         extractor_args["youtubepot-bgutilhttp"] = {
             "base_url": [provider_url],
         }
@@ -363,17 +600,16 @@ def stream_failure_diagnostics(exc: Exception) -> dict:
     status = getattr(getattr(exc, "response", None), "status_code", None)
     if isinstance(status, int) and 400 <= status <= 599:
         diagnostics["http_status"] = status
+    flags = getattr(exc, '_auralis_extractor_flags', None)
+    if flags:
+        diagnostics['extractor_flags'] = sorted(flags)
     return diagnostics
 
 
 @contextmanager
-def _ytdlp_extractor(options: dict):
-    # cookiefile enables save-back on YoutubeDL.close. Deployment credentials
-    # are read-only; each extractor instead owns a fresh, memory-only jar.
-    options = dict(options)
-    cookie_path = options.pop("cookiefile", None)
-    try:
-        with yt_dlp.YoutubeDL(options) as ydl:
+def _new_ytdlp(options, cookie_path, fast, refresh_bootstrap):
+    # A mounted master jar is never assigned to YoutubeDL's save-back owner.
+    with yt_dlp.YoutubeDL(options) as ydl:
             if cookie_path:
                 try:
                     cookies = YoutubeDLCookieJar(cookie_path)
@@ -383,15 +619,81 @@ def _ytdlp_extractor(options: dict):
                 except Exception as exc:
                     _mark_failure_stage(exc, "cookie_load")
                     raise
+            if fast:
+                from .youtube_acquisition import install_direct_extractor
+                install_direct_extractor(ydl, refresh=refresh_bootstrap)
+            ydl._neatie_extractor_reused = False
+            logger = options.get('logger')
+            if isinstance(logger, _QuietYtDlpLogger):
+                original_open = ydl.urlopen
+                def timed_open(request):
+                    logger = ydl.params.get('logger')
+                    path = urllib.parse.urlsplit(getattr(request, 'url', '')).path
+                    stage = ('token' if path == '/get_pot' else
+                             'player' if path.endswith('/player') else
+                             'watch' if path == '/watch' else
+                             'player_script' if path.endswith('.js') else 'other')
+                    started = time.perf_counter()
+                    if path == '/get_pot':
+                        request.extensions['timeout'] = 8
+                    try:
+                        return original_open(request)
+                    finally:
+                        if isinstance(logger, _QuietYtDlpLogger):
+                            logger.request_headers_ms[stage] = logger.request_headers_ms.get(stage, 0) + round(
+                                (time.perf_counter()-started)*1000)
+                ydl.urlopen = timed_open
+            yield ydl
+
+
+@contextmanager
+def _ytdlp_extractor(options: dict):
+    options = dict(options)
+    cookie_path = options.pop('cookiefile', None)
+    fast = options.pop('neatie_fast_acquisition', False)
+    refresh_bootstrap = options.pop('neatie_refresh_bootstrap', False)
+    background = _background_acquisition.get()
+    logger = options.get('logger')
+    admitted_at = time.perf_counter()
+    reserved = background and _direct_background_slots.acquire(blocking=False)
+    if background and not reserved:
+        raise RuntimeError('audio_resolver_busy')
+    admitted = _direct_extraction_slots.acquire(timeout=2 if not background else 0)
+    if not admitted:
+        if reserved:
+            _direct_background_slots.release()
+        raise RuntimeError('audio_resolver_busy')
+    if isinstance(logger, _QuietYtDlpLogger):
+        logger.stages_ms['slot_wait'] = round((time.perf_counter()-admitted_at)*1000)
+    try:
+        def factory():
+            return _new_ytdlp(options, cookie_path, fast, refresh_bootstrap)
+        if fast and os.environ.get('NEATIE_DIRECT_POOL', '0') == '1':
+            from .youtube_acquisition import reuse_extractor
+            manager = reuse_extractor(factory, options, cookie_path, refresh=refresh_bootstrap)
+        else:
+            manager = factory()
+        setup_at = time.perf_counter()
+        with manager as ydl:
+            if isinstance(logger, _QuietYtDlpLogger):
+                logger.stages_ms['setup'] = round((time.perf_counter()-setup_at)*1000)
             yield ydl
     except Exception as exc:
         _mark_failure_stage(exc, "extraction")
+        logger = options.get('logger')
+        if isinstance(logger, _QuietYtDlpLogger):
+            exc._auralis_extractor_flags = tuple(logger.flags)
         raise
+    finally:
+        _direct_extraction_slots.release()
+        if reserved:
+            _direct_background_slots.release()
 
 
-def extract_stream_info(server: Any, video_id: str):
+def extract_stream_info(server: Any, video_id: str, refresh_bootstrap=False):
     url = f"https://www.youtube.com/watch?v={video_id}"
     ydl_opts = _ytdlp_opts(server)
+    ydl_opts['neatie_refresh_bootstrap'] = refresh_bootstrap
     try:
         with _ytdlp_extractor(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -411,6 +713,8 @@ def extract_stream_info(server: Any, video_id: str):
             if isinstance(entry, dict)
             and entry.get("url")
             and str(entry.get("acodec") or "none").lower() != "none"
+            and str(entry.get("vcodec") or "none").lower() == "none"
+            and entry.get('protocol') in {None, '', 'http', 'https'}
         ]
         if not formats:
             raise exc
@@ -453,6 +757,13 @@ def extract_stream_info(server: Any, video_id: str):
         "mime_type": selected.get("ext") or selected.get("acodec") or "audio/mp4",
         "protocol": selected.get("protocol") or (info or {}).get("protocol"),
         "duration": selected.get("duration") or (info or {}).get("duration") or 0,
+        "extraction_request_headers_ms": dict(ydl_opts['logger'].request_headers_ms),
+        "extraction_stages_ms": dict(ydl_opts['logger'].stages_ms),
+        "extractor_flags": sorted(ydl_opts['logger'].flags),
+        "acquisition_path": 'direct_fast' if getattr(ydl, '_neatie_fast_acquisition', False) is True else 'direct_standard',
+        "session_bootstrap_reused": getattr(ydl, '_neatie_bootstrap_reused', False) is True,
+        "extractor_reused": getattr(ydl, '_neatie_extractor_reused', False) is True,
+        "direct_client": ydl_opts['extractor_args']['youtube']['player_client'][0],
     }
 
 
@@ -461,7 +772,13 @@ def validate_stream_info(server: Any, video_id: str, stream_info: dict) -> dict:
     if stream_info.get("protocol") not in {None, "", "http", "https"}:
         raise RuntimeError("Requested format is not available: direct audio required")
     headers = dict(stream_info.get("headers") or {})
-    headers["range"] = "bytes=0-0"
+    combined = (os.environ.get('NEATIE_COLD_COMBINED_READ', '1') != '0'
+                and not stream_info.get('compatibility'))
+    retained = combined and not _background_acquisition.get() and os.environ.get('NEATIE_RETAIN_STARTUP_READ', '0') == '1'
+    request_last = 1048575 if retained else 65535
+    headers['Accept-Encoding'] = 'identity'
+    headers["range"] = f'bytes=0-{request_last}' if combined else 'bytes=0-0'
+    kept = False
     try:
         response = server.upstream_http.get(
             stream_info["url"],
@@ -474,26 +791,62 @@ def validate_stream_info(server: Any, video_id: str, stream_info: dict) -> dict:
         raise
     try:
         response.raise_for_status()
-        first_chunk = next(
-            (chunk for chunk in response.iter_content(chunk_size=1) if chunk),
-            b"",
-        )
-        if not first_chunk:
-            raise RuntimeError("stream_preflight_empty")
         content_type = str(response.headers.get("content-type") or "").casefold()
         if "mpegurl" in content_type or "dash+xml" in content_type:
             raise RuntimeError("Requested format is not available: playlist is not audio")
         if content_type.startswith(("text/", "application/json")):
             raise RuntimeError(f"stream_preflight_invalid_content_type:{content_type}")
         validated = dict(stream_info)
+        if content_type:
+            validated['mime_type'] = content_type.split(';')[0]
         validated["validated_at"] = time.time()
         validated["validation_video_id"] = video_id
+        if combined:
+            match = re.fullmatch(r'bytes (\d+)-(\d+)/(\d+)', response.headers.get('content-range', ''))
+            if response.status_code != 206 or not match or int(match[1]) != 0:
+                raise ValueError('Combined preflight did not honor the byte range')
+            total, last = int(match[3]), int(match[2])
+            if total <= 0 or last != min(request_last, total-1):
+                raise ValueError('Combined preflight returned an invalid audio range')
+            declared = response.headers.get('content-length')
+            if declared is not None and int(declared) != last+1:
+                raise ValueError('Combined preflight returned an invalid content length')
+            if response.headers.get('content-encoding', 'identity').lower() != 'identity':
+                raise ValueError('Combined preflight changed the byte encoding')
+            pieces, received = [], 0
+            target = min(65536, total)
+            chunks = iter(response.iter_content(chunk_size=65536))
+            for chunk in chunks:
+                if not chunk:
+                    continue
+                received += len(chunk)
+                if received > target:
+                    raise ValueError('Combined preflight exceeded the byte range')
+                pieces.append(chunk)
+                if retained and received == target:
+                    break
+            first_chunk = b''.join(pieces)
+            if received != target:
+                raise ValueError('Combined preflight returned incomplete audio')
+            store_stream_chunk(server, video_id, {'bytes': first_chunk,
+                'content_type': content_type.split(';')[0], 'total_length': total,
+                'representation_key': stream_representation_key(validated),
+                'etag': response.headers.get('etag'), 'compatibility': None})
+            if retained and last+1 > received:
+                _keep_initial_read(server, video_id, validated, response, chunks, received,
+                    last, total, content_type.split(';')[0], response.headers.get('etag'))
+                kept = True
+        else:
+            first_chunk = next((chunk for chunk in response.iter_content(chunk_size=1) if chunk), b'')
+            if not first_chunk:
+                raise RuntimeError('stream_preflight_empty')
         return validated
     except Exception as exc:
         _mark_failure_stage(exc, "media_preflight")
         raise
     finally:
-        response.close()
+        if not kept:
+            response.close()
 
 
 def is_stream_info_cached(server: Any, video_id: str):
@@ -869,6 +1222,8 @@ def prepare_stream_track(
     stream_cache_meta = stream_cache.head(video_id)
     stream_cache_head_ms = int((time.perf_counter() - stream_cache_head_start) * 1000)
     if stream_cache_meta:
+        if stream_cache.backend_name == 'r2':
+            schedule_cached_audio_repair(server, video_id, stream_cache_meta)
         prefix = None
         prefix_started = time.perf_counter()
         if stream_cache.backend_name == 'r2':
@@ -877,9 +1232,13 @@ def prepare_stream_track(
             except Exception:
                 pass  # A prefix miss is not proof that startup bytes exist.
         content_length = int(stream_cache_meta.get("content_length") or 0)
+        cache_path = ''
+        if stream_cache.backend_name == 'r2' and isinstance(stream_cache_meta.get('key'), str):
+            variant = 'seek-v1' if stream_cache_meta['key'].endswith('.seek-v1') else 'legacy'
+            cache_path = f'/playback/stream/{video_id}?resolve=1&source_id={video_id}&cache_variant={variant}'
         metrics = {
             "prepared": True,
-            "playback_path": "",
+            "playback_path": cache_path,
             "playback_url": "",
             "source_kind": f"{stream_cache.backend_name}_proxy",
             "cache_tier": "r2_full" if stream_cache.backend_name == "r2" else "local_full",
@@ -887,7 +1246,10 @@ def prepare_stream_track(
             "mime_type": stream_cache_meta.get("content_type") or "audio/mp4",
             "content_length": content_length,
             "range_supported": True,
-            "expires_at": time.time() + min(getattr(server, 'STREAM_CHUNK_TTL_SECONDS', 300), 300),
+            # Prefix bytes may expire; this immutable cached resource does not
+            # inherit the upstream URL/prefix lease. Availability is checked at
+            # read time and sessions still pin key, ETag, type and length.
+            "expires_at": time.time() + 12 * 60 * 60,
             "r2_cache_hit": bool(stream_cache.backend_name == "r2"),
             "resolve_cache_hit": False,
             "chunk_cache_hit": prefix is not None,
@@ -985,6 +1347,9 @@ def prepare_stream_track_safely(server: Any, video_id: str, target_chunk_bytes: 
 
 
 def classify_stream_failure(exc: Exception):
+    if str(exc) == 'audio_resolver_busy':
+        return {'code':'preparation_busy','message':'Audio preparation capacity is busy',
+                'status_code':503}
     if isinstance(exc, TimeoutError):
         return {"code": "preparation_timeout", "message": "Audio preparation timed out",
                 "status_code": 504}
@@ -1107,11 +1472,10 @@ def selected_stream_info(server: Any, video_id: str, session: str = ''):
 
 
 def get_stream_info(server: Any, video_id: str, *, background=False, session=''):
-    if not os.environ.get('AURALIS_BROWSER_AUDIO_URL', '').strip():
-        return _resolve_stream_info(server, video_id, background=background)
     selected = selected_stream_info(server, video_id, session)
     if selected is not None:
-        _cache_capture(server, video_id, selected)
+        if selected.get('compatibility'):
+            raise PlaybackSourceExpired('Browser capture has been retired; start playback again')
         return selected
     key = f'selected:{session}:{video_id}'
     with server.stream_info_lock:
@@ -1127,24 +1491,13 @@ def get_stream_info(server: Any, video_id: str, *, background=False, session='')
         if payload is None and session:
             payload = selected_stream_info(server, video_id)
             if payload is not None and payload.get('compatibility'):
-                try:
-                    payload = validate_stream_info(server, video_id, payload)
-                except Exception:
-                    with server.stream_info_lock:
-                        server.stream_info_cache.pop(f'selected::{video_id}', None)
-                    payload = None
+                payload = None
             if payload is not None:
                 print(f'[EBB:stream] video={video_id} event=prepared_source_reused')
         if payload is None:
             payload = _resolve_stream_info(server, video_id, background=background,
                                            priority=0 if session else (2 if background else 1))
         payload = {**payload, 'pinned': bool(session)}
-        if session and payload.get('compatibility'):
-            parts = urllib.parse.urlsplit(payload['url'])
-            query = dict(urllib.parse.parse_qsl(parts.query))
-            query.pop('background', None)
-            query.pop('priority', None)
-            payload['url'] = urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
         with server.stream_info_lock:
             keys = [k for k in server.stream_info_cache if k.startswith('selected:')]
             for old in keys[:-255]:
@@ -1154,7 +1507,6 @@ def get_stream_info(server: Any, video_id: str, *, background=False, session='')
                 'expires_at': float(payload.get('expires_at') or time.time()+1200),
             }
         pending.set_result(payload)
-        _cache_capture(server, video_id, payload)
         return payload
     except Exception as exc:
         pending.set_exception(exc)
@@ -1165,26 +1517,13 @@ def get_stream_info(server: Any, video_id: str, *, background=False, session='')
 
 
 def _resolve_stream_info(server: Any, video_id: str, *, background=False, priority=0):
-    if not background and os.environ.get('AURALIS_BROWSER_AUDIO_URL', '').strip():
-        from .browser_compat import race_primary, resolve_browser_audio
-        failure = _get_stream_failure(server, video_id)
-        if failure and failure.get('code') in {'source_blocked', 'format_unavailable'}:
-            fallback = resolve_browser_audio(video_id, failure['code'], priority=priority)
-            if fallback is None:
-                raise RuntimeError(failure['code'])
-            return fallback
-        return race_primary(lambda: _get_primary_stream_info(server, video_id),
-                            lambda: resolve_browser_audio(video_id, 'slow_primary', priority=priority))
+    # Playback and speculative preparation share direct acquisition only.
+    # Never open an authenticated browser player as a recovery transport.
+    token = _background_acquisition.set(background)
     try:
         return _get_primary_stream_info(server, video_id)
-    except Exception as exc:
-        from .browser_compat import resolve_browser_audio
-        failure = _get_stream_failure(server, video_id) or classify_stream_failure(exc)
-        fallback = (resolve_browser_audio(video_id, failure.get('code'), background=True)
-                    if background else resolve_browser_audio(video_id, failure.get('code'), priority=priority))
-        if fallback is not None:
-            return fallback
-        raise
+    finally:
+        _background_acquisition.reset(token)
 
 
 def _get_primary_stream_info(server: Any, video_id: str):
@@ -1208,34 +1547,52 @@ def _get_primary_stream_info(server: Any, video_id: str):
     if not should_extract:
         return pending.result(timeout=25)
 
+    timings = {}
+    def measured(name, fn, *args):
+        started = time.perf_counter()
+        try:
+            return fn(*args)
+        finally:
+            timings[name] = timings.get(name, 0) + int((time.perf_counter()-started)*1000)
+    def fresh_resolution():
+        info = measured('extraction', extract_stream_info, server, video_id)
+        try:
+            return measured('validation', validate_stream_info, server, video_id, info)
+        except Exception as exc:
+            status = getattr(getattr(exc, 'response', None), 'status_code', None)
+            if info.get('acquisition_path') != 'direct_fast' or status not in {401, 403}:
+                raise
+            # A stale session must not poison the source for fifteen minutes.
+            # Retry one fresh context only before any media is published.
+            return measured('validation', validate_stream_info, server, video_id,
+                measured('extraction', extract_stream_info, server, video_id, True))
     try:
-        persisted = _load_persisted_stream_info(server, video_id)
+        persisted = measured('persisted_lookup', _load_persisted_stream_info, server, video_id)
         if persisted is not None:
             payload, expires_at = persisted
             try:
-                payload = validate_stream_info(server, video_id, payload)
+                payload = measured('validation', validate_stream_info, server, video_id, payload)
             except Exception:
                 _delete_persisted_stream_info(server, video_id)
-                payload = validate_stream_info(
-                    server,
-                    video_id,
-                    extract_stream_info(server, video_id),
-                )
+                payload = fresh_resolution()
                 expires_at, should_persist = _resolved_stream_expiry(server, payload)
                 payload["expires_at"] = expires_at
                 if should_persist:
-                    _persist_stream_info(server, video_id, payload, expires_at)
+                    _defer_stream_store(server, _persist_stream_info, video_id, payload, expires_at, resolved_at=now)
         else:
-            payload = validate_stream_info(
-                server,
-                video_id,
-                extract_stream_info(server, video_id),
-            )
+            payload = fresh_resolution()
             expires_at, should_persist = _resolved_stream_expiry(server, payload)
             payload = dict(payload)
             payload["expires_at"] = expires_at
             if should_persist:
-                _persist_stream_info(server, video_id, payload, expires_at)
+                _defer_stream_store(server, _persist_stream_info, video_id, payload, expires_at, resolved_at=now)
+        payload = {**payload, 'resolution_timings_ms': timings}
+        print(f'[EBB:resolution] track={video_id} extractionMs={timings.get("extraction", 0)} '
+              f'validationMs={timings.get("validation", 0)} persistedMs={timings.get("persisted_lookup", 0)} '
+              f'client={payload.get("direct_client", "web_music")} poolReused={int(payload.get("extractor_reused") is True)} '
+              f'headersMs={json.dumps(payload.get("extraction_request_headers_ms", {}), separators=(",", ":"))} '
+              f'stagesMs={json.dumps(payload.get("extraction_stages_ms", {}), separators=(",", ":"))} '
+              f'flags={",".join(payload.get("extractor_flags", [])) or "none"}', flush=True)
         _clear_stream_failure(server, video_id)
         with server.stream_info_lock:
             server.stream_info_cache[video_id] = {

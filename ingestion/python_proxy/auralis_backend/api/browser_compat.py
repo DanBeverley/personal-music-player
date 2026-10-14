@@ -9,28 +9,39 @@ from threading import BoundedSemaphore
 
 _workers = ThreadPoolExecutor(max_workers=4, thread_name_prefix='audio-resolve')
 _capacity = BoundedSemaphore(4)
+_upcoming_capacity = BoundedSemaphore(2)
 
 
-def _submit(work):
+def _submit(work, *, priority=0):
+    upcoming = priority > 0
+    if upcoming and not _upcoming_capacity.acquire(blocking=False):
+        return None
     if not _capacity.acquire(blocking=False):
+        if upcoming:
+            _upcoming_capacity.release()
         return None
     try:
         future = _workers.submit(work)
     except BaseException:
         _capacity.release()
+        if upcoming:
+            _upcoming_capacity.release()
         raise
-    future.add_done_callback(lambda _: _capacity.release())
+    def release(_):
+        _capacity.release()
+        if upcoming:
+            _upcoming_capacity.release()
+    future.add_done_callback(release)
     return future
 
 
-def race_primary(primary, alternate, delay=1.0):
+def race_primary(primary, alternate, delay=1.0, *, priority=0):
     """Bounded hedge: return the first validated source, never queue extra work."""
-    first = _submit(primary)
+    first = _submit(primary, priority=priority)
     if first is None:
-        try:
-            return primary()
-        except Exception:
-            return alternate()
+        # Preparation cannot bypass admission by running extraction in the
+        # caller. Keep two slots available for a selected track and its hedge.
+        raise RuntimeError('audio_resolver_busy')
     deadline = time.monotonic() + 80
     error = None
     try:
@@ -39,9 +50,17 @@ def race_primary(primary, alternate, delay=1.0):
         pass
     except Exception as exc:
         error = exc
-    second = _submit(alternate)
+    second = _submit(alternate, priority=priority)
     if second is None:
-        return first.result(timeout=80)
+        try:
+            return first.result(timeout=max(0, deadline-time.monotonic()))
+        except Exception:
+            # The primary has released its slot. A failed preparation still
+            # gets its compatibility attempt, without unbounded caller work.
+            second = _submit(alternate, priority=priority)
+            if second is None:
+                raise
+            return second.result(timeout=max(0, deadline-time.monotonic()))
     pending = {first, second}
     try:
         while pending:

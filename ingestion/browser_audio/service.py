@@ -109,7 +109,9 @@ async def capture_slot(job):
         # Reclaim only an unpublished speculative capture. Once a URL or
         # bytes have escaped, its representation remains pinned to completion.
         def available():
-            if (sum(j.running for j in jobs.values()) >= 2 and rank(job) < 2
+            preparation_occupied = any(j.running and rank(j) > 0 for j in jobs.values())
+            if ((sum(j.running for j in jobs.values()) >= 2
+                    or rank(job) > 0 and preparation_occupied) and rank(job) < 2
                     and not any(j.running and j.preempted for j in jobs.values())):
                 victims = [j for j in jobs.values() if j.running and
                            rank(j) > rank(job) and not j.published and
@@ -121,7 +123,9 @@ async def capture_slot(job):
             return (sum(j.running for j in jobs.values()) < 2 and
                 not any(not j.running and not j.done and not j.error and rank(j) < rank(job)
                         for j in jobs.values() if j is not job) and
-                (rank(job) < 2 or not any(j.running and rank(j) == 2 for j in jobs.values())))
+                # Published preparation cannot be safely cancelled. Reserve
+                # one physical browser slot for selected playback instead.
+                (rank(job) == 0 or not preparation_occupied))
         await slots.wait_for(available)
         job.running = True
         job.started = time.monotonic()

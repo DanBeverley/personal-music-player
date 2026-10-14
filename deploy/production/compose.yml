@@ -52,12 +52,20 @@ services:
 
   api:
     <<: *backend-common
+    mem_limit: 1536m
     environment:
       AURALIS_RUNTIME_DIR: /var/lib/neatie/runtime
       AURALIS_PROXY_RUNTIME_DIR: /var/lib/neatie/runtime
       PORT: "8000"
       AURALIS_YTDLP_JS_RUNTIME: node
       AURALIS_YTDLP_PO_PROVIDER_URL: http://pot-provider:4416
+      NEATIE_FAST_ACQUISITION: "1"
+      NEATIE_DIRECT_CLIENT: mweb
+      NEATIE_DIRECT_POOL: "1"
+      NEATIE_DIRECT_CONTEXT_TTL: "900"
+      NEATIE_RETAIN_STARTUP_READ: "1"
+      NEATIE_PLAYBACK_STARTUP: "1"
+      NODE_OPTIONS: "--max-old-space-size=384"
       RECOMMENDATION_ENABLE_SCHEDULER: "0"
       RECOMMENDATION_EXTERNAL_WORKER: "1"
     healthcheck:
@@ -79,12 +87,18 @@ services:
 
   recommendation-worker:
     <<: *backend-common
+    mem_limit: 3g
     command: ["python", "worker_main.py"]
     environment:
       AURALIS_RUNTIME_DIR: /var/lib/neatie/runtime
       AURALIS_PROXY_RUNTIME_DIR: /var/lib/neatie/runtime
       AURALIS_YTDLP_JS_RUNTIME: node
       AURALIS_YTDLP_PO_PROVIDER_URL: http://pot-provider:4416
+      NEATIE_FAST_ACQUISITION: "1"
+      NEATIE_DIRECT_CLIENT: mweb
+      NEATIE_DIRECT_POOL: "1"
+      NEATIE_DIRECT_CONTEXT_TTL: "900"
+      NODE_OPTIONS: "--max-old-space-size=384"
       RECOMMENDATION_ENABLE_SCHEDULER: "1"
       RECOMMENDATION_EXTERNAL_WORKER: "1"
     depends_on:

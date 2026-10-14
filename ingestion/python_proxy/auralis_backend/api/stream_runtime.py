@@ -5,6 +5,7 @@ import os
 import re
 import time
 import urllib.parse
+import uuid
 from typing import Any
 
 import yt_dlp
@@ -28,6 +29,7 @@ from .stream_core_runtime import (
     get_stream_info,
     selected_stream_info,
     iter_upstream_stream,
+    iter_initial_read,
     open_upstream_stream,
     parse_byte_range,
     prepare_streams_with_failures,
@@ -263,10 +265,11 @@ def prepare_playback_tracks(
                 metrics = retry_prepared.get(source_id)
                 failure = retry_failed.get(source_id)
             if metrics is not None:
+                path = metrics.get('playback_path') or _playback_path(track_key)
                 resolved = {
                     **dict(metrics),
-                    "playback_path": _playback_path(track_key),
-                    "playback_url": _playback_path(track_key),
+                    "playback_path": path,
+                    "playback_url": path,
                     "provider": "youtube",
                     "source_id": source_id,
                     "source_kind": "youtube_proxy",
@@ -378,14 +381,21 @@ def stream_audio(server: Any, video_id: str):
 
 def proxy_stream(server: Any, video_id: str, request: Request):
     started = time.perf_counter()
+    request_id = uuid.uuid4().hex[:12]
     session = request.query_params.get('playback_session', '')
     session = session if re.fullmatch(r'[A-Za-z0-9_-]{1,80}', session) else 'legacy'
     try:
         response = _proxy_stream(server, video_id, request)
     except Exception as exc:
-        print(f'[EBB:playback] track={video_id} session={session} result=failed '
+        print(f'[EBB:playback] track={video_id} session={session} request={request_id} result=failed '
               f'error={type(exc).__name__} ms={int((time.perf_counter()-started)*1000)}')
         raise
+    handler_ms = int((time.perf_counter()-started)*1000)
+    response.headers['Server-Timing'] = f'handler;dur={handler_ms}'
+    response.headers['Timing-Allow-Origin'] = '*'
+    response.headers['X-Neatie-Playback-Request'] = request_id
+    print(f'[EBB:playback-start] request={request_id} handlerMs={handler_ms} '
+          f'status={response.status_code} source={response.headers.get("X-Auralis-Stream-Cache", "upstream")}', flush=True)
     iterator = response.body_iterator
     async def measured():
         sent = 0
@@ -395,6 +405,7 @@ def proxy_stream(server: Any, video_id: str, request: Request):
             async for chunk in iterator:
                 if first_ms is None:
                     first_ms = int((time.perf_counter()-started)*1000)
+                    print(f'[EBB:playback-first] request={request_id} firstMs={first_ms} bytes={len(chunk)}', flush=True)
                 sent += len(chunk)
                 yield chunk
             result = 'complete'
@@ -405,7 +416,7 @@ def proxy_stream(server: Any, video_id: str, request: Request):
             # Suppress successful probe requests; keep failures and full transfers.
             if sent > 65536 or result not in {'complete', 'cancelled'} or os.environ.get('AURALIS_PLAYBACK_VERBOSE') == '1':
                 source = response.headers.get('X-Auralis-Stream-Cache', 'upstream')
-                print(f'[EBB:playback] track={video_id} session={session} source={source} '
+                print(f'[EBB:playback] track={video_id} session={session} request={request_id} source={source} '
                       f'firstMs={first_ms} ms={int((time.perf_counter()-started)*1000)} '
                       f'bytes={sent} result={result}', flush=True)
     response.body_iterator = measured()
@@ -421,9 +432,26 @@ def _proxy_stream(server: Any, video_id: str, request: Request):
         # Only an active play session may keep us on an upstream representation.
         # Legacy resolver/preparation entries must not bypass completed audio.
         selected = selected_stream_info(server, video_id, session) if session else None
+        if selected and selected.get('compatibility'):
+            raise PlaybackSourceExpired('Browser capture has been retired; start playback again')
         stream_cache = get_stream_cache(server)
-        stream_cache_meta = selected.get('cached_object') if selected else stream_cache.head(video_id)
+        variant = request.query_params.get('cache_variant', '')
+        if variant and variant not in {'legacy', 'seek-v1'}:
+            raise HTTPException(status_code=422, detail='Invalid cached representation')
+        stream_cache_meta = (selected.get('cached_object') if selected else
+            stream_cache.head_variant(video_id, variant) if variant and stream_cache.backend_name == 'r2'
+            else stream_cache.head(video_id))
+        if variant and not stream_cache_meta:
+            raise PlaybackSourceExpired('Cached playback resource is unavailable')
+        if selected and variant and stream_cache_meta:
+            actual_variant = ('seek-v1' if str(stream_cache_meta.get('key') or '').endswith('.seek-v1')
+                              else 'legacy')
+            if actual_variant != variant:
+                raise PlaybackSourceExpired('Cached playback representation changed')
         if stream_cache_meta:
+            if stream_cache.backend_name == 'r2':
+                from .stream_core_runtime import schedule_cached_audio_repair
+                schedule_cached_audio_repair(server, video_id, stream_cache_meta)
             total_length = int(stream_cache_meta.get("content_length") or 0) or None
             parsed_range = parse_byte_range(range_header, total_length)
             if range_header and parsed_range is None:
@@ -433,6 +461,12 @@ def _proxy_stream(server: Any, video_id: str, request: Request):
                 )
             start = parsed_range[0] if parsed_range else 0
             end = parsed_range[1] if parsed_range else None
+            if (session and not selected and not variant and start > 0
+                    and str(stream_cache_meta.get('key') or '').endswith('.seek-v1')):
+                # After a restart, an unversioned session may refer to the old
+                # file. Ask for a new resource instead of appending new-layout
+                # bytes. Prepared URLs explicitly bind their immutable variant.
+                raise PlaybackSourceExpired('Playback representation must be renewed')
             headers, status_code = cached_response_headers(
                 stream_cache_meta,
                 start=start,
@@ -532,15 +566,11 @@ def _proxy_stream(server: Any, video_id: str, request: Request):
                             return
                         # Yield the proven prefix before waiting for a network
                         # continuation. Every later range keeps this resource.
-                        yield from iter_upstream_stream(
+                        yield from iter_initial_read(
                             server,
                             video_id,
                             {**stream_info, 'pinned': True},
-                            start=upstream_start,
-                            end=end,
-                            expected_total_length=total_length,
-                            expected_content_type=str(content_type).split(';')[0],
-                            expected_etag=str(cached_chunk.get('etag') or ''),
+                            cached_chunk, upstream_start, end,
                         )
 
                     resp_headers = {"Accept-Ranges": "bytes", "X-Auralis-Stream-Cache": "prefix"}
@@ -566,7 +596,7 @@ def _proxy_stream(server: Any, video_id: str, request: Request):
                             video_id,
                             response_iter,
                             content_type=content_type,
-                            capture_duration=stream_info.get('duration', 0) if stream_info.get('compatibility') else None,
+                            capture_duration=stream_info.get('duration') or None,
                         )
 
                     return StreamingResponse(
@@ -609,7 +639,7 @@ def _proxy_stream(server: Any, video_id: str, request: Request):
                     video_id,
                     chunks,
                     content_type=stream_info.get("mime_type", "audio/mp4"),
-                    capture_duration=stream_info.get('duration', 0) if stream_info.get('compatibility') else None,
+                    capture_duration=stream_info.get('duration') or None,
                 )
                 return
             yield from chunks

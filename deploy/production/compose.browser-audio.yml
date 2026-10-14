@@ -1,17 +1,11 @@
-# Optional private compatibility transport; omit this overlay to disable it.
+# Capture service retained for rollback; direct acquisition owns playback.
 services:
   api:
     environment:
-      AURALIS_BROWSER_AUDIO_URL: http://browser-audio:8020
-    depends_on:
-      browser-audio:
-        condition: service_healthy
+      AURALIS_BROWSER_AUDIO_URL: ""
   recommendation-worker:
     environment:
-      AURALIS_BROWSER_AUDIO_URL: http://browser-audio:8020
-    depends_on:
-      browser-audio:
-        condition: service_healthy
+      AURALIS_BROWSER_AUDIO_URL: ""
   browser-audio:
     init: true
     build:

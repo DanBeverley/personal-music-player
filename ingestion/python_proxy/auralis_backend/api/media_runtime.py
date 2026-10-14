@@ -3,7 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from threading import Lock
+from threading import Lock, Condition, BoundedSemaphore, Event
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from fastapi import HTTPException
@@ -24,6 +25,203 @@ from ..storage.cache_runtime import (
 
 # Bounded striped locks coalesce a seed's requests without retaining futures.
 _related_locks = [Lock() for _ in range(32)]
+_lyrics_service_lock = Lock()
+
+# Queue work uses the existing stream/cache owner, not Home's durable jobs.
+# Plans are transient playback intent; downloaded assets remain reusable.
+_queue_cache_lock = Lock()
+_queue_cache_plans = {}
+_queue_cache_slots = BoundedSemaphore(2)
+# Coordinators must not occupy the warm executor while awaiting capture jobs
+# submitted to that same executor (including installations with one warm slot).
+_queue_cache_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='queue-plan')
+
+
+def _cache_queue_track(server, track_key, plan):
+    from .stream_runtime import playback_source_candidates
+    from .stream_core_runtime import cache_prepared_track, get_stream_info
+    from .stream_cache import get_stream_cache
+    with _queue_cache_slots:
+        if plan['cancel'].is_set() or time.monotonic() >= plan['until']:
+            return 'cancelled', 0
+        cache = get_stream_cache(server)
+        sources = playback_source_candidates(server, track_key)
+        for source in sources:
+            if source['provider'] == 'youtube':
+                head = cache.head(source['source_id'])
+                if head:
+                    if cache_prepared_track(server, source['source_id']):
+                        return 'cached', int(head.get('content_length') or 0)
+        from ..discovery.source_registry import youtube_background_resolution_blocked
+        if youtube_background_resolution_blocked(server):
+            return 'blocked', 0
+        for source in sources[:3]:
+            if source['provider'] != 'youtube':
+                continue
+            with plan['budget_lock']:
+                while plan['byte_limit'] <= plan['committed'] + plan['reserved'] and plan['reserved']:
+                    if plan['cancel'].is_set() or time.monotonic() >= plan['until']:
+                        return 'cancelled', 0
+                    plan['budget_lock'].wait(.2)
+                # Split reservations fairly across the two download slots.
+                allowance = min(80*1024*1024, max(1, plan['byte_limit']//2),
+                    plan['byte_limit'] - plan['committed'] - plan['reserved'])
+                if allowance <= 0:
+                    return 'budget', 0
+                plan['reserved'] += allowance
+            size = 0
+            try:
+                # Full caching needs source resolution, not another prefix job.
+                get_stream_info(server, source['source_id'], background=True)
+                if plan['cancel'].is_set():
+                    return 'cancelled', 0
+                if cache_prepared_track(server, source['source_id'], max_bytes=allowance):
+                    head = cache.head(source['source_id'])
+                    if head:
+                        size = int(head.get('content_length') or 0)
+                        if size > allowance:
+                            # A coalesced foreground download is already stored;
+                            # it did not spend this plan's reserved upload budget.
+                            size = 0
+                            return 'cached', 0
+                        return 'stored', size
+            except Exception:
+                continue
+            finally:
+                with plan['budget_lock']:
+                    plan['reserved'] -= allowance
+                    plan['committed'] += size
+                    plan['budget_lock'].notify_all()
+        return 'failed', 0
+
+
+def _run_queue_cache(server, plan):
+    # Select five *uncached* tracks. Existing assets do not consume batch slots.
+    # Failed tracks retry once after the rest of the queue, never gate neighbours.
+    try:
+        from .stream_runtime import playback_source_candidates_batch
+        from .stream_cache import get_stream_cache
+        cache = get_stream_cache(server)
+        if plan['cancel'].is_set() or time.monotonic() >= plan['until']:
+            plan['status'] = 'cancelled' if plan['cancel'].is_set() else 'expired'
+            return
+        if not cache.enabled:
+            plan['status'] = 'disabled'
+            return
+        sources = playback_source_candidates_batch(server, plan['tracks'])
+        remaining = []
+        for key in plan['tracks']:
+            if plan['cancel'].is_set():
+                break
+            cached = any(s['provider'] == 'youtube' and
+                         (head := cache.head(s['source_id'])) and
+                          head.get('metadata', {}).get('validated') == 'capture-v1' and
+                          head.get('metadata', {}).get('seek_index') == 'v1'
+                         for s in sources.get(key, []))
+            if cached:
+                plan['cached'] += 1
+            else:
+                remaining.append(key)
+        retried = False
+        retries = []
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix='queue-cache') as workers:
+            while remaining and not plan['cancel'].is_set() and time.monotonic() < plan['until']:
+                if plan['bytes'] >= plan['byte_limit']:
+                    plan['status'] = 'budget_reached'
+                    return
+                batch, remaining = remaining[:5], remaining[5:]
+                plan['batches'] += 1
+                futures = [workers.submit(_cache_queue_track, server, key, plan) for key in batch]
+                deferred = []
+                for key, future in zip(batch, futures):
+                    try:
+                        outcome, size = future.result()
+                    except Exception:
+                        outcome, size = 'failed', 0
+                    if outcome in {'stored', 'cached'}:
+                        plan['cached'] += 1
+                        if outcome == 'stored':
+                            plan['bytes'] += size
+                    elif outcome == 'blocked':
+                        deferred.append(key)
+                    elif outcome == 'budget':
+                        plan['status'] = 'budget_reached'
+                    elif outcome == 'failed':
+                        plan['failures'] += 1
+                        if not retried:
+                            retries.append(key)
+                if plan['status'] == 'budget_reached':
+                    return
+                if deferred:
+                    remaining = deferred + remaining
+                    plan['status'] = 'provider_backoff'
+                    if plan['cancel'].wait(30):
+                        break
+                    plan['status'] = 'running'
+                    continue
+                if not remaining and retries and not retried:
+                    # Interruptible wait; this is backend work, not an iOS timer.
+                    if plan['cancel'].wait(30):
+                        break
+                    remaining, retries, retried = retries, [], True
+        plan['status'] = 'cancelled' if plan['cancel'].is_set() else (
+            'expired' if time.monotonic() >= plan['until'] else
+            'complete' if plan['cached'] == len(plan['tracks']) else 'partial')
+    except Exception:
+        plan['status'] = 'failed'
+    finally:
+        plan['finished'] = time.monotonic()
+
+
+def queue_cache_session(server, req):
+    token = req.queue_cache_id
+    key = (id(getattr(server, 'raw', server)), token)
+    now = time.monotonic()
+    with _queue_cache_lock:
+        for old, value in list(_queue_cache_plans.items()):
+            if now >= value['until'] or (value.get('finished') and now-value['finished'] > 60):
+                value['cancel'].set()
+                _queue_cache_plans.pop(old)
+        previous = _queue_cache_plans.get(key)
+        if previous and req.queue_cache_revision <= previous['revision']:
+            return _queue_cache_result(previous)
+        if previous:
+            previous['cancel'].set()
+        active = sum(p['status'] in {'running', 'provider_backoff'} for p in _queue_cache_plans.values())
+        if not previous and active >= 8 and not req.cancel_queue_cache:
+            return {'status': 'success', 'queue_cache': {'status': 'capacity'}}
+        if len(_queue_cache_plans) >= 128 and not previous:
+            retired = next((k for k,p in _queue_cache_plans.items()
+                            if p['status'] not in {'running', 'provider_backoff'}), None)
+            if retired is None:
+                return {'status': 'success', 'queue_cache': {'status': 'capacity'}}
+            _queue_cache_plans.pop(retired)
+        if req.cancel_queue_cache:
+            # Retain a revision tombstone so a delayed older request cannot restart.
+            plan = dict(tracks=[], revision=req.queue_cache_revision, cancel=Event(),
+                until=now+1800, status='cancelled', cached=0, failures=0, batches=0,
+                bytes=0, byte_limit=0)
+            plan['cancel'].set()
+        else:
+            tracks = list(dict.fromkeys(k.strip() for k in req.track_keys if k.strip()))[:100]
+            plan = dict(tracks=tracks, revision=req.queue_cache_revision, cancel=Event(),
+                until=now+1800, status='running', cached=0, failures=0, batches=0,
+                bytes=0, byte_limit=int(getattr(server, 'QUEUE_CACHE_MAX_BYTES', 128*1024*1024)),
+                budget_lock=Condition(), reserved=0, committed=0)
+        _queue_cache_plans[key] = plan
+        if not req.cancel_queue_cache and plan['tracks']:
+            try:
+                _queue_cache_executor.submit(_run_queue_cache, server, plan)
+            except Exception:
+                plan['status'] = 'failed'
+        elif not req.cancel_queue_cache:
+            plan['status'] = 'complete'
+        return _queue_cache_result(plan)
+
+
+def _queue_cache_result(plan):
+    return {'status': 'success', 'queue_cache': {k: plan[k] for k in
+        ('status', 'revision', 'cached', 'failures', 'batches', 'bytes')}}
 
 
 def _related_watch(server: Any, source_id: str, depth: int):
@@ -99,21 +297,23 @@ class MediaService:
 
 def prepare_session(server: Any, req: Any):
     start_time = time.perf_counter()
+    if getattr(req, 'queue_cache_id', ''):
+        return queue_cache_session(server, req)
+    requested = req.track_keys
+    blocked = []
     if req.background:
         from ..discovery.source_registry import youtube_background_resolution_blocked
 
         if youtube_background_resolution_blocked(server):
-            return {
-                "status": "success",
-                "prepared": {},
-                "prepared_ids": [],
-                "failed": {},
-                "failed_ids": [],
-                "background_skipped": True,
-                "skip_reason": "youtube_temporarily_blocked",
-                "summary": summarize_prepare_metrics(server),
-                "server_ms": int((time.perf_counter() - start_time) * 1000),
-            }
+            from .stream_runtime import playback_source_candidates_batch
+            from .stream_cache import get_stream_cache
+            sources = playback_source_candidates_batch(server, requested)
+            cache = get_stream_cache(server)
+            allowed = [key for key in requested if any(
+                source['provider'] == 'audius' or cache.head(source['source_id'])
+                for source in sources.get(key, []))]
+            blocked = [key for key in requested if key not in allowed]
+            requested = allowed
     requested_limit = max(req.lookahead or len(req.track_keys), 1)
     if req.background:
         requested_limit = min(
@@ -125,12 +325,12 @@ def prepare_session(server: Any, req: Any):
 
     prepared, failed = prepare_playback_tracks(
         server,
-        req.track_keys,
+        requested,
         limit=limit,
         current_track_key=req.current_track_key,
         active_queue=req.active_queue,
         defer_all_chunks=req.background,
-    )
+    ) if requested else ({}, {})
     if getattr(req, 'cache_full', False):
         from .stream_core_runtime import cache_prepared_track
         for value in list(prepared.values())[:1]:
@@ -150,7 +350,9 @@ def prepare_session(server: Any, req: Any):
         "prepared_ids": list(prepared.keys()),
         "failed": failed,
         "failed_ids": list(failed.keys()),
-        "background_skipped": False,
+        "background_skipped": bool(blocked),
+        "skip_reason": 'youtube_temporarily_blocked' if blocked else None,
+        "skipped_ids": blocked,
         "summary": summarize_prepare_metrics(server),
         "server_ms": int((time.perf_counter() - start_time) * 1000),
     }
@@ -310,12 +512,12 @@ def get_related_tracks(server: Any, req: Any):
 
 
 def _lyrics_service(server: Any) -> LyricsService:
-    service = getattr(server, "lyrics_service", None)
-    if isinstance(service, LyricsService):
+    with _lyrics_service_lock:
+        service = getattr(server, "lyrics_service", None)
+        if not isinstance(service, LyricsService):
+            service = LyricsService(server)
+            setattr(server, "lyrics_service", service)
         return service
-    service = LyricsService(server)
-    setattr(server, "lyrics_service", service)
-    return service
 
 
 def get_track_lyrics(

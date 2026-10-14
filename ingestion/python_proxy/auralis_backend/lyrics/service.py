@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import json
+import hashlib
 import re
 import time
 from threading import RLock
@@ -198,8 +200,16 @@ class LyricsService:
         self._server = server
         self._cache: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = {}
         self._cache_lock = RLock()
+        self._resolve_locks = [RLock() for _ in range(16)]
 
-    def get(
+    def get(self, track_key: str, **metadata) -> dict[str, Any]:
+        # Panel opens and background prefetch share one provider lookup.
+        identity = (track_key, metadata.get('title'), metadata.get('artist'),
+                    metadata.get('album'), metadata.get('duration'), metadata.get('source_id'))
+        with self._resolve_locks[hash(identity) % len(self._resolve_locks)]:
+            return self._resolve(track_key, **metadata)
+
+    def _resolve(
         self,
         track_key: str,
         *,
@@ -216,7 +226,7 @@ class LyricsService:
         normalized_album = _clean(album)
         normalized_duration = _positive_int(duration)
         cache_key = (
-            normalized_key.casefold(),
+            normalized_key,
             normalized_title.casefold(),
             normalized_artist.casefold(),
             normalized_album.casefold(),
@@ -503,13 +513,51 @@ class LyricsService:
         now = time.monotonic()
         with self._cache_lock:
             cached = self._cache.get(key)
-            if cached is None:
-                return None
-            expires_at, payload = cached
-            if expires_at <= now:
+            if cached is not None:
+                expires_at, payload = cached
+                if expires_at > now:
+                    return dict(payload)
                 self._cache.pop(key, None)
-                return None
+        stored = self._persisted(key)
+        if stored is not None:
+            payload, ttl = stored
+            with self._cache_lock:
+                if len(self._cache) >= 512:
+                    self._cache.pop(min(self._cache, key=lambda item: self._cache[item][0]), None)
+                self._cache[key] = (now+ttl, payload)
             return dict(payload)
+        return None
+
+    def _persisted(self, key, payload=None, ttl=0):
+        """Reuse the catalogue feature store; no separate lyrics database."""
+        if not getattr(self._server, 'RECOMMENDATION_STORE_DB_PATH', None):
+            return None
+        from ..recommend.store_runtime import open_recommendation_store_connection_without_init
+        identity = hashlib.sha256(json.dumps(key, ensure_ascii=True).encode()).hexdigest()
+        connection = None
+        try:
+            connection = open_recommendation_store_connection_without_init(self._server)
+            if payload is not None:
+                body = json.dumps({'expires_at':time.time()+ttl, 'payload':payload}, separators=(',',':'))
+                if len(body.encode()) > 131072:
+                    return None
+                connection.execute('''INSERT INTO recommendation_feature_store
+                    (namespace, entity_id, model_id, payload_json, updated_at) VALUES (?,?,?,?,?)
+                    ON CONFLICT(namespace,entity_id) DO UPDATE SET
+                    payload_json=excluded.payload_json, updated_at=excluded.updated_at, model_id=excluded.model_id''',
+                    ('lyrics',identity,'lyrics-v1',body,time.time()))
+                connection.commit()
+                return None
+            row = connection.execute('SELECT payload_json FROM recommendation_feature_store '
+                'WHERE namespace=? AND entity_id=? AND model_id=?',('lyrics',identity,'lyrics-v1')).fetchone()
+            if row:
+                stored=json.loads(row[0]);remaining=float(stored['expires_at'])-time.time()
+                if remaining > 0 and isinstance(stored.get('payload'),dict):
+                    return stored['payload'],remaining
+        except Exception:
+            return None  # A cache outage must not suppress a provider result.
+        finally:
+            if connection is not None: connection.close()
 
     def _cache_put(
         self,
@@ -531,4 +579,5 @@ class LyricsService:
                 oldest_key = min(self._cache, key=lambda item: self._cache[item][0])
                 self._cache.pop(oldest_key, None)
             self._cache[key] = (time.monotonic() + ttl, stored)
+        self._persisted(key, stored, ttl)
         return dict(stored)

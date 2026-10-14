@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'package:http/http.dart' as http;
 import '../logic/track_metadata.dart';
@@ -33,6 +34,9 @@ class MusicApi {
   static const searchContextLifetime = Duration(minutes: 10);
   String? Function()? accessToken;
   void Function(String, Map<String, dynamic>)? onDiagnostic;
+  bool Function()? online;
+  String transportRoute = 'unspecified';
+  int _requestSerial = 0;
   MusicApi(this.base, {http.Client? client}) : client = client ?? http.Client();
 
   Uri endpoint(String path) => base.resolve(path);
@@ -184,8 +188,9 @@ class MusicApi {
   }
 
   Future<Map<String, dynamic>> post(String path, Map<String, dynamic> body,
-          {Duration timeout = const Duration(seconds: 30)}) =>
-      _request(path, body: body, timeout: timeout);
+          {Duration timeout = const Duration(seconds: 30),
+          Future<void>? cancel}) =>
+      _request(path, body: body, timeout: timeout, cancel: cancel);
 
   Future<Map<String, dynamic>> get(String path,
           {Duration timeout = const Duration(seconds: 30)}) =>
@@ -193,6 +198,7 @@ class MusicApi {
 
   Future<Map<String, dynamic>> _request(String path,
       {Map<String, dynamic>? body,
+      Future<void>? cancel,
       Duration timeout = const Duration(seconds: 30)}) async {
     final timer = Stopwatch()..start();
     final revision = _scopeRevision;
@@ -209,33 +215,67 @@ class MusicApi {
     } else if (path == '/prepare_session') {
       purpose = (body?['background'] == true) ? 'background_cache' : 'upcoming';
     }
+    final endpointPath = Uri.parse(path).path;
+    final requestId =
+        '${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}-${_requestSerial++}';
+    final encodedBody = body == null ? null : jsonEncode(body);
     final details = <String, dynamic>{
-      'path': path.startsWith('/artist/')
-          ? '/artist/*'
-          : path.startsWith('/album/')
-              ? '/album/*'
-              : path,
+      'requestId': requestId,
+      'requestBytes': encodedBody == null ? 0 : utf8.encode(encodedBody).length,
+      'transportRoute': transportRoute,
+      'path': endpointPath.startsWith('/lyrics/')
+          ? '/lyrics/*'
+          : endpointPath.startsWith('/artist/')
+              ? '/artist/*'
+              : endpointPath.startsWith('/album/')
+                  ? '/album/*'
+                  : endpointPath,
       'requestedTrack': body?['current_track_key'],
       'requestPurpose': purpose,
     };
     late http.Response response;
+    final abort = Completer<void>();
     try {
       final headers = {
         if (body != null) 'Content-Type': 'application/json',
         if (accessToken?.call() case final String token)
-          'Authorization': 'Bearer $token'
+          'Authorization': 'Bearer $token',
+        'X-Neatie-Request': requestId,
       };
-      response = await (body == null
-              ? client.get(endpoint(path), headers: headers)
-              : client.post(endpoint(path),
-                  headers: headers, body: jsonEncode(body)))
-          .timeout(timeout);
+      final request = http.AbortableRequest(
+          body == null ? 'GET' : 'POST', endpoint(path),
+          abortTrigger: cancel == null
+              ? abort.future
+              : Future.any<void>([abort.future, cancel]))
+        ..headers.addAll(headers);
+      if (encodedBody != null) request.body = encodedBody;
+      response = await client
+          .send(request)
+          .then(http.Response.fromStream)
+          .timeout(timeout, onTimeout: () {
+        if (!abort.isCompleted) abort.complete();
+        throw TimeoutException('Music request timed out.');
+      });
     } catch (e) {
       if (revision == _scopeRevision) {
         onDiagnostic?.call('api-failure', {
           ...details,
           'ms': timer.elapsedMilliseconds,
-          'errorType': e.runtimeType.toString()
+          'online': online?.call(),
+          'failureCode': e is TimeoutException
+              ? 'request_timeout'
+              : e is http.RequestAbortedException
+                  ? 'request_aborted'
+                  : e is http.ClientException
+                      ? 'network_error'
+                      : 'request_error',
+          'errorType': e is TimeoutException
+              ? 'TimeoutException'
+              : e is http.RequestAbortedException
+                  ? 'RequestAbortedException'
+                  : e is http.ClientException
+                      ? 'ClientException'
+                      : 'RequestError',
         });
       }
       rethrow;
@@ -254,6 +294,57 @@ class MusicApi {
     try {
       final decoded = jsonDecode(response.body);
       if (decoded is! Map) throw const FormatException('Invalid payload');
+      if (revision == _scopeRevision &&
+          (endpointPath == '/search' || endpointPath == '/suggest') &&
+          (body?['revision'] as num? ?? 0) == 0) {
+        final diagnostics = decoded['diagnostics'];
+        onDiagnostic?.call(
+            endpointPath == '/search' ? 'search-response' : 'suggest-response',
+            {
+              ...details,
+              'ms': timer.elapsedMilliseconds,
+              'resultCount': endpointPath == '/suggest'
+                  ? (decoded['suggestions'] as List? ??
+                          decoded['results'] as List? ??
+                          const [])
+                      .length
+                  : tracks(decoded['tracks'] ?? decoded['results']).length,
+              'serverRequestId': decoded['request_id']?.toString(),
+              'searchSurface': body?['result_type']?.toString() ?? 'all',
+              'preview': body?['search_preview'] == true,
+              if (diagnostics is Map)
+                if (diagnostics['request_ms'] is num)
+                  'serverMs': diagnostics['request_ms'],
+              if (diagnostics is Map)
+                for (final key in [
+                  'first_response_contract_ms',
+                  'direct_lookup_ms'
+                ])
+                  if (diagnostics[key] is num) key: diagnostics[key],
+              if (diagnostics is Map) ...{
+                'snapshotHit': diagnostics['search_snapshot_hit'] == true,
+                'searchOutcome': diagnostics['search_outcome']?.toString(),
+                for (final stage in [
+                  'retrieval',
+                  'ranking',
+                  'essential_target',
+                  'artist_surface_completion',
+                  'snapshot_store'
+                ])
+                  if (diagnostics['stage_timings_ms'] is Map &&
+                      diagnostics['stage_timings_ms'][stage] is num)
+                    '${stage}Ms': diagnostics['stage_timings_ms'][stage],
+                if (diagnostics['retrieval'] is Map &&
+                    diagnostics['retrieval']['local_index_ms'] is num)
+                  'localIndexMs': diagnostics['retrieval']['local_index_ms'],
+                if (diagnostics['retrieval'] is Map &&
+                    diagnostics['retrieval']['timed_out_sources'] is List)
+                  'providerTimeoutCount':
+                      (diagnostics['retrieval']['timed_out_sources'] as List)
+                          .length,
+              },
+            });
+      }
       return Map<String, dynamic>.from(decoded);
     } on FormatException {
       if (revision == _scopeRevision) {
@@ -315,6 +406,18 @@ class MusicApi {
     });
   }
 
+  Future<Map<String, dynamic>> cacheQueue(
+      String token, int revision, List<Map<String, dynamic>> tracks,
+      {bool cancel = false}) {
+    return post('/prepare_session', {
+      'queue_cache_id': token,
+      'queue_cache_revision': revision,
+      'cancel_queue_cache': cancel,
+      'track_keys':
+          tracks.map(extractTrackId).whereType<String>().take(100).toList(),
+    });
+  }
+
   Future<Uri> prepare(Map<String, dynamic> track,
       {bool activeQueue = false, bool cacheFull = false}) async {
     final id = extractTrackId(track)!;
@@ -368,6 +471,18 @@ class MusicApi {
     if ((result['prepared'] as Map?)?[id] == null) {
       throw StateError('Next track is not prepared yet.');
     }
+    final path = ((result['prepared'] as Map?)?[id] as Map?)?['playback_path']
+        ?.toString();
+    if (path != null && path.isNotEmpty && revision == _scopeRevision) {
+      final uri = base.resolve(path);
+      if (!['http', 'https'].contains(uri.scheme) ||
+          uri.origin != base.origin ||
+          !uri.path.startsWith('/playback/stream/')) {
+        throw StateError(
+            'The music service returned an unexpected stream origin.');
+      }
+      return uri;
+    }
     return streamUri(track);
   }
 
@@ -380,6 +495,7 @@ class MusicApi {
         'playback_source_failed',
         'playback_sources_failed',
         'preparation_timeout',
+        'preparation_busy',
         'youtube_temporarily_blocked'
       }.contains(value)
           ? value as String

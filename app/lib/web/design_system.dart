@@ -1,6 +1,95 @@
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
 
+class NeatieNavigation extends StatelessWidget {
+  const NeatieNavigation(
+      {super.key,
+      required this.labels,
+      required this.icons,
+      required this.selected,
+      required this.onSelect,
+      this.vertical = false});
+  final List<String> labels;
+  final List<IconData> icons;
+  final int selected;
+  final ValueChanged<int> onSelect;
+  final bool vertical;
+
+  @override
+  Widget build(BuildContext context) => SizedBox(
+      height: vertical ? labels.length * 58.0 : 68,
+      child: LayoutBuilder(builder: (context, constraints) {
+        final slot = constraints.maxWidth / labels.length;
+        final duration = MediaQuery.disableAnimationsOf(context)
+            ? Duration.zero
+            : const Duration(milliseconds: 300);
+        return Stack(children: [
+          AnimatedPositioned(
+              key: const ValueKey('navigation-highlight'),
+              duration: duration,
+              curve: Curves.easeInOutCubic,
+              left: vertical ? 0 : selected * slot + 8,
+              top: vertical ? selected * 58.0 : 6,
+              width: vertical ? constraints.maxWidth : slot - 16,
+              height: vertical ? 52 : 42,
+              child: IgnorePointer(
+                  child: DecoratedBox(
+                      decoration: BoxDecoration(
+                          color: NeatieDesign.accent.withValues(alpha: .12),
+                          borderRadius:
+                              BorderRadius.circular(vertical ? 14 : 24))))),
+          for (var i = 0; i < labels.length; i++)
+            Positioned(
+                left: vertical ? 0 : i * slot,
+                top: vertical ? i * 58.0 : 0,
+                width: vertical ? constraints.maxWidth : slot,
+                height: vertical ? 52 : 68,
+                child: Semantics(
+                    selected: selected == i,
+                    button: true,
+                    child: Material(
+                        color: Colors.transparent,
+                        child: InkWell(
+                            borderRadius: BorderRadius.circular(14),
+                            onTap: () => onSelect(i),
+                            child: Padding(
+                                padding: vertical
+                                    ? const EdgeInsets.symmetric(horizontal: 14)
+                                    : EdgeInsets.zero,
+                                child: AnimatedDefaultTextStyle(
+                                    duration: duration,
+                                    style: TextStyle(
+                                        fontSize: 12,
+                                        fontWeight: FontWeight.w600,
+                                        color: selected == i
+                                            ? NeatieDesign.accent
+                                            : NeatieDesign.ink),
+                                    child: vertical
+                                        ? Row(children: [
+                                            Icon(icons[i],
+                                                size: 21,
+                                                color: selected == i
+                                                    ? NeatieDesign.accent
+                                                    : NeatieDesign.muted),
+                                            const SizedBox(width: 14),
+                                            Text(labels[i])
+                                          ])
+                                        : Column(
+                                            mainAxisAlignment:
+                                                MainAxisAlignment.center,
+                                            children: [
+                                                Icon(icons[i],
+                                                    size: 21,
+                                                    color: selected == i
+                                                        ? NeatieDesign.accent
+                                                        : NeatieDesign.muted),
+                                                const SizedBox(height: 5),
+                                                Text(labels[i])
+                                              ]))))))),
+        ]);
+      }));
+}
+
 abstract final class NeatieDesign {
   static const background = Color(0xff0d1010);
   static const surface = Color(0xff171c1b);

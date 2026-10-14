@@ -66,6 +66,9 @@ abstract class PlaybackPort {
   bool get paused;
   PlaybackPhase get phase;
   bool get needsNewSource => false;
+
+  /// An expired URL need not be replaced when all remaining audio is buffered.
+  bool get fullyBuffered => false;
   String? get loadedTrackId;
   bool get sourceMatches;
   void syncMetadata(Map<String, dynamic> track);

@@ -37,11 +37,35 @@ class PlaybackDiagnostics {
     'ms',
     'startupMs',
     'nextGapMs',
+    'resumeMs',
+    'sourceRetained',
+    'fullyBuffered',
+    'resultCount',
+    'preview',
+    'first_response_contract_ms',
+    'direct_lookup_ms',
+    'inputToResultsMs',
+    'queryLength',
     'serverMs',
+    'serverRequestId',
+    'searchSurface',
+    'searchOutcome',
+    'snapshotHit',
+    'retrievalMs',
+    'rankingMs',
+    'essential_targetMs',
+    'artist_surface_completionMs',
+    'snapshot_storeMs',
+    'localIndexMs',
+    'providerTimeoutCount',
     'cachedPrefixBytes',
     'chunkDeferred',
     'requestedTrack',
     'requestPurpose',
+    'requestId',
+    'requestBytes',
+    'transportRoute',
+    'online',
     'failureCode',
     'cacheTier',
     'status',
@@ -63,15 +87,44 @@ class PlaybackDiagnostics {
   };
   final List<Map<String, dynamic>> _recent = [];
   final List<Map<String, dynamic>> _incidents = [];
+  final List<Map<String, dynamic>> _performance = [];
   final Map<String, dynamic> device;
   int _serial = 0;
 
   // Actual player failures and remote commands outrank speculative API work.
-  static int _priority(String reason) =>
-      reason.startsWith('api-') || reason == 'prepare-result' ? 0 : 2;
+  static int _priority(String reason) => reason.startsWith('api-') ||
+          reason.startsWith('history-') ||
+          const {
+            'prepare-result',
+            'search-response',
+            'search-rendered',
+            'suggest-response'
+          }.contains(reason)
+      ? 0
+      : 2;
 
   static int _auxiliaryIndex(List events) => events.indexWhere((row) =>
-      '${row['event']}'.startsWith('api-') || row['event'] == 'prepare-result');
+      '${row['event']}'.startsWith('api-') ||
+      '${row['event']}'.startsWith('history-') ||
+      const {
+        'prepare-result',
+        'search-response',
+        'search-rendered',
+        'suggest-response'
+      }.contains(row['event']));
+
+  static int _budgetEventIndex(List events) {
+    final auxiliary = _auxiliaryIndex(events);
+    if (auxiliary >= 0) return auxiliary;
+    // Keep remote commands and failure evidence before routine media events.
+    final ordinary = events.indexWhere((row) =>
+        row['event'] != 'media-action' &&
+        row['failed'] != true &&
+        !'${row['event']}'.contains('failed') &&
+        !'${row['event']}'.contains('rejected') &&
+        row['event'] != 'error');
+    return ordinary >= 0 && ordinary < events.length - 1 ? ordinary : 0;
+  }
 
   void _trimIncidents() {
     while (_incidents.length > 4) {
@@ -86,6 +139,81 @@ class PlaybackDiagnostics {
   }
 
   PlaybackDiagnostics(this.device);
+
+  static String? _performanceKind(Map row) {
+    final event = '${row['event']}';
+    if (event == 'suggest-response') return 'suggest';
+    if (event == 'search-response' ||
+        event == 'search-rendered' ||
+        event == 'api-failure' &&
+            row['failureCode'] != 'request_aborted' &&
+            const {'/search', '/suggest'}.contains(row['path']))
+      return 'search';
+    if (event.startsWith('resume-')) return 'resume';
+    if (event == 'playback-startup') return 'playback';
+    if (event == 'prepare-result') return 'prepare';
+    return null;
+  }
+
+  void _retainPerformance(Map<String, dynamic> row) {
+    final kind = _performanceKind(row);
+    if (kind == null) return;
+    _performance.add({
+      for (final key in const [
+        'at',
+        'event',
+        'track',
+        'session',
+        'build',
+        'ms',
+        'startupMs',
+        'nextGapMs',
+        'resumeMs',
+        'pauseMs',
+        'ready',
+        'bufferedEnd',
+        'time',
+        'visibility',
+        'sourceRetained',
+        'fullyBuffered',
+        'reason',
+        'kind',
+        'requestId',
+        'requestBytes',
+        'transportRoute',
+        'path',
+        'resultCount',
+        'preview',
+        'inputToResultsMs',
+        'queryLength',
+        'first_response_contract_ms',
+        'direct_lookup_ms',
+        'cacheTier',
+        'prepared',
+        'fullyCached',
+        'failureCode',
+        'serverMs',
+        'serverRequestId',
+        'searchSurface',
+        'searchOutcome',
+        'snapshotHit',
+        'retrievalMs',
+        'rankingMs',
+        'essential_targetMs',
+        'artist_surface_completionMs',
+        'snapshot_storeMs',
+        'localIndexMs',
+        'providerTimeoutCount'
+      ])
+        if (row[key] != null) key: row[key],
+    });
+    final limit = kind == 'resume' || kind == 'search' ? 6 : 4;
+    while (_performance.where((item) => _performanceKind(item) == kind).length >
+        limit) {
+      _performance.removeAt(
+          _performance.indexWhere((item) => _performanceKind(item) == kind));
+    }
+  }
 
   static String safeText(String value) {
     final text = value
@@ -132,9 +260,16 @@ class PlaybackDiagnostics {
   void restore(String? saved) {
     _recent.clear();
     _incidents.clear();
+    _performance.clear();
     if (saved == null || utf8.encode(saved).length > 65536) return;
     try {
       final decoded = jsonDecode(saved);
+      if (decoded is Map && decoded['performance'] is List) {
+        for (final item
+            in (decoded['performance'] as List).whereType<Map>().take(24)) {
+          _retainPerformance(_safe(item));
+        }
+      }
       final entries = decoded is List ? decoded : decoded['incidents'] as List;
       for (final item in entries.reversed.take(4).toList().reversed) {
         final rows = item is List ? item : item['events'] as List;
@@ -163,6 +298,7 @@ class PlaybackDiagnostics {
 
   void record(Map<String, dynamic> row) {
     final safe = _safe(row);
+    _retainPerformance(safe);
     _recent.add(safe);
     if (_recent.length > 80) _recent.removeAt(0);
     // Keep a short aftermath, without appending unrelated preparation or tracks.
@@ -180,6 +316,9 @@ class PlaybackDiagnostics {
     }
     final event = '${safe['event']}';
     final failure = event == 'error' ||
+        event == 'playback-interrupted' ||
+        event == 'media-aborted' ||
+        event == 'api-failure' && safe['failureCode'] != 'request_aborted' ||
         event.contains('failed') ||
         event.contains('rejected') ||
         safe['failed'] == true ||
@@ -213,18 +352,26 @@ class PlaybackDiagnostics {
   }
 
   String encodeSaved() {
-    var encoded = jsonEncode({'version': 2, 'incidents': _incidents});
+    String encode() => jsonEncode(
+        {'version': 2, 'incidents': _incidents, 'performance': _performance});
+    var encoded = encode();
     while (utf8.encode(encoded).length > 65536) {
       if (_incidents.length > 1) {
         final auxiliary = _incidents
             .indexWhere((item) => _priority('${item['reason']}') == 0);
         _incidents.removeAt(auxiliary < 0 ? 0 : auxiliary);
+      } else if (_incidents.isNotEmpty &&
+          (_incidents.first['events'] as List).length > 8) {
+        final events = _incidents.first['events'] as List;
+        events.removeAt(_budgetEventIndex(events));
+      } else if (_performance.isNotEmpty) {
+        _performance.removeAt(0);
       } else {
         final events = _incidents.first['events'] as List;
         if (events.length <= 1) break;
-        events.removeAt(0);
+        events.removeAt(_budgetEventIndex(events));
       }
-      encoded = jsonEncode({'version': 2, 'incidents': _incidents});
+      encoded = encode();
     }
     return encoded;
   }
@@ -261,15 +408,41 @@ class PlaybackDiagnostics {
         'cacheTier': last['cacheTier'],
         'requestPurpose': last['requestPurpose']
       },
-      'events': events
+      'events': events,
+      'performance': _performance,
+      'incidents': [
+        for (final item in _incidents)
+          {
+            'reportId': item['id'],
+            'reason': item['reason'],
+            'at': item['at'],
+            'track': item['track'],
+            'session': item['session'],
+            'context': {
+              for (final key in const ['mediaCode', 'mediaMessage', 'phase', 'time',
+                'paused', 'ready', 'network', 'bufferedEnd', 'visibility', 'audioSession',
+                'cause', 'failureCode', 'requestPurpose', 'recoveryAttempts', 'build'])
+                if ((item['context'] as Map?)?[key] != null)
+                  key: (item['context'] as Map)[key],
+            },
+          }
+      ],
     })) as Map<String, dynamic>;
     final exported = output['events'] as List;
-    while (
-        utf8.encode(const JsonEncoder.withIndent('  ').convert(output)).length >
-                32768 &&
-            exported.length > 1) {
-      final auxiliary = _auxiliaryIndex(exported);
-      exported.removeAt(auxiliary < 0 ? 0 : auxiliary);
+    while (utf8
+                .encode(const JsonEncoder.withIndent('  ').convert(output))
+                .length >
+            32768 &&
+        (exported.length > 1 || (output['performance'] as List).isNotEmpty)) {
+      if (exported.length > 8) {
+        exported.removeAt(_budgetEventIndex(exported));
+        continue;
+      }
+      if ((output['performance'] as List).isNotEmpty) {
+        (output['performance'] as List).removeAt(0);
+        continue;
+      }
+      exported.removeAt(_budgetEventIndex(exported));
     }
     return output;
   }

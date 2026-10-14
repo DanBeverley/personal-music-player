@@ -4,6 +4,7 @@ import 'browser_audio.dart';
 import 'design_system.dart';
 import 'home_widgets.dart';
 import 'web_player.dart';
+import 'lyrics_panel.dart';
 
 /// Both layouts control the same browser audio element and playback session.
 class PlaybackDock extends StatelessWidget {
@@ -20,6 +21,16 @@ class PlaybackDock extends StatelessWidget {
   final BrowserAudio audio;
   final bool wide, liked;
   final VoidCallback onLike, onRepeat, onQueue;
+
+  void _lyrics(BuildContext context) => showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      backgroundColor: NeatieDesign.surface,
+      builder: (context) => SafeArea(
+          child: SizedBox(
+              height: MediaQuery.sizeOf(context).height * .8,
+              child: LyricsPanel(player: player))));
 
   String _time(double value) =>
       '${value.toInt() ~/ 60}:${(value.toInt() % 60).toString().padLeft(2, '0')}';
@@ -164,6 +175,10 @@ class PlaybackDock extends StatelessWidget {
                                               : null,
                                           icon: const Icon(Icons.repeat_one))),
                                   IconButton(
+                                      tooltip: 'Lyrics',
+                                      onPressed: () => _lyrics(context),
+                                      icon: const Icon(Icons.lyrics_outlined)),
+                                  IconButton(
                                       tooltip: 'Open queue',
                                       onPressed: () {
                                         Navigator.pop(context);
@@ -216,6 +231,10 @@ class PlaybackDock extends StatelessWidget {
                                         ? NeatieDesign.accent
                                         : null,
                                     icon: const Icon(Icons.repeat_one)),
+                                IconButton(
+                                    tooltip: 'Lyrics',
+                                    onPressed: () => _lyrics(context),
+                                    icon: const Icon(Icons.lyrics_outlined)),
                                 IconButton(
                                     tooltip: 'Open queue',
                                     onPressed: onQueue,

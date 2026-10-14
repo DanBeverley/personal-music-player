@@ -69,6 +69,16 @@ class BrowserAudio extends PlaybackPort {
   PlaybackPhase get phase => _progress.phase;
   @override
   bool get needsNewSource => _renewSource;
+  @override
+  bool get fullyBuffered {
+    if (!sourceMatches || element.error != null || duration <= 0) return false;
+    for (var i = 0; i < element.buffered.length; i++) {
+      if (element.buffered.start(i) <= position &&
+          element.buffered.end(i) >= duration - .1) return true;
+    }
+    return false;
+  }
+
   Map<String, dynamic> diagnosticReport({bool current = false}) {
     final report = _reports.report(current: current);
     _persistFailures();
@@ -120,6 +130,7 @@ class BrowserAudio extends PlaybackPort {
           : 0,
       'visibility': _foreground && !web.document.hidden ? 'visible' : 'hidden',
       'audioSession': _audioSession?.state,
+      ...?diagnosticContext?.call(),
       ...extra,
       'phase': phase.name,
       'playRequested': _progress.requested,
@@ -141,7 +152,6 @@ class BrowserAudio extends PlaybackPort {
           ? Uri.tryParse(element.currentSrc)
               ?.queryParameters['playback_session']
           : null,
-      ...?diagnosticContext?.call(),
     });
     _persistFailures();
   }
@@ -233,7 +243,9 @@ class BrowserAudio extends PlaybackPort {
             _progress.interrupt();
           } else {
             _progress.stop(PlaybackPhase.failed);
-            _renewSource = true;
+            // A transfer failure does not establish source expiry. Retry the
+            // pinned resource first; decoding/unsupported media needs renewal.
+            _renewSource = element.error?.code != 2;
           }
         }
         _sampleProgress();
@@ -242,7 +254,8 @@ class BrowserAudio extends PlaybackPort {
         // An explicit media abort is different from a network/decode failure.
         _events.add(event == 'error' && element.error?.code == 1
             ? 'media-aborted'
-            : forwarded);
+            : event == 'error' && element.error?.code == 2
+                ? 'media-network-error' : forwarded);
       }).toJS;
       _listeners[event] = callback;
       element.addEventListener(event, callback);
@@ -370,7 +383,7 @@ class BrowserAudio extends PlaybackPort {
     } catch (_) {}
     // A terminal MEDIA_ERR_ABORTED cannot be restarted by play() alone.
     // Reload the same selected URL; do not resolve a different source.
-    if (sourceMatches && element.error?.code == 1) {
+    if (sourceMatches && (element.error?.code == 1 || element.error?.code == 2)) {
       element.load();
       record('aborted-source-reload');
     }

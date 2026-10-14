@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from difflib import SequenceMatcher
 from typing import Any, Dict, List
 
 from ..domain.result_quality import (
@@ -17,7 +18,7 @@ from ..domain.catalog import (
 )
 from .server_adapter import adapt_search_server
 from .canonical import source_quality_score
-from .intelligence import search_text_similarity, query_mentions_artist
+from .intelligence import search_text_similarity, search_spacing_equivalent, query_mentions_artist, track_query_similarity
 from .runtime import semantic_search_lexical_score
 
 
@@ -82,11 +83,17 @@ def _track_relevance(
     title = server.trim_text(track.get("title") or track.get("name"))
     artist = server.trim_text(track.get("channel") or track.get("artist"))
     album = server.trim_text(track.get("album") or track.get("album_title"))
-    title_score = search_text_similarity(query, title)
+    title_score = track_query_similarity(query, title, artist)
+    spacing_match = search_spacing_equivalent(query, title)
     artist_score = search_text_similarity(query, artist)
     album_score = search_text_similarity(query, album)
     normalized_query_title = normalize_track_title(query)
     normalized_result_title = normalize_track_title(title)
+    close_title_typo = (
+        min(len(normalized_query_title), len(normalized_result_title)) >= 5
+        and abs(len(normalized_query_title) - len(normalized_result_title)) <= 2
+        and SequenceMatcher(None, normalized_query_title, normalized_result_title).ratio() >= 0.9
+    )
     query_tokens = {
         token for token in normalized_query_title.split() if len(token) >= 4
     } or set(normalized_query_title.split())
@@ -94,10 +101,7 @@ def _track_relevance(
     normalized_result_artist = normalize_artist_name(artist)
     artist_tokens = set(normalized_result_artist.split())
     full_query_tokens = set(normalized_query_title.split())
-    artist_mentioned = bool(
-        artist_tokens
-        and artist_tokens.issubset(full_query_tokens)
-    )
+    artist_mentioned = query_mentions_artist(query, artist)
     title_token_overlap = (
         len(query_tokens & title_tokens) / len(query_tokens)
         if query_tokens
@@ -125,6 +129,7 @@ def _track_relevance(
         admitted = (
             artist_score >= 0.70
             or (normalized_query_title and normalized_query_title == normalized_result_title)
+            or (spacing_match and source_quality_score(server, track) >= .8)
             or combined_score >= 0.78
             or relationship_match
         )
@@ -146,19 +151,23 @@ def _track_relevance(
             artist_mentioned
             or title_token_overlap >= 0.5
             or title_contains_query
+            or spacing_match
         )
         lexical_match = (
             title_score >= 0.70
             and (
                 title_token_overlap >= 0.5
                 or title_contains_query
+                or spacing_match
+                or close_title_typo
+                or artist_mentioned and title_score >= .90
             )
         )
         admitted = (
             lexical_match
             or (
                 combined_score >= 0.82
-                and title_token_overlap >= 0.5
+                and (title_token_overlap >= 0.5 or artist_mentioned and title_score >= .90)
             )
             or relationship_match
             or provider_supported
@@ -250,7 +259,8 @@ def rank_track_candidates_fast_path(
             # A query can name both an artist and a song by someone else.
             # Keep exact-title playable candidates without changing the target.
             and not (
-                normalize_track_title(track.get("title") or "") == normalized_canonical_query
+                (normalize_track_title(track.get("title") or "") == normalized_canonical_query
+                 or search_spacing_equivalent(query, track.get('title') or ''))
                 and source_quality_score(server, track) >= 0.8
             )
             and search_text_similarity(
@@ -274,7 +284,8 @@ def rank_track_candidates_fast_path(
         lexical_score = semantic_search_lexical_score(query, title, artist, album, server=server)
         title_lexical = semantic_search_lexical_score(query, title, server=server)
         normalized_title = server.normalize_text(title or "")
-        exact_title_match = 1.0 if normalized_title and normalized_title == normalized_query else 0.0
+        exact_title_match = (1.0 if normalized_title and normalized_title == normalized_query
+                             else .98 if search_spacing_equivalent(query, title or '') else 0.0)
         anchor_artist_match = (
             1.0
             if server.normalize_text(artist or "") in normalized_anchor_artists

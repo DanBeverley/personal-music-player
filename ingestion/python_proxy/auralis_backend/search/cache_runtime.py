@@ -4,6 +4,7 @@ import os
 import json
 import time
 from typing import Any
+from threading import BoundedSemaphore
 
 from ..storage.cache_runtime import (
     lookup_ttl_cache,
@@ -15,6 +16,21 @@ from ..recommend.store_runtime import open_recommendation_store_connection
 
 
 SEARCH_RESULT_CACHE_TTL_SECONDS = int(os.environ.get("SEARCH_RESULT_CACHE_TTL_SECONDS", "600"))
+_suggestion_writes = BoundedSemaphore(16)
+
+
+def schedule_suggestion_base_write(server: Any, key: str, value: Any) -> None:
+    """Use the existing persistence owner, with bounded best-effort admission."""
+    if not _suggestion_writes.acquire(blocking=False):
+        return
+    try:
+        from .service import _SEARCH_SNAPSHOT_PERSIST_EXECUTOR
+        future = _SEARCH_SNAPSHOT_PERSIST_EXECUTOR.submit(
+            store_persistent_suggestion_base, server, key, value,
+        )
+        future.add_done_callback(lambda _: _suggestion_writes.release())
+    except Exception:
+        _suggestion_writes.release()
 
 
 def lookup_search_result(namespace: str, key: str) -> Any:
@@ -50,8 +66,6 @@ def lookup_persistent_suggestion_base(server: Any, key: str) -> Any:
         row = connection.execute("SELECT payload_json FROM search_suggestion_cache WHERE cache_key = ?", (key,)).fetchone()
         if not row:
             return None
-        connection.execute("UPDATE search_suggestion_cache SET updated_at = ? WHERE cache_key = ?", (time.time(), key))
-        connection.commit()
         return json.loads(row[0])
     except Exception:
         return None

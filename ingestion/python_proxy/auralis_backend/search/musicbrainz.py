@@ -420,14 +420,25 @@ class MusicBrainzClient:
         # Hold the lane through the complete HTTP exchange.  This guarantees
         # one in-flight public MusicBrainz request per backend process while
         # retaining the documented minimum start interval.
-        with _inflight_lock:
+        interactive = self.timeout_seconds <= 2.0
+        acquired = _inflight_lock.acquire(timeout=self.timeout_seconds) if interactive else _inflight_lock.acquire()
+        if not acquired:
+            raise MusicBrainzRequestFailure(path, TimeoutError("MusicBrainz lane busy"),
+                                           int((time.perf_counter() - started) * 1000))
+        try:
             with _rate_lock:
                 delay = MUSICBRAINZ_MIN_INTERVAL_SECONDS - (time.time() - _last_request_at)
+                if interactive and delay >= self.timeout_seconds - (time.perf_counter() - started):
+                    raise MusicBrainzRequestFailure(path, TimeoutError("MusicBrainz rate deadline"),
+                                                   int((time.perf_counter() - started) * 1000))
                 if delay > 0:
                     time.sleep(delay)
                 _last_request_at = time.time()
             try:
-                with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                remaining = self.timeout_seconds - (time.perf_counter() - started) if interactive else self.timeout_seconds
+                if remaining <= 0:
+                    raise TimeoutError("MusicBrainz request deadline")
+                with urllib.request.urlopen(request, timeout=remaining) as response:
                     raw = response.read()
             except Exception as exc:
                 raise MusicBrainzRequestFailure(
@@ -435,6 +446,8 @@ class MusicBrainzClient:
                     exc,
                     int((time.perf_counter() - started) * 1000),
                 ) from exc
+        finally:
+            _inflight_lock.release()
         try:
             parsed = json.loads(raw.decode("utf-8"))
         except Exception:

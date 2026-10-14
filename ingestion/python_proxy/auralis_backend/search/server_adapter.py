@@ -41,12 +41,15 @@ class SearchServerAdapter:
             lightweight=lightweight,
         )
 
-    def search_upstream_call_with_retry(self, fn, *, default):
+    def search_upstream_call_with_retry(self, fn, *, default, timeout_seconds=None):
         return self.raw._search_upstream_call_with_retry(
             fn,
-            attempts=self.raw.UPSTREAM_RETRY_ATTEMPTS,
+            attempts=1,
             backoff_seconds=self.raw.UPSTREAM_RETRY_BACKOFF_SECONDS,
             default=default,
+            **({"timeout_seconds": timeout_seconds} if timeout_seconds is not None else {}),
+            **({'admission_wait_seconds': self.raw.search_admission_wait_seconds}
+               if getattr(self.raw, 'search_admission_wait_seconds', 0) else {}),
         )
 
     def upstream_call_with_retry(self, fn, *, default):

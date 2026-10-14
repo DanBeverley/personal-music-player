@@ -1,14 +1,51 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
+from contextvars import ContextVar
+import time
+import requests
 
 from ytmusicapi import YTMusic
 
 from .server_adapter import adapt_search_server
 
 
+_search_http_deadline: ContextVar[float | None] = ContextVar("search_http_deadline", default=None)
+
+
+class _ProviderSession(requests.Session):
+    def request(self, method, url, **kwargs):
+        deadline = _search_http_deadline.get()
+        if deadline is None:
+            kwargs.setdefault("timeout", 30)
+        else:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise requests.exceptions.Timeout("Search provider deadline reached")
+            connect = min(0.4, remaining / 3)
+            kwargs["timeout"] = (connect, max(0.01, remaining - connect))
+        return super().request(method, url, **kwargs)
+
+
 class CompatibleYTMusic(YTMusic):
     """Normalize unavailable optional watch tabs before ytmusicapi parses them."""
+
+    def _prepare_session(self, requests_session):
+        return requests_session if isinstance(requests_session, requests.Session) else _ProviderSession()
+
+    def search(self, *args, **kwargs):
+        token = _search_http_deadline.set(time.monotonic() + 2.0)
+        try:
+            return super().search(*args, **kwargs)
+        finally:
+            _search_http_deadline.reset(token)
+
+    def get_search_suggestions(self, *args, **kwargs):
+        token = _search_http_deadline.set(time.monotonic() + 0.8)
+        try:
+            return super().get_search_suggestions(*args, **kwargs)
+        finally:
+            _search_http_deadline.reset(token)
 
     def _send_request(self, endpoint, *args, **kwargs):
         payload = super()._send_request(endpoint, *args, **kwargs)
@@ -121,7 +158,7 @@ def normalize_song_result(server: Any, entry: Optional[Dict[str, Any]]):
     }
 
 
-def ytmusic_song_search(server: Any, query: str, limit: int):
+def ytmusic_song_search(server: Any, query: str, limit: int, *, first_page_only: bool = False):
     server = adapt_search_server(server)
     results = []
     seen = set()
@@ -146,7 +183,7 @@ def ytmusic_song_search(server: Any, query: str, limit: int):
         if len(results) >= limit:
             return results
 
-    if len(results) < limit:
+    if len(results) < limit and not (first_page_only and results):
         fallback_results = server.search_upstream_call_with_retry(
             lambda: server.ytmusic.search(query, limit=max(limit * 3, 12)),
             default=[],

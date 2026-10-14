@@ -10,9 +10,9 @@ from .cache_runtime import (
     lookup_search_result,
     store_search_result,
     lookup_persistent_suggestion_base,
-    store_persistent_suggestion_base,
+    schedule_suggestion_base_write,
 )
-from .intelligence import load_fuzzy_catalog_entity_memories
+from .intelligence import load_fuzzy_catalog_entity_memories, search_spacing_equivalent
 from .server_adapter import SearchServerAdapter, adapt_search_server
 from .upstream_runtime import (
     search_artists as resolve_search_artists,
@@ -117,7 +117,8 @@ def _resolved_albums(server: Any, albums: Any) -> List[Dict[str, Any]]:
     ]
 
 
-def search_tracks_direct(query: str, limit: int, *, server: Any | None = None):
+def search_tracks_direct(query: str, limit: int, *, server: Any | None = None,
+                         first_page_only: bool = False):
     server = _resolve_server(server)
     query = (query or "").strip()
     # Search pages ask for 24 visible tracks and need headroom for canonical
@@ -127,12 +128,15 @@ def search_tracks_direct(query: str, limit: int, *, server: Any | None = None):
     if not query:
         return []
     cache_key = _search_cache_key(query, limit, server=server)
+    if first_page_only:
+        cache_key = f"preview::{cache_key}"
     cached = lookup_search_result("tracks_direct", cache_key)
     if cached:
         return [dict(item) for item in cached]
 
     ytmusic_started = time.perf_counter()
-    results = resolve_ytmusic_song_search(server, query, max(limit, 12))
+    results = (resolve_ytmusic_song_search(server, query, max(limit, 12), first_page_only=True)
+               if first_page_only else resolve_ytmusic_song_search(server, query, max(limit, 12)))
     print(
         "[EBB:search][direct] "
         f"query={query[:48]} stage=ytmusic done elapsed_ms={int((time.perf_counter() - ytmusic_started) * 1000)} "
@@ -336,9 +340,10 @@ def semantic_search_lexical_score(query: str, *texts, server: Any | None = None)
 
     primary_text = normalized_texts[0]
     combined_text = " ".join(normalized_texts)
+    spacing_match = search_spacing_equivalent(normalized_query, primary_text)
     score = 0.0
 
-    if normalized_query and primary_text == normalized_query:
+    if normalized_query and (primary_text == normalized_query or spacing_match):
         score += 5.2
     elif normalized_query and normalized_query in primary_text:
         score += 4.2
@@ -346,10 +351,10 @@ def semantic_search_lexical_score(query: str, *texts, server: Any | None = None)
         score += 3.4
 
     if tokens:
-        token_hits = sum(1 for token in tokens[:6] if token in combined_text)
+        token_hits = len(tokens[:6]) if spacing_match else sum(1 for token in tokens[:6] if token in combined_text)
         if token_hits:
             score += min(token_hits, 4) * 0.62
-        if all(token in combined_text for token in tokens[:4]):
+        if spacing_match or all(token in combined_text for token in tokens[:4]):
             score += 1.15
 
     return score
@@ -681,12 +686,12 @@ def semantic_search_suggestion_items(
                 add_candidate(item.get("text"), float(item.get("source_score") or 0.0), "suggestion_cache", item.get("suggestion_type") or "query")
 
     catalog_started_at = time.perf_counter()
-    for memory in load_fuzzy_catalog_entity_memories(
+    for memory in ([] if cached is not None else load_fuzzy_catalog_entity_memories(
         server,
         query=query,
         limit=max(limit * 2, 8),
         scan_limit=600,
-    ):
+    )):
         payload = dict(memory.get("payload") or {})
         entity_type = str(memory.get("entity_type") or "")
         if entity_type == "artist":
@@ -706,21 +711,16 @@ def semantic_search_suggestion_items(
     catalog_ms = int((time.perf_counter() - catalog_started_at) * 1000)
 
     search_started_at = time.perf_counter()
-    upstream_future = None
     # A shared cached base is already a complete typeahead response. Do not
     # put upstream latency back on the critical path merely because a provider
     # returned fewer than the requested cap on its first successful fetch.
-    if cached is None and hasattr(server, "ytmusic"):
-        upstream_future = _search_upstream_executor(server).submit(
-            server.ytmusic.get_search_suggestions,
-            query,
-        )
-
     try:
-        if upstream_future is None:
-            upstream_suggestions = []
-        else:
-            upstream_suggestions = upstream_future.result(timeout=_SUGGEST_UPSTREAM_TIMEOUT_SECONDS)
+        upstream_suggestions = (
+            server.search_upstream_call_with_retry(
+                lambda: server.ytmusic.get_search_suggestions(query),
+                default=[], timeout_seconds=_SUGGEST_UPSTREAM_TIMEOUT_SECONDS,
+            ) if cached is None and hasattr(server, "ytmusic") else []
+        )
     except Exception:
         upstream_suggestions = []
     for index, raw_suggestion in enumerate(upstream_suggestions[:8]):
@@ -820,9 +820,11 @@ def semantic_search_suggestion_items(
 
     # Persist only the canonical base; user-specific direct-play rows are
     # intentionally overlaid above and never cached for another account.
-    canonical_base = list(results[:limit])
-    store_search_result("suggestions", cache_key, canonical_base)
-    store_persistent_suggestion_base(server, cache_key, canonical_base)
+    canonical_base = [item for item in results[:limit]
+                      if item.get("source_name") != "recent_query_history"]
+    if cached is None:
+        store_search_result("suggestions", cache_key, canonical_base)
+        schedule_suggestion_base_write(server, cache_key, canonical_base)
     output = []
     seen_output = set()
     for item in direct_play_items:

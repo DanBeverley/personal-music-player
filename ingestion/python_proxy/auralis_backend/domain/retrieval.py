@@ -18,23 +18,26 @@ from .catalog import (
     normalize_track_title,
     normalized_popularity,
     parse_compact_number,
+    verified_playback_source,
 )
 from .server_adapter import adapt_domain_server
 from ..search.query_mode import resolve_search_mode
 from ..search.intelligence import (
     load_catalog_entity_memories,
     load_fuzzy_catalog_entity_memories,
-    remove_unconfirmed_display_memories,
-    remove_untrusted_catalog_query_aliases,
     search_text_similarity,
+    search_spacing_equivalent,
     search_query_key,
     query_mentions_artist,
+    query_is_artist,
+    track_query_similarity,
 )
 from ..search.catalog_pipeline import (
     catalog_albums_for_artist,
     catalog_playable_tracks_for_artist,
 )
 from ..search.musicbrainz import search_musicbrainz_recording_items
+from ..storage.cache_runtime import retained_size
 from ..search.runtime import (
     search_albums_direct,
     search_artists_direct_cached,
@@ -481,7 +484,8 @@ def _provider_recording_families(
     catalog_credit_counts: Dict[str, int] = {}
     query_key = search_query_key(query)
     complete_title_matches = any(
-        query_key and query_key in search_query_key(track.get("title") or track.get("name") or "")
+        query_key and (query_key in search_query_key(track.get("title") or track.get("name") or "")
+                      or search_spacing_equivalent(query, track.get("title") or track.get("name") or ""))
         for track in provider_tracks
     )
     query_requests_live = bool(re.search(r"\blive\b", query, re.IGNORECASE))
@@ -519,8 +523,9 @@ def _provider_recording_families(
     for index, track in enumerate(provider_tracks):
         title = trim_text(track.get("title") or track.get("name"))
         artist = trim_text(track.get("channel") or track.get("artist"))
-        title_match = search_text_similarity(query, title)
-        contains_query = bool(query_key and query_key in search_query_key(title))
+        title_match = track_query_similarity(query, title, artist)
+        contains_query = bool(query_key and (query_key in search_query_key(title)
+                                            or search_spacing_equivalent(query, title)))
         artist_key = normalize_artist_name(artist)
         title_is_live = bool(re.search(r"\blive\b", title, re.IGNORECASE))
         rendition_counterpart = bool(
@@ -773,7 +778,7 @@ def resolve_search_target(
         credited_name = trim_text(
             primary_track.get("channel") or primary_track.get("artist")
         )
-        title_match = search_text_similarity(query, title)
+        title_match = track_query_similarity(query, title, credited_name)
         canonical_title_match = (
             search_text_similarity(canonical_title, title) if canonical_title else 0.0
         )
@@ -851,6 +856,8 @@ def resolve_search_target(
         independent_canonical = bool(
             canonical.get("independent_provider_corroboration")
         )
+        compound_credit = (not explicit_album and query_mentions_artist(query, credited_name)
+                           and title_match >= .94 and not query_is_artist(query, credited_name))
         score = (
             title_match * 4.0
             + (2.0 if title_match >= 0.98 else 0.0)
@@ -864,9 +871,12 @@ def resolve_search_target(
             + (1.25 if structurally_supported_lead else 0.0)
             + (0.5 if provider_authority_supported else 0.0)
             + (2.5 if explicit_track else 0.0)
+            + (3.5 if compound_credit else 0.0)
             - mismatch_penalty
         )
         evidence = ["exact_title"] if title_match >= 0.98 else ["title_match"]
+        if compound_credit:
+            evidence.append('title_and_artist_query')
         if stable_id:
             evidence.append("provider_track_identity")
         if canonical_pair_match >= 0.80 and independent_canonical:
@@ -983,7 +993,7 @@ def resolve_search_target(
             evidence.append("provider_catalog_credit")
         if authority_supported:
             evidence.append("source_authority")
-        if query_mentions_artist(query, name) and stable_id and artist_supported:
+        if query_is_artist(query, name) and stable_id and artist_supported:
             candidates.append(
                 {
                     "entity_type": "artist",
@@ -1370,7 +1380,7 @@ def _best_track_match(
         title = trim_text(item.get("title") or item.get("name"))
         artist = trim_text(item.get("channel") or item.get("artist"))
         query_score = max(
-            search_text_similarity(query, title),
+            track_query_similarity(query, title, artist),
             search_text_similarity(
                 query,
                 " ".join(value for value in (title, artist) if value),
@@ -2427,6 +2437,9 @@ def _retrieval_cache_get(cache_key: str) -> Dict[str, Any] | None:
     if not cache_key:
         return None
     with _search_retrieval_cache_lock:
+        for key in list(_search_retrieval_cache):
+            if float(_search_retrieval_cache[key].get("expires_at") or 0) <= time.time():
+                _search_retrieval_cache.pop(key, None)
         cached = _search_retrieval_cache.get(cache_key)
         if not cached:
             return None
@@ -2439,10 +2452,18 @@ def _retrieval_cache_get(cache_key: str) -> Dict[str, Any] | None:
 def _retrieval_cache_set(cache_key: str, payload: Dict[str, Any]) -> None:
     if not cache_key:
         return
+    size_bytes = retained_size(payload)
     with _search_retrieval_cache_lock:
+        _search_retrieval_cache.pop(cache_key, None)
+        for key in list(_search_retrieval_cache):
+            if float(_search_retrieval_cache[key].get("expires_at") or 0) <= time.time():
+                _search_retrieval_cache.pop(key, None)
+        if size_bytes > 32 * 1024 * 1024:
+            return
         _search_retrieval_cache[cache_key] = {
             "expires_at": time.time() + _SEARCH_RETRIEVAL_CACHE_TTL_SECONDS,
             "payload": deepcopy(payload),
+            "size_bytes": size_bytes,
         }
         if len(_search_retrieval_cache) > 96:
             expired_keys = [
@@ -2460,6 +2481,8 @@ def _retrieval_cache_set(cache_key: str, payload: Dict[str, Any]) -> None:
                     ),
                 )
                 _search_retrieval_cache.pop(oldest_key, None)
+        while sum(entry.get("size_bytes", 0) for entry in _search_retrieval_cache.values()) > 32 * 1024 * 1024:
+            _search_retrieval_cache.pop(next(iter(_search_retrieval_cache)))
 
 
 def _search_executor(server: Any):
@@ -2644,6 +2667,11 @@ def retrieve_search_candidates_fast(
     defer_expansion = bool(
         getattr(legacy_req, "defer_side_surfaces", False)
     ) and not requested_surface
+    preview = bool(getattr(legacy_req, "search_preview", False))
+    # A short admission wait gives interactive requests a chance to use an
+    # existing slot instead of silently treating a busy provider as empty.
+    server.search_admission_wait_seconds = .6 if preview else 0
+    retrieval_budget = 2.0 if preview else _SEARCH_RETRIEVAL_TOTAL_BUDGET_SECONDS
     complete_first_page = not requested_surface and not defer_expansion
     if not query:
         return {
@@ -2665,14 +2693,9 @@ def retrieve_search_candidates_fast(
             },
         }
 
-    removed_untrusted_aliases = remove_untrusted_catalog_query_aliases(
-        getattr(server, "raw", server),
-        query=query,
-    )
-    removed_untrusted_aliases += remove_unconfirmed_display_memories(
-        getattr(server, "raw", server),
-        query=query,
-    )
+    # Catalog loaders reject unsafe aliases while reading; physical hygiene
+    # belongs to the existing background catalog writer, not tap-to-results.
+    removed_untrusted_aliases = 0
     cache_key = ""
     if not bool(getattr(legacy_req, "force_refresh", False)):
         cache_key = f"fast::{_retrieval_cache_key(legacy_req, profile, limit, server=server)}"
@@ -2692,7 +2715,7 @@ def retrieve_search_candidates_fast(
             if (
                 cached_payload is not None
                 and not legacy_track_target
-                and (cached_target.get('entity_type') != 'artist' or query_mentions_artist(query,
+                and (cached_target.get('entity_type') != 'artist' or query_is_artist(query,
                     (cached_target.get('item') or {}).get('name') or (cached_target.get('item') or {}).get('artist') or ''))
                 and (
                     search_mode == "taste"
@@ -2703,6 +2726,24 @@ def retrieve_search_candidates_fast(
                 diagnostics["cache_hit"] = True
                 cached_payload["retrieval_diagnostics"] = diagnostics
                 return cached_payload
+
+    # Provider I/O and the persisted index are independent. Start requests
+    # before local hydration so catalog work does not consume their window.
+    executor = _search_executor(server)
+    retrieval_started_at = time.perf_counter()
+    track_options = {'server': server}
+    if preview:
+        track_options['first_page_only'] = True
+    fast_track_future = executor.submit(search_tracks_direct, query,
+        16 if preview else max(limit * 2, 18), **track_options)
+    words = search_query_key(query).split()
+    spacing_future = None
+    if preview and len(words) == 2 and all(len(word) >= 3 for word in words) and 5 <= sum(map(len, words)) <= 12:
+        spacing_future = executor.submit(search_tracks_direct, ''.join(words), 8, **track_options)
+    fast_artist_future = executor.submit(search_artists_direct_cached, query,
+        max(limit, 12 if complete_first_page else 8), server=server)
+    fast_album_future = executor.submit(search_albums_direct, query,
+        max(limit, 18 if complete_first_page else 8), server=server)
 
     local_index_started_at = time.perf_counter()
     exact_memories: List[Dict[str, Any]] = []
@@ -2805,8 +2846,6 @@ def retrieve_search_candidates_fast(
         (time.perf_counter() - local_index_started_at) * 1000
     )
 
-    executor = _search_executor(server)
-    retrieval_started_at = time.perf_counter()
     track_candidates: Dict[str, Dict[str, Any]] = {}
     artist_candidates: Dict[str, Dict[str, Any]] = {}
     album_candidates: Dict[str, Dict[str, Any]] = {}
@@ -2817,40 +2856,6 @@ def retrieve_search_candidates_fast(
     first_track_evidence_ms: int | None = None
     acceptance_barrier_ms: int | None = None
 
-    fast_track_future = executor.submit(
-        search_tracks_direct,
-        query,
-        max(limit * 2, 18),
-        server=server,
-    )
-    fast_artist_future = None
-    fast_album_future = None
-    if complete_first_page:
-        fast_artist_future = executor.submit(
-            search_artists_direct_cached,
-            query,
-            max(limit, 12),
-            server=server,
-        )
-        fast_album_future = executor.submit(
-            search_albums_direct,
-            query,
-            max(limit, 18),
-            server=server,
-        )
-    elif not complete_first_page:
-        fast_artist_future = executor.submit(
-            search_artists_direct_cached,
-            query,
-            max(limit, 8),
-            server=server,
-        )
-        fast_album_future = executor.submit(
-            search_albums_direct,
-            query,
-            max(limit, 8),
-            server=server,
-        )
     canonical_evidence_future = None
     canonical_evidence_started_ms: int | None = None
     canonical_evidence_completed_ms: int | None = None
@@ -2929,6 +2934,8 @@ def retrieve_search_candidates_fast(
     future_sources = {
         fast_track_future: "tracks.fast",
     }
+    if spacing_future is not None:
+        future_sources[spacing_future] = 'tracks.spacing'
     if fast_artist_future is not None:
         future_sources[fast_artist_future] = "artists.fast"
     if fast_album_future is not None:
@@ -2937,14 +2944,22 @@ def retrieve_search_candidates_fast(
         "tracks.fast": [],
         "artists.fast": [],
         "albums.fast": [],
+        'tracks.spacing': [],
     }
     pending = set(future_sources)
     provider_deadline = (
         None
         if _SEARCH_DISABLE_TIMEOUTS
         else time.perf_counter()
-        + _SEARCH_RETRIEVAL_BRANCH_TIMEOUT_SECONDS
+        + (1.65 if preview else _SEARCH_RETRIEVAL_BRANCH_TIMEOUT_SECONDS)
     )
+    if preview:
+        provider_deadline = min(provider_deadline or float('inf'),
+            float(getattr(legacy_req, 'search_deadline', time.perf_counter() + 2.0)))
+        if spacing_future is None and any(track_query_similarity(query, trim_text(t.get('title') or t.get('name')),
+                                      trim_text(t.get('channel') or t.get('artist'))) >= .94
+               and _track_provider_identity(t) for t in fuzzy_tracks):
+            provider_deadline = min(provider_deadline, time.perf_counter() + .35)
     while pending:
         remaining = (
             None
@@ -2980,6 +2995,14 @@ def retrieve_search_candidates_fast(
                     start_canonical_evidence_if_warranted(
                         resolved_values[source_name]
                     )
+                    if preview and spacing_future is None and any(
+                        track_query_similarity(query, trim_text(t.get('title') or t.get('name')),
+                                               trim_text(t.get('channel') or t.get('artist'))) >= .90
+                        and _track_provider_identity(t) for t in resolved_values[source_name]
+                    ):
+                        # A usable recording must not wait for optional slower
+                        # branches. Their existing snapshot enrichment continues.
+                        provider_deadline = min(provider_deadline or float('inf'), time.perf_counter() + .15)
             except Exception:
                 timed_out_sources.append(source_name)
     for future in pending:
@@ -2994,6 +3017,9 @@ def retrieve_search_candidates_fast(
     )
 
     fast_tracks = list(resolved_values["tracks.fast"] or [])
+    known_sources = {_track_provider_identity(t) for t in fast_tracks}
+    fast_tracks.extend(t for t in resolved_values['tracks.spacing']
+                       if _track_provider_identity(t) not in known_sources)
     canonical_tracks: List[Dict[str, Any]] = []
     fast_artists = list(resolved_values["artists.fast"] or [])
     fast_albums = list(resolved_values["albums.fast"] or [])
@@ -3071,9 +3097,13 @@ def retrieve_search_candidates_fast(
     elif canonical_evidence_future is not None:
         elapsed_seconds = time.perf_counter() - retrieval_started_at
         remaining_seconds = max(
-            _SEARCH_RETRIEVAL_TOTAL_BUDGET_SECONDS - elapsed_seconds,
+            retrieval_budget - elapsed_seconds,
             0.0,
         )
+        if preview:
+            remaining_seconds = min(remaining_seconds, max(0.0,
+                float(getattr(legacy_req, 'search_deadline', retrieval_started_at + retrieval_budget)) - time.perf_counter()))
+            remaining_seconds = min(remaining_seconds, .1)
         decisive_provider = bool(
             provider_recording_decision.get("decisive")
             and provider_recording_decision.get("structurally_supported")
@@ -3085,13 +3115,20 @@ def retrieve_search_candidates_fast(
         )
         if decisive_provider:
             remaining_seconds = min(
-                remaining_seconds, _SEARCH_DECISIVE_CANONICAL_GRACE_SECONDS
+                remaining_seconds, 0.05 if preview else _SEARCH_DECISIVE_CANONICAL_GRACE_SECONDS
             )
-        if cross_entity_recording_conflict:
+        elif (preview and provider_recording_decision.get("structurally_supported")
+              and not cross_entity_recording_conflict
+              and not provider_recording_decision.get("conflict")):
+            # Initial surfaces may show provider-supported candidates without
+            # claiming canonical verification. Full snapshot completion retains
+            # the existing independent recording/credit conflict resolution.
+            remaining_seconds = min(remaining_seconds, 0.1)
+        if cross_entity_recording_conflict and not preview:
             remaining_seconds += _SEARCH_CANONICAL_CONFLICT_GRACE_SECONDS
         if canonical_evidence_future.done():
             canonical_done = {canonical_evidence_future}
-        elif _SEARCH_DISABLE_TIMEOUTS:
+        elif _SEARCH_DISABLE_TIMEOUTS and not preview:
             wait({canonical_evidence_future})
             canonical_done = {canonical_evidence_future}
         elif remaining_seconds > 0.0:
@@ -3305,7 +3342,8 @@ def retrieve_search_candidates_fast(
         resolved_target = resolve_search_target(
             server=server,
             query=query,
-            tracks=[*canonical_tracks, *fast_tracks][:24],
+            tracks=[*canonical_tracks, *fast_tracks,
+                    *(t for t in fuzzy_tracks if verified_playback_source(t))][:24],
             artists=[*fast_artists, *fuzzy_artists][:16],
             albums=[*fast_albums, *fuzzy_albums][:16],
             canonical_resolution=canonical_resolution,
@@ -3418,10 +3456,10 @@ def retrieve_search_candidates_fast(
     if expansion_future is not None:
         elapsed_seconds = time.perf_counter() - retrieval_started_at
         remaining_seconds = max(
-            _SEARCH_RETRIEVAL_TOTAL_BUDGET_SECONDS - elapsed_seconds,
+            retrieval_budget - elapsed_seconds,
             0.0,
         )
-        if _SEARCH_DISABLE_TIMEOUTS:
+        if _SEARCH_DISABLE_TIMEOUTS and not preview:
             expansion_done = {expansion_future}
             wait(expansion_done)
         elif remaining_seconds > 0.0:
@@ -3581,7 +3619,7 @@ def retrieve_search_candidates_fast(
                 track_candidates or artist_candidates or album_candidates
             ),
             "retrieval_ms": int((time.perf_counter() - retrieval_started_at) * 1000),
-            "deadline_ms": int(_SEARCH_RETRIEVAL_TOTAL_BUDGET_SECONDS * 1000),
+            "deadline_ms": int(retrieval_budget * 1000),
             "timeouts_disabled": bool(_SEARCH_DISABLE_TIMEOUTS),
             "completed_sources": completed_sources,
             "timed_out_sources": timed_out_sources,

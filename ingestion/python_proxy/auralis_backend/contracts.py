@@ -73,6 +73,8 @@ class SearchRequest(BaseModel):
     row_id: Optional[str] = None
     row_context: Optional[str] = None
     defer_side_surfaces: bool = False
+    # Browser live Top response; full category/detail requests retain their contract.
+    search_preview: bool = False
     # Optional bounded long-poll for an existing canonical search snapshot.
     # The backend never starts retrieval for a revision wait.
     revision: int = 0
@@ -106,6 +108,7 @@ class RecommendationSearchEventRequest(BaseModel):
 class HistorySeedRequest(BaseModel):
     user_scope_id: str = "guest"
     limit: int = 24
+    pending_play_keys: List[str] = Field(default_factory=list, max_length=512)
 
 
 class RecommendationModelTrainRequest(BaseModel):
@@ -124,8 +127,11 @@ class DownloadRequest(BaseModel):
 
 
 class PrepareSessionRequest(BaseModel):
+    queue_cache_id: str = Field(default="", max_length=128)
+    queue_cache_revision: int = Field(default=0, ge=0)
+    cancel_queue_cache: bool = False
     cache_full: bool = False
-    track_keys: List[str] = Field(default_factory=list)
+    track_keys: List[str] = Field(default_factory=list, max_length=100)
     current_track_key: Optional[str] = None
     active_queue: bool = False
     lookahead: int = 0

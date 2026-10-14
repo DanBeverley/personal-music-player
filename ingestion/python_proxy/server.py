@@ -8,7 +8,7 @@ from concurrent.futures import (
     as_completed,
     wait,
 )
-from threading import Event, Lock, Thread
+from threading import BoundedSemaphore, Event, Lock, Thread
 from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException, Request
@@ -1441,15 +1441,29 @@ def _executor_call_with_retry(
     backoff_seconds: float = 0.12,
     timeout_seconds: float | None = None,
     default=None,
+    admission=None,
+    admission_wait_seconds: float = 0,
 ):
     for attempt in range(max(1, int(attempts or 1))):
         future = None
+        if admission is not None and not admission.acquire(timeout=max(0, admission_wait_seconds)):
+            return default
         try:
             future = executor.submit(fn)
+            if admission is not None:
+                future.add_done_callback(lambda _future: admission.release())
             if timeout_seconds is None:
                 return future.result()
             return future.result(timeout=max(0.05, float(timeout_seconds)))
+        except FutureTimeoutError:
+            if future is not None:
+                future.cancel()
+            # Cancellation cannot stop a running HTTP call. Keep its slot
+            # until completion and never overlap it with another attempt.
+            return default
         except Exception:
+            if future is None and admission is not None:
+                admission.release()
             if future is not None:
                 future.cancel()
             if attempt + 1 >= max(1, int(attempts or 1)):
@@ -1461,10 +1475,11 @@ def _executor_call_with_retry(
 def _search_upstream_call_with_retry(
     fn,
     *,
-    attempts: int = 2,
+    attempts: int = 1,
     backoff_seconds: float = 0.12,
     timeout_seconds: float | None = None,
     default=None,
+    admission_wait_seconds: float = 0,
 ):
     return _executor_call_with_retry(
         fn,
@@ -1473,6 +1488,8 @@ def _search_upstream_call_with_retry(
         backoff_seconds=backoff_seconds,
         timeout_seconds=timeout_seconds or SEARCH_UPSTREAM_TIMEOUT_SECONDS,
         default=default,
+        admission=search_upstream_admission,
+        admission_wait_seconds=admission_wait_seconds,
     )
 
 
@@ -1830,6 +1847,7 @@ recommendation_executor = ThreadPoolExecutor(
 precompute_executor = ThreadPoolExecutor(max_workers=PRECOMPUTE_EXECUTOR_WORKERS)
 search_executor = ThreadPoolExecutor(max_workers=SEARCH_EXECUTOR_WORKERS)
 search_upstream_executor = ThreadPoolExecutor(max_workers=SEARCH_UPSTREAM_WORKERS)
+search_upstream_admission = BoundedSemaphore(SEARCH_UPSTREAM_WORKERS)
 recommendation_row_executor = ThreadPoolExecutor(
     max_workers=RECOMMENDATION_ROW_BUILD_WORKERS
 )

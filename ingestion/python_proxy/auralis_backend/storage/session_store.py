@@ -25,31 +25,52 @@ class SessionStore:
 
 
 class MemorySessionStore(SessionStore):
-    def __init__(self) -> None:
+    def __init__(self, *, max_bytes: int = 64 * 1024 * 1024, max_entries: int = 256) -> None:
         self._lock = Lock()
         self._items: Dict[str, Dict[str, Any]] = {}
+        self._max_bytes = max(0, int(max_bytes))
+        self._max_entries = max(0, int(max_entries))
+        self._size_bytes = 0
+
+    def _remove(self, key: str) -> None:
+        previous = self._items.pop(key, None)
+        if previous is not None:
+            self._size_bytes -= len(previous["value"])
+
+    def _expire(self, now: float) -> None:
+        for key in list(self._items):
+            if self._items[key]["expires_at"] <= now:
+                self._remove(key)
 
     def get(self, key: str) -> Optional[Dict[str, Any]]:
         now = time.time()
         with self._lock:
+            self._expire(now)
             payload = self._items.get(key)
             if not payload:
                 return None
-            if payload["expires_at"] <= now:
-                self._items.pop(key, None)
-                return None
-            return json.loads(json.dumps(payload["value"]))
+            # Retain serialized bytes, not a second expanded inventory tree.
+            raw = payload["value"]
+        return json.loads(raw)
 
     def set(self, key: str, value: Dict[str, Any], ttl_seconds: int) -> None:
+        raw = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         with self._lock:
+            self._expire(time.time())
+            self._remove(key)
+            if len(raw) > self._max_bytes or ttl_seconds <= 0 or not self._max_entries:
+                return
             self._items[key] = {
-                "value": json.loads(json.dumps(value)),
+                "value": raw,
                 "expires_at": time.time() + ttl_seconds,
             }
+            self._size_bytes += len(raw)
+            while self._items and (self._size_bytes > self._max_bytes or len(self._items) > self._max_entries):
+                self._remove(next(iter(self._items)))
 
     def delete(self, key: str) -> None:
         with self._lock:
-            self._items.pop(key, None)
+            self._remove(key)
 
 
 class RedisSessionStore(SessionStore):

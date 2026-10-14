@@ -56,6 +56,59 @@ def search_query_key(query: str) -> str:
     return normalize_track_title(re.sub(r"(?<=\w)['’](?=\w)", "", str(query or "")))
 
 
+def search_spacing_equivalent(query: str, candidate: str) -> bool:
+    left = search_query_key(query).replace(" ", "")
+    right = search_query_key(candidate).replace(" ", "")
+    return len(left) >= 5 and left == right
+
+
+def search_match_key(value: str) -> str:
+    """Numeric spelling is retrieval evidence; canonical IDs stay unchanged."""
+    units = dict(zip(('zero one two three four five six seven eight nine ten eleven '
+                      'twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen').split(), range(20)))
+    tens = dict(zip('twenty thirty forty fifty sixty seventy eighty ninety'.split(), range(20, 100, 10)))
+    words = search_query_key(value).split()
+    output = []
+    i = 0
+    while i < len(words):
+        word = words[i]
+        if word in tens:
+            number = tens[word]
+            if i + 1 < len(words) and 0 < units.get(words[i + 1], 0) < 10:
+                i += 1
+                number += units[words[i]]
+            output.append(str(number))
+        else:
+            output.append(str(units[word]) if word in units else word)
+        i += 1
+    return ' '.join(output)
+
+
+def query_is_artist(query: str, artist: str) -> bool:
+    left, right = search_match_key(query), search_match_key(artist)
+    for marker in ('artist', 'band', 'singer'):
+        if left == marker + ' ' + right or left == right + ' ' + marker:
+            return True
+    return bool(right and (left.replace(' ', '') == right.replace(' ', '')
+                          or len(left.split()) == len(right.split())
+                          and search_text_similarity(left, right) >= .90))
+
+
+def track_query_similarity(query: str, title: str, artist: str) -> float:
+    """Require title evidence after removing a matched credited artist."""
+    q, t, a = map(search_match_key, (query, title, artist))
+    score = search_text_similarity(query, title)
+    if not t or not a:
+        return score
+    words, credit = q.split(), a.split()
+    for at in range(len(words) - len(credit) + 1):
+        if words[at:at + len(credit)] == credit:
+            residual = ' '.join(words[:at] + words[at + len(credit):])
+            if residual:
+                score = max(score, search_text_similarity(residual, t))
+    return score
+
+
 def search_text_similarity(query: str, candidate: str) -> float:
     """Order-tolerant lexical similarity for canonical search entities."""
     query_key = search_query_key(query)
@@ -64,6 +117,9 @@ def search_text_similarity(query: str, candidate: str) -> float:
         return 0.0
     if query_key == candidate_key:
         return 1.0
+    if search_spacing_equivalent(query, candidate):
+        # Retrieval evidence only: never change catalog IDs or exact aliases.
+        return 0.98
     if query_key in candidate_key or candidate_key in query_key:
         shorter = min(len(query_key), len(candidate_key))
         longer = max(len(query_key), len(candidate_key))
@@ -617,6 +673,40 @@ def annotate_canonical_entity(server: Any, item: Dict[str, Any]) -> Dict[str, An
 
 
 
+def _trusted_catalog_alias(connection, row, alias_key: str, cache=None) -> bool:
+    """Reject stale learned aliases without acquiring a database write lock."""
+    source = _text(row["source"])
+    key = (row['entity_type'], row['entity_key'], source)
+    if cache is not None and key in cache:
+        value = cache[key]
+        return alias_key in value if isinstance(value, set) else value
+    if source == "canonical_search_result":
+        item = _json_loads(row["payload_json"])
+        title, artist, album = canonical_track_fields(item, query="")
+        aliases = set(_catalog_alias_keys(
+            "", entity_type=row["entity_type"], item=item,
+            title_key=title, artist_key=artist, album_key=album, include_query_alias=False,
+        ))
+        if cache is not None:
+            cache[key] = aliases
+        return alias_key in aliases
+    if source in {"search_interaction", "canonical_search_response"}:
+        events = connection.execute(
+            "SELECT event_type FROM search_entity_events WHERE entity_type=? AND entity_key=?",
+            [row["entity_type"], row["entity_key"]],
+        )
+        types = {str(event[0]) for event in events}
+        inferred = {"exact_query_intent", "search_resolution"}
+        confirmed = {"play_start", "suggestion_play_start", "result_play", "search_result_play", "play",
+                     "detail_open", "artist_open", "album_open", "playlist_open", "result_click", "click",
+                     "tap", "save", "like", "add_to_playlist"}
+        trusted = not (types & inferred) or bool(types & confirmed)
+        if cache is not None:
+            cache[key] = trusted
+        return trusted
+    return True
+
+
 def load_catalog_entity_memories(
     server: Any,
     *,
@@ -635,7 +725,7 @@ def load_catalog_entity_memories(
     try:
         rows = connection.execute(
             """
-            SELECT a.entity_type, a.entity_key, a.score, a.confidence,
+            SELECT a.entity_type, a.entity_key, a.score, a.confidence, a.source,
                    e.display_title, e.display_artist, e.display_album,
                    e.learned_popularity, e.popularity, e.payload_json, e.updated_at
             FROM catalog_entity_aliases a
@@ -648,6 +738,7 @@ def load_catalog_entity_memories(
             """,
             [alias_key, normalized_type, max(int(limit or 0), 1)],
         ).fetchall()
+        rows = [row for row in rows if _trusted_catalog_alias(connection, row, alias_key)]
     except Exception:
         return []
     finally:
@@ -706,47 +797,8 @@ def load_catalog_artist_records(
     )
     if not artist_keys:
         return {}
-    # Bounded hygiene for legacy query/backfill aliases. Name aliases are
-    # useful only when they agree with the payload's intrinsic name/aliases;
-    # stable identity aliases and authoritative sources are retained.
-    try:
-        connection = open_recommendation_store_connection(server)
-        rows = connection.execute(
-            """SELECT a.entity_key, a.alias_key, a.source, e.payload_json
-               FROM catalog_entity_aliases a
-               JOIN catalog_entities e ON e.entity_type=a.entity_type AND e.entity_key=a.entity_key
-               WHERE a.entity_type='artist' AND (
-                 lower(coalesce(a.source,'')) IN
-                   ('query','search','backfill','catalog_backfill','musicbrainz_query_backfill','catalog_backfill_search_event')
-                 OR lower(coalesce(a.source,'')) LIKE '%query_backfill%'
-                 OR lower(coalesce(a.source,'')) LIKE '%search_backfill%'
-               )
-               LIMIT 256"""
-        ).fetchall()
-        stale = []
-        for row in rows:
-            payload = _json_loads(row["payload_json"])
-            intrinsic = {
-                normalize_artist_name(payload.get("name")),
-                *(normalize_artist_name(v) for v in (payload.get("artist_aliases") or []) if normalize_artist_name(v)),
-                *(normalize_artist_name(v) for v in (payload.get("aliases") or []) if normalize_artist_name(v)),
-            }
-            alias_key = normalize_artist_name(row["alias_key"])
-            if alias_key and alias_key not in intrinsic:
-                stale.append((row["entity_key"], row["alias_key"]))
-        for entity_key, alias_key in stale:
-            connection.execute(
-                "DELETE FROM catalog_entity_aliases WHERE entity_type='artist' AND entity_key=? AND alias_key=?",
-                [entity_key, alias_key],
-            )
-        if stale:
-            connection.commit()
-        connection.close()
-    except Exception:
-        try:
-            connection.close()
-        except Exception:
-            pass
+    # Reject legacy query/backfill aliases during reading. A metadata read
+    # must never wait for a SQLite writer just to delete unrelated aliases.
     placeholders = ",".join("?" for _ in artist_keys)
     try:
         connection = open_recommendation_store_connection(server)
@@ -835,6 +887,18 @@ def load_catalog_artist_records(
 
     for row in rows:
         payload = _json_loads(row["payload_json"])
+        alias_source = _text(row["alias_source"]).casefold()
+        if alias_source in {
+            "query", "search", "backfill", "catalog_backfill", "musicbrainz_query_backfill",
+            "catalog_backfill_search_event",
+        } or "query_backfill" in alias_source or "search_backfill" in alias_source:
+            intrinsic = {
+                normalize_artist_name(payload.get("name")),
+                *(normalize_artist_name(v) for v in (payload.get("artist_aliases") or [])),
+                *(normalize_artist_name(v) for v in (payload.get("aliases") or [])),
+            }
+            if normalize_artist_name(row["matched_key"]) not in intrinsic:
+                continue
         payload["popularity"] = max(
             float(payload.get("popularity") or 0.0),
             float(row["popularity"] or 0.0),
@@ -860,7 +924,8 @@ def load_catalog_artist_records(
                 continue
             preferred, secondary = (
                 (payload, previous)
-                if record_priority(payload) > record_priority(previous)
+                if (normalize_artist_name(payload.get("name")) == key, record_priority(payload))
+                > (normalize_artist_name(previous.get("name")) == key, record_priority(previous))
                 else (previous, payload)
             )
             combined = _merge_entity_metadata_payload(
@@ -883,8 +948,8 @@ def load_catalog_artist_records(
 
 def query_mentions_artist(query: str, artist: str) -> bool:
     """Catalog popularity cannot turn a partial name into an artist query."""
-    query_tokens = search_query_key(query).split()
-    artist_tokens = search_query_key(artist).split()
+    query_tokens = search_match_key(query).split()
+    artist_tokens = search_match_key(artist).split()
     if not artist_tokens:
         return False
     if ''.join(query_tokens) == ''.join(artist_tokens):
@@ -933,6 +998,10 @@ def load_fuzzy_catalog_entity_memories(
         f"% {escaped_query}",
         f"% {escaped_query} %",
     ]
+    joined = escaped_query.replace(" ", "")
+    if len(joined) >= 5:
+        alias_clauses.append("replace(a.alias_key, ' ', '') LIKE ? ESCAPE '\\'")
+        alias_parameters.append(f"%{joined}%")
     if len(query_key) > 3:
         alias_clauses.append("a.alias_key LIKE ? ESCAPE '\\'")
         alias_parameters.append(f"%{escaped_query}%")
@@ -961,9 +1030,61 @@ def load_fuzzy_catalog_entity_memories(
     )
     try:
         rows = []
+        trust_cache = {}
         for requested_type in requested_types:
-            rows.extend(
-                connection.execute(
+            # The existing alias-key index can serve exact/prefix input without
+            # scanning every alias or decoding hundreds of payloads per key.
+            select_sql = """
+                SELECT a.alias_key, a.entity_type, a.entity_key, a.score,
+                       a.confidence, a.source, e.display_title,
+                       e.display_artist, e.display_album, e.learned_popularity,
+                       e.popularity, e.payload_json, e.updated_at
+                FROM catalog_entity_aliases a
+                JOIN catalog_entities e
+                  ON e.entity_type = a.entity_type AND e.entity_key = a.entity_key
+            """
+            prefix_rows = connection.execute(
+                select_sql + """
+                WHERE a.alias_key >= ? AND a.alias_key < ? AND a.entity_type = ?
+                ORDER BY CASE WHEN a.alias_key = ? THEN 1 ELSE 0 END DESC,
+                         a.score DESC, a.confidence DESC, e.learned_popularity DESC
+                LIMIT ?
+                """,
+                [query_key, query_key + chr(0x10ffff), requested_type, query_key,
+                 min(per_type_budget, max(limit * 4, 32))],
+            ).fetchall()
+            trusted_prefix = [row for row in prefix_rows
+                              if _trusted_catalog_alias(connection, row, row['alias_key'], trust_cache)]
+            # Missing domains/typos retain the existing broad similarity path.
+            # Never let an unrelated prefix suppress a stronger fuzzy match.
+            exact_prefix = any(row['alias_key'] == query_key for row in trusted_prefix)
+            indexed = connection.execute("SELECT 1 FROM sqlite_master WHERE name='catalog_search_fts'").fetchone()
+            if indexed and any(len(word) >= 3 for word in query_key.split()):
+                # MATCH selects compact catalog fields through the inverted
+                # index. Payload hydration is bounded; no alias-table scan.
+                terms = list(dict.fromkeys([query_key, *query_key.split()]))
+                grams = [word[i:i+3] for word in query_key.split() if len(word) >= 4
+                         for i in range(len(word)-2)]
+                expression = ' OR '.join('"' + term.replace('"', '""') + '"'
+                                         for term in terms if len(term) >= 3)
+                indexed_sql = """
+                    SELECT e.display_title AS alias_key, e.entity_type, e.entity_key,
+                           1.0 AS score, e.confidence, 'catalog_field' AS source,
+                           e.display_title, e.display_artist, e.display_album,
+                           e.learned_popularity, e.popularity, e.payload_json, e.updated_at
+                    FROM catalog_search_fts JOIN catalog_entities e ON e.rowid=catalog_search_fts.rowid
+                    WHERE catalog_search_fts MATCH ? AND e.entity_type=?
+                    ORDER BY bm25(catalog_search_fts, 6.0, 3.0, 1.0) LIMIT ?
+                """
+                type_rows = connection.execute(indexed_sql, [expression, requested_type, min(per_type_budget, 96)]).fetchall()
+                if not type_rows and grams:
+                    expression = ' OR '.join('"' + gram.replace('"', '""') + '"'
+                                             for gram in list(dict.fromkeys(grams))[:24])
+                    type_rows = connection.execute(indexed_sql, [expression, requested_type, min(per_type_budget, 96)]).fetchall()
+                rows.extend(type_rows)
+                rows.extend(trusted_prefix)
+                continue
+            type_rows = [] if exact_prefix else connection.execute(
                     f"""
                     SELECT a.alias_key, a.entity_type, a.entity_key, a.score,
                            a.confidence, a.source, e.display_title,
@@ -987,7 +1108,8 @@ def load_fuzzy_catalog_entity_memories(
                         per_type_budget,
                     ],
                 ).fetchall()
-            )
+            rows.extend(trusted_prefix)
+            rows.extend(row for row in type_rows if _trusted_catalog_alias(connection, row, row["alias_key"], trust_cache))
     except Exception:
         return []
     finally:
@@ -996,7 +1118,9 @@ def load_fuzzy_catalog_entity_memories(
     best_by_entity: Dict[tuple[str, str], Dict[str, Any]] = {}
     for row in rows:
         alias_key = _text(row["alias_key"])
-        similarity = search_text_similarity(query_key, alias_key)
+        similarity = max(search_text_similarity(query_key, alias_key),
+                         track_query_similarity(query_key, row['display_title'], row['display_artist'])
+                         if row['entity_type'] == 'track' else 0.0)
         if similarity < 0.62:
             continue
         payload = _json_loads(row["payload_json"])
@@ -1843,6 +1967,28 @@ def remove_unconfirmed_display_memories(
     return removed
 
 
+def _artist_metadata_conflicts(existing: Dict[str, Any], incoming: Dict[str, Any]) -> bool:
+    def identities(payload):
+        provider = _text(payload.get('provider_artist_id') or payload.get('browseId')
+                         or payload.get('artist_id') or payload.get('id'))
+        if provider.startswith(('musicbrainz:', 'artist-name:', 'derived:', 'provider:')):
+            provider = ''
+        canonical = _text(payload.get('canonical_artist_id') or payload.get('canonical_artist_key')).casefold()
+        if not canonical.startswith('musicbrainz:artist:'):
+            canonical = ''
+        name = normalize_artist_name(payload.get('name') or payload.get('artist'))
+        return provider, canonical, name
+    left, right = identities(existing), identities(incoming)
+    if left[1] and right[1] and left[1] != right[1]:
+        return True
+    same_canonical = bool(left[1] and left[1] == right[1])
+    same_provider = bool(left[0] and left[0] == right[0])
+    if left[0] and right[0] and left[0] != right[0] and not same_canonical:
+        return True
+    return bool(left[2] and right[2] and left[2] != right[2]
+                and not same_canonical and not same_provider)
+
+
 def _merge_entity_metadata_payload(
     existing: Dict[str, Any],
     incoming: Dict[str, Any],
@@ -1850,6 +1996,10 @@ def _merge_entity_metadata_payload(
     entity_type: str,
 ) -> Dict[str, Any]:
     """Preserve rich catalog metadata when a thinner search row arrives."""
+    if entity_type == 'artist' and _artist_metadata_conflicts(existing, incoming):
+        # Alias overlap or popularity cannot transfer identity, art or aliases
+        # across two distinct artists. The caller's preferred record stands alone.
+        return dict(incoming)
     merged = dict(existing or {})
     for key, value in dict(incoming or {}).items():
         if value not in (None, "", [], {}):

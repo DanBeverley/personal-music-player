@@ -10,10 +10,15 @@ Map<String, dynamic> buildWebHomeSignals({
   Map<String, dynamic>? currentTrack,
   double currentPosition = 0,
   Iterable<Map<String, dynamic>> playedSnapshots = const [],
+  Iterable<Map<String, dynamic>>? frequentSnapshots,
 }) {
-  final boundedSnapshots = playedSnapshots.toList().reversed.take(32).toList(growable: false);
-  final frequent = boundedSnapshots.where((item) => (item['play_count'] as num? ?? 1) >= 2).toList()
-    ..sort((a, b) => (b['play_count'] as num).compareTo(a['play_count'] as num));
+  final boundedSnapshots =
+      playedSnapshots.toList().reversed.take(32).toList(growable: false);
+  final frequent = (frequentSnapshots ?? boundedSnapshots)
+      .where((item) => (item['play_count'] as num? ?? 1) >= 2)
+      .toList()
+    ..sort(
+        (a, b) => (b['play_count'] as num).compareTo(a['play_count'] as num));
   final libraryTrackIds = <String>{};
   final artistHints = <String>{};
   final playlistNames = <String>[];
@@ -60,7 +65,8 @@ Map<String, dynamic> buildWebHomeSignals({
   final hasSignals = libraryTrackIds.isNotEmpty ||
       artistHints.isNotEmpty ||
       playlistNames.isNotEmpty ||
-      playedId != null || boundedSnapshots.isNotEmpty;
+      playedId != null ||
+      boundedSnapshots.isNotEmpty;
   return {
     if (hasSignals)
       'client_signal_tier': 'personalized'
@@ -74,7 +80,8 @@ Map<String, dynamic> buildWebHomeSignals({
       'artist_hints': artistHints.take(6).toList(growable: false),
     if (playlistNames.isNotEmpty) 'playlist_names': playlistNames,
     if (frequent.isNotEmpty) ...{
-      'top_track_ids': frequent.map(extractTrackId).whereType<String>().take(16).toList(),
+      'top_track_ids':
+          frequent.map(extractTrackId).whereType<String>().take(16).toList(),
       'top_track_snapshots': frequent.take(16).toList(),
     },
     if (playedId != null || boundedSnapshots.isNotEmpty)

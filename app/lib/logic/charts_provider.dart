@@ -5,6 +5,22 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'proxy_runtime.dart';
 import 'track_metadata.dart';
 
+// Regions supported by the existing Last.fm/YouTube country adapters.
+const chartCountries = <String, String>{
+  'GLOBAL': 'Global',
+  'US': 'United States',
+  'GB': 'United Kingdom',
+  'VN': 'Vietnam',
+  'JP': 'Japan',
+  'KR': 'South Korea',
+  'AU': 'Australia',
+  'BR': 'Brazil',
+  'CA': 'Canada',
+  'DE': 'Germany',
+  'FR': 'France',
+  'IN': 'India',
+};
+
 class ChartQuery {
   const ChartQuery({
     this.country = 'GLOBAL',

@@ -14,7 +14,8 @@ class WebAuth extends ChangeNotifier {
         _session = null;
         _user = null;
       }
-      if (state.event == AuthChangeEvent.passwordRecovery) _passwordRecovery = true;
+      if (state.event == AuthChangeEvent.passwordRecovery)
+        _passwordRecovery = true;
       if (state.event == AuthChangeEvent.signedOut) _passwordRecovery = false;
       _busy = false;
       _error = null;
@@ -33,7 +34,8 @@ class WebAuth extends ChangeNotifier {
 
   static Future<WebAuth> _initialize() async {
     const url = String.fromEnvironment('SUPABASE_URL', defaultValue: '');
-    const anonKey = String.fromEnvironment('SUPABASE_ANON_KEY', defaultValue: '');
+    const anonKey =
+        String.fromEnvironment('SUPABASE_ANON_KEY', defaultValue: '');
     if (url.trim().isEmpty || anonKey.trim().isEmpty) {
       return WebAuth._(null, configured: false);
     }
@@ -55,7 +57,8 @@ class WebAuth extends ChangeNotifier {
       }
     }
     final adapter = WebAuth._(client, configured: true);
-    adapter._passwordRecovery = recoveryRequested && client.auth.currentSession != null;
+    adapter._passwordRecovery =
+        recoveryRequested && client.auth.currentSession != null;
     return adapter;
   }
 
@@ -71,6 +74,25 @@ class WebAuth extends ChangeNotifier {
   SupabaseClient? get client => _client;
   String? get userId => _user?.id;
   String? get email => _user?.email;
+  String? get displayName =>
+      (_user?.userMetadata?['full_name'] ?? _user?.userMetadata?['name'])
+          ?.toString();
+  String? get avatarUrl {
+    final value =
+        (_user?.userMetadata?['avatar_url'] ?? _user?.userMetadata?['picture'])
+            ?.toString();
+    final uri = Uri.tryParse(value ?? '');
+    return uri != null && uri.scheme == 'https' && uri.host.isNotEmpty
+        ? uri.toString()
+        : null;
+  }
+
+  String get initial {
+    final name = displayName?.trim() ?? '';
+    final value = name.isEmpty ? email?.trim() ?? 'N' : name;
+    return value.isEmpty ? 'N' : value.substring(0, 1).toUpperCase();
+  }
+
   bool get busy => _busy;
   String? get error => _error;
   bool get passwordRecovery => _passwordRecovery;

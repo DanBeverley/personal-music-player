@@ -6,7 +6,7 @@
     }
     @apiPost {
         method POST
-        path /search /search_interaction /related_tracks /playback/resolve /prepare_session /recommend /interaction_event /history_seed
+        path /search /suggest /search_interaction /related_tracks /playback/resolve /prepare_session /recommend /interaction_event /history_seed
     }
     handle @apiPost {
         header Cache-Control "no-store"
@@ -14,7 +14,7 @@
     }
     @apiGet {
         method GET HEAD
-        path /playback/stream/* /artist_artwork/* /entity_artwork/* /album/* /artist/*
+        path /playback/stream/* /artist_artwork/* /entity_artwork/* /album/* /artist/* /lyrics/* /recent_search_picks /charts /new_releases
     }
     handle @apiGet {
         header Cache-Control "no-store"

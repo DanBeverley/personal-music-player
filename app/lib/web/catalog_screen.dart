@@ -9,6 +9,10 @@ import 'home_widgets.dart';
 import 'design_system.dart';
 import 'music_api.dart';
 import 'web_player.dart';
+import 'playback_port.dart';
+import 'search_history.dart';
+import 'discovery_shelves.dart';
+import 'chart_region.dart';
 
 class CatalogScreen extends StatefulWidget {
   final MusicApi api;
@@ -22,6 +26,9 @@ class CatalogScreen extends StatefulWidget {
   final Future<void> Function(Map<String, dynamic>) onLike;
   final Map<String, dynamic> Function()? homeSignals;
   final VoidCallback? onHomePainted;
+  final SessionStore? historyStore;
+  final ChartRegion? chartRegion;
+  final Future<List<Map<String, dynamic>>> Function()? recentQueries;
   const CatalogScreen(
       {super.key,
       required this.api,
@@ -30,6 +37,9 @@ class CatalogScreen extends StatefulWidget {
       required this.active,
       required this.onLike,
       this.homeSignals,
+      this.historyStore,
+      this.chartRegion,
+      this.recentQueries,
       this.onHomePainted,
       this.homeSignalsReady = true,
       this.homeSignalRevision = 0,
@@ -42,6 +52,8 @@ class CatalogScreen extends StatefulWidget {
 
 class _CatalogScreenState extends State<CatalogScreen> {
   late final catalog = CatalogApi(widget.api);
+  late final history =
+      SearchHistory(widget.api.userScopeId, store: widget.historyStore);
   final query = TextEditingController();
   Map<String, dynamic> data = {}, pagination = {};
   final List<({String type, Map<String, dynamic> item})> extras = [];
@@ -52,10 +64,21 @@ class _CatalogScreenState extends State<CatalogScreen> {
   bool busy = false, submitted = false, automatic = true;
   String? error;
   String submittedQuery = '', filter = 'all';
+  String displayedQuery = '';
   int generation = 0;
   int revision = 0;
-  Timer? poll, homePoll;
+  Timer? poll, homePoll, homeRetry;
+  int homeFailures = 0;
+  DateTime? homeWaitStartedAt;
   Timer? homePrepare;
+  Timer? searchDebounce;
+  Completer<void>? searchCancel, suggestionCancel;
+  Stopwatch? searchWatch;
+  int suggestionVersion = 0;
+  bool historyLoading = false;
+  DateTime? historyLoadedAt;
+  bool fullSearchLoaded = false;
+  List<Map<String, dynamic>> suggestions = [];
   final String launchToken = 'web:${DateTime.now().microsecondsSinceEpoch}';
   String lastPreparedSignals = '';
   DateTime? lastPreparedAt;
@@ -89,6 +112,178 @@ class _CatalogScreenState extends State<CatalogScreen> {
     // Persisted Home can arrive independently of cloud library hydration.
     // Updated signals prepare successors without replacing the active feed.
     if (widget.home && homeActive) unawaited(load());
+    if (!widget.home && widget.active) unawaited(_loadHistory());
+  }
+
+  void _queryChanged(String value) {
+    searchWatch = Stopwatch()..start();
+    generation++;
+    suggestionVersion++;
+    _cancelSearchRequests();
+    poll?.cancel();
+    searchDebounce?.cancel();
+    widget.api.clearSearchContext();
+    fullSearchLoaded = false;
+    setState(() {
+      suggestions = _localSuggestions(value);
+      error = null;
+      detail = null;
+      if (value.trim().isEmpty) {
+        data = {};
+        extras.clear();
+        pagination = {};
+        pagedItems.clear();
+        pagedCursors.clear();
+        submitted = false;
+        busy = false;
+      } else {
+        busy = true;
+      }
+    });
+    if (value.trim().isEmpty) return;
+    searchDebounce = Timer(const Duration(milliseconds: 220), () {
+      unawaited(load());
+      final version = suggestionVersion;
+      unawaited(_suggest(value.trim(), version));
+    });
+  }
+
+  Future<void> _suggest(String value, int version) async {
+    if (suggestionCancel?.isCompleted == false) suggestionCancel!.complete();
+    final cancel = suggestionCancel = Completer<void>();
+    try {
+      final incoming = await catalog.suggest(value,
+          recentQueries: history.queries,
+          recentTracks:
+              maps(widget.homeSignals?.call()['recent_track_snapshots']),
+          cancel: cancel.future);
+      if (mounted &&
+          suggestionVersion == version &&
+          query.text.trim() == value) {
+        setState(() => suggestions = incoming.isEmpty
+            ? _localSuggestions(value)
+            : incoming.take(5).toList());
+      }
+    } catch (_) {/* Suggestions never prevent full search. */}
+  }
+
+  void _cancelSearchRequests() {
+    for (final request in [searchCancel, suggestionCancel]) {
+      if (request?.isCompleted == false) request!.complete();
+    }
+  }
+
+  List<Map<String, dynamic>> _localSuggestions(String value) {
+    final needle = value.trim().toLowerCase();
+    if (needle.isEmpty) return [];
+    return [
+      for (final entry in history.entries)
+        if ('${entry['query']}'.toLowerCase().contains(needle))
+          {
+            'text': entry['query'],
+            'track': entry['track'],
+            'direct_play': entry['track'] != null
+          }
+    ].take(5).toList();
+  }
+
+  Future<void> _loadHistory() async {
+    if (widget.home ||
+        !widget.active ||
+        historyLoading ||
+        (historyLoadedAt != null &&
+            DateTime.now().difference(historyLoadedAt!) <
+                const Duration(seconds: 45))) return;
+    historyLoading = true;
+    final scope = widget.api.userScopeId;
+    final incoming = <Map<String, dynamic>>[];
+    await Future.wait([
+      if (widget.recentQueries != null)
+        () async {
+          try {
+            incoming.addAll(await widget.recentQueries!());
+          } catch (_) {}
+        }(),
+      () async {
+        try {
+          incoming.addAll(await catalog.recentSearchPicks());
+        } catch (_) {}
+      }(),
+    ]);
+    if (!mounted || scope != widget.api.userScopeId) return;
+    setState(() {
+      history.merge(incoming);
+      historyLoading = false;
+      historyLoadedAt = DateTime.now();
+    });
+  }
+
+  void _recordQuery(String value, {Map<String, dynamic>? track}) {
+    history.record(value, track: track);
+  }
+
+  void _selectSuggestion(Map<String, dynamic> suggestion) {
+    final value = '${suggestion['text'] ?? suggestion['query'] ?? ''}'.trim();
+    final raw = suggestion['track'];
+    if ((suggestion['direct_play'] == true ||
+            suggestion['directPlay'] == true) &&
+        raw is Map) {
+      final track = normalizeTrack(Map<String, dynamic>.from(raw));
+      if (extractTrackId(track) != null && track['playable'] != false) {
+        generation++;
+        suggestionVersion++;
+        poll?.cancel();
+        searchDebounce?.cancel();
+        _cancelSearchRequests();
+        widget.api.setManualSearchContext(value);
+        unawaited(widget.player.start(track));
+        _recordQuery(value, track: track);
+        setState(() => busy = false);
+        return;
+      }
+    }
+    query.text = value;
+    _queryChanged(value);
+    _recordQuery(value);
+    unawaited(load(manualSearch: true));
+  }
+
+  Widget _suggestionTile(Map<String, dynamic> suggestion) {
+    final raw = suggestion['track'];
+    final track =
+        raw is Map ? normalizeTrack(Map<String, dynamic>.from(raw)) : null;
+    final direct = (suggestion['direct_play'] == true ||
+            suggestion['directPlay'] == true) &&
+        track != null &&
+        extractTrackId(track) != null &&
+        track['playable'] != false;
+    return ListTile(
+        dense: true,
+        leading: direct
+            ? HomeArtwork(api: widget.api, item: track, kind: 'track', size: 40)
+            : const Icon(Icons.search),
+        title: Text(
+            direct ? '${track['title']}' : '${suggestion['text'] ?? ''}',
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis),
+        subtitle: direct
+            ? Text('${track['artist'] ?? track['channel'] ?? ''}',
+                maxLines: 1, overflow: TextOverflow.ellipsis)
+            : null,
+        trailing:
+            Icon(direct ? Icons.play_arrow_rounded : Icons.north_west_rounded),
+        onTap: () => _selectSuggestion(suggestion));
+  }
+
+  void _selectFilter(String value) {
+    if (filter == value) return;
+    generation++;
+    _cancelSearchRequests();
+    poll?.cancel();
+    setState(() => filter = value);
+    if (query.text.trim().isNotEmpty) {
+      unawaited(load());
+    }
   }
 
   @override
@@ -111,13 +306,22 @@ class _CatalogScreenState extends State<CatalogScreen> {
             !old.homeSignalsReady)) {
       _scheduleHomePrepare();
     }
-    if (!widget.home && old.active && !widget.active) poll?.cancel();
-    if (!widget.home &&
-        widget.active &&
-        !old.active &&
-        submitted &&
-        detail == null) {
-      _scheduleEnrichment(generation, pollAttempts);
+    if (!widget.home && old.active && !widget.active) {
+      poll?.cancel();
+      generation++;
+      suggestionVersion++;
+      searchDebounce?.cancel();
+      _cancelSearchRequests();
+      busy = false;
+    }
+    if (!widget.home && widget.active && !old.active) {
+      unawaited(_loadHistory());
+      if (submitted && query.text.trim() != displayedQuery) {
+        unawaited(load());
+        return;
+      }
+      if (submitted && detail == null)
+        _scheduleEnrichment(generation, pollAttempts);
     }
   }
 
@@ -294,6 +498,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
       .any((item) => extractTrackId(item) == extractTrackId(track));
 
   void _trackOptions(Map<String, dynamic> track) {
+    final accountScope = widget.api.userScopeId;
     final title = '${track['title'] ?? ''}',
         artist = '${track['artist'] ?? track['channel'] ?? ''}';
     final albumId = '${track['album_id'] ?? track['album_browse_id'] ?? ''}';
@@ -340,6 +545,16 @@ class _CatalogScreenState extends State<CatalogScreen> {
                               onTap: () {
                                 Navigator.pop(sheet);
                                 unawaited(widget.player.start(track));
+                              }),
+                          ListTile(
+                              leading: const Icon(Icons.playlist_play),
+                              title: const Text('Play next'),
+                              enabled: track['playable'] != false,
+                              onTap: () {
+                                Navigator.pop(sheet);
+                                if (mounted &&
+                                    widget.api.userScopeId == accountScope)
+                                  widget.player.playNext(track);
                               }),
                           ListTile(
                               leading: Icon(_isLiked(track)
@@ -444,9 +659,22 @@ class _CatalogScreenState extends State<CatalogScreen> {
       {bool refresh = false,
       bool autoCorrect = true,
       bool manualSearch = false}) async {
+    if (widget.home && busy) return;
     if (!widget.home && query.text.trim().isEmpty) return;
+    if (widget.home) {
+      homeRetry?.cancel();
+      homeWaitStartedAt = widget.api.clock();
+      if (refresh) homeFailures = 0;
+    }
+    if (!widget.home) {
+      searchDebounce?.cancel();
+      if (searchCancel?.isCompleted == false) searchCancel!.complete();
+      searchCancel = Completer<void>();
+      if (manualSearch) _recordQuery(query.text.trim());
+    }
     if (!widget.home && manualSearch) widget.api.clearSearchContext();
     final version = ++generation;
+    final renderWatch = searchWatch ?? (Stopwatch()..start());
     poll?.cancel();
     homePoll?.cancel();
     homeAwaitingPreparation = false;
@@ -461,7 +689,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
       submitted = true;
       error = null;
       detail = null;
-      if (!widget.home || data.isEmpty) data = {};
+      if (data.isEmpty) data = {};
       extras.clear();
       seen.clear();
       pagination = {};
@@ -473,16 +701,23 @@ class _CatalogScreenState extends State<CatalogScreen> {
               refresh: refresh,
               launchToken: promoteOnLaunch ? launchToken : '',
               signals: widget.homeSignals?.call() ?? const {})
-          : await catalog.search(submittedQuery, autoCorrect: automatic);
+          : await catalog.search(submittedQuery,
+              autoCorrect: automatic,
+              preview: filter == 'all' && !fullSearchLoaded,
+              cancel: searchCancel!.future,
+              continuation: filter == 'all' ? null : {'result_type': filter});
       if (!mounted || version != generation) return;
       if (widget.home) {
+        homeFailures = 0;
         launchedHome = true;
         lastHomeRevalidatedAt = widget.api.clock();
       }
       if (!widget.home && manualSearch)
         widget.api.setManualSearchContext(submittedQuery);
+      if (!widget.home && filter != 'all') fullSearchLoaded = true;
       setState(() {
         data = result;
+        if (!widget.home) displayedQuery = submittedQuery;
         revision = (((result['diagnostics']
                             as Map?)?['search_snapshot_revision'] ??
                         (result['diagnostics'] as Map?)?['snapshot_revision'])
@@ -499,6 +734,17 @@ class _CatalogScreenState extends State<CatalogScreen> {
         }
       });
       if (!widget.home) {
+        searchWatch = null;
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted || version != generation || !widget.active) return;
+          widget.api.onDiagnostic?.call('search-rendered', {
+            'inputToResultsMs': renderWatch.elapsedMilliseconds,
+            'resultCount':
+                MusicApi.tracks(result['tracks'] ?? result['results']).length,
+            'preview': filter == 'all' && !fullSearchLoaded,
+            'queryLength': submittedQuery.length,
+          });
+        });
         widget.player
             .preloadSearch(MusicApi.tracks(data['tracks'] ?? data['results']));
         _scheduleEnrichment(version, 0);
@@ -516,9 +762,20 @@ class _CatalogScreenState extends State<CatalogScreen> {
               'Could not load ${widget.home ? 'Home' : 'search'}. Please retry.';
           if (!widget.home) data = {};
         });
+      if (widget.home) _scheduleHomeRetry(version);
     } finally {
       if (mounted && version == generation) setState(() => busy = false);
     }
+  }
+
+  void _scheduleHomeRetry(int version) {
+    homeRetry?.cancel();
+    if (!mounted || !homeActive || version != generation || homeFailures >= 3)
+      return;
+    homeFailures++;
+    homeRetry = Timer(Duration(seconds: 1 << homeFailures), () {
+      if (mounted && homeActive && version == generation) unawaited(load());
+    });
   }
 
   void _scheduleHomePrepare() {
@@ -589,6 +846,15 @@ class _CatalogScreenState extends State<CatalogScreen> {
         !mounted ||
         version != generation ||
         !homeAwaitingPreparation) return;
+    homeWaitStartedAt ??= widget.api.clock();
+    if (widget.api.clock().difference(homeWaitStartedAt!) >=
+        const Duration(seconds: 90)) {
+      homeAwaitingPreparation = false;
+      if (maps(data['rows']).isEmpty)
+        setState(() => error =
+            'Home is taking longer than expected. Please retry, or keep listening while it prepares.');
+      return;
+    }
     homePoll = Timer(const Duration(seconds: 1), () {
       homePoll = null;
       unawaited(_pollHomeStatus(version));
@@ -733,6 +999,8 @@ class _CatalogScreenState extends State<CatalogScreen> {
         final next = await catalog.search(
             preferred ?? corrected ?? submittedQuery,
             autoCorrect: false,
+            preview: filter == 'all' && !fullSearchLoaded,
+            cancel: searchCancel?.future,
             continuation: {'revision': revision, 'revision_wait_ms': 1000});
         if (!mounted || version != generation) return;
         _append(next);
@@ -834,6 +1102,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
       final next = await catalog.search(
           preferred ?? corrected ?? submittedQuery,
           autoCorrect: false,
+          cancel: searchCancel?.future,
           offset: (page['next_offset'] as num? ?? 0).toInt(),
           continuation: {'result_type': type});
       if (mounted && version == generation) _append(next, pageSurface: type);
@@ -849,6 +1118,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
   }
 
   void open(String kind, String id, String title) {
+    if (!widget.home && displayedQuery.isNotEmpty) _recordQuery(displayedQuery);
     poll?.cancel();
     setState(() => detail = (kind: kind, id: id, title: title));
   }
@@ -860,7 +1130,14 @@ class _CatalogScreenState extends State<CatalogScreen> {
 
   void _playSearchSelection(Map<String, dynamic> track) {
     // Start playback in this synchronous gesture turn; feedback is best effort.
+    if (displayedQuery == query.text.trim()) {
+      widget.api.setManualSearchContext(displayedQuery);
+    } else {
+      widget.api.clearSearchContext();
+    }
     unawaited(widget.player.start(track));
+    if (displayedQuery == query.text.trim())
+      _recordQuery(displayedQuery, track: track);
   }
 
   Future<void> moreHome(Map<String, dynamic> row) async {
@@ -993,7 +1270,18 @@ class _CatalogScreenState extends State<CatalogScreen> {
                 ])),
       ]);
     }
-    final tracks = MusicApi.tracks(items);
+    final signals = widget.homeSignals?.call() ?? const <String, dynamic>{};
+    final historyKey = row['kind'] == 'last_played'
+        ? 'last_played_tracks'
+        : row['kind'] == 'frequently_listened'
+            ? 'top_track_snapshots'
+            : null;
+    // Listening history is live account/device state, separate from immutable
+    // recommendations. A previous feed must not override newly heard plays.
+    final tracks = MusicApi.tracks(
+        historyKey != null && signals['listening_history_available'] == true
+            ? signals[historyKey]
+            : items);
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
       if (row['kind'] == 'last_played' || row['kind'] == 'frequently_listened')
         _trackStrip(rowTitle, tracks,
@@ -1151,12 +1439,24 @@ class _CatalogScreenState extends State<CatalogScreen> {
         return true;
       }).toList();
     }
-    final hasSearchResult = initial.values.any((items) => items.isNotEmpty) ||
-        extras.isNotEmpty ||
-        maps(data['artist_tracks']).isNotEmpty ||
-        topItem != null ||
-        lead != null ||
-        containingAlbum != null;
+    final hasSearchResult = filter == 'all'
+        ? initial.values.any((items) => items.isNotEmpty) ||
+            extras.isNotEmpty ||
+            maps(data['artist_tracks']).isNotEmpty ||
+            topItem != null ||
+            lead != null ||
+            containingAlbum != null
+        : maps(data[filter]).isNotEmpty ||
+            (filter == 'tracks' && maps(data['artist_tracks']).isNotEmpty) ||
+            (filter == 'artists' && lead != null) ||
+            (filter == 'albums' && containingAlbum != null) ||
+            (topSurface == filter && topItem != null);
+    final pendingSurfaces =
+        (data['diagnostics'] as Map?)?['search_pending_surfaces'] as List? ??
+            const [];
+    final selectedPending = filter == 'all'
+        ? pendingSurfaces.isNotEmpty
+        : pendingSurfaces.contains(filter);
     final artistTracks = maps(data['artist_tracks']);
     final additionalArtistTracks = filter == 'artists'
         ? artistTracks
@@ -1208,6 +1508,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
                     label: 'Search songs',
                     child: TextField(
                         controller: query,
+                        onChanged: _queryChanged,
                         textInputAction: TextInputAction.search,
                         onSubmitted: (_) => load(manualSearch: true),
                         decoration: InputDecoration(
@@ -1222,12 +1523,57 @@ class _CatalogScreenState extends State<CatalogScreen> {
                                 icon:
                                     const Icon(Icons.arrow_forward_rounded))))),
                 const SizedBox(height: 18),
+                if (suggestions.isNotEmpty && query.text.trim().isNotEmpty)
+                  EditorialSurface(
+                      child: Material(
+                          color: Colors.transparent,
+                          child: Column(children: [
+                            for (final suggestion in suggestions)
+                              _suggestionTile(suggestion)
+                          ]))),
+                if (query.text.trim().isEmpty &&
+                    history.entries.isNotEmpty) ...[
+                  SectionHeading(
+                      title: 'Recent searches',
+                      action: TextButton(
+                          onPressed: () => setState(() => history.clear()),
+                          child: const Text('Clear'))),
+                  for (final entry in history.entries.take(8))
+                    ListTile(
+                        leading: entry['track'] is Map
+                            ? HomeArtwork(
+                                api: widget.api,
+                                item: Map<String, dynamic>.from(entry['track']),
+                                kind: 'track',
+                                size: 40)
+                            : const Icon(Icons.history),
+                        title: Text(
+                            entry['track'] is Map
+                                ? '${entry['track']['title'] ?? entry['query']}'
+                                : '${entry['query']}',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis),
+                        subtitle: entry['track'] is Map
+                            ? Text(
+                                '${entry['track']['artist'] ?? entry['track']['channel'] ?? entry['query']}')
+                            : null,
+                        onTap: () => _selectSuggestion({
+                              'text': entry['query'],
+                              'track': entry['track'],
+                              'direct_play': entry['track'] != null
+                            }),
+                        trailing: IconButton(
+                            tooltip: 'Remove recent search',
+                            icon: const Icon(Icons.close),
+                            onPressed: () => setState(
+                                () => history.remove('${entry['query']}')))),
+                ],
                 Wrap(spacing: 8, runSpacing: 8, children: [
                   for (final type in ['all', ...labels.keys])
                     ChoiceChip(
                         label: Text(type == 'all' ? 'Top' : labels[type]!),
                         selected: filter == type,
-                        onSelected: (_) => setState(() => filter = type))
+                        onSelected: (_) => _selectFilter(type))
                 ]),
               ],
               if (busy && !widget.home)
@@ -1350,6 +1696,16 @@ class _CatalogScreenState extends State<CatalogScreen> {
                       'items': _laneItems(selectedLane, 'artists')
                     }),
                 ],
+                if (selectedLane == 'all' && (submitted || rows.isNotEmpty))
+                  DiscoveryShelves(
+                      key: ValueKey('discovery:${widget.api.userScopeId}'),
+                      api: catalog,
+                      player: widget.player,
+                      active: homeActive,
+                      region: widget.chartRegion,
+                      onLike: widget.onLike,
+                      isLiked: _isLiked,
+                      onOpenAlbum: (entry) => open('album', entry.id, entry.title)),
               ] else ...[
                 if (!submitted && !busy && !hasSearchResult)
                   Padding(
@@ -1370,11 +1726,20 @@ class _CatalogScreenState extends State<CatalogScreen> {
                                         'Start with a song you love, an artist you miss, or an album you have been meaning to hear.'),
                                   ])))),
                 if (submitted && !busy && error == null && !hasSearchResult)
-                  const Text('No results found.'),
+                  Text(selectedPending
+                      ? 'Still finding matches…'
+                      : 'No results found.'),
                 for (final type in labels.keys)
                   if ((filter == 'all' || filter == type) &&
                       (initial[type]?.isNotEmpty ?? false))
-                    section(labels[type]!, type, initial[type]!),
+                    section(
+                        labels[type]!,
+                        type,
+                        filter == 'all'
+                            ? initial[type]!
+                                .take(type == 'tracks' ? 5 : 2)
+                                .toList()
+                            : initial[type]!),
                 if (additionalArtistTracks.isNotEmpty &&
                     (filter == 'all' ||
                         filter == 'tracks' ||
@@ -1388,9 +1753,11 @@ class _CatalogScreenState extends State<CatalogScreen> {
                               ? 'Top songs by this artist'
                               : 'Top songs by $artistName'),
                       'tracks',
-                      additionalArtistTracks),
+                      filter == 'all'
+                          ? additionalArtistTracks.take(3).toList()
+                          : additionalArtistTracks),
                 // Separately fetched pages follow the current ranked first page.
-                for (final extra in extras)
+                for (final extra in (filter == 'all' ? extras.take(3) : extras))
                   if ((filter == 'all' || filter == extra.type) &&
                       identity(extra.type, extra.item) != topKey &&
                       identity(extra.type, extra.item) != leadKey &&
@@ -1414,6 +1781,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
   }
 
   String _homeEmptyMessage() {
+    if (error != null) return error!;
     final diagnostics =
         data['diagnostics'] is Map ? data['diagnostics'] as Map : const {};
     final action = '${data['feed_action'] ?? diagnostics['feed_action'] ?? ''}';
@@ -1433,10 +1801,13 @@ class _CatalogScreenState extends State<CatalogScreen> {
 
   @override
   void dispose() {
+    homeRetry?.cancel();
+    _cancelSearchRequests();
     generation++;
     poll?.cancel();
     homePoll?.cancel();
     homePrepare?.cancel();
+    searchDebounce?.cancel();
     query.dispose();
     super.dispose();
   }

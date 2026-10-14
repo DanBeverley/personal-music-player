@@ -10,20 +10,7 @@ import '../navigation/player_navigation.dart';
 import '../ui/app_theme_tokens.dart';
 import '../widgets/app_artwork.dart';
 
-const Map<String, String> _chartCountries = <String, String>{
-  'GLOBAL': 'Global',
-  'US': 'United States',
-  'GB': 'United Kingdom',
-  'VN': 'Vietnam',
-  'JP': 'Japan',
-  'KR': 'South Korea',
-  'AU': 'Australia',
-  'BR': 'Brazil',
-  'CA': 'Canada',
-  'DE': 'Germany',
-  'FR': 'France',
-  'IN': 'India',
-};
+const _chartCountries = chartCountries;
 
 const Map<String, String> _chartRanges = <String, String>{
   'week': 'Week',

@@ -79,7 +79,7 @@ class Gateway(SimpleHTTPRequestHandler):
             return
         if not self.gate():
             return
-        if path not in ('/search', '/search_interaction', '/related_tracks', '/playback/resolve', '/prepare_session', '/recommend'):
+        if path not in ('/search', '/suggest', '/search_interaction', '/related_tracks', '/playback/resolve', '/prepare_session', '/recommend'):
             self.send_error(404)
             return
         body = self.body()
@@ -96,8 +96,8 @@ class Gateway(SimpleHTTPRequestHandler):
         if '\\' in path or any(part in ('.', '..') for part in path.split('/')):
             self.send_error(404)
             return
-        if any(path.startswith(prefix) and path[len(prefix):] and '/' not in path[len(prefix):]
-               for prefix in ('/playback/stream/', '/artist_artwork/', '/entity_artwork/', '/album/', '/artist/')):
+        if path in ('/recent_search_picks', '/charts', '/new_releases') or any(path.startswith(prefix) and path[len(prefix):] and '/' not in path[len(prefix):]
+               for prefix in ('/playback/stream/', '/artist_artwork/', '/entity_artwork/', '/album/', '/artist/', '/lyrics/')):
             self.proxy()
             return
         target = (BUILD / path.lstrip('/')).resolve()

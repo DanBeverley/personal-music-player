@@ -36,6 +36,23 @@ class WebLibrary extends ChangeNotifier {
   bool get loading => _loading;
   String? get error => _error;
 
+  Future<List<Map<String, dynamic>>> recentSearchQueries() async {
+    final rows = await _client
+        .from('search_events')
+        .select('query,result_count,created_at')
+        .eq('user_id', _userId)
+        .order('created_at', ascending: false)
+        .limit(32)
+        .timeout(const Duration(seconds: 2));
+    if (_disposed) return [];
+    return [
+      for (final row in rows)
+        if ((row['result_count'] as num? ?? 0) > 0 &&
+            '${row['query'] ?? ''}'.trim().isNotEmpty)
+          {'query': row['query'], 'selected_at': row['created_at']}
+    ];
+  }
+
   @override
   void dispose() {
     _disposed = true;

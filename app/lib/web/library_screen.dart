@@ -6,16 +6,21 @@ import '../logic/track_metadata.dart';
 import 'web_library.dart';
 import 'web_player.dart';
 import 'design_system.dart';
+import 'web_auth.dart';
+import 'account_screen.dart';
+import 'collection_search.dart';
 
 class LibraryScreen extends StatefulWidget {
   const LibraryScreen(
       {super.key,
       required this.library,
       required this.player,
+      this.auth,
       required this.onSignIn});
 
   final WebLibrary? library;
   final WebPlayer player;
+  final WebAuth? auth;
   final VoidCallback onSignIn;
 
   @override
@@ -26,11 +31,21 @@ class _LibraryScreenState extends State<LibraryScreen> {
   String? _selectedPlaylist;
   String? _writeError;
   bool _writing = false;
+  final _playlistSearch = TextEditingController();
+
+  @override
+  void dispose() {
+    _playlistSearch.dispose();
+    super.dispose();
+  }
 
   @override
   void didUpdateWidget(covariant LibraryScreen oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (!identical(oldWidget.library, widget.library)) _selectedPlaylist = null;
+    if (!identical(oldWidget.library, widget.library)) {
+      _selectedPlaylist = null;
+      _playlistSearch.clear();
+    }
   }
 
   Future<void> _write(Future<void> Function(WebLibrary repo) action) async {
@@ -100,10 +115,12 @@ class _LibraryScreenState extends State<LibraryScreen> {
       Map<String, dynamic> track, List<Map<String, dynamic>> queue, int index,
       {VoidCallback? remove}) {
     final playable = extractTrackId(track)?.isNotEmpty == true;
+    final owner = widget.library;
     return ListTile(
         title: Text(_trackTitle(track),
             maxLines: 1, overflow: TextOverflow.ellipsis),
-        subtitle: Text(_trackSubtitle(track)),
+        subtitle: Text(_trackSubtitle(track),
+            maxLines: 1, overflow: TextOverflow.ellipsis),
         leading: _trackArtwork(track),
         onTap: playable
             ? () => unawaited(widget.player.startQueue(queue, index, 'Library'))
@@ -116,6 +133,15 @@ class _LibraryScreenState extends State<LibraryScreen> {
                       widget.player.startQueue(queue, index, 'Library'))
                   : null,
               icon: const Icon(Icons.play_arrow)),
+          IconButton(
+              tooltip: 'Play next ${_trackTitle(track)}',
+              onPressed: !playable
+                  ? null
+                  : () {
+                      if (mounted && identical(owner, widget.library))
+                        widget.player.playNext(track);
+                    },
+              icon: const Icon(Icons.playlist_play)),
           if (remove != null)
             IconButton(
                 tooltip: 'Remove from playlist',
@@ -142,6 +168,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
   @override
   Widget build(BuildContext context) {
+    if (widget.auth?.passwordRecovery == true) {
+      return AccountScreen(auth: widget.auth!);
+    }
     final repo = widget.library;
     if (repo == null)
       return ListView(padding: const EdgeInsets.all(32), children: [
@@ -173,89 +202,134 @@ class _LibraryScreenState extends State<LibraryScreen> {
                                   child: const Text('Sign in')),
                             ])))))
       ]);
-    final selected =
-        repo.playlists.where((p) => p['id'] == _selectedPlaylist).firstOrNull;
-    if (_selectedPlaylist != null && selected == null) _selectedPlaylist = null;
-    final selectedTracks = selected == null
-        ? const <Map<String, dynamic>>[]
-        : List<Map<String, dynamic>>.from(
-            selected['tracks'] as List? ?? const []);
     return AnimatedBuilder(
         animation: repo,
-        builder: (context, _) =>
-            ListView(padding: const EdgeInsets.all(20), children: [
-              EditorialHeading(
-                  title: 'Keep what you love.',
-                  eyebrow: 'YOUR LIBRARY',
-                  subtitle: 'Your favourite songs and playlists, all here.',
-                  action: IconButton.outlined(
-                      tooltip: 'Refresh library',
-                      onPressed:
-                          repo.loading ? null : () => unawaited(repo.refresh()),
-                      icon: const Icon(Icons.refresh))),
-              if (repo.loading)
-                const Padding(
-                    padding: EdgeInsets.symmetric(vertical: 12),
-                    child: NeatieLoading(
-                        label: 'Opening your library', showLabel: true)),
-              if (repo.error != null) ...[
-                Text(repo.error!,
-                    style:
-                        TextStyle(color: Theme.of(context).colorScheme.error)),
-                TextButton(
-                    onPressed: () => unawaited(repo.refresh()),
-                    child: const Text('Retry'))
-              ],
-              if (_writeError != null)
-                Text(_writeError!,
-                    style:
-                        TextStyle(color: Theme.of(context).colorScheme.error)),
-              if (!repo.playlistWritesEnabled)
-                const Padding(
-                    padding: EdgeInsets.symmetric(vertical: 8),
-                    child: Text(
-                        'Playlist editing is currently disabled on the web.')),
-              _heading('Liked songs'),
-              if (!repo.loading && repo.likes.isEmpty)
-                const Text('No liked songs yet.'),
+        builder: (context, _) {
+          final selected = repo.playlists
+              .where((p) => p['id'] == _selectedPlaylist)
+              .firstOrNull;
+          if (_selectedPlaylist != null && selected == null)
+            _selectedPlaylist = null;
+          final selectedTracks = selected == null
+              ? const <Map<String, dynamic>>[]
+              : List<Map<String, dynamic>>.from(
+                  selected['tracks'] as List? ?? const []);
+          final visible =
+              matchingTrackIndices(selectedTracks, _playlistSearch.text);
+          return ListView(padding: const EdgeInsets.all(20), children: [
+            if (widget.auth case final auth?) ...[
+              EditorialSurface(
+                  child: Padding(
+                      padding: const EdgeInsets.all(20),
+                      child: Row(children: [
+                        CircleAvatar(
+                            radius: 27,
+                            foregroundImage: auth.avatarUrl == null
+                                ? null
+                                : NetworkImage(auth.avatarUrl!),
+                            onForegroundImageError:
+                                auth.avatarUrl == null ? null : (_, __) {},
+                            child: Text(auth.initial)),
+                        const SizedBox(width: 16),
+                        Expanded(
+                            child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                              Text(
+                                  auth.displayName?.trim().isNotEmpty == true
+                                      ? auth.displayName!
+                                      : 'Your library',
+                                  style:
+                                      Theme.of(context).textTheme.titleLarge),
+                              if (auth.email != null)
+                                SelectableText(auth.email!),
+                              if (auth.error != null) Text(auth.error!),
+                            ])),
+                        const SizedBox(width: 8),
+                        TextButton(
+                            onPressed: auth.busy ? null : auth.signOut,
+                            child: const Text('Sign out')),
+                      ]))),
+              const SizedBox(height: 24),
+            ],
+            EditorialHeading(
+                title: 'Keep what you love.',
+                eyebrow: 'YOUR LIBRARY',
+                subtitle: 'Your favourite songs and playlists, all here.',
+                action: IconButton.outlined(
+                    tooltip: 'Refresh library',
+                    onPressed:
+                        repo.loading ? null : () => unawaited(repo.refresh()),
+                    icon: const Icon(Icons.refresh))),
+            if (repo.loading)
+              const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 12),
+                  child: NeatieLoading(
+                      label: 'Opening your library', showLabel: true)),
+            if (repo.error != null) ...[
+              Text(repo.error!,
+                  style: TextStyle(color: Theme.of(context).colorScheme.error)),
+              TextButton(
+                  onPressed: () => unawaited(repo.refresh()),
+                  child: const Text('Retry'))
+            ],
+            if (_writeError != null)
+              Text(_writeError!,
+                  style: TextStyle(color: Theme.of(context).colorScheme.error)),
+            if (!repo.playlistWritesEnabled)
+              const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 8),
+                  child: Text(
+                      'Playlist editing is currently disabled on the web.')),
+            _heading('Liked songs'),
+            if (!repo.loading && repo.likes.isEmpty)
+              const Text('No liked songs yet.'),
+            ...[
+              for (var i = 0; i < repo.likes.length; i++)
+                _trackTile(repo.likes[i], repo.likes, i,
+                    remove: () =>
+                        _write((r) => r.setLiked(repo.likes[i], false)))
+            ],
+            Row(children: [
+              Expanded(child: _heading('Playlists')),
+              if (repo.playlistWritesEnabled)
+                IconButton(
+                    tooltip: 'Create playlist',
+                    onPressed: _writing
+                        ? null
+                        : () async {
+                            final name =
+                                await _nameDialog(title: 'New playlist');
+                            if (name != null)
+                              await _write((r) => r.createPlaylist(name));
+                          },
+                    icon: const Icon(Icons.add))
+            ]),
+            if (repo.playlists.isEmpty) const Text('No playlists yet.'),
+            for (final playlist in repo.playlists) _playlistRow(playlist),
+            if (selected != null) ...[
+              _heading(selected['name']?.toString() ?? 'Playlist'),
+              CollectionSearchField(
+                  controller: _playlistSearch,
+                  label: 'Search this playlist',
+                  onChanged: (_) => setState(() {})),
+              const SizedBox(height: 8),
+              Text('${visible.length} of ${selectedTracks.length} songs'),
+              if (selectedTracks.isEmpty) const Text('This playlist is empty.'),
+              if (selectedTracks.isNotEmpty && visible.isEmpty)
+                const Text('No matching songs in this playlist.'),
               ...[
-                for (var i = 0; i < repo.likes.length; i++)
-                  _trackTile(repo.likes[i], repo.likes, i,
-                      remove: () =>
-                          _write((r) => r.setLiked(repo.likes[i], false)))
-              ],
-              Row(children: [
-                Expanded(child: _heading('Playlists')),
-                if (repo.playlistWritesEnabled)
-                  IconButton(
-                      tooltip: 'Create playlist',
-                      onPressed: _writing
-                          ? null
-                          : () async {
-                              final name =
-                                  await _nameDialog(title: 'New playlist');
-                              if (name != null)
-                                await _write((r) => r.createPlaylist(name));
-                            },
-                      icon: const Icon(Icons.add))
-              ]),
-              if (repo.playlists.isEmpty) const Text('No playlists yet.'),
-              for (final playlist in repo.playlists) _playlistRow(playlist),
-              if (selected != null) ...[
-                _heading(selected['name']?.toString() ?? 'Playlist'),
-                if (selectedTracks.isEmpty)
-                  const Text('This playlist is empty.'),
-                ...[
-                  for (var i = 0; i < selectedTracks.length; i++)
-                    _trackTile(selectedTracks[i], selectedTracks, i,
-                        remove: repo.playlistWritesEnabled
-                            ? () => _write((r) => r.removeTrack(
-                                selected['id'].toString(),
-                                extractTrackId(selectedTracks[i])!))
-                            : null)
-                ]
+                for (final i in visible)
+                  _trackTile(selectedTracks[i], selectedTracks, i,
+                      remove: repo.playlistWritesEnabled
+                          ? () => _write((r) => r.removeTrack(
+                              selected['id'].toString(),
+                              extractTrackId(selectedTracks[i])!))
+                          : null)
               ]
-            ]));
+            ]
+          ]);
+        });
   }
 
   Widget _heading(String text) => Padding(
@@ -267,8 +341,11 @@ class _LibraryScreenState extends State<LibraryScreen> {
       subtitle:
           Text('${(playlist['tracks'] as List? ?? const []).length} songs'),
       selected: playlist['id'] == _selectedPlaylist,
-      onTap: () =>
-          setState(() => _selectedPlaylist = playlist['id']?.toString()),
+      onTap: () => setState(() {
+            if (_selectedPlaylist != playlist['id']?.toString())
+              _playlistSearch.clear();
+            _selectedPlaylist = playlist['id']?.toString();
+          }),
       trailing: repoActions(playlist));
 
   Widget? repoActions(Map<String, dynamic> playlist) => widget

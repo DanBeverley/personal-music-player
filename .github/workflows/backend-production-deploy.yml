@@ -2,13 +2,6 @@ name: Backend production deploy
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - develop
-    paths:
-      - ".github/workflows/backend-production-deploy.yml"
-      - "deploy/production/**"
-      - "ingestion/python_proxy/**"
 
 permissions:
   contents: read
@@ -19,6 +12,9 @@ concurrency:
 
 jobs:
   deploy:
+    # The legacy host procedure needs validation against the current AWS stack.
+    # Keep it disabled unless an operator explicitly enables and dispatches it.
+    if: ${{ github.event_name == 'workflow_dispatch' && vars.NEATIE_LEGACY_DEPLOY_ENABLED == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:

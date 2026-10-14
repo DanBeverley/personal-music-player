@@ -164,13 +164,14 @@ def _artist_cache_identities(artist: Dict[str, Any]) -> list[str]:
     ):
         add(f"provider:artist:{provider_artist_id.casefold()}")
     for value in (
-        artist.get("artwork_cache_identity"),
         artist.get("canonical_artist_id"),
         artist.get("canonical_artist_key"),
     ):
         identity = _clean(value)
         if identity.startswith(("provider:artist:", "musicbrainz:artist:")):
             add(identity)
+    # Cache metadata cannot establish ownership of a different artist.
+    # It must already agree with the provider or canonical identity above.
     normalized_name = re.sub(
         r"[^a-z0-9]+",
         " ",

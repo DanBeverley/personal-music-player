@@ -30,6 +30,7 @@ from ..discovery.source_registry import verify_materialized_supply
 from ..discovery.ranking import admitted_artist_candidates
 from ..discovery.structured_providers import LastFmClient
 from ..search.intelligence import remember_catalog_entity
+from ..domain.catalog import normalize_artist_name
 from ..storage.artist_artwork import cache_artist_artwork_now
 from .contracts import (
     HOME_DISCOVERY_EXPOSURE_COOLDOWN_SECONDS,
@@ -823,7 +824,10 @@ class ArtworkSupplyService:
     @staticmethod
     def _thumbnail_urls(value: Mapping[str, Any]) -> list[str]:
         output: list[str] = []
-        for raw in value.get("thumbnails") or []:
+        for raw in sorted(
+            (v for v in value.get("thumbnails") or [] if isinstance(v, Mapping)),
+            key=lambda v: int(v.get("width") or 0) * int(v.get("height") or 0), reverse=True,
+        ):
             if isinstance(raw, Mapping):
                 url = str(raw.get("url") or "").strip()
                 if url.startswith(("http://", "https://")):
@@ -889,7 +893,8 @@ class ArtworkSupplyService:
                     detail = client.get_artist(artist_id) or {}
                 except Exception:
                     detail = {}
-                urls.extend(self._thumbnail_urls(detail))
+                if normalize_artist_name(detail.get("name") or detail.get("artist")) == normalize_artist_name(artist):
+                    urls = self._thumbnail_urls(detail) + urls
         try:
             lastfm = LastFmClient(self._server).artist_info(
                 artist,

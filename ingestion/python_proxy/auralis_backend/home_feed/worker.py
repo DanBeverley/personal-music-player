@@ -13,7 +13,7 @@ from ..contracts import SearchRequest
 from ..discovery.signals import build_taste_profile
 from ..discovery.inventory import candidate_inventory_from_payload
 from .candidate_supply import CandidateSupplyService
-from .composer import HomeFeedComposer, candidate_artist_artwork_repairs
+from .composer import ComposeOutcome, HomeFeedComposer, candidate_artist_artwork_repairs
 from .contracts import (
     QUEUE_TARGET_DEPTH,
     SUPPLY_IDLE_NO_PROGRESS_RECHECK_SECONDS,
@@ -33,6 +33,7 @@ _logger = logging.getLogger(__name__)
 HOME_JOB_LEASE_SECONDS = 180.0
 HOME_JOB_LEASE_RENEW_SECONDS = 30.0
 HOME_ARTWORK_BATCH_LIMIT = 8
+_inventory_work_slot = threading.BoundedSemaphore(1)
 
 
 class RetryableHomeJob(RuntimeError):
@@ -201,7 +202,16 @@ class HomeFeedWorker:
         )
         heartbeat.start()
         try:
-            result = handler(job)
+            if job.job_type in {HomeJobType.REFRESH_CANDIDATES, HomeJobType.REFRESH_RADIO}:
+                # Snapshot expansion is memory-heavy. Renew waiting leases,
+                # serialize bulk refreshes. Compose, artwork and interactions
+                # retain their independent lanes and never wait on providers.
+                with _inventory_work_slot:
+                    if lease_lost.is_set():
+                        raise LeaseLost("home job lease lost while waiting for inventory slot")
+                    result = handler(job)
+            else:
+                result = handler(job)
         finally:
             stop.set()
             heartbeat.join(timeout=2.0)
@@ -587,6 +597,11 @@ class HomeFeedWorker:
 
     def _compose_feed(self, job: HomeJobRecord) -> Any:
         started = time.perf_counter()
+        # The composer repeats this check at commit time. This cheap guard
+        # avoids decoding immutable supply when no ready slot is requested.
+        state = self._repositories.state.reconcile(job.user_scope_id)
+        if len(state.ready_artifact_ids) >= QUEUE_TARGET_DEPTH:
+            return ComposeOutcome(reason="queue_full")
         request = self._request(job)
         taste = build_taste_profile(self._server, request)
         requested_candidate_snapshot_id = str(

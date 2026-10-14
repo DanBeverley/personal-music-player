@@ -290,6 +290,7 @@ class CandidateSupplyService:
     def __init__(self, server: Any, repositories: HomeRepositorySet | None = None) -> None:
         self._server = server
         self._repositories = repositories or HomeRepositorySet.from_server(server)
+        self._consolidation_scans: dict[str, tuple[str, tuple[str, ...]]] = {}
 
     def _consolidate_inventory(
         self,
@@ -305,29 +306,52 @@ class CandidateSupplyService:
             require_fresh=False,
             allow_profile_mismatch=True,
         )
-        fragments: dict[str, CandidateInventory] = {}
-        if current is not None and current.generation_id:
-            fragments[current.generation_id] = current
-        for record in self._repositories.candidates.recent(
-            taste.user_scope_id,
-            limit=12,
-        ):
-            inventory = candidate_inventory_from_payload(dict(record.payload or {}))
-            if inventory is not None and inventory.generation_id:
-                fragments.setdefault(inventory.generation_id, inventory)
-        if not fragments:
-            return None, False
-        ordered = sorted(
-            fragments.values(),
-            key=lambda value: (float(value.generated_at or 0.0), value.generation_id),
-            reverse=True,
-        )
-        consolidated = replace(ordered[0], profile_fingerprint=stable_profile)
-        for fragment in ordered[1:]:
-            consolidated = merge_candidate_inventories(
-                consolidated,
-                replace(fragment, profile_fingerprint=stable_profile),
+        recent_ids = self._repositories.candidates.recent_ids(taste.user_scope_id, limit=12)
+        ledger = dict(current.acquisition_ledger or {}) if current is not None else {}
+        scan_key = (current.generation_id, recent_ids) if current is not None else None
+        scan_completed = (
+            current is not None
+            and current.profile_fingerprint == stable_profile
+            and (
+                self._consolidation_scans.get(taste.user_scope_id) == scan_key
+                or (ledger.get("consolidation_generation_id") == current.generation_id
+                    and set(recent_ids) - {current.generation_id}
+                        <= set(ledger.get("consolidation_fragment_ids") or []))
             )
+        )
+        # Only the historical scan is skipped. Current album/source admission
+        # and coverage checks below still run, including revoked proofs.
+        seen: set[str] = set(recent_ids) | {current.generation_id} if scan_completed else set()
+        consolidated = current if scan_completed else None
+        freshness_source = current if scan_completed else None
+        pending_current = None if scan_completed else current
+
+        def merge_fragment(fragment):
+            nonlocal consolidated, freshness_source
+            if fragment is None or not fragment.generation_id or fragment.generation_id in seen:
+                return
+            seen.add(fragment.generation_id)
+            fragment = replace(fragment, profile_fingerprint=stable_profile)
+            if consolidated is None:
+                consolidated = fragment
+                freshness_source = fragment
+            else:
+                consolidated = merge_candidate_inventories(consolidated, fragment)
+
+        records = () if scan_completed else self._repositories.candidates.iter_recent(taste.user_scope_id, limit=12)
+        for record in records:
+            inventory = candidate_inventory_from_payload(dict(record.payload or {}))
+            if inventory is None:
+                continue
+            if pending_current is not None and (
+                float(pending_current.generated_at or 0), pending_current.generation_id
+            ) >= (float(inventory.generated_at or 0), inventory.generation_id):
+                merge_fragment(pending_current)
+                pending_current = None
+            merge_fragment(inventory)
+        merge_fragment(pending_current)
+        if consolidated is None:
+            return None, False
         albums = list(consolidated.pools.get("album") or [])
         if albums:
             # Reuse the source verifier with no acquisition or artwork work.
@@ -356,13 +380,16 @@ class CandidateSupplyService:
             or _general_candidate_content_hash(current) != _general_candidate_content_hash(consolidated)
         )
         if not migration_required:
+            if len(self._consolidation_scans) >= 64:
+                self._consolidation_scans.pop(next(iter(self._consolidation_scans)))
+            self._consolidation_scans[taste.user_scope_id] = scan_key
             return current, False
         now = time.time()
-        freshness_source = ordered[0]
+        migration_id = str(uuid.uuid4())
         migrated = replace(
             consolidated,
             profile_fingerprint=stable_profile,
-            generation_id=str(uuid.uuid4()),
+            generation_id=migration_id,
             base_generation_id=str(current.generation_id if current is not None else ""),
             # Consolidation changes ownership, not freshness. Retain the
             # newest source generation's verification clock so an expired
@@ -377,7 +404,9 @@ class CandidateSupplyService:
             ),
             acquisition_ledger={
                 **dict(consolidated.acquisition_ledger or {}),
-                "profile_fragments_consolidated": len(ordered),
+                "profile_fragments_consolidated": len(seen),
+                "consolidation_generation_id": migration_id,
+                "consolidation_fragment_ids": sorted(seen),
                 "profile_consolidation_added_identity_count": len(
                     consolidated_ids - current_ids
                 ),

@@ -71,6 +71,11 @@ def _with_persisted_artist_artwork(
         server,
         artist_names=[name],
     ).get(normalize_artist_name(name)) or {}
+    wanted_provider = str(artist.get("provider_artist_id") or artist.get("id") or "").strip()
+    stored_provider = str(persisted.get("provider_artist_id") or persisted.get("browseId") or "").strip()
+    # Names alone are insufficient: homonymous artists must keep their own art.
+    if not wanted_provider or wanted_provider != stored_provider:
+        return artist
     thumbnail = str(persisted.get("thumbnail") or "").strip()
     if thumbnail.startswith("/artist_artwork/"):
         artist["thumbnail"] = thumbnail

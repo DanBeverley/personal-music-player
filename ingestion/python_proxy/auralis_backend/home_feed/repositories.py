@@ -380,6 +380,7 @@ class HomeStateRepository(_Repository):
         user_scope_id: str,
         *,
         now: float | None = None,
+        _attempt: int = 0,
     ) -> HomeStateRecord:
         """Remove missing/expired references without deleting immutable history."""
 
@@ -387,18 +388,12 @@ class HomeStateRepository(_Repository):
         timestamp = time.time() if now is None else float(now)
         connection = self._connect()
         try:
-            connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 "SELECT * FROM home_feed_state WHERE user_scope_id = ?",
                 [scope],
             ).fetchone()
             if row is None:
-                connection.execute(
-                    "INSERT INTO home_feed_state(user_scope_id, updated_at) VALUES (?, ?)",
-                    [scope, timestamp],
-                )
-                connection.commit()
-                return self.get(scope)  # type: ignore[return-value]
+                return self.get_or_create(scope, now=timestamp)
             state = _state_from_row(row)
 
             def valid(artifact_id: str, *, promotable: bool) -> bool:
@@ -442,7 +437,7 @@ class HomeStateRepository(_Repository):
             if active == state.active_artifact_id and ready == state.ready_artifact_ids:
                 connection.rollback()
                 return state
-            connection.execute(
+            changed = connection.execute(
                 """
                 UPDATE home_feed_state
                 SET active_artifact_id = ?, ready_artifact_ids_json = ?,
@@ -457,6 +452,11 @@ class HomeStateRepository(_Repository):
                     state.revision,
                 ],
             )
+            if changed.rowcount != 1:
+                connection.rollback()
+                if _attempt >= 2:
+                    raise StaleRevision("home state changed during reconciliation")
+                return self.reconcile(scope, now=timestamp, _attempt=_attempt + 1)
             connection.commit()
             return self.get(scope)  # type: ignore[return-value]
         except Exception:
@@ -1331,7 +1331,6 @@ class HomeJobRepository(_Repository):
         """
 
         timestamp = time.time() if now is None else float(now)
-        self.reconcile_expired(now=timestamp)
         type_values = [value.value for value in job_types]
         type_clause = ""
         parameters: list[Any] = [
@@ -1366,7 +1365,7 @@ class HomeJobRepository(_Repository):
                 SELECT 1 FROM home_feed_jobs
                 WHERE user_scope_id = ? AND (
                     status IN (?, ?)
-                    OR (status = ? AND lease_expires_at > ?)
+                    OR (status = ? AND (lease_expires_at > ? OR attempts < max_attempts))
                 )
                 {type_clause}
                 {idle_clause}
@@ -1391,7 +1390,6 @@ class HomeJobRepository(_Repository):
         """
 
         timestamp = time.time() if now is None else float(now)
-        self.reconcile_expired(now=timestamp)
         type_values = [value.value for value in job_types]
         type_clause = ""
         parameters: list[Any] = [
@@ -1413,7 +1411,7 @@ class HomeJobRepository(_Repository):
                 SELECT 1 FROM home_feed_jobs
                 WHERE user_scope_id = ? AND (
                     (status IN (?, ?) AND run_after <= ?)
-                    OR (status = ? AND lease_expires_at > ?)
+                    OR (status = ? AND (lease_expires_at > ? OR attempts < max_attempts))
                 )
                 {type_clause}
                 LIMIT 1
@@ -1591,6 +1589,22 @@ class CandidateSnapshotRepository(_SnapshotRepository):
     ) -> tuple[CandidateSnapshotRecord, ...]:
         """Return bounded durable fragments for one-time profile consolidation."""
 
+        return tuple(self.iter_recent(user_scope_id, limit=limit, now=now))
+
+    def recent_ids(self, user_scope_id: str, *, limit: int = 12) -> tuple[str, ...]:
+        """Read immutable fragment identities without decoding their bodies."""
+        connection = self._connect()
+        try:
+            return tuple(str(row[0]) for row in connection.execute(
+                f"SELECT snapshot_id FROM {self.table_name} WHERE user_scope_id = ? AND generated_at <= ? "
+                "ORDER BY generated_at DESC, snapshot_id DESC LIMIT ?",
+                [_scope(user_scope_id), time.time(), max(1, min(int(limit), 32))],
+            ))
+        finally:
+            connection.close()
+
+    def iter_recent(self, user_scope_id: str, *, limit: int = 8, now: float | None = None):
+        """Decode one immutable snapshot at a time instead of retaining all bodies."""
         timestamp = time.time() if now is None else float(now)
         connection = self._connect()
         try:
@@ -1602,8 +1616,9 @@ class CandidateSnapshotRepository(_SnapshotRepository):
                 LIMIT ?
                 """,
                 [_scope(user_scope_id), timestamp, max(1, min(int(limit), 32))],
-            ).fetchall()
-            return tuple(self._from_row(row) for row in rows)
+            )
+            for row in rows:
+                yield self._from_row(row)
         finally:
             connection.close()
 

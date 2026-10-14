@@ -213,7 +213,7 @@ def _attach_inventory_portraits(
             portraits.setdefault(identity, set()).add(thumbnail)
     artist_items = [
         item for row in rows if row.item_type == "artist"
-        for item in row.items if not item.get("thumbnail")
+        for item in row.items
     ]
     persisted = load_catalog_artist_records(
         server,
@@ -223,8 +223,6 @@ def _attach_inventory_portraits(
         if row.item_type != 'artist':
             continue
         for item in row.items:
-            if item.get('thumbnail'):
-                continue
             item_ids = _stable_artist_ids(item)
             if server is not None and item_ids:
                 name_key = normalize_artist_name(item.get("name") or item.get("artist"))
@@ -233,8 +231,12 @@ def _attach_inventory_portraits(
                     verified = attach_persisted_artist_artwork(server, dict(record))
                     thumbnail = str(verified.get("thumbnail") or "")
                     if thumbnail.startswith("/artist_artwork/"):
-                        item["thumbnail"] = thumbnail
+                        item.update({key: value for key, value in verified.items()
+                                     if key.startswith("artwork_") or key in
+                                     {"thumbnail", "canonical_artist_id", "musicbrainz_artist_id"}})
                         continue
+            if item.get('thumbnail'):
+                continue
             matches = set().union(*(portraits.get(identity, set()) for identity in item_ids)) if item_ids else set()
             if len(matches) == 1:
                 item['thumbnail'] = next(iter(matches))

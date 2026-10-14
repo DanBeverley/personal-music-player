@@ -20,7 +20,7 @@ from ..discovery.radio_inventory import (
     artist_radio_inventory_from_payload,
     merge_radio_exposure,
 )
-from .composer import artifact_exposure_entries, artifact_from_record
+from .composer import artifact_exposure_entries, artifact_from_record, _attach_inventory_portraits
 from .candidate_supply import exposure_aware_candidate_supply_status
 from .bundles import is_complete_feed_bundle_payload
 from .contracts import (
@@ -33,6 +33,13 @@ from .contracts import (
 from .repositories import HomeRepositorySet, InvalidArtifactReference, StaleRevision
 from .scheduler import HomeJobScheduler
 from .radio_supply import _radio_expansion_needed
+
+
+def _home_stage(trace, name, started):
+    if isinstance(trace, dict):
+        stages = trace.setdefault('stage_ms', {})
+        key = 'recommend.' + name
+        stages[key] = stages.get(key, 0) + int((time.perf_counter()-started)*1000)
 
 
 class HomeFeedApi:
@@ -64,11 +71,13 @@ class HomeFeedApi:
         ):
             return self._queue_status(request, scope=scope, request_id=request_id)
 
+        reconcile_started = time.perf_counter()
         state = self._repositories.state.reconcile(scope)
+        _home_stage(trace, 'state_reconcile', reconcile_started)
         if request_mode == "background_prepare":
             self._ensure_successors(request, state, reason="background_prepare")
             return self._serve_or_prepare(
-                request, state, request_id=request_id, action="served_active"
+                request, state, request_id=request_id, action="served_active", trace=trace
             )
 
         force = bool(
@@ -79,6 +88,7 @@ class HomeFeedApi:
         launch = bool(getattr(request, "promote_ready_on_launch", False))
         promoted = ""
         action = "served_active"
+        promotion_started = time.perf_counter()
 
         if force and state.ready_artifact_ids:
             state, promoted = self._promote(state)
@@ -92,10 +102,13 @@ class HomeFeedApi:
             state, promoted = self._promote(state)
             action = "promoted_prepared" if promoted else "preparing_initial"
 
+        _home_stage(trace, 'promotion', promotion_started)
         if promoted:
+            radio_started = time.perf_counter()
             artifact = artifact_from_record(self._repositories.artifacts.get(promoted))
             if artifact is not None:
                 self._record_radio_exposure(artifact)
+            _home_stage(trace, 'radio_exposure', radio_started)
             self._replenish_after_delivery(request, state, reason="post_promotion",
                                           background_tasks=background_tasks)
             return self._serve_or_prepare(
@@ -104,6 +117,7 @@ class HomeFeedApi:
                 request_id=request_id,
                 action=action,
                 changed=True,
+                trace=trace,
             )
 
         if force and state.active_artifact_id and not state.ready_artifact_ids:
@@ -130,6 +144,7 @@ class HomeFeedApi:
                             action="promoted_prepared",
                             changed=True,
                             reason="refresh_wait_promoted",
+                            trace=trace,
                         )
             action = "unchanged_no_rotation"
 
@@ -146,17 +161,29 @@ class HomeFeedApi:
             action=action,
             changed=False,
             reason=("refresh_preparing_timeout" if force else ""),
+            trace=trace,
         )
 
     def _replenish_after_delivery(
         self, request: Any, state: HomeStateRecord, *, reason: str,
         background_tasks: Any = None,
     ) -> None:
-        # Only accepted, persisted Home may bypass inventory decoding before
-        # delivery. Initial supply and explicit preparation remain synchronous.
-        if background_tasks is None or not state.active_artifact_id:
+        if background_tasks is None:
             self._ensure_successors(request, state, reason=reason)
             return
+        if not state.active_artifact_id and not state.ready_artifact_ids:
+            # A fresh guest still gets durable acquisition before delivery,
+            # but inventory decoding and supply reconciliation must not hold
+            # its first HTTP response. Existing jobs remain the only owner.
+            if not self._repositories.jobs.has_active(
+                state.user_scope_id,
+                job_types=(HomeJobType.REFRESH_CANDIDATES, HomeJobType.REFRESH_RADIO,
+                           HomeJobType.COMPOSE_FEED), ignore_delayed_idle=True,
+            ):
+                self._scheduler.candidates(
+                    request, reason="candidate_inventory_refresh",
+                    profile_fingerprint=home_supply_profile_fingerprint(state.user_scope_id),
+                )
         background_tasks.add_task(self._replenish_delivered, request, state.user_scope_id, reason)
 
     def _replenish_delivered(self, request: Any, scope: str, reason: str) -> None:
@@ -382,14 +409,9 @@ class HomeFeedApi:
                 HomeJobType.COMPOSE_FEED,
             ),
         )
-        complete_bundle_ids = [
-            artifact_id
-            for artifact_id in state.ready_artifact_ids
-            if (
-                (record := self._repositories.artifacts.get(artifact_id)) is not None
-                and is_complete_feed_bundle_payload(record.payload)
-            )
-        ]
+        # Reconciliation/promotion already validate these immutable references.
+        # Status must not decode the same full bundles a second time.
+        complete_bundle_ids = list(state.ready_artifact_ids)
         depth = len(complete_bundle_ids)
         phase = (
             "ready"
@@ -457,6 +479,12 @@ class HomeFeedApi:
             and time.monotonic() < deadline
         ):
             time.sleep(min(0.1, max(deadline - time.monotonic(), 0.0)))
+            current = self._repositories.state.get(scope)
+            if current is None or current.revision != state.revision:
+                state = self._repositories.state.reconcile(scope)
+        # Expiry can change validity without changing the state revision. Check
+        # it once before publication, rather than decoding every bundle at 10Hz.
+        if wait_ms > 0:
             state = self._repositories.state.reconcile(scope)
         diagnostics = {
             "engine": "discovery_engine",
@@ -485,8 +513,9 @@ class HomeFeedApi:
         action: str,
         changed: bool = False,
         reason: str = "",
+        trace: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        state = self._repositories.state.reconcile(state.user_scope_id)
+        artifact_started = time.perf_counter()
         record = (
             self._repositories.artifacts.get(state.active_artifact_id)
             if state.active_artifact_id
@@ -499,11 +528,15 @@ class HomeFeedApi:
             )
             stale_fallback = record is not None
         artifact = artifact_from_record(record)
+        _home_stage(trace, 'artifact_read', artifact_started)
+        queue_started = time.perf_counter()
+        queue_diagnostics = self._queue_diagnostics(state)
+        _home_stage(trace, 'queue_diagnostics', queue_started)
         if artifact is None:
             diagnostics = {
                 "engine": "discovery_engine",
                 "feed_action": "preparing_initial",
-                **self._queue_diagnostics(state),
+                **queue_diagnostics,
                 "artifact_status": "preparing",
                 "artifact_quality": "preparing",
             }
@@ -524,7 +557,7 @@ class HomeFeedApi:
         )
         artifact.diagnostics = {
             **dict(artifact.diagnostics or {}),
-            **self._queue_diagnostics(state),
+            **queue_diagnostics,
             "feed_action": effective_action,
             "feed_version": state.active_version,
             "feed_changed": bool(changed),
@@ -552,13 +585,20 @@ class HomeFeedApi:
             else action
         )
         if not stale_fallback:
+            exposure_started = time.perf_counter()
             self._record_impressions_once(
                 artifact,
                 delivery_key="complete",
                 row_offset=0,
                 row_limit=None,
             )
-        return home_response_from_artifact(
+            _home_stage(trace, 'exposures', exposure_started)
+        projection_started = time.perf_counter()
+        # Refresh presentation metadata from the same persisted artist record
+        # used by artist details. Feed identity, order and promotion stay owned
+        # by the durable artifact; this performs no external artwork lookup.
+        _attach_inventory_portraits(artifact.rows, None, self._server)
+        response = home_response_from_artifact(
             artifact,
             request_id=request_id,
             page_size=max(
@@ -566,6 +606,8 @@ class HomeFeedApi:
                 1,
             ),
         )
+        _home_stage(trace, 'projection', projection_started)
+        return response
 
     def _row_page(
         self,
@@ -581,6 +623,7 @@ class HomeFeedApi:
         artifact = artifact_from_record(self._repositories.artifacts.get(artifact_id))
         if artifact is None or artifact.user_scope_id != scope:
             raise HTTPException(status_code=404, detail="Discovery row is not available")
+        _attach_inventory_portraits(artifact.rows, None, self._server)
         response = row_page_response_from_artifact(
             artifact,
             row_id=str(getattr(request, "row_id", "") or "").strip(),

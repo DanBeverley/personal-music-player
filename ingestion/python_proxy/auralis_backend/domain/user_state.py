@@ -323,6 +323,8 @@ def _build_scope_history_seed_from_events(
     user_scope_id: str,
     *,
     allow_remote_metadata: bool = False,
+    pending_play_keys: frozenset[str] = frozenset(),
+    strict_errors: bool = False,
 ) -> Dict[str, Any]:
     normalized_scope = trim_text(user_scope_id or "guest") or "guest"
     if normalized_scope == "guest":
@@ -330,6 +332,8 @@ def _build_scope_history_seed_from_events(
     try:
         connection = open_recommendation_store_connection(server)
     except Exception:
+        if strict_errors:
+            raise
         return {}
     event_rows = []
     search_rows = []
@@ -359,6 +363,8 @@ def _build_scope_history_seed_from_events(
             [normalized_scope],
         ).fetchall()
     except Exception:
+        if strict_errors:
+            raise
         return {}
     finally:
         connection.close()
@@ -399,7 +405,9 @@ def _build_scope_history_seed_from_events(
     history_snapshot_by_identity: Dict[str, Dict[str, Any]] = {}
     play_count_by_identity: Dict[str, int] = defaultdict(int)
     latest_play_by_identity: Dict[str, float] = {}
+    acknowledged_play_keys: set[str] = set()
     last_counted_play_by_identity: Dict[str, float] = {}
+    counted_web_play_keys: set[str] = set()
     recent_track_snapshots: List[Dict[str, Any]] = []
     seen_recent_ids = set()
     seen_library_ids = set()
@@ -420,6 +428,9 @@ def _build_scope_history_seed_from_events(
             payload = {}
         artist_name = trim_text(row["artist_name"])
         event_type = trim_text(row["event_type"]).lower() or "play"
+        play_key = str(payload.get("web_play_key") or "")
+        if event_type == "play" and play_key in pending_play_keys:
+            acknowledged_play_keys.add(play_key)
         occurred_at = float(row["occurred_at"] or 0.0)
         age_days = max(0.0, (now - occurred_at) / 86400.0) if now > 0.0 else float(index) / 18.0
         recency_bonus = max(0.35, 1.45 - (age_days * 0.08))
@@ -459,6 +470,7 @@ def _build_scope_history_seed_from_events(
                 snapshot.get("canonical_entity_id")
                 or snapshot.get("canonical_track_identity")
                 or snapshot.get("musicbrainz_recording_id")
+                or snapshot.get("canonical_recording_id")
                 or snapshot.get("recording_mbid")
                 or snapshot.get("isrc")
             )
@@ -477,9 +489,16 @@ def _build_scope_history_seed_from_events(
                 )
             if event_type == "play":
                 last_counted = last_counted_play_by_identity.get(canonical_identity)
-                if last_counted is None or last_counted - occurred_at >= 30.0:
+                # Web emits a stable key only after real progression. Distinct
+                # listening operations must not collapse into the legacy
+                # 30-second alias/import dedupe window; retries keep one key.
+                count_play = (play_key not in counted_web_play_keys if play_key
+                              else last_counted is None or last_counted - occurred_at >= 30.0)
+                if count_play:
                     play_count_by_identity[canonical_identity] += 1
                     last_counted_play_by_identity[canonical_identity] = occurred_at
+                    if play_key:
+                        counted_web_play_keys.add(play_key)
                 latest_play_by_identity[canonical_identity] = max(
                     latest_play_by_identity.get(canonical_identity, 0.0),
                     occurred_at,
@@ -539,6 +558,15 @@ def _build_scope_history_seed_from_events(
         ),
         reverse=True,
     )
+    # Preserve profile evidence from saves/likes, but attach actual listening
+    # clocks/counts to recent snapshots as well as the frequent list.
+    listening_by_identity = {
+        item["canonical_entity_id"]: item for item in history_track_snapshots
+    }
+    for item in [*recent_track_snapshots, *top_track_snapshots, *last_played_tracks]:
+        evidence = listening_by_identity.get(item.get("canonical_entity_id"), {})
+        item["play_count"] = int(evidence.get("play_count") or 0)
+        item["last_played_at"] = float(evidence.get("last_played_at") or 0)
     anchor_track_snapshots = unique_snapshot_tracks(
         [*last_played_tracks[:4], *top_track_snapshots[:4]],
         8,
@@ -560,6 +588,7 @@ def _build_scope_history_seed_from_events(
         "anchor_track_snapshots": anchor_track_snapshots,
         "history_track_snapshots": history_track_snapshots,
         "frequent_track_snapshots": frequent_track_snapshots,
+        "acknowledged_play_keys": sorted(acknowledged_play_keys),
         "recent_queries": recent_queries,
         "taste_queries": taste_queries,
         "artist_hints": unique_strings(artist_hints, 12),

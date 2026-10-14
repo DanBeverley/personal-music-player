@@ -326,6 +326,39 @@ def init_recommendation_store(server: Any | None = None) -> Any:
                     "CREATE INDEX IF NOT EXISTS idx_catalog_entities_type_popularity "
                     "ON catalog_entities(entity_type, learned_popularity DESC, popularity DESC, updated_at DESC)"
                 )
+                # Derived text index: no copied payloads or account data. Build
+                # once during store initialization, never during a Search read.
+                indexed = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name='catalog_search_fts'"
+                ).fetchone()
+                connection.execute("""
+                    CREATE VIRTUAL TABLE IF NOT EXISTS catalog_search_fts USING fts5(
+                        display_title, display_artist, display_album,
+                        content='catalog_entities', content_rowid='rowid',
+                        tokenize='trigram'
+                    )
+                """)
+                connection.execute("""CREATE TRIGGER IF NOT EXISTS catalog_search_insert
+                    AFTER INSERT ON catalog_entities BEGIN
+                    INSERT INTO catalog_search_fts(rowid, display_title, display_artist, display_album)
+                    VALUES (new.rowid, new.display_title, new.display_artist, new.display_album);
+                    END""")
+                connection.execute("""CREATE TRIGGER IF NOT EXISTS catalog_search_delete
+                    AFTER DELETE ON catalog_entities BEGIN
+                    INSERT INTO catalog_search_fts(catalog_search_fts, rowid, display_title, display_artist, display_album)
+                    VALUES ('delete', old.rowid, old.display_title, old.display_artist, old.display_album);
+                    END""")
+                connection.execute("""CREATE TRIGGER IF NOT EXISTS catalog_search_update
+                    AFTER UPDATE OF display_title, display_artist, display_album ON catalog_entities
+                    WHEN old.display_title != new.display_title OR old.display_artist != new.display_artist
+                         OR old.display_album != new.display_album BEGIN
+                    INSERT INTO catalog_search_fts(catalog_search_fts, rowid, display_title, display_artist, display_album)
+                    VALUES ('delete', old.rowid, old.display_title, old.display_artist, old.display_album);
+                    INSERT INTO catalog_search_fts(rowid, display_title, display_artist, display_album)
+                    VALUES (new.rowid, new.display_title, new.display_artist, new.display_album);
+                    END""")
+                if not indexed:
+                    connection.execute("INSERT INTO catalog_search_fts(catalog_search_fts) VALUES ('rebuild')")
                 connection.execute(
                     """
                     CREATE TABLE IF NOT EXISTS catalog_entity_aliases (

@@ -1,6 +1,5 @@
 :8080 {
     header {
-        Cache-Control "no-cache"
         X-Content-Type-Options "nosniff"
         Referrer-Policy "no-referrer"
     }
@@ -12,9 +11,18 @@
         header Cache-Control "no-store"
         reverse_proxy api:8000
     }
+    @media {
+        method GET HEAD
+        path /playback/stream/*
+    }
+    handle @media {
+        reverse_proxy api:8000 {
+            flush_interval -1
+        }
+    }
     @apiGet {
         method GET HEAD
-        path /playback/stream/* /artist_artwork/* /entity_artwork/* /album/* /artist/* /lyrics/* /recent_search_picks /charts /new_releases
+        path /artist_artwork/* /entity_artwork/* /album/* /artist/* /lyrics/* /recent_search_picks /charts /new_releases
     }
     handle @apiGet {
         header Cache-Control "no-store"
@@ -24,10 +32,12 @@
     }
     @static method GET HEAD
     handle @static {
+        header Cache-Control "no-cache"
         root * /srv
         file_server
     }
     handle {
+        header Cache-Control "no-store"
         respond 404
     }
 }

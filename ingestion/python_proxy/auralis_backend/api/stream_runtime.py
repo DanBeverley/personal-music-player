@@ -10,10 +10,11 @@ from typing import Any
 
 import yt_dlp
 from fastapi import HTTPException, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse, Response
 
 from .stream_cache import (
     cached_response_headers,
+    cached_resource_version,
     get_stream_cache,
     iter_and_store_full_stream,
     should_cache_full_response,
@@ -33,6 +34,9 @@ from .stream_core_runtime import (
     open_upstream_stream,
     parse_byte_range,
     prepare_streams_with_failures,
+    prepared_cached_object,
+    explicit_source_retry,
+    _stream_failure_payload,
 )
 
 def _catalog_entity_key(track_key: str) -> str:
@@ -387,15 +391,28 @@ def proxy_stream(server: Any, video_id: str, request: Request):
     try:
         response = _proxy_stream(server, video_id, request)
     except Exception as exc:
+        detail = exc.detail if isinstance(exc, HTTPException) and isinstance(exc.detail, dict) else {}
+        facts = detail.get('diagnostics') or {}
         print(f'[EBB:playback] track={video_id} session={session} request={request_id} result=failed '
-              f'error={type(exc).__name__} ms={int((time.perf_counter()-started)*1000)}')
+              f'error={type(exc).__name__} code={detail.get("code", "stream_failed")} '
+              f'stage={facts.get("stage", "source_resolution")} '
+              f'httpStatus={facts.get("http_status", 0)} '
+              f'ms={int((time.perf_counter()-started)*1000)}', flush=True)
         raise
     handler_ms = int((time.perf_counter()-started)*1000)
     response.headers['Server-Timing'] = f'handler;dur={handler_ms}'
     response.headers['Timing-Allow-Origin'] = '*'
     response.headers['X-Neatie-Playback-Request'] = request_id
+    response.headers.setdefault('Cache-Control', 'no-store')
+    byte_range = request.headers.get('range', '')
+    safe_range = byte_range.removeprefix('bytes=') if re.fullmatch(r'bytes=\d{0,19}-\d{0,19}', byte_range) else 'none'
     print(f'[EBB:playback-start] request={request_id} handlerMs={handler_ms} '
-          f'status={response.status_code} source={response.headers.get("X-Auralis-Stream-Cache", "upstream")}', flush=True)
+          f'status={response.status_code} source={response.headers.get("X-Auralis-Stream-Cache", "upstream")} '
+          f'range={safe_range} native={int("x-playback-session-id" in request.headers)} '
+          f'versioned={int(bool(request.query_params.get("cache_version")))} '
+          f'media={response.headers.get("Content-Type", "unknown").split(";")[0]}', flush=True)
+    if not isinstance(response, StreamingResponse):
+        return response
     iterator = response.body_iterator
     async def measured():
         sent = 0
@@ -436,13 +453,21 @@ def _proxy_stream(server: Any, video_id: str, request: Request):
             raise PlaybackSourceExpired('Browser capture has been retired; start playback again')
         stream_cache = get_stream_cache(server)
         variant = request.query_params.get('cache_variant', '')
+        version = request.query_params.get('cache_version', '')
+        if version and not re.fullmatch(r'v1-[a-f0-9]{32}', version):
+            raise HTTPException(status_code=422, detail='Invalid cached version', headers={'Cache-Control': 'no-store'})
+        if version and not variant:
+            raise HTTPException(status_code=422, detail='Cached versions require a representation', headers={'Cache-Control': 'no-store'})
         if variant and variant not in {'legacy', 'seek-v1'}:
             raise HTTPException(status_code=422, detail='Invalid cached representation')
         stream_cache_meta = (selected.get('cached_object') if selected else
-            stream_cache.head_variant(video_id, variant) if variant and stream_cache.backend_name == 'r2'
-            else stream_cache.head(video_id))
+            prepared_cached_object(server, video_id, variant)
+            or (stream_cache.head_variant(video_id, variant) if variant and stream_cache.backend_name == 'r2'
+                else stream_cache.head(video_id)))
         if variant and not stream_cache_meta:
             raise PlaybackSourceExpired('Cached playback resource is unavailable')
+        if version and cached_resource_version(stream_cache_meta or {}) != version:
+            raise PlaybackSourceExpired('Cached playback representation changed')
         if selected and variant and stream_cache_meta:
             actual_variant = ('seek-v1' if str(stream_cache_meta.get('key') or '').endswith('.seek-v1')
                               else 'legacy')
@@ -453,6 +478,15 @@ def _proxy_stream(server: Any, video_id: str, request: Request):
                 from .stream_core_runtime import schedule_cached_audio_repair
                 schedule_cached_audio_repair(server, video_id, stream_cache_meta)
             total_length = int(stream_cache_meta.get("content_length") or 0) or None
+            resource_headers = {'Cache-Control': 'no-store'}
+            if version:
+                resource_headers = {'ETag': '"' + version + '"',
+                                    'Cache-Control': 'no-store' if session else 'private, max-age=3600, immutable'}
+                validators = [tag.strip().removeprefix('W/') for tag in request.headers.get('if-none-match', '').split(',')]
+                if resource_headers['ETag'] in validators or '*' in validators:
+                    return Response(status_code=304, headers=resource_headers)
+                if request.headers.get('if-range') and request.headers['if-range'] != resource_headers['ETag']:
+                    range_header = None
             parsed_range = parse_byte_range(range_header, total_length)
             if range_header and parsed_range is None:
                 raise HTTPException(
@@ -473,6 +507,7 @@ def _proxy_stream(server: Any, video_id: str, request: Request):
                 end=end,
                 ranged=bool(range_header),
             )
+            headers.update(resource_headers)
             if os.environ.get('AURALIS_PLAYBACK_VERBOSE') == '1': print(
                 "[EBB:stream-cache] "
                 f"video={video_id} event=hit backend={stream_cache.backend_name} "
@@ -481,6 +516,14 @@ def _proxy_stream(server: Any, video_id: str, request: Request):
             prefix = get_cached_stream_chunk(server, video_id) if hasattr(server, 'stream_chunk_lock') else None
             key = cached_object_key(stream_cache_meta)
             prefix = prefix if key and prefix and prefix.get('representation_key') == key else None
+            if (stream_cache.backend_name == 'r2' and not prefix and start == 0
+                    and end is not None and end < 65536 and total_length
+                    and hasattr(server, 'stream_chunk_inflight_lock')):
+                # A small browser probe can retain useful startup bytes from
+                # this same ETag-checked read for the immediately following GET.
+                # Its response still contains only the exact requested range.
+                from .stream_core_runtime import warm_cached_object_prefix
+                prefix = warm_cached_object_prefix(server, video_id, stream_cache, stream_cache_meta)
             if stream_cache.backend_name != 'r2':
                 chunks = stream_cache.iter_object(video_id, start=start, end=end)
             elif prefix and start < len(prefix['bytes']):
@@ -499,7 +542,7 @@ def _proxy_stream(server: Any, video_id: str, request: Request):
                 except Exception:
                     # Choose a different transport only before this new resource
                     # has emitted any bytes. Existing object sessions stay pinned.
-                    if selected is not None:
+                    if selected is not None or version:
                         raise PlaybackSourceExpired('Cached playback resource is unavailable')
                     stream_cache.invalidate(video_id)
                     stream_cache_meta = None
@@ -530,8 +573,11 @@ def _proxy_stream(server: Any, video_id: str, request: Request):
                 f"range={range_header or 'full'}"
             )
 
-        stream_info = selected or (get_stream_info(server, video_id, session=session)
-                                   if session else get_stream_info(server, video_id))
+        retry = (request.query_params.get('retry_source') == '1'
+                 and request.query_params.get('background', '').lower() not in {'1', 'true', 'yes'})
+        with explicit_source_retry(retry):
+            stream_info = selected or (get_stream_info(server, video_id, session=session)
+                                       if session else get_stream_info(server, video_id))
         cached_chunk = get_cached_stream_chunk(server, video_id)
         if not stream_chunk_matches(cached_chunk, stream_info):
             cached_chunk = None
@@ -667,17 +713,18 @@ def _proxy_stream(server: Any, video_id: str, request: Request):
             ),
         )
     except PlaybackSourceExpired:
-        raise HTTPException(status_code=410, detail={'code': 'playback_source_expired'})
+        raise HTTPException(status_code=410, detail={'code': 'playback_source_expired'}, headers={'Cache-Control': 'no-store'})
     except HTTPException:
         raise
     except Exception as exc:
-        classified = classify_stream_failure(exc)
+        classified = _stream_failure_payload(exc)
         raise HTTPException(
             status_code=classified["status_code"],
             detail={
                 "code": classified["code"],
-                "message": classified["message"],
+                "message": "Audio source preparation failed",
                 "video_id": video_id,
+                "diagnostics": classified.get('diagnostics') or {},
             },
         )
 
@@ -835,6 +882,7 @@ def playback_stream(server: Any, track_key: str, request: Request):
             detail={"code": "playback_source_missing", "track_key": track_key},
         )
     failures: list[str] = []
+    failure_details: list[dict] = []
     background = str(request.query_params.get("background") or "").casefold() in {
         "1",
         "true",
@@ -854,6 +902,8 @@ def playback_stream(server: Any, track_key: str, request: Request):
                 continue
             return proxy_stream(server, source["source_id"], request)
         except HTTPException as exc:
+            if request.query_params.get('cache_version'):
+                raise
             detail = exc.detail if isinstance(exc.detail, dict) else {}
             if background and detail.get("code") == "source_blocked":
                 from ..discovery.source_registry import record_youtube_background_failures
@@ -863,7 +913,10 @@ def playback_stream(server: Any, track_key: str, request: Request):
                     {source["source_id"]: detail},
                 )
                 youtube_blocked = True
-            failures.append(str(exc.detail))
+            failures.append(str(detail.get('code') or 'stream_failed'))
+            failure_details.append({'source_id': source['source_id'],
+                'code': detail.get('code') or 'stream_failed',
+                'diagnostics': detail.get('diagnostics') or {}})
             continue
     raise HTTPException(
         status_code=502,
@@ -871,5 +924,6 @@ def playback_stream(server: Any, track_key: str, request: Request):
             "code": "playback_sources_failed",
             "track_key": track_key,
             "failures": failures,
+            "failure_details": failure_details,
         },
     )

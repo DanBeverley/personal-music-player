@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import json
+import hashlib
 import subprocess
 import tempfile
 import time
@@ -342,6 +343,15 @@ def get_stream_cache(server: Any) -> StreamCacheBackend:
 
     _STREAM_CACHE_CLIENTS[key] = cache
     return cache
+
+
+def cached_resource_version(metadata: Dict[str, Any]) -> str:
+    """Bind a reusable browser URL to one exact object representation."""
+    if not metadata.get('key') or not metadata.get('etag') or int(metadata.get('content_length') or 0) <= 0:
+        return ''
+    identity = [metadata['key'], metadata['etag'], int(metadata['content_length']),
+                _content_type(metadata.get('content_type'))]
+    return 'v1-' + hashlib.sha256(json.dumps(identity, separators=(',', ':')).encode()).hexdigest()[:32]
 
 
 def cached_response_headers(

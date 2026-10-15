@@ -17,13 +17,14 @@ import yt_dlp
 import yt_dlp.plugins
 from yt_dlp.cookies import YoutubeDLCookieJar
 
-from .stream_cache import get_stream_cache, iter_and_store_full_stream
+from .stream_cache import get_stream_cache, iter_and_store_full_stream, cached_resource_version
 
 _capture_cache_slots = BoundedSemaphore(2)
 _stream_store_slots = BoundedSemaphore(2)
 _direct_extraction_slots = BoundedSemaphore(2)
 _direct_background_slots = BoundedSemaphore(1)
 _background_acquisition = ContextVar('background_acquisition', default=False)
+_explicit_source_retry = ContextVar('explicit_source_retry', default=False)
 _startup_tools_lock = Lock()
 _startup_tools_thread = None
 _startup_tools_stop = Event()
@@ -477,20 +478,49 @@ def _delete_stream_info_before(server: Any, video_id: str, cutoff: float) -> Non
             connection.close()
 
 
+class CachedStreamFailure(RuntimeError):
+    """Keep a cached failure's category/stage without renewing its lifetime."""
+
+    def __init__(self, payload):
+        self.payload = dict(payload)
+        super().__init__(payload['code'])
+
+
+@contextmanager
+def explicit_source_retry(enabled: bool):
+    token = _explicit_source_retry.set(enabled)
+    try:
+        yield
+    finally:
+        _explicit_source_retry.reset(token)
+
+
 def _stream_failure_payload(exc: Exception):
+    if isinstance(exc, CachedStreamFailure):
+        return dict(exc.payload)
     classified = classify_stream_failure(exc)
     return {
         **classified,
+        'diagnostics': stream_failure_diagnostics(exc),
         "created_at": time.time(),
     }
 
 
-def _get_stream_failure(server: Any, video_id: str):
+def _get_stream_failure(server: Any, video_id: str, *, retry: bool = False):
     now = time.time()
     cooldown = int(getattr(server, "STREAM_FAILURE_COOLDOWN_SECONDS", 900) or 900)
     with server.stream_failure_lock:
         cached = server.stream_failure_cache.get(video_id)
+        if cached and cached.get('code') not in {'video_unavailable', 'format_unavailable'}:
+            cooldown = min(cooldown, 60)
         if cached and (now - float(cached.get("created_at") or 0.0)) < cooldown:
+            # Only an explicit foreground Retry can bypass a temporary failure.
+            # Keep the reservation through another failure; repeated taps and
+            # speculative work cannot create an extraction retry loop.
+            if (retry and cached.get('code') not in {'video_unavailable', 'format_unavailable'}
+                    and now >= float(cached.get('retry_after') or 0)):
+                cached['retry_after'] = now + 30
+                return None
             return dict(cached)
         if cached:
             server.stream_failure_cache.pop(video_id, None)
@@ -499,9 +529,16 @@ def _get_stream_failure(server: Any, video_id: str):
 
 def _store_stream_failure(server: Any, video_id: str, exc: Exception) -> dict:
     payload = _stream_failure_payload(exc)
+    if isinstance(exc, CachedStreamFailure):
+        return payload
     if payload['code'] == 'preparation_busy':
         return payload  # Capacity pressure is not a bad source or a cooldown.
     with server.stream_failure_lock:
+        previous = server.stream_failure_cache.get(video_id) or {}
+        if previous.get('retry_after'):
+            payload['retry_after'] = previous['retry_after']
+        if len(server.stream_failure_cache) >= 512 and video_id not in server.stream_failure_cache:
+            server.stream_failure_cache.pop(next(iter(server.stream_failure_cache)))
         server.stream_failure_cache[video_id] = payload
     return payload
 
@@ -927,7 +964,8 @@ def warm_cached_object_prefix(server, video_id, cache, metadata, target_bytes=65
             if len(data) != target:
                 raise ValueError('Invalid cached startup prefix')
             result = {'bytes': data, 'representation_key': key, 'total_length': metadata['content_length'],
-                      'content_type': metadata['content_type'], 'etag': metadata['etag']}
+                      'content_type': metadata['content_type'], 'etag': metadata['etag'],
+                      'cached_object': dict(metadata), 'object_proven_until': time.time()+1200}
             store_stream_chunk(server, video_id, result)
             pending.set_result(result)
             return result
@@ -938,6 +976,28 @@ def warm_cached_object_prefix(server, video_id, cache, metadata, target_bytes=65
             with server.stream_chunk_inflight_lock:
                 if server.stream_chunk_inflight.get(video_id) is pending:
                     server.stream_chunk_inflight.pop(video_id, None)
+
+
+def prepared_cached_object(server, video_id, variant=''):
+    """Reuse a GET/ETag-proven prefix; continuation still uses If-Match.
+
+    Unversioned starts only reuse indexed objects. Active sessions keep their
+    selected representation, including when a newer object is published.
+    """
+    if not hasattr(server, 'stream_chunk_lock'):
+        return None
+    prefix = get_cached_stream_chunk(server, video_id)
+    if not prefix or float(prefix.get('object_proven_until') or 0) <= time.time():
+        return None
+    metadata = prefix.get('cached_object') or {}
+    key = cached_object_key(metadata)
+    if (not key or key != prefix.get('representation_key')
+            or metadata.get('backend') != 'r2' or not prefix.get('bytes')):
+        return None
+    actual = 'seek-v1' if str(metadata.get('key') or '').endswith('.seek-v1') else 'legacy'
+    if (variant and variant != actual) or (not variant and actual != 'seek-v1'):
+        return None
+    return dict(metadata)
 
 
 def stream_representation_key(stream_info: dict) -> str:
@@ -1219,7 +1279,8 @@ def prepare_stream_track(
     total_start = time.perf_counter()
     stream_cache = get_stream_cache(server)
     stream_cache_head_start = time.perf_counter()
-    stream_cache_meta = stream_cache.head(video_id)
+    stream_cache_meta = (prepared_cached_object(server, video_id)
+                         or stream_cache.head(video_id))
     stream_cache_head_ms = int((time.perf_counter() - stream_cache_head_start) * 1000)
     if stream_cache_meta:
         if stream_cache.backend_name == 'r2':
@@ -1236,6 +1297,9 @@ def prepare_stream_track(
         if stream_cache.backend_name == 'r2' and isinstance(stream_cache_meta.get('key'), str):
             variant = 'seek-v1' if stream_cache_meta['key'].endswith('.seek-v1') else 'legacy'
             cache_path = f'/playback/stream/{video_id}?resolve=1&source_id={video_id}&cache_variant={variant}'
+            version = cached_resource_version(stream_cache_meta)
+            if version:
+                cache_path += f'&cache_version={version}'
         metrics = {
             "prepared": True,
             "playback_path": cache_path,
@@ -1347,6 +1411,9 @@ def prepare_stream_track_safely(server: Any, video_id: str, target_chunk_bytes: 
 
 
 def classify_stream_failure(exc: Exception):
+    if isinstance(exc, CachedStreamFailure):
+        return {key: exc.payload[key] for key in ('code', 'message', 'status_code', 'diagnostics')
+                if key in exc.payload}
     if str(exc) == 'audio_resolver_busy':
         return {'code':'preparation_busy','message':'Audio preparation capacity is busy',
                 'status_code':503}
@@ -1488,7 +1555,8 @@ def get_stream_info(server: Any, video_id: str, *, background=False, session='')
         return pending.result(timeout=85)
     try:
         payload = selected_stream_info(server, video_id, session)
-        if payload is None and session:
+        if (payload is None and session and not (
+                _explicit_source_retry.get() and video_id in server.stream_failure_cache)):
             payload = selected_stream_info(server, video_id)
             if payload is not None and payload.get('compatibility'):
                 payload = None
@@ -1528,16 +1596,18 @@ def _resolve_stream_info(server: Any, video_id: str, *, background=False, priori
 
 def _get_primary_stream_info(server: Any, video_id: str):
     now = time.time()
-    cached_failure = _get_stream_failure(server, video_id)
-    if cached_failure is not None:
-        raise RuntimeError(cached_failure.get("message") or cached_failure.get("code") or "stream_failed")
     with server.stream_info_lock:
-        cached = server.stream_info_cache.get(video_id)
-        if cached and cached["expires_at"] > now + 90:
-            return cached["payload"]
-
         pending = server.stream_info_inflight.get(video_id)
         if pending is None:
+            retrying = (_explicit_source_retry.get() and not _background_acquisition.get()
+                        and video_id in server.stream_failure_cache)
+            cached_failure = _get_stream_failure(server, video_id,
+                retry=retrying)
+            if cached_failure is not None:
+                raise CachedStreamFailure(cached_failure)
+            cached = server.stream_info_cache.get(video_id)
+            if cached and cached["expires_at"] > now + 90 and not retrying:
+                return cached["payload"]
             pending = Future()
             server.stream_info_inflight[video_id] = pending
             should_extract = True
@@ -1555,19 +1625,20 @@ def _get_primary_stream_info(server: Any, video_id: str):
         finally:
             timings[name] = timings.get(name, 0) + int((time.perf_counter()-started)*1000)
     def fresh_resolution():
-        info = measured('extraction', extract_stream_info, server, video_id)
+        info = (measured('extraction', extract_stream_info, server, video_id, True) if retrying
+                else measured('extraction', extract_stream_info, server, video_id))
         try:
             return measured('validation', validate_stream_info, server, video_id, info)
         except Exception as exc:
             status = getattr(getattr(exc, 'response', None), 'status_code', None)
-            if info.get('acquisition_path') != 'direct_fast' or status not in {401, 403}:
+            if retrying or info.get('acquisition_path') != 'direct_fast' or status not in {401, 403}:
                 raise
             # A stale session must not poison the source for fifteen minutes.
             # Retry one fresh context only before any media is published.
             return measured('validation', validate_stream_info, server, video_id,
                 measured('extraction', extract_stream_info, server, video_id, True))
     try:
-        persisted = measured('persisted_lookup', _load_persisted_stream_info, server, video_id)
+        persisted = None if retrying else measured('persisted_lookup', _load_persisted_stream_info, server, video_id)
         if persisted is not None:
             payload, expires_at = persisted
             try:
@@ -1602,7 +1673,15 @@ def _get_primary_stream_info(server: Any, video_id: str):
         pending.set_result(payload)
         return payload
     except Exception as exc:
-        _store_stream_failure(server, video_id, exc)
+        failed = _store_stream_failure(server, video_id, exc)
+        facts = failed.get('diagnostics') or {}
+        print(f'[EBB:resolution-failed] track={video_id} code={failed["code"]} '
+              f'stage={facts.get("stage", "source_resolution")} '
+              f'error={facts.get("exception_type", type(exc).__name__)} '
+              f'httpStatus={facts.get("http_status", 0)} '
+              f'flags={",".join(facts.get("extractor_flags", [])) or "none"} '
+              f'extractionMs={timings.get("extraction", 0)} '
+              f'validationMs={timings.get("validation", 0)}', flush=True)
         pending.set_exception(exc)
         raise
     finally:

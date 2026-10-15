@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
+import '../logic/track_metadata.dart';
 import 'collection_search.dart';
 import 'artwork_image.dart';
 import 'design_system.dart';
@@ -7,25 +8,21 @@ import 'web_player.dart';
 
 class QueueScreen extends StatefulWidget {
   const QueueScreen(
-      {super.key, required this.player, required this.onLike, this.isLiked});
+      {super.key,
+      required this.player,
+      required this.onLike,
+      this.isLiked,
+      this.active = true});
   final WebPlayer player;
   final Future<void> Function(Map<String, dynamic>) onLike;
   final bool Function(Map<String, dynamic>)? isLiked;
+  final bool active;
   @override
   State<QueueScreen> createState() => _QueueScreenState();
 }
 
 class _QueueScreenState extends State<QueueScreen> {
-  final _search = TextEditingController();
   int? _dragRevision;
-  List<Map<String, dynamic>>? _filteredQueue;
-  String _filteredQuery = '';
-  List<int> _filteredIndices = [];
-  @override
-  void dispose() {
-    _search.dispose();
-    super.dispose();
-  }
 
   void _edited(bool success) {
     if (!success && mounted)
@@ -38,14 +35,6 @@ class _QueueScreenState extends State<QueueScreen> {
       animation: widget.player,
       builder: (context, _) {
         final player = widget.player, revision = player.queueRevision;
-        if (!identical(_filteredQueue, player.queue) ||
-            _filteredQuery != _search.text) {
-          _filteredQueue = player.queue;
-          _filteredQuery = _search.text;
-          _filteredIndices = matchingTrackIndices(player.queue, _search.text);
-        }
-        final visible = _filteredIndices;
-        final filtering = _search.text.trim().isNotEmpty;
         return CustomScrollView(slivers: [
           SliverToBoxAdapter(
               child: Padding(
@@ -58,55 +47,50 @@ class _QueueScreenState extends State<QueueScreen> {
                             eyebrow: 'YOUR QUEUE',
                             subtitle: player.title),
                         const SizedBox(height: 16),
-                        CollectionSearchField(
-                            controller: _search,
-                            label: 'Search this queue',
-                            onChanged: (_) => setState(() {})),
+                        CatalogTrackSearch(
+                            key: ValueKey(
+                                'queue-search:${player.api.userScopeId}'),
+                            api: player.api,
+                            active: widget.active,
+                            label: 'Find songs to add to your queue',
+                            isAdded: (track) => player.queue.any((item) =>
+                                extractTrackId(item) == extractTrackId(track)),
+                            onAdd: (track) async => player.addToQueue(track)),
                         const SizedBox(height: 8),
-                        Text(filtering
-                            ? '${visible.length} of ${player.queue.length} songs'
-                            : '${player.queue.length} songs · drag to reorder'),
+                        Text('${player.queue.length} songs · drag to reorder'),
                       ]))),
-          if (player.queue.isEmpty || visible.isEmpty)
+          if (player.queue.isEmpty)
             SliverToBoxAdapter(
                 child: Padding(
                     padding: const EdgeInsets.all(24),
-                    child: Text(player.queue.isEmpty
-                        ? 'Choose a song to start a related-song queue.'
-                        : 'No matching songs in this queue.')))
+                    child: const Text(
+                        'Choose a song to start a related-song queue.')))
           else
             SliverPadding(
                 padding: const EdgeInsets.symmetric(horizontal: 16),
-                sliver: filtering
-                    ? SliverList.builder(
-                        itemCount: visible.length,
-                        itemBuilder: (context, at) =>
-                            _tile(visible[at], revision, drag: false))
-                    : SliverReorderableList(
-                        proxyDecorator: (child, _, __) => Material(
-                            elevation: 4,
-                            color: Theme.of(context).colorScheme.surface,
-                            child: child),
-                        itemCount: player.queue.length,
-                        onReorderStart: (_) =>
-                            _dragRevision = player.queueRevision,
-                        onReorder: (from, drop) {
-                          final to = drop > from ? drop - 1 : drop;
-                          if (from != to)
-                            _edited(player.moveQueueItem(from, to,
-                                revision: _dragRevision ?? revision));
-                          _dragRevision = null;
-                        },
-                        itemBuilder: (context, at) =>
-                            _tile(at, revision, drag: true))),
+                sliver: SliverReorderableList(
+                    proxyDecorator: (child, _, __) => Material(
+                        elevation: 4,
+                        color: Theme.of(context).colorScheme.surface,
+                        child: child),
+                    itemCount: player.queue.length,
+                    onReorderStart: (_) => _dragRevision = player.queueRevision,
+                    onReorder: (from, drop) {
+                      final to = drop > from ? drop - 1 : drop;
+                      if (from != to)
+                        _edited(player.moveQueueItem(from, to,
+                            revision: _dragRevision ?? revision));
+                      _dragRevision = null;
+                    },
+                    itemBuilder: (context, at) =>
+                        _tile(at, revision, drag: true))),
           SliverToBoxAdapter(
               child: Column(children: [
             if (player.relatedError != null)
               Padding(
                   padding: const EdgeInsets.all(8),
                   child: Text(player.relatedError!)),
-            if (player.queue.isNotEmpty &&
-                (player.hasMore || player.relatedError != null))
+            if (player.queue.isNotEmpty)
               TextButton(
                   onPressed: player.loadingRelated
                       ? null

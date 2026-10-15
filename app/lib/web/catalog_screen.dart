@@ -128,12 +128,14 @@ class _CatalogScreenState extends State<CatalogScreen> {
       suggestions = _localSuggestions(value);
       error = null;
       detail = null;
+      // A new input owns a new result set. Keep suggestions separate from the
+      // previous query; enrichment of an unchanged query still preserves it.
+      data = {};
+      extras.clear();
+      pagination = {};
+      pagedItems.clear();
+      pagedCursors.clear();
       if (value.trim().isEmpty) {
-        data = {};
-        extras.clear();
-        pagination = {};
-        pagedItems.clear();
-        pagedCursors.clear();
         submitted = false;
         busy = false;
       } else {
@@ -159,6 +161,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
           cancel: cancel.future);
       if (mounted &&
           suggestionVersion == version &&
+          (busy || displayedQuery != value) &&
           query.text.trim() == value) {
         setState(() => suggestions = incoming.isEmpty
             ? _localSuggestions(value)
@@ -235,6 +238,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
         poll?.cancel();
         searchDebounce?.cancel();
         _cancelSearchRequests();
+        suggestions = [];
         widget.api.setManualSearchContext(value);
         unawaited(widget.player.start(track));
         _recordQuery(value, track: track);
@@ -715,9 +719,17 @@ class _CatalogScreenState extends State<CatalogScreen> {
       if (!widget.home && manualSearch)
         widget.api.setManualSearchContext(submittedQuery);
       if (!widget.home && filter != 'all') fullSearchLoaded = true;
+      if (!widget.home) {
+        suggestionVersion++;
+        if (suggestionCancel?.isCompleted == false)
+          suggestionCancel!.complete();
+      }
       setState(() {
         data = result;
-        if (!widget.home) displayedQuery = submittedQuery;
+        if (!widget.home) {
+          displayedQuery = submittedQuery;
+          suggestions = [];
+        }
         revision = (((result['diagnostics']
                             as Map?)?['search_snapshot_revision'] ??
                         (result['diagnostics'] as Map?)?['snapshot_revision'])
@@ -1523,7 +1535,9 @@ class _CatalogScreenState extends State<CatalogScreen> {
                                 icon:
                                     const Icon(Icons.arrow_forward_rounded))))),
                 const SizedBox(height: 18),
-                if (suggestions.isNotEmpty && query.text.trim().isNotEmpty)
+                if (suggestions.isNotEmpty &&
+                    query.text.trim().isNotEmpty &&
+                    (busy || displayedQuery != query.text.trim()))
                   EditorialSurface(
                       child: Material(
                           color: Colors.transparent,
@@ -1705,7 +1719,8 @@ class _CatalogScreenState extends State<CatalogScreen> {
                       region: widget.chartRegion,
                       onLike: widget.onLike,
                       isLiked: _isLiked,
-                      onOpenAlbum: (entry) => open('album', entry.id, entry.title)),
+                      onOpenAlbum: (entry) =>
+                          open('album', entry.id, entry.title)),
               ] else ...[
                 if (!submitted && !busy && !hasSearchResult)
                   Padding(

@@ -23,7 +23,7 @@ import 'design_system.dart';
 import 'playback_dock.dart';
 import 'playback_diagnostics.dart';
 
-const webBuild = '2026-10-13-search-playback';
+const webBuild = '2026-10-15-stable-media';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -85,9 +85,10 @@ class _PlayerPageState extends State<_PlayerPage> {
     super.initState();
     _foreground = web.document.visibilityState == 'visible';
     const configured = String.fromEnvironment('AURALIS_PROXY_URL');
-    storageNamespace = configured.isEmpty
-        ? Uri.base.origin : Uri.parse(configured).toString();
-    const sameOrigin = bool.fromEnvironment('NEATIE_SAME_ORIGIN_API', defaultValue: true);
+    storageNamespace =
+        configured.isEmpty ? Uri.base.origin : Uri.parse(configured).toString();
+    const sameOrigin =
+        bool.fromEnvironment('NEATIE_SAME_ORIGIN_API', defaultValue: true);
     api = MusicApi(configured.isEmpty || sameOrigin
         ? Uri.parse(Uri.base.origin)
         : Uri.parse(configured));
@@ -168,11 +169,14 @@ class _PlayerPageState extends State<_PlayerPage> {
   }
 
   void _openLibrary() {
+    final accountId = widget.auth.userId;
     library?.removeListener(_libraryChanged);
     library?.dispose();
-    library = widget.auth.userId == null || widget.auth.client == null
+    library = accountId == null || widget.auth.client == null
         ? null
-        : WebLibrary(widget.auth.client!, widget.auth.userId!,
+        : WebLibrary(widget.auth.client!, accountId,
+            accessToken: api.accessToken,
+            scopeIsCurrent: () => widget.auth.userId == accountId,
             playlistWritesEnabled:
                 const bool.fromEnvironment('WEB_PLAYLIST_WRITES'));
     library?.addListener(_libraryChanged);
@@ -189,8 +193,7 @@ class _PlayerPageState extends State<_PlayerPage> {
     if (next != scope) {
       scope = next;
       api.userScopeId = next;
-      player
-          .changeAccount(BrowserSessionStore(storageNamespace, scope: next));
+      player.changeAccount(BrowserSessionStore(storageNamespace, scope: next));
       audio.setDiagnosticScope(storageNamespace, next);
       _historyTracker.reset();
       _listeningHistory = _loadListeningHistory();
@@ -489,6 +492,7 @@ class _PlayerPageState extends State<_PlayerPage> {
   Widget _queue() => QueueScreen(
       key: ValueKey('queue:$scope'),
       player: player,
+      active: tab == 3 && _foreground,
       onLike: _like,
       isLiked: (track) =>
           library?.likes
@@ -558,7 +562,12 @@ class _PlayerPageState extends State<_PlayerPage> {
   @override
   Widget build(BuildContext context) => AnimatedBuilder(
       animation: player,
-      builder: (context, _) {
+      child: LibraryScreen(
+          auth: widget.auth,
+          library: library,
+          player: player,
+          onSignIn: _showAccount),
+      builder: (context, libraryPage) {
         final wide = MediaQuery.sizeOf(context).width >= 850;
         final pageChildren = <Widget>[
           CatalogScreen(
@@ -581,18 +590,15 @@ class _PlayerPageState extends State<_PlayerPage> {
               api: api,
               home: false,
               active: tab == 1,
-              historyStore: BrowserSessionStore('$storageNamespace::search-history',
+              historyStore: BrowserSessionStore(
+                  '$storageNamespace::search-history',
                   scope: scope == 'guest' ? _guestHome.scopeId : scope),
               recentQueries: library?.recentSearchQueries,
               homeSignals: _homeSignals,
               player: player,
               likedTracks: library?.likes ?? const [],
               onLike: _like),
-          LibraryScreen(
-              auth: widget.auth,
-              library: library,
-              player: player,
-              onSignIn: _showAccount),
+          libraryPage!,
           _queue(),
         ];
         final pages = IndexedStack(index: tab, children: [

@@ -72,7 +72,7 @@ abstract class PlaybackPort {
   String? get loadedTrackId;
   bool get sourceMatches;
   void syncMetadata(Map<String, dynamic> track);
-  void load(Uri uri, Map<String, dynamic> track);
+  void load(Uri uri, Map<String, dynamic> track, {String? mimeType});
 
   /// Reload the selected resource without changing its playback session.
   void reloadSource();

@@ -56,6 +56,13 @@ class BrowserAudio extends PlaybackPort {
   String _track = '';
   String _session = '';
   String _expectedSource = '';
+  web.HTMLSourceElement? _typedSource;
+  String? _declaredMediaType;
+  Stopwatch? _loadWatch;
+  int? _loadStartMs, _metadataMs, _canPlayMs, _playingEventMs;
+  int _sourceAssignments = 0, _sourceReloads = 0;
+  double _performanceStart = 0;
+  double _expectedDuration = 0;
   Map<String, dynamic> Function()? diagnosticContext;
   void Function(String)? onReconcile;
   @override
@@ -63,7 +70,7 @@ class BrowserAudio extends PlaybackPort {
   @override
   bool get sourceMatches =>
       _expectedSource.isNotEmpty &&
-      element.src == _expectedSource &&
+      (_typedSource?.src ?? element.src) == _expectedSource &&
       (element.currentSrc.isEmpty || element.currentSrc == _expectedSource);
   @override
   PlaybackPhase get phase => _progress.phase;
@@ -93,8 +100,15 @@ class BrowserAudio extends PlaybackPort {
       _loadedAt = _pausedAt = _lastProgressAt = _deadline = null;
       _everAdvanced = _resume = _renewSource = false;
       _pauseDurationMs = 0;
+      _declaredMediaType = null;
+      _loadWatch = null;
+      _loadStartMs = _metadataMs = _canPlayMs = _playingEventMs = null;
+      _sourceAssignments = _sourceReloads = 0;
+      _expectedDuration = 0;
       _progress.stop(PlaybackPhase.idle);
       element.removeAttribute('src');
+      element.textContent = '';
+      _typedSource = null;
       element.load();
       try {
         web.window.navigator.mediaSession.metadata = null;
@@ -118,6 +132,13 @@ class BrowserAudio extends PlaybackPort {
       'track': _track,
       'session': _session,
       'time': position,
+      'expectedDuration': _expectedDuration > 0 ? _expectedDuration : null,
+      'nativeDuration': element.duration.isFinite ? element.duration : null,
+      'playbackRate': element.playbackRate,
+      'bufferedRanges': [
+        for (var i = 0; i < element.buffered.length && i < 4; i++)
+          '${element.buffered.start(i).toStringAsFixed(3)}-${element.buffered.end(i).toStringAsFixed(3)}'
+      ].join(','),
       'paused': paused,
       'muted': element.muted,
       'volume': element.volume,
@@ -130,6 +151,18 @@ class BrowserAudio extends PlaybackPort {
           : 0,
       'visibility': _foreground && !web.document.hidden ? 'visible' : 'hidden',
       'audioSession': _audioSession?.state,
+      'declaredMediaType': _declaredMediaType,
+      'stableResource': Uri.tryParse(_expectedSource)
+              ?.queryParameters
+              .containsKey('cache_version') ??
+          false,
+      'sourceAssignments': _sourceAssignments,
+      'sourceReloads': _sourceReloads,
+      'loadStartMs': _loadStartMs,
+      'metadataMs': _metadataMs,
+      'canPlayMs': _canPlayMs,
+      'playingEventMs': _playingEventMs,
+      if (event == 'playback-startup') ..._resourceTimings(),
       ...?diagnosticContext?.call(),
       ...extra,
       'phase': phase.name,
@@ -148,12 +181,33 @@ class BrowserAudio extends PlaybackPort {
           : DateTime.now().difference(_lastProgressAt!).inSeconds,
       'repeatOne': element.loop,
       'sourceMatches': sourceMatches,
-      'elementSession': sourceMatches
-          ? Uri.tryParse(element.currentSrc)
-              ?.queryParameters['playback_session']
-          : null,
+      'elementSession': sourceMatches ? _session : null,
     });
     _persistFailures();
+  }
+
+  Map<String, dynamic> _resourceTimings() {
+    try {
+      final entries = web.window.performance
+          .getEntriesByName(_expectedSource)
+          .toDart
+          .where((entry) =>
+              entry.entryType == 'resource' &&
+              entry.startTime >= _performanceStart - 1)
+          .toList();
+      if (entries.isEmpty) return {'resourceTimingCount': 0};
+      final latest = entries.last as web.PerformanceResourceTiming;
+      return {
+        'resourceTimingCount': entries.length,
+        'resourceFirstByteMs': latest.responseStart > 0
+            ? latest.responseStart - latest.startTime
+            : null,
+        'resourceTotalMs': latest.duration,
+        'resourceTransferBytes': latest.transferSize,
+      };
+    } catch (_) {
+      return {'resourceTimingCount': 0};
+    }
   }
 
   void _persistFailures() {
@@ -216,6 +270,11 @@ class BrowserAudio extends PlaybackPort {
           if (event != 'timeupdate') record('ignored-event', {'kind': event});
           return;
         }
+        final elapsed = _loadWatch?.elapsedMilliseconds;
+        if (event == 'loadstart') _loadStartMs ??= elapsed;
+        if (event == 'loadedmetadata') _metadataMs ??= elapsed;
+        if (event == 'canplay') _canPlayMs ??= elapsed;
+        if (event == 'playing') _playingEventMs ??= elapsed;
         var forwarded = event;
         if (event == 'seeking' ||
             event == 'seeked' ||
@@ -225,8 +284,9 @@ class BrowserAudio extends PlaybackPort {
         } else if (event == 'waiting' || event == 'stalled') {
           _progress.buffer();
         } else if (event == 'pause' && paused) {
-          if (_progress.requested) _pausedAt = DateTime.now();
-          if (_progress.requested &&
+          if (element.error != null || phase == PlaybackPhase.failed) {
+            _progress.stop(PlaybackPhase.failed);
+          } else if (_progress.requested &&
               (!_foreground ||
                   web.document.hidden ||
                   _audioSession?.state == 'interrupted')) {
@@ -255,7 +315,8 @@ class BrowserAudio extends PlaybackPort {
         _events.add(event == 'error' && element.error?.code == 1
             ? 'media-aborted'
             : event == 'error' && element.error?.code == 2
-                ? 'media-network-error' : forwarded);
+                ? 'media-network-error'
+                : forwarded);
       }).toJS;
       _listeners[event] = callback;
       element.addEventListener(event, callback);
@@ -324,7 +385,7 @@ class BrowserAudio extends PlaybackPort {
   set repeatOne(bool enabled) => element.loop = enabled;
 
   @override
-  void load(Uri uri, Map<String, dynamic> track) {
+  void load(Uri uri, Map<String, dynamic> track, {String? mimeType}) {
     _attempt++;
     _watchdog?.cancel();
     _progress.stop(PlaybackPhase.idle);
@@ -332,11 +393,39 @@ class BrowserAudio extends PlaybackPort {
     _lastProgressAt = null;
     _pausedAt = null;
     _pauseDurationMs = 0;
+    _loadWatch = Stopwatch()..start();
+    _performanceStart = web.window.performance.now();
+    _loadStartMs = _metadataMs = _canPlayMs = _playingEventMs = null;
+    _sourceAssignments++;
+    _sourceReloads = 0;
     _everAdvanced = _resume = _renewSource = false;
     _track = extractTrackId(track) ?? '';
-    _session = uri.queryParameters['playback_session'] ?? '';
-    element.src = uri.toString();
-    _expectedSource = element.src;
+    _expectedDuration = trackDurationSeconds(track).toDouble();
+    _session = uri.queryParameters['playback_session'] ??
+        '${DateTime.now().microsecondsSinceEpoch}-$_attempt';
+    element.removeAttribute('src');
+    element.textContent = '';
+    _typedSource = null;
+    _declaredMediaType = null;
+    if (const {
+          'audio/mp4',
+          'audio/webm',
+          'audio/mpeg',
+          'audio/ogg',
+          'audio/wav'
+        }.contains(mimeType) &&
+        element.canPlayType(mimeType!).isNotEmpty) {
+      final source = web.HTMLSourceElement()
+        ..src = uri.toString()
+        ..type = mimeType;
+      element.append(source);
+      _typedSource = source;
+      _declaredMediaType = mimeType;
+      _expectedSource = source.src;
+    } else {
+      element.src = uri.toString();
+      _expectedSource = element.src;
+    }
     element.load();
     record('load');
     syncMetadata(track);
@@ -344,6 +433,10 @@ class BrowserAudio extends PlaybackPort {
 
   @override
   void syncMetadata(Map<String, dynamic> track) {
+    if (extractTrackId(track) == loadedTrackId &&
+        trackDurationSeconds(track) > 0) {
+      _expectedDuration = trackDurationSeconds(track).toDouble();
+    }
     try {
       final image = track['thumbnail']?.toString() ?? '';
       web.window.navigator.mediaSession.metadata =
@@ -364,6 +457,7 @@ class BrowserAudio extends PlaybackPort {
     _attempt++;
     _watchdog?.cancel();
     _renewSource = false;
+    _sourceReloads++;
     _progress.interrupt();
     element.load();
     record('resume-source-reload');
@@ -383,7 +477,9 @@ class BrowserAudio extends PlaybackPort {
     } catch (_) {}
     // A terminal MEDIA_ERR_ABORTED cannot be restarted by play() alone.
     // Reload the same selected URL; do not resolve a different source.
-    if (sourceMatches && (element.error?.code == 1 || element.error?.code == 2)) {
+    if (sourceMatches &&
+        (element.error?.code == 1 || element.error?.code == 2)) {
+      _sourceReloads++;
       element.load();
       record('aborted-source-reload');
     }
@@ -550,7 +646,9 @@ class BrowserAudio extends PlaybackPort {
   void pause() {
     _attempt++;
     _pausedAt = DateTime.now();
-    _progress.stop(PlaybackPhase.paused);
+    _progress.stop(element.error != null || phase == PlaybackPhase.failed
+        ? PlaybackPhase.failed
+        : PlaybackPhase.paused);
     _watchdog?.cancel();
     element.pause();
     _updateSession();
@@ -577,6 +675,7 @@ class BrowserAudio extends PlaybackPort {
     }
     element.pause();
     element.removeAttribute('src');
+    element.textContent = '';
     element.load();
     element.remove();
     _events.close();

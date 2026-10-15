@@ -69,6 +69,14 @@ class PlaybackDock extends StatelessWidget {
                 ? () => unawaited(player.next())
                 : null,
             icon: const Icon(Icons.skip_next_rounded)),
+        IconButton(
+            tooltip: 'Load related songs',
+            onPressed: player.loadingRelated
+                ? null
+                : () => unawaited(player.replenish()),
+            icon: player.loadingRelated
+                ? const NeatieLoading(label: 'Finding related songs', size: 18)
+                : const Icon(Icons.auto_awesome_rounded)),
       ]);
   Widget _progress() => Row(children: [
         Text(_time(player.position),

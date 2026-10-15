@@ -19,6 +19,7 @@ class WebPlayer extends ChangeNotifier {
   String? storageError;
   bool loading = false;
   bool loadingRelated = false;
+  Future<void>? _relatedRequest;
   bool startupInterrupted = false;
   bool _hiddenDuringStartup = false;
   bool _awaitingFirstPlayback = false;
@@ -191,6 +192,8 @@ class WebPlayer extends ChangeNotifier {
       if (raw != null) {
         final saved = jsonDecode(raw) as Map;
         if (saved['version'] == 1) {
+          if (saved['preparedMedia'] is List)
+            api.restorePreparedMedia(saved['preparedMedia']);
           queue = MusicApi.tracks(saved['queue']);
           final storedIndex = saved['currentIndex'];
           final savedIndex = storedIndex is int &&
@@ -287,16 +290,21 @@ class WebPlayer extends ChangeNotifier {
     queue = tracks.map((track) => Map<String, dynamic>.from(track)).toList();
     index = selected;
     title = label;
-    _discoverySession = '';
+    _discoverySession =
+        '${DateTime.now().microsecondsSinceEpoch}-${_session.toRadixString(36)}';
     loadingRelated = false;
     relatedError = null;
-    hasMore = false;
+    hasMore = true;
     if (retain) {
       audio.record('queue-context-replaced', {'sourceRetained': true});
       _queueEdited();
+      if (queue.length - index <= 5) unawaited(replenish());
       return;
     }
     final playback = playIndex(selected);
+    // Start native playback in the gesture before requesting recommendations.
+    // Keep album/playlist order; related songs only extend the tail.
+    if (queue.length - index <= 5) unawaited(replenish());
     unawaited(
         api.recordExplicitSearchSelection(tracks[selected]).catchError((_) {}));
     await playback;
@@ -305,8 +313,12 @@ class WebPlayer extends ChangeNotifier {
   Map<String, dynamic>? get current => queue.isEmpty ? null : queue[index];
 
   bool _canRetain(Map<String, dynamic> track) =>
-      playing && !audio.paused && !audio.needsNewSource && audio.sourceMatches &&
-      _loadedId != null && _loadedId == audio.loadedTrackId &&
+      playing &&
+      !audio.paused &&
+      !audio.needsNewSource &&
+      audio.sourceMatches &&
+      _loadedId != null &&
+      _loadedId == audio.loadedTrackId &&
       _loadedId == extractTrackId(track);
 
   bool _canEditQueue(int at, int? revision) =>
@@ -377,9 +389,27 @@ class WebPlayer extends ChangeNotifier {
       queue = [copy];
       index = 0;
       title = 'Your queue';
-      hasMore = false;
+      hasMore = true;
     } else {
       queue = List.of(queue)..insert(index + 1, copy);
+    }
+    _queueEdited();
+    return true;
+  }
+
+  bool addToQueue(Map<String, dynamic> track, {int? revision}) {
+    final id = extractTrackId(track);
+    if (_disposed ||
+        id == null ||
+        track['playable'] == false ||
+        (revision != null && revision != _queueRevision) ||
+        queue.any((item) => extractTrackId(item) == id)) return false;
+    _queueRemovedIds.remove(id);
+    queue = [...queue, Map<String, dynamic>.from(track)];
+    if (queue.length == 1) {
+      index = 0;
+      title = 'Your queue';
+      hasMore = true;
     }
     _queueEdited();
     return true;
@@ -455,6 +485,7 @@ class WebPlayer extends ChangeNotifier {
         if (until.isAfter(api.clock().add(const Duration(seconds: 60)))) {
           _ready[id] = uri;
           _readyUntil[id] = until;
+          if (api.preparedMedia(id) != null) save();
         } else {
           _prepareRetryAfter[id] = api.clock().add(const Duration(seconds: 30));
           _prepareRetryTimer?.cancel();
@@ -589,7 +620,9 @@ class WebPlayer extends ChangeNotifier {
   }
 
   Future<void> playIndex(int target,
-      {bool resume = false, bool recovery = false}) async {
+      {bool resume = false,
+      bool recovery = false,
+      bool explicitRetry = false}) async {
     if (target < 0 || target >= queue.length) return;
     if (!resume && target == index && _canRetain(queue[target])) return;
     if (!resume) _resumeWatch = null;
@@ -626,26 +659,34 @@ class WebPlayer extends ChangeNotifier {
     try {
       // Call play within the tap. The stream endpoint resolves/prepares audio;
       // awaiting an HTTP request here loses iPhone's first-play permission.
-      final prepared = _readyUntil[id]
-              ?.isAfter(api.clock().add(const Duration(seconds: 60))) ??
-          false;
-      _usedPreparation = prepared && _ready.containsKey(id);
-      final source =
-          prepared ? _ready[id] ?? api.streamUri(track) : api.streamUri(track);
+      if (explicitRetry) api.forgetPreparedMedia(id);
+      final media = explicitRetry ? null : api.preparedMedia(id);
+      final prepared = !explicitRetry &&
+          (_readyUntil[id]
+                  ?.isAfter(api.clock().add(const Duration(seconds: 60))) ??
+              false);
+      _usedPreparation = media != null || prepared && _ready.containsKey(id);
+      final source = media?.uri ??
+          (prepared
+              ? _ready[id] ?? api.streamUri(track)
+              : api.streamUri(track));
       final sessionUntil = api.clock().add(const Duration(minutes: 20));
       _loadedUntil = source.queryParameters.containsKey('cache_variant')
           ? null
           : prepared && _readyUntil[id]!.isBefore(sessionUntil)
               ? _readyUntil[id]
               : sessionUntil;
-      final uri = source.replace(queryParameters: {
-        ...source.queryParameters,
-        'playback_session':
-            '${DateTime.now().microsecondsSinceEpoch}-$operation',
-      });
+      final uri = media != null
+          ? source
+          : source.replace(queryParameters: {
+              ...source.queryParameters,
+              if (explicitRetry) 'retry_source': '1',
+              'playback_session':
+                  '${DateTime.now().microsecondsSinceEpoch}-$operation',
+            });
       if (_disposed || operation != _operation) return;
       _loadedId = id;
-      audio.load(uri, track);
+      audio.load(uri, track, mimeType: media?.mimeType);
       final pending = audio.play();
       if (resume) _recordResumeRequest();
       await pending;
@@ -654,7 +695,7 @@ class WebPlayer extends ChangeNotifier {
       startupInterrupted = false;
       _markPlayed(id);
       if (playing) _primeNext();
-      if (queue.length - index <= 3 && hasMore) unawaited(replenish());
+      if (queue.length - index <= 5 && hasMore) unawaited(replenish());
     } catch (e) {
       if (operation != _operation || _disposed) return;
       // A media error event may have already invalidated this loaded source.
@@ -670,6 +711,7 @@ class WebPlayer extends ChangeNotifier {
             : 'Playback was interrupted while starting. Tap Play to resume this track.';
       } else {
         _ready.remove(id);
+        api.forgetPreparedMedia(id);
         _wantsPlayback = false;
         _loadedId = null;
         _metadataReady = false;
@@ -722,6 +764,7 @@ class WebPlayer extends ChangeNotifier {
 
   Future<void> play({bool automatic = false}) async {
     if (current == null) return;
+    final retrySource = !automatic && phase == PlaybackPhase.failed;
     // Only identity validation belongs before native play. Reconciliation
     // also writes storage and metadata, which delays remote iOS commands.
     if (_loadedId != null &&
@@ -743,7 +786,8 @@ class WebPlayer extends ChangeNotifier {
       audio.record('resume-new-session', {
         'reason': audio.needsNewSource ? 'source-invalidated' : 'lease-expired'
       });
-      await playIndex(index, resume: true, recovery: automatic);
+      await playIndex(index,
+          resume: true, recovery: automatic, explicitRetry: retrySource);
       return;
     }
     if (_loadedId == extractTrackId(current)) {
@@ -792,7 +836,8 @@ class WebPlayer extends ChangeNotifier {
         _notify();
       }
     } else {
-      await playIndex(index, resume: true, recovery: automatic);
+      await playIndex(index,
+          resume: true, recovery: automatic, explicitRetry: retrySource);
     }
   }
 
@@ -865,7 +910,10 @@ class WebPlayer extends ChangeNotifier {
             {'reason': reason, 'recoveryAttempts': _resumeRecoveries});
         unawaited(playIndex(index, resume: true, recovery: true));
       }
-    } else if (!_visible && _wantsPlayback && reason == 'media-network-error' && !audio.needsNewSource) {
+    } else if (!_visible &&
+        _wantsPlayback &&
+        reason == 'media-network-error' &&
+        !audio.needsNewSource) {
       // Preserve intent and the selected resource while the browser is hidden.
       // Foreground/native activation can retry; background timers cannot.
       audio.record('resume-recovery-deferred', {'reason': reason});
@@ -894,8 +942,17 @@ class WebPlayer extends ChangeNotifier {
   Future<void> next() => playIndex(index + 1);
   Future<void> previous() => playIndex(index - 1);
 
-  Future<void> replenish() async {
+  Future<void> replenish() {
+    if (loadingRelated && _relatedRequest != null) return _relatedRequest!;
+    return _relatedRequest = _replenish();
+  }
+
+  Future<void> _replenish() async {
     if (loadingRelated || current == null) return;
+    if (_discoverySession.isEmpty) {
+      _discoverySession =
+          '${DateTime.now().microsecondsSinceEpoch}-${_session.toRadixString(36)}';
+    }
     final session = _session;
     loadingRelated = true;
     relatedError = null;
@@ -1000,6 +1057,12 @@ class WebPlayer extends ChangeNotifier {
           'prepared': _usedPreparation,
         });
         _startupWatch = _transitionWatch = null;
+        // Learn a completed cached resource without putting HTTP before Play.
+        // The existing preparation owner coalesces and scopes this lookup.
+        if (!_usedPreparation && audio.position > .02 && current != null) {
+          unawaited(_prepare(current!)
+              .then<void>((_) {}, onError: (Object _, StackTrace __) {}));
+        }
       }
       _awaitingFirstPlayback = false;
       _hiddenDuringStartup = false;
@@ -1066,6 +1129,7 @@ class WebPlayer extends ChangeNotifier {
     if (queue.isEmpty) return;
     try {
       store.write(jsonEncode({
+        'preparedMedia': api.savedPreparedMedia(),
         'version': 1,
         'queue': queue,
         'current': extractTrackId(current),

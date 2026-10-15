@@ -11,6 +11,80 @@ class MusicApi {
   int _scopeRevision = 0;
   final Map<String, DateTime> _preparationExpiry = {};
   DateTime? preparedUntil(String id) => _preparationExpiry[id];
+  final Map<String, ({Uri uri, String mimeType, DateTime until})>
+      _preparedMedia = {};
+  ({Uri uri, String mimeType, DateTime until})? preparedMedia(String id) {
+    final value = _preparedMedia[id];
+    if (value != null &&
+        value.until.isAfter(clock().add(const Duration(seconds: 60)))) {
+      return value;
+    }
+    _preparedMedia.remove(id);
+    return null;
+  }
+
+  void forgetPreparedMedia(String id) => _preparedMedia.remove(id);
+
+  bool _rememberMedia(String id, Uri uri, String mime, DateTime until) {
+    if (id.isEmpty ||
+        id.length > 256 ||
+        uri.origin != base.origin ||
+        !uri.path.startsWith('/playback/stream/') ||
+        uri.userInfo.isNotEmpty ||
+        uri.fragment.isNotEmpty ||
+        uri.queryParameters.keys.any((key) => !const {
+              'resolve',
+              'source_id',
+              'cache_variant',
+              'cache_version'
+            }.contains(key)) ||
+        !RegExp(r'^v1-[a-f0-9]{32}$')
+            .hasMatch(uri.queryParameters['cache_version'] ?? '') ||
+        !const {'legacy', 'seek-v1'}
+            .contains(uri.queryParameters['cache_variant']) ||
+        !const {
+          'audio/mp4',
+          'audio/webm',
+          'audio/mpeg',
+          'audio/ogg',
+          'audio/wav'
+        }.contains(mime) ||
+        !until.isAfter(clock().add(const Duration(seconds: 60))) ||
+        until.isAfter(clock().add(const Duration(days: 1)))) return false;
+    if (_preparedMedia.length >= 256)
+      _preparedMedia.remove(_preparedMedia.keys.first);
+    _preparedMedia[id] = (uri: uri, mimeType: mime, until: until);
+    return true;
+  }
+
+  List<Map<String, dynamic>> savedPreparedMedia() => [
+        for (final entry in _preparedMedia.entries.toList().reversed.take(64))
+          if (entry.value.until
+              .isAfter(clock().add(const Duration(seconds: 60))))
+            {
+              'id': entry.key,
+              'uri': entry.value.uri.toString(),
+              'mime': entry.value.mimeType,
+              'until': entry.value.until.millisecondsSinceEpoch
+            },
+      ];
+
+  void restorePreparedMedia(List values) {
+    for (final value in values.take(64)) {
+      if (value is! Map ||
+          value['id'] is! String ||
+          value['uri'] is! String ||
+          value['mime'] is! String ||
+          value['until'] is! int ||
+          (value['uri'] as String).length > 1024) continue;
+      try {
+        _rememberMedia(value['id'], Uri.parse(value['uri']), value['mime'],
+            DateTime.fromMillisecondsSinceEpoch(value['until']));
+      } catch (_) {
+        /* Invalid saved metadata falls back to isolated playback. */
+      }
+    }
+  }
 
   /// Optional feed-only scope. Search and playback discovery keep userScopeId.
   String? homeScopeId;
@@ -23,6 +97,7 @@ class MusicApi {
     if (next != _userScopeId) {
       _scopeRevision++;
       _preparationExpiry.clear();
+      _preparedMedia.clear();
       clearSearchContext();
     }
     _userScopeId = next;
@@ -434,6 +509,7 @@ class MusicApi {
         },
         timeout: const Duration(seconds: 90));
     if (revision == _scopeRevision) {
+      _preparedMedia.remove(id);
       final expiry = ((result['prepared'] as Map?)?[id] as Map?)?['expires_at'];
       _preparationExpiry.remove(id);
       if (expiry is num &&
@@ -449,20 +525,41 @@ class MusicApi {
             (expiry * 1000).round(),
             isUtc: true);
       }
+      final failed = (result['failed'] as Map?)?[id] as Map?;
+      final facts = failed?['diagnostics'] as Map?;
+      final tier = _cacheTier((result['prepared'] as Map?)?[id]);
       onDiagnostic?.call('prepare-result', {
         'requestedTrack': id,
         'requestPurpose': cacheFull ? 'background_cache' : 'upcoming',
         'failureCode': _failureCode(
             ((result['failed'] as Map?)?[id] as Map?)?['code'] ??
                 result['skip_reason']),
-        'cacheTier': _cacheTier((result['prepared'] as Map?)?[id]),
+        'cacheTier': tier,
+        'failureStage': const {
+          'cookie_load',
+          'extraction',
+          'media_preflight',
+          'source_resolution'
+        }.contains(facts?['stage'])
+            ? facts!['stage']
+            : null,
+        'failureType': facts?['exception_type'] is String &&
+                RegExp(r'^[A-Za-z][A-Za-z0-9_]{0,63}$')
+                    .hasMatch(facts!['exception_type'])
+            ? facts['exception_type']
+            : null,
+        'failureHttpStatus': facts?['http_status'] is int &&
+                facts!['http_status'] >= 400 &&
+                facts['http_status'] <= 599
+            ? facts['http_status']
+            : null,
         'serverMs': result['server_ms'],
         'cachedPrefixBytes':
             ((result['prepared'] as Map?)?[id] as Map?)?['cached_prefix_bytes'],
         'chunkDeferred':
             ((result['prepared'] as Map?)?[id] as Map?)?['chunk_deferred'],
         'prepared': (result['prepared'] as Map?)?[id] != null,
-        'fullyCached':
+        'fullyCached': const {'r2_full', 'local_full'}.contains(tier) ||
             ((result['prepared'] as Map?)?[id] as Map?)?['fully_cached'] ==
                 true,
         'failed': (result['failed_ids'] as List?)?.contains(id) == true
@@ -480,6 +577,17 @@ class MusicApi {
           !uri.path.startsWith('/playback/stream/')) {
         throw StateError(
             'The music service returned an unexpected stream origin.');
+      }
+      final data = (result['prepared'] as Map)[id] as Map;
+      final mime =
+          '${data['mime_type'] ?? ''}'.split(';').first.trim().toLowerCase();
+      final until = _preparationExpiry[id];
+      final version = uri.queryParameters['cache_version'] ?? '';
+      if (const {'r2_full', 'local_full'}.contains(_cacheTier(data)) &&
+          until != null) _rememberMedia(id, uri, mime, until);
+      if (version.isNotEmpty && !_preparedMedia.containsKey(id)) {
+        // Incomplete/untrusted descriptors keep the ordinary isolated path.
+        return streamUri(track);
       }
       return uri;
     }

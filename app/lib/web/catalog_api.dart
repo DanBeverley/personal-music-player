@@ -10,6 +10,48 @@ class CatalogApi {
   CatalogApi(this.api);
 
   final MusicApi api;
+  String _snapshotScope = '';
+  final _readySnapshots = <String, ({DateTime until, Object value})>{};
+  final _snapshotTasks = <String, Future<Object>>{};
+
+  Future<T> _snapshot<T extends Object>(String key, Future<T> Function() load,
+      bool Function(T) ready, {bool refresh = false}) {
+    final scope = api.userScopeId;
+    if (_snapshotScope != scope) {
+      _snapshotScope = scope;
+      _readySnapshots.clear();
+      _snapshotTasks.clear();
+    }
+    _readySnapshots.removeWhere((_, value) => !value.until.isAfter(api.clock()));
+    final saved = _readySnapshots[key];
+    if (!refresh && saved != null) return Future.value(saved.value as T);
+    if (_snapshotTasks[key] case final pending?) return pending.then((value) => value as T);
+    late final Future<T> task;
+    task = load().then((value) {
+      if (_snapshotScope == scope && ready(value)) {
+        _readySnapshots.remove(key);
+        if (_readySnapshots.length >= 8) _readySnapshots.remove(_readySnapshots.keys.first);
+        _readySnapshots[key] = (until: api.clock().add(const Duration(minutes: 5)), value: value);
+      }
+      return value;
+    }).whenComplete(() {
+      if (identical(_snapshotTasks[key], task)) _snapshotTasks.remove(key);
+    });
+    _snapshotTasks[key] = task;
+    return task;
+  }
+
+  Future<ChartsSnapshot> cachedCharts(ChartQuery query, {bool refresh = false}) =>
+      _snapshot('charts:${query.country}:${query.range}:${query.source}',
+        () => charts(query),
+        (value) => value.entries.isNotEmpty && !value.isWarming &&
+            !value.isUnavailable && !value.isRefreshing, refresh: refresh);
+
+  Future<NewReleasesSnapshot> cachedNewReleases({bool refresh = false}) =>
+      _snapshot('releases', newReleases,
+        (value) => value.entries.isNotEmpty && value.status == 'ready' &&
+            !const {'running', 'queued', 'preparing'}.contains(value.refreshStatus),
+        refresh: refresh);
 
   Future<ChartsSnapshot> charts(ChartQuery query) async =>
       ChartsSnapshot.fromJson(await api.get(
@@ -29,8 +71,10 @@ class CatalogApi {
     String query, {
     bool autoCorrect = true,
     int offset = 0,
+    int limit = 24,
     Map<String, dynamic>? continuation,
     bool preview = false,
+    bool forceRefresh = false,
     Future<void>? cancel,
   }) async {
     final normalizedQuery = query.trim();
@@ -43,13 +87,16 @@ class CatalogApi {
           // canonical backend retains correction and resolution in its response.
           'auto_correct': preview ? false : autoCorrect,
           'search_mode': classifySearchQueryMode(normalizedQuery),
-          'limit': preview ? 8 : 24,
+          'limit': preview ? 8 : limit.clamp(1, 100),
           if (preview) 'search_preview': true,
           'user_scope_id': api.userScopeId,
-          'context_surface': 'interactive_search',
+          'context_surface':
+              preview ? 'interactive_search' : 'submitted_search',
           'defer_side_surfaces': preview,
+          if (forceRefresh) 'force_refresh': true,
           'offset': offset < 0 ? 0 : offset,
         },
+        timeout: Duration(seconds: continuation?['revision'] != null ? 4 : 10),
         cancel: cancel);
     return _withNormalizedTrackLists(payload);
   }
@@ -119,10 +166,23 @@ class CatalogApi {
   }
 
   Future<Map<String, dynamic>> album(String id) =>
-      _get('/album/${Uri.encodeComponent(id)}');
+      _snapshot('album:$id', () => _get('/album/${Uri.encodeComponent(id)}'),
+          (value) => (value['tracks'] as List?)?.isNotEmpty == true);
 
   Future<Map<String, dynamic>> artist(String id) =>
-      _get('/artist/${Uri.encodeComponent(id)}');
+      _snapshot('artist:$id',
+          () => _get('/artist/${Uri.encodeComponent(id)}?view=overview'),
+          (value) => (value['name'] as String?)?.isNotEmpty == true);
+
+  Future<List<Map<String, dynamic>>> artistWorks(
+      String id, String section, {String collectionId = ''}) async {
+    final path = '/artist/${Uri.encodeComponent(id)}?section=$section'
+        '&collection_id=${Uri.encodeQueryComponent(collectionId)}';
+    final result = await _snapshot('artist:$id:$section:$collectionId',
+        () => _get(path), (value) => (value['items'] as List?)?.isNotEmpty == true);
+    return (result['items'] as List? ?? const [])
+        .whereType<Map<String, dynamic>>().toList();
+  }
 
   static const _homeSignalKeys = <String>{
     'client_signal_tier',
@@ -148,6 +208,8 @@ class CatalogApi {
     bool refresh = false,
     bool prepare = false,
     String launchToken = '',
+    String refreshToken = '',
+    int? refreshFromVersion,
     Map<String, dynamic> signals = const {},
   }) async {
     final payload = await api.post('/recommend', {
@@ -161,7 +223,11 @@ class CatalogApi {
         'promote_ready_on_launch': true,
         'launch_token': launchToken,
       },
-      if (refresh) 'feed_refresh_wait_ms': 8000,
+      if (refresh && refreshFromVersion != null) ...{
+        'refresh_from_version': refreshFromVersion,
+        'refresh_token': refreshToken,
+      } else if (refresh)
+        'feed_refresh_wait_ms': 8000,
     });
     return _withNormalizedTrackLists(payload);
   }
@@ -285,6 +351,41 @@ class CatalogApi {
     Map<String, dynamic> payload,
   ) {
     final normalized = Map<String, dynamic>.from(payload);
+    Map<String, dynamic> track(Map value) {
+      final item = Map<String, dynamic>.from(value);
+      bool usable(dynamic name) =>
+          name is String &&
+          name.trim().isNotEmpty &&
+          name.trim().toLowerCase() != 'unknown artist';
+      final lead = payload['lead_artist'];
+      final album = payload['containing_album'];
+      final credits = [
+        item['channel'],
+        item['artist'],
+        item['artist_name'],
+        ...extractTrackArtists(item),
+        if (item['artist_entities'] is List)
+          ...(item['artist_entities'] as List)
+              .whereType<Map>()
+              .map((a) => a['name']),
+        if (lead is Map &&
+            item['artist_id'] != null &&
+            item['artist_id'] == lead['id'])
+          lead['name'],
+        if (album is Map &&
+            item['album_id'] != null &&
+            item['album_id'] == album['id'])
+          album['artist'],
+        if (payload['tracks'] is List) payload['artist'],
+      ];
+      final credit = credits.where(usable).firstOrNull;
+      if (credit != null) {
+        if (!usable(item['artist'])) item['artist'] = credit;
+        if (!usable(item['channel'])) item['channel'] = credit;
+      }
+      return normalizeTrack(item);
+    }
+
     for (final key in const [
       'results',
       'tracks',
@@ -295,13 +396,13 @@ class CatalogApi {
       final value = payload[key];
       if (value is List) {
         normalized[key] = value.map((item) {
-          return item is Map ? normalizeTrack(item) : item;
+          return item is Map ? track(item) : item;
         }).toList(growable: false);
       } else if (key == 'top_result' && value is Map) {
         final topResult = Map<String, dynamic>.from(value);
         final item = topResult['item'];
         if (topResult['entity_type'] == 'track' && item is Map) {
-          topResult['item'] = normalizeTrack(Map<String, dynamic>.from(item));
+          topResult['item'] = track(item);
         }
         normalized[key] = topResult;
       }

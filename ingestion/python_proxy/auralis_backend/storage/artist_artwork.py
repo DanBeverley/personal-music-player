@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 import hashlib
 import json
 import re
 import threading
 import time
+from io import BytesIO
+from PIL import Image, ImageOps
 from typing import Any, Callable, Dict
 
-from ..domain.catalog import catalog_artwork_source_urls, is_placeholder_artwork_url
+from ..domain.catalog import catalog_artwork_source_urls, is_placeholder_artwork_url, normalized_artist_payload
 from ..recommend.store_runtime import open_recommendation_store_connection
 
 try:
@@ -20,6 +23,53 @@ except Exception:  # pragma: no cover - optional production dependency
 
 
 _CLIENTS: Dict[int, "ArtistArtworkCache | None"] = {}
+_VARIANT_SIZES = (160, 384, 768)
+_VARIANT_SLOTS = threading.BoundedSemaphore(2)
+_VARIANT_IO_SLOTS = threading.BoundedSemaphore(8)
+_VARIANT_FLIGHTS: Dict[tuple[int, str, int], list[Any]] = {}
+_VARIANT_FLIGHTS_LOCK = threading.Lock()
+_VARIANT_FLIGHT_SLOTS = threading.BoundedSemaphore(16)
+_TRANSIENT_RETRY_SECONDS = 15 * 60
+
+
+@dataclass(frozen=True)
+class ArtworkStoreResult:
+    stage: str
+
+    @property
+    def stored(self) -> bool:
+        return self.stage == "stored"
+
+
+def artist_artwork_retry_after(artist: Dict[str, Any]) -> float | None:
+    """Earliest known source eligibility, or None when one is ready."""
+    urls = catalog_artwork_source_urls(artist, entity_type="artist")
+    failures = artist.get("artwork_source_failures")
+    failures = failures if isinstance(failures, dict) else {}
+    now = time.time()
+    eligible = []
+    for url in urls:
+        try:
+            eligible.append(float(failures.get(url) or 0) + _SOURCE_RETRY_SECONDS)
+        except (TypeError, ValueError):
+            return None
+    return min(eligible) if eligible and min(eligible) > now else None
+
+
+def artwork_variant(data: bytes, size: int) -> bytes:
+    """Bounded still-image derivative; never mutate the retained original."""
+    if size not in _VARIANT_SIZES:
+        raise ValueError("unsupported artwork size")
+    with Image.open(BytesIO(data)) as source:
+        if source.width * source.height > 16_000_000:
+            raise ValueError("artwork pixel limit")
+        image = ImageOps.exif_transpose(source)
+        image.thumbnail((size, size), Image.Resampling.LANCZOS)
+        if image.mode not in ("RGB", "RGBA"):
+            image = image.convert("RGBA" if "transparency" in image.info else "RGB")
+        output = BytesIO()
+        image.save(output, "WEBP", quality=82, method=3)
+        return output.getvalue()
 _ENTITY_CLIENTS: Dict[int, "ArtistArtworkCache | None"] = {}
 _EXECUTOR = ThreadPoolExecutor(
     max_workers=2,
@@ -113,11 +163,18 @@ def _valid_image_bytes(data: bytes, content_type: str) -> bool:
 
 
 def _download_artwork(
+    server: Any, source_url: str,
+) -> tuple[bytes, str] | None:
+    return _download_artwork_result(server, source_url)[1]
+
+
+def _download_artwork_result(
     server: Any,
     source_url: str,
-) -> tuple[bytes, str] | None:
+) -> tuple[str, tuple[bytes, str] | None]:
     if not _http_artwork_url(source_url) or is_placeholder_artwork_url(source_url):
-        return None
+        return "invalid_source", None
+    response = None
     try:
         response = server.upstream_http.get(
             source_url,
@@ -127,7 +184,7 @@ def _download_artwork(
         response.raise_for_status()
         content_type = _clean(response.headers.get("Content-Type")).split(";", 1)[0]
         if not content_type.startswith("image/"):
-            return None
+            return "invalid_source", None
         chunks = []
         total = 0
         for chunk in response.iter_content(chunk_size=64 * 1024):
@@ -135,12 +192,23 @@ def _download_artwork(
                 continue
             total += len(chunk)
             if total > 2 * 1024 * 1024:
-                return None
+                return "invalid_source", None
             chunks.append(chunk)
         data = b"".join(chunks)
-        return (data, content_type) if _valid_image_bytes(data, content_type) else None
-    except Exception:
-        return None
+        if not _valid_image_bytes(data, content_type):
+            return "invalid_source", None
+        return "downloaded", (data, content_type)
+    except Exception as exc:
+        status = getattr(getattr(exc, "response", None), "status_code", 0) or 0
+        if status in (404, 410):
+            return "invalid_source", None
+        return "source_transient", None
+    finally:
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
 
 
 def _artist_cache_identities(artist: Dict[str, Any]) -> list[str]:
@@ -389,6 +457,84 @@ class ArtistArtworkCache:
         with self._verified_tokens_lock:
             return token in self._missing_tokens
 
+    def read_variant(self, token: str, size: int) -> tuple[bytes, str] | None:
+        if not _TOKEN_RE.fullmatch(token) or size not in _VARIANT_SIZES:
+            return None
+        return self._variant_flight(token, size, lambda: self._read_variant(token, size))
+
+    def _variant_flight(
+        self, token: str, size: int,
+        work: Callable[[], tuple[bytes, str] | None],
+    ) -> tuple[bytes, str] | None:
+        flight_key = (id(self), token, size)
+        with _VARIANT_FLIGHTS_LOCK:
+            flight = _VARIANT_FLIGHTS.get(flight_key)
+            if flight is not None:
+                flight[2] += 1
+        owner = flight is None
+        if owner:
+            _VARIANT_FLIGHT_SLOTS.acquire()
+            with _VARIANT_FLIGHTS_LOCK:
+                flight = _VARIANT_FLIGHTS.get(flight_key)
+                if flight is None:
+                    flight = [threading.Event(), None, 1]
+                    _VARIANT_FLIGHTS[flight_key] = flight
+                else:
+                    flight[2] += 1
+                    owner = False
+                    _VARIANT_FLIGHT_SLOTS.release()
+        try:
+            if owner:
+                try:
+                    flight[1] = work()
+                finally:
+                    flight[0].set()
+            else:
+                flight[0].wait()
+            return flight[1]
+        finally:
+            with _VARIANT_FLIGHTS_LOCK:
+                flight[2] -= 1
+                if flight[2] == 0:
+                    del _VARIANT_FLIGHTS[flight_key]
+                    _VARIANT_FLIGHT_SLOTS.release()
+
+    def _read_variant(self, token: str, size: int) -> tuple[bytes, str] | None:
+        key = f"{self.prefix.rstrip('/')}/{token}.size-v1-{size}.webp"
+        try:
+            with _VARIANT_IO_SLOTS:
+                response = self.client.get_object(Bucket=self.bucket, Key=key)
+                body = response["Body"]
+                try:
+                    data = body.read(2 * 1024 * 1024 + 1)
+                finally:
+                    body.close()
+            if data and len(data) <= 2 * 1024 * 1024 and _valid_image_bytes(data, "image/webp"):
+                return data, "image/webp"
+        except Exception:
+            pass
+        with _VARIANT_SLOTS:
+            original = self.read(token)
+            if original is None:
+                return None
+            return self._write_variant(token, size, original[0])
+
+    def _write_variant(self, token: str, size: int, original: bytes) -> tuple[bytes, str] | None:
+        try:
+            data = artwork_variant(original, size)
+            key = f"{self.prefix.rstrip('/')}/{token}.size-v1-{size}.webp"
+            self.client.put_object(Bucket=self.bucket, Key=key, Body=data,
+                ContentType="image/webp", CacheControl="public, max-age=2592000, immutable")
+            return data, "image/webp"
+        except Exception:
+            return None
+
+    def _prepare_variant(self, token: str, size: int, original: bytes) -> tuple[bytes, str] | None:
+        def write() -> tuple[bytes, str] | None:
+            with _VARIANT_SLOTS:
+                return self._write_variant(token, size, original)
+        return self._variant_flight(token, size, write)
+
     def store(
         self,
         *,
@@ -397,14 +543,22 @@ class ArtistArtworkCache:
         canonical_artist_id: str = "",
         cache_identity: str = "",
     ) -> bool:
+        return self.store_result(token=token, source_url=source_url,
+                                 canonical_artist_id=canonical_artist_id,
+                                 cache_identity=cache_identity).stored
+
+    def store_result(
+        self, *, token: str, source_url: str,
+        canonical_artist_id: str = "", cache_identity: str = "",
+    ) -> ArtworkStoreResult:
         if not _TOKEN_RE.match(token) or not source_url.startswith(("http://", "https://")):
-            return False
+            return ArtworkStoreResult("invalid_source")
         if self.head(token) is not None:
-            return True
+            return ArtworkStoreResult("stored")
+        stage, downloaded = _download_artwork_result(self.server, source_url)
+        if downloaded is None:
+            return ArtworkStoreResult(stage)
         try:
-            downloaded = _download_artwork(self.server, source_url)
-            if downloaded is None:
-                return False
             data, content_type = downloaded
             self.client.put_object(
                 Bucket=self.bucket,
@@ -423,9 +577,22 @@ class ArtistArtworkCache:
             with self._verified_tokens_lock:
                 self._verified_tokens.add(token)
                 self._missing_tokens.discard(token)
-            return True
         except Exception:
-            return False
+            return ArtworkStoreResult("storage")
+        for size in _VARIANT_SIZES:
+            try:
+                self._prepare_variant(token, size, data)
+            except Exception:
+                # Derivatives are optional; the validated original is stored.
+                continue
+        return ArtworkStoreResult("stored")
+
+
+def _store_result(cache: Any, **kwargs: Any) -> ArtworkStoreResult:
+    """Retain compatibility with existing cache doubles and adapters."""
+    if isinstance(cache, ArtistArtworkCache):
+        return cache.store_result(**kwargs)
+    return ArtworkStoreResult("stored" if cache.store(**kwargs) else "invalid_source")
 
 
 def get_artist_artwork_cache(server: Any) -> ArtistArtworkCache | None:
@@ -747,6 +914,7 @@ def schedule_entity_artwork_cache(
     def run() -> None:
         try:
             selected_source = ""
+            transient_stage = ""
             failure_times = dict(
                 cached_item.get("artwork_source_failures") or {}
                 if isinstance(cached_item.get("artwork_source_failures"), dict)
@@ -760,13 +928,19 @@ def schedule_entity_artwork_cache(
                 )
             )
             for source_url in source_urls:
-                if cache.store(
+                outcome = _store_result(cache,
                     token=token,
                     source_url=source_url,
                     cache_identity=identity,
-                ):
+                )
+                if outcome.stored:
                     selected_source = source_url
                     break
+                if outcome.stage != "invalid_source":
+                    transient_stage = outcome.stage
+                    if outcome.stage == "storage":
+                        break
+                    continue
                 if source_url not in failed_sources:
                     failed_sources.append(source_url)
                 failure_times[source_url] = time.time()
@@ -788,14 +962,18 @@ def schedule_entity_artwork_cache(
                 failure_times.pop(selected_source, None)
                 updated["artwork_source_failures"] = failure_times
                 updated["artwork_cache_status"] = "cached"
+                updated.pop("artwork_failure_stage", None)
                 updated["artwork_cached_at"] = int(time.time())
                 updated.pop("artwork_retry_after", None)
                 updated["thumbnail"] = f"/entity_artwork/{token}"
                 with _ENTITY_RECORDS_LOCK:
                     _ENTITY_RECORDS[token] = (server, dict(updated))
             else:
-                updated["artwork_cache_status"] = "source_failed"
-                updated["artwork_retry_after"] = time.time() + _SOURCE_RETRY_SECONDS
+                updated["artwork_cache_status"] = "pending" if transient_stage else "source_failed"
+                updated["artwork_failure_stage"] = transient_stage or "invalid_source"
+                updated["artwork_retry_after"] = time.time() + (
+                    _TRANSIENT_RETRY_SECONDS if transient_stage else _SOURCE_RETRY_SECONDS
+                )
                 updated.pop("thumbnail", None)
             notify_entity_metadata_updated(updated)
             if on_cached is not None:
@@ -877,6 +1055,7 @@ def cache_artist_artwork_now(
     """
 
     server = getattr(server, "raw", server)
+    retry_after = artist_artwork_retry_after(artist)
     cached_artist = attach_cached_artist_artwork(server, artist)
     if _clean(cached_artist.get("thumbnail")).startswith("/artist_artwork/"):
         notify_artist_metadata_updated(cached_artist)
@@ -908,10 +1087,13 @@ def cache_artist_artwork_now(
         canonical_artist_id = _clean(
             cached_artist.get("normalized_name") or cached_artist.get("name")
         )
-    if (
-        not source_urls
-        or not canonical_artist_id
-    ):
+    if not source_urls and retry_after is not None:
+        failed = dict(artist)
+        failed["artwork_cache_status"] = "source_failed"
+        failed["artwork_failure_stage"] = "invalid_source"
+        failed["artwork_retry_after"] = retry_after
+        return failed
+    if not source_urls or not canonical_artist_id:
         return None
     cache = get_artist_artwork_cache(server)
     if cache is None:
@@ -920,6 +1102,7 @@ def cache_artist_artwork_now(
     if not token:
         return None
     selected_source = ""
+    transient_stage = ""
     failure_times = dict(
         cached_artist.get("artwork_source_failures") or {}
         if isinstance(cached_artist.get("artwork_source_failures"), dict)
@@ -933,13 +1116,19 @@ def cache_artist_artwork_now(
         )
     )
     for source_url in source_urls:
-        if cache.store(
+        outcome = _store_result(cache,
             token=token,
             source_url=source_url,
             canonical_artist_id=canonical_artist_id,
-        ):
+        )
+        if outcome.stored:
             selected_source = source_url
             break
+        if outcome.stage != "invalid_source":
+            transient_stage = outcome.stage
+            if outcome.stage == "storage":
+                break
+            continue
         if source_url not in failed_sources:
             failed_sources.append(source_url)
         failure_times[source_url] = time.time()
@@ -947,7 +1136,10 @@ def cache_artist_artwork_now(
         failed = dict(cached_artist)
         failed["artwork_failed_source_urls"] = failed_sources
         failed["artwork_source_failures"] = failure_times
-        failed["artwork_cache_status"] = "source_failed"
+        failed["artwork_cache_status"] = "pending" if transient_stage else "source_failed"
+        failed["artwork_failure_stage"] = transient_stage or "invalid_source"
+        failed["artwork_retry_after"] = (time.time() + _TRANSIENT_RETRY_SECONDS
+            if transient_stage else artist_artwork_retry_after(failed))
         notify_artist_metadata_updated(failed)
         return failed
     updated = dict(cached_artist)
@@ -962,6 +1154,8 @@ def cache_artist_artwork_now(
     failure_times.pop(selected_source, None)
     updated["artwork_source_failures"] = failure_times
     updated["artwork_cache_status"] = "cached"
+    updated.pop("artwork_failure_stage", None)
+    updated.pop("artwork_retry_after", None)
     updated["artwork_cached_at"] = int(time.time())
     updated["artwork_cache_identity"] = canonical_artist_id
     updated["artwork_cache_token"] = token
@@ -970,14 +1164,32 @@ def cache_artist_artwork_now(
     return updated
 
 
+def artist_artwork_is_pending(server: Any, artist: Dict[str, Any]) -> bool:
+    """Observe the existing cache queue without starting work or doing I/O."""
+    server = getattr(server, "raw", server)
+    normalized = normalized_artist_payload(artist)
+    identities = {
+        _clean(value)
+        for record in (artist, normalized)
+        for value in (record.get("canonical_artist_id"), record.get("canonical_artist_key"),
+                      record.get("provider_artist_id"), record.get("id"))
+        if _clean(value)
+    }
+    keys = {f"{id(server)}:{artist_artwork_token(value)}" for value in identities}
+    with _PENDING_LOCK:
+        return not keys.isdisjoint(_PENDING)
+
+
 def schedule_artist_artwork_cache(
     server: Any,
     artist: Dict[str, Any],
     *,
     on_cached: Callable[[Dict[str, Any]], None] | None = None,
+    local_only: bool = False,
 ) -> bool:
     server = getattr(server, "raw", server)
-    cached = attach_cached_artist_artwork(server, artist)
+    cached = (attach_persisted_artist_artwork(server, artist) if local_only
+              else attach_cached_artist_artwork(server, artist))
     if _clean(cached.get("thumbnail")).startswith("/artist_artwork/"):
         notify_artist_metadata_updated(cached)
         if on_cached is not None:

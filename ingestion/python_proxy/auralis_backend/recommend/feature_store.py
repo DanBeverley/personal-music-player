@@ -6,6 +6,7 @@ from contextvars import ContextVar
 import json
 import os
 import re
+import sys
 from threading import Lock
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -30,6 +31,10 @@ _HOT_CACHE_TTL_SECONDS = max(
     30,
     int(os.environ.get("AURALIS_FEATURE_HOT_CACHE_TTL_SECONDS", "600")),
 )
+_HOT_CACHE_MAX_ENTRIES = max(1, int(os.environ.get("AURALIS_FEATURE_HOT_CACHE_ENTRIES", "512")))
+_HOT_CACHE_MAX_BYTES = max(1024, int(os.environ.get("AURALIS_FEATURE_HOT_CACHE_BYTES", str(16 * 1024 * 1024))))
+_HOT_CACHE_MAX_VALUE_BYTES = min(_HOT_CACHE_MAX_BYTES, 1024 * 1024)
+_HOT_CACHE_BYTES: Dict[str, int] = {}
 
 
 _SCHEMA_LOCK = Lock()
@@ -41,7 +46,7 @@ _REQUEST_STORE_RUNTIME: ContextVar[Dict[str, Any] | None] = ContextVar(
     default=None,
 )
 _CACHE_MISS = object()
-_HOT_CACHES: Dict[str, Dict[str, Tuple[float, Any]]] = {
+_HOT_CACHES: Dict[str, Dict[str, Tuple[float, Any, int]]] = {
     "catalog": {},
     "taste": {},
     "negative": {},
@@ -316,32 +321,87 @@ def hot_runtime_cache_get(bucket: str, key: str) -> Tuple[bool, Any]:
         row = cache.get(key)
         if row is None:
             return False, None
-        expires_at, value = row
+        expires_at, value, _ = row
         if expires_at <= time.time():
-            cache.pop(key, None)
+            _hot_cache_remove(bucket, key)
             return False, None
+        # Dict insertion order is the LRU order; no second payload cache.
+        cache.pop(key)
+        cache[key] = row
         if value is _CACHE_MISS:
             return True, None
         return True, _copy_cached_value(value)
 
 
 def hot_runtime_cache_put(bucket: str, key: str, value: Any) -> Any:
+    stored = _CACHE_MISS if value is None else _copy_cached_value(value)
+    weight = _hot_cache_weight(stored) + sys.getsizeof(key)
     with _HOT_CACHE_LOCK:
-        _HOT_CACHES.setdefault(bucket, {})[key] = (
-            time.time() + float(_HOT_CACHE_TTL_SECONDS),
-            _CACHE_MISS if value is None else _copy_cached_value(value),
-        )
+        _prune_hot_cache(bucket, time.time())
+        _hot_cache_remove(bucket, key)
+        if weight <= _HOT_CACHE_MAX_VALUE_BYTES:
+            cache = _HOT_CACHES.setdefault(bucket, {})
+            while cache and (len(cache) >= _HOT_CACHE_MAX_ENTRIES or
+                    _HOT_CACHE_BYTES.get(bucket, 0) + weight > _HOT_CACHE_MAX_BYTES):
+                _hot_cache_remove(bucket, next(iter(cache)))
+            cache[key] = (time.time() + float(_HOT_CACHE_TTL_SECONDS), stored, weight)
+            _HOT_CACHE_BYTES[bucket] = _HOT_CACHE_BYTES.get(bucket, 0) + weight
     return value
+
+
+def _hot_cache_weight(value: Any) -> int:
+    """Bound traversal too: oversized/deep values stay in persisted storage."""
+    pending, seen, total = [value], set(), 0
+    while pending:
+        item = pending.pop()
+        if id(item) in seen:
+            continue
+        seen.add(id(item))
+        total += sys.getsizeof(item)
+        if total > _HOT_CACHE_MAX_VALUE_BYTES or len(seen) > 8192:
+            return _HOT_CACHE_MAX_VALUE_BYTES + 1
+        if isinstance(item, dict):
+            if len(item) > 8192:
+                return _HOT_CACHE_MAX_VALUE_BYTES + 1
+            pending.extend(item.keys())
+            pending.extend(item.values())
+        elif isinstance(item, (list, tuple, set)):
+            if len(item) > 8192:
+                return _HOT_CACHE_MAX_VALUE_BYTES + 1
+            pending.extend(item)
+    return total
+
+
+def _hot_cache_remove(bucket: str, key: str) -> None:
+    row = _HOT_CACHES.setdefault(bucket, {}).pop(key, None)
+    if row is not None:
+        _HOT_CACHE_BYTES[bucket] = max(0, _HOT_CACHE_BYTES.get(bucket, 0) - row[2])
+
+
+def _prune_hot_cache(bucket: str, now: float) -> None:
+    cache = _HOT_CACHES.setdefault(bucket, {})
+    for key in list(cache):
+        if cache[key][0] <= now:
+            _hot_cache_remove(bucket, key)
+
+
+def prune_hot_runtime_caches() -> dict[str, int]:
+    with _HOT_CACHE_LOCK:
+        for bucket in _HOT_CACHES:
+            _prune_hot_cache(bucket, time.time())
+        return {"entries": sum(map(len, _HOT_CACHES.values())),
+                "estimated_bytes": sum(_HOT_CACHE_BYTES.values())}
 
 
 def hot_runtime_cache_invalidate(bucket: str, key: str) -> None:
     with _HOT_CACHE_LOCK:
-        _HOT_CACHES.setdefault(bucket, {}).pop(key, None)
+        _hot_cache_remove(bucket, key)
 
 
 def hot_runtime_cache_clear(bucket: str) -> None:
     with _HOT_CACHE_LOCK:
         _HOT_CACHES.setdefault(bucket, {}).clear()
+        _HOT_CACHE_BYTES[bucket] = 0
 
 
 def ensure_feature_schema(server: Any) -> None:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Mapping
 import hashlib
 import json
@@ -28,10 +28,9 @@ from ..discovery.radio_inventory import (
 )
 from ..discovery.source_registry import verify_materialized_supply
 from ..discovery.ranking import admitted_artist_candidates
-from ..discovery.structured_providers import LastFmClient
 from ..search.intelligence import remember_catalog_entity
 from ..domain.catalog import normalize_artist_name
-from ..storage.artist_artwork import cache_artist_artwork_now
+from ..storage.artist_artwork import artist_artwork_retry_after, cache_artist_artwork_now
 from .contracts import (
     HOME_DISCOVERY_EXPOSURE_COOLDOWN_SECONDS,
     RADIO_SNAPSHOT_TTL_SECONDS,
@@ -170,6 +169,7 @@ class RadioSupplyOutcome:
     expansion_needed: bool = False
     retryable: bool = False
     reason: str = ""
+    funnel: Mapping[str, Any] = field(default_factory=dict)
 
 
 def _radio_expansion_needed(inventory: ArtistRadioInventory | None) -> bool:
@@ -177,11 +177,7 @@ def _radio_expansion_needed(inventory: ArtistRadioInventory | None) -> bool:
         return True
     diagnostics = dict(inventory.diagnostics or {})
     reservoir = list(inventory.reservoir_cards or inventory.cards or [])
-    discovery_count = int(
-        diagnostics.get("reservoir_discovery_card_count")
-        or diagnostics.get("discovery_card_count")
-        or 0
-    )
+    discovery_count = _qualified_discovery_count(diagnostics)
     return bool(
         len(reservoir) < RADIO_WORKING_RESERVOIR_TARGET_CARDS
         or discovery_count < RADIO_DISCOVERY_RESERVE_TARGET_CARDS
@@ -224,12 +220,10 @@ def _radio_known_artist_identities(
 def _qualified_discovery_count(diagnostics: Mapping[str, Any] | None) -> int:
     """Read the profile-aware count before the legacy affinity-only count."""
     values = dict(diagnostics or {})
-    return int(
-        values.get("reservoir_discovery_card_count")
-        or values.get("selected_discovery_card_count")
-        or values.get("discovery_card_count")
-        or 0
-    )
+    for key in ("reservoir_discovery_card_count", "selected_discovery_card_count", "discovery_card_count"):
+        if values.get(key) is not None:
+            return int(values[key])
+    return 0
 
 
 class RadioSupplyService:
@@ -246,6 +240,14 @@ class RadioSupplyService:
         candidate_snapshot_id: str = "",
     ) -> RadioSupplyOutcome:
         candidates = None
+        funnel: dict[str, Any] = {"seed_candidates_offered": 0}
+
+        def finish(**values: Any) -> RadioSupplyOutcome:
+            return RadioSupplyOutcome(
+                seed_candidates_offered=funnel["seed_candidates_offered"],
+                funnel=dict(funnel), **values,
+            )
+
         known_artist_identities = _radio_known_artist_identities(
             self._repositories,
             taste,
@@ -270,6 +272,10 @@ class RadioSupplyService:
                 require_fresh=False,
                 allow_profile_mismatch=False,
             )
+        funnel["seed_candidates_offered"] = sum(
+            len((getattr(candidates, "pools", {}) or {}).get(name) or [])
+            for name in DISCOVERY_SOURCE_POOLS
+        )
         existing = load_artist_radio_inventory(
             self._server,
             taste.user_scope_id,
@@ -280,7 +286,7 @@ class RadioSupplyService:
         if existing is not None:
             # Cover the fresh-reservoir reuse path as well as acquisition.
             if not merge_store_artist_radio_inventory(self._server, existing):
-                return RadioSupplyOutcome(reason="radio_source_revalidation_failed", retryable=True)
+                return finish(reason="radio_source_revalidation_failed", retryable=True)
             existing = load_artist_radio_inventory(
                 self._server,
                 taste.user_scope_id,
@@ -344,7 +350,7 @@ class RadioSupplyService:
                 merge_store_artist_radio_inventory(self._server, servable_existing)
             final_cards = list(servable_existing.cards or [])
             final_diag = dict(servable_existing.diagnostics or {})
-            return RadioSupplyOutcome(
+            return finish(
                 snapshot_id=self._publish_snapshot(servable_existing),
                 ready=True,
                 made_progress=not bool(getattr(existing, "cards", []) or []),
@@ -367,7 +373,7 @@ class RadioSupplyService:
             base_tracks <= 0 and not bool(getattr(candidates, "is_ready", False))
         ):
             if servable_existing is not None:
-                return RadioSupplyOutcome(
+                return finish(
                     snapshot_id=self._publish_snapshot(servable_existing),
                     ready=True,
                     reservoir_count=len(
@@ -384,7 +390,7 @@ class RadioSupplyService:
                     expansion_needed=_radio_expansion_needed(servable_existing),
                     reason="ready_reservoir_reused",
                 )
-            return RadioSupplyOutcome(
+            return finish(
                 retryable=True,
                 reason="fresh_candidate_snapshot_required",
             )
@@ -421,6 +427,7 @@ class RadioSupplyService:
                 *list(known_artist_identities),
             ),
         )
+        funnel["seed_candidates_eligible"] = len(discovery_seeds)
         discovery_count = _qualified_discovery_count(existing_diag)
         reservoir_count = len(before_cards)
         exposure_deficit = int(existing_diag.get("exposure_deficit") or 0)
@@ -462,9 +469,22 @@ class RadioSupplyService:
             max_pending_jobs=4,
         )
         scheduled = int((supply.diagnostics or {}).get("scheduled_request_count") or 0)
+        funnel.update({
+            key: int((supply.diagnostics or {}).get(source) or 0)
+            for key, source in (
+                ("requests_planned", "planned_request_count"),
+                ("requests_scheduled", "scheduled_request_count"),
+                ("requests_cached", "cached_request_count"),
+                ("requests_retry_deferred", "retry_deferred_request_count"),
+                ("requests_exhausted", "exhausted_request_count"),
+                ("requests_provider_deferred", "provider_deferred_request_count"),
+                ("requests_completed", "completed_request_count"),
+                ("requests_failed", "failed_request_count"),
+            )
+        })
         if scheduled <= 0 and not supply.pools:
             if servable_existing is not None:
-                return RadioSupplyOutcome(
+                return finish(
                     snapshot_id=self._publish_snapshot(servable_existing),
                     ready=True,
                     reservoir_count=len(
@@ -481,7 +501,7 @@ class RadioSupplyService:
                     expansion_needed=_radio_expansion_needed(servable_existing),
                     reason="ready_reservoir_reused_no_expansion_work",
                 )
-            return RadioSupplyOutcome(
+            return finish(
                 ready=bool(existing and existing.is_ready),
                 reservoir_count=reservoir_count,
                 discovery_count=discovery_count,
@@ -514,7 +534,7 @@ class RadioSupplyService:
             server=self._server,
         )
         built.diagnostics["radio_supply_funnel"] = {
-            "seed_candidates_offered": len(discovery_seeds),
+            **funnel,
             "requests_scheduled": scheduled,
             "requests_completed": int(
                 (supply.diagnostics or {}).get("completed_request_count") or 0
@@ -598,7 +618,8 @@ class RadioSupplyService:
             and not (artist_identity_aliases(card) & known_artist_identities)
         }
         made_progress = bool(qualified_new_identity_ids)
-        funnel = dict(final_diag.get("radio_supply_funnel") or {})
+        funnel = {**dict(final_diag.get("radio_supply_funnel") or {}),
+                  **built.diagnostics["radio_supply_funnel"]}
         funnel.update(
             {
                 "cards_after": len(final_cards),
@@ -637,16 +658,13 @@ class RadioSupplyService:
                 ).casefold(),
             ),
         )
-        return RadioSupplyOutcome(
+        return finish(
             snapshot_id=snapshot_id,
             ready=final.is_ready,
             made_progress=made_progress,
             scheduled_requests=scheduled,
             reservoir_count=len(final_cards),
             discovery_count=_qualified_discovery_count(final_diag),
-            seed_candidates_offered=int(
-                funnel.get("seed_candidates_offered") or 0
-            ),
             source_verification_verified=int(
                 funnel.get("source_verification_verified") or 0
             ),
@@ -815,6 +833,18 @@ class RadioSupplyService:
         return snapshot_id
 
 
+@dataclass(frozen=True)
+class ArtworkRepairOutcome:
+    stored: bool
+    record: dict[str, Any]
+    retry_after: float | None = None
+    stage: str = "unavailable"
+    deferred: bool = False
+
+    def __bool__(self) -> bool:
+        return self.stored
+
+
 class ArtworkSupplyService:
     """Sole blocking owner of Home artist-artwork repair jobs."""
 
@@ -836,6 +866,10 @@ class ArtworkSupplyService:
             url = str(value.get(key) or "").strip()
             if url.startswith(("http://", "https://")):
                 output.append(url)
+        output.extend(
+            str(url).strip() for url in value.get("artwork_source_urls") or []
+            if str(url).strip().startswith(("http://", "https://"))
+        )
         return list(dict.fromkeys(output))
 
     def _resolve_sources(self, record: Mapping[str, Any]) -> dict[str, Any]:
@@ -849,13 +883,17 @@ class ArtworkSupplyService:
         client = getattr(self._server, "ytmusic", None)
         if client is not None:
             wanted = " ".join(artist.casefold().split())
-            expected_provider_id = str(
-                record.get("provider_artist_id")
-                or record.get("artist_id")
-                or ""
-            ).strip()
+            expected_provider_id = str(record.get("provider_artist_id") or "").strip()
+            if expected_provider_id.casefold().startswith("provider:artist:"):
+                expected_provider_id = expected_provider_id[len("provider:artist:"):]
+            mbid = str(record.get("musicbrainz_artist_id") or "").strip().casefold()
+            canonical = str(record.get("canonical_artist_id") or "").strip()
+            if not mbid and canonical.casefold().startswith("musicbrainz:artist:"):
+                mbid = canonical[len("musicbrainz:artist:"):].casefold()
+            if not expected_provider_id and canonical.casefold().startswith("provider:artist:"):
+                expected_provider_id = canonical[len("provider:artist:"):]
             matches: list[Any] = []
-            if not expected_provider_id:
+            if not expected_provider_id and mbid:
                 try:
                     matches = client.search(
                         artist,
@@ -873,6 +911,7 @@ class ArtworkSupplyService:
                         str(value.get("artist") or value.get("name") or "")
                         .strip().casefold().split()
                     ) == wanted
+                    and str(value.get("musicbrainz_artist_id") or value.get("mbid") or "").strip().casefold() == mbid
                 ),
                 None,
             )
@@ -895,38 +934,31 @@ class ArtworkSupplyService:
                     detail = {}
                 if normalize_artist_name(detail.get("name") or detail.get("artist")) == normalize_artist_name(artist):
                     urls = self._thumbnail_urls(detail) + urls
-        try:
-            lastfm = LastFmClient(self._server).artist_info(
-                artist,
-                artist_mbid=str(record.get("musicbrainz_artist_id") or "").strip(),
-            )
-        except Exception:
-            lastfm = {}
-        urls.extend(self._thumbnail_urls(lastfm))
-        urls.extend(
-            str(value or "").strip()
-            for value in lastfm.get("artwork_source_urls") or []
-            if str(value or "").strip().startswith(("http://", "https://"))
-        )
         urls = list(dict.fromkeys(urls))
         if urls:
             resolved["artwork_source_url"] = urls[0]
             resolved["artwork_source_urls"] = urls
             resolved.setdefault("artist_thumbnail", urls[0])
-        for key in ("musicbrainz_artist_id", "canonical_artist_id"):
-            if lastfm.get(key) and not resolved.get(key):
-                resolved[key] = lastfm[key]
         return resolved
 
-    def repair(self, record: Mapping[str, Any]) -> bool:
+    def repair(self, record: Mapping[str, Any]) -> ArtworkRepairOutcome:
+        retry_after = artist_artwork_retry_after(dict(record))
+        if retry_after is not None:
+            return ArtworkRepairOutcome(False, dict(record), retry_after, "source_cooldown", True)
+        resolved = dict(record) if record.get("artwork_sources_resolved") else self._resolve_sources(record)
+        resolved["artwork_sources_resolved"] = True
         updated = cache_artist_artwork_now(
             self._server,
-            self._resolve_sources(record),
+            resolved,
         )
         if updated is None or not str(updated.get("thumbnail") or "").startswith(
             "/artist_artwork/"
         ):
-            return False
+            failed = dict(updated or resolved)
+            return ArtworkRepairOutcome(
+                False, failed, failed.get("artwork_retry_after"),
+                str(failed.get("artwork_failure_stage") or "unavailable"),
+            )
         name = str(updated.get("name") or "").strip()
         if name:
             remember_catalog_entity(
@@ -941,4 +973,4 @@ class ArtworkSupplyService:
                 source="home_radio_artwork_worker",
                 learn_query_alias=False,
             )
-        return True
+        return ArtworkRepairOutcome(True, updated)

@@ -44,8 +44,10 @@ flutter:
       fonts:
         - asset: assets/fonts/DMSerifDisplay.ttf
   assets:
-    - assets/branding/neatie_3rd.png
-    - assets/branding/neatie_login_wave_bg.png
+    - path: assets/branding/neatie_3rd.png
+      platforms: [android, ios, linux, macos, windows]
+    - path: assets/branding/neatie_login_wave_bg.png
+      platforms: [android, ios, linux, macos, windows]
 
 flutter_launcher_icons:
   android: true

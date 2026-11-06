@@ -214,7 +214,6 @@ def _recommendation_album_embeddings(albums):
     return resolved
 
 
-@_with_server_globals
 def _recommendation_trim_text(value: Optional[str]) -> str:
     return (value or "").strip()
 

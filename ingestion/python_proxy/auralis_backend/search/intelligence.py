@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import time
+import unicodedata
 from difflib import SequenceMatcher
 from typing import Any, Dict, Iterable, List
 
@@ -57,9 +58,15 @@ def search_query_key(query: str) -> str:
 
 
 def search_spacing_equivalent(query: str, candidate: str) -> bool:
-    left = search_query_key(query).replace(" ", "")
-    right = search_query_key(candidate).replace(" ", "")
+    left = search_folded_key(query).replace(" ", "")
+    right = search_folded_key(candidate).replace(" ", "")
     return len(left) >= 5 and left == right
+
+
+def search_folded_key(value: str) -> str:
+    """Accent-insensitive comparison only; never rewrite catalog identities."""
+    text = unicodedata.normalize('NFKD', search_query_key(value).casefold())
+    return ''.join(c for c in text if not unicodedata.combining(c)).replace('đ', 'd')
 
 
 def search_match_key(value: str) -> str:
@@ -67,7 +74,7 @@ def search_match_key(value: str) -> str:
     units = dict(zip(('zero one two three four five six seven eight nine ten eleven '
                       'twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen').split(), range(20)))
     tens = dict(zip('twenty thirty forty fifty sixty seventy eighty ninety'.split(), range(20, 100, 10)))
-    words = search_query_key(value).split()
+    words = search_folded_key(value).split()
     output = []
     i = 0
     while i < len(words):
@@ -94,25 +101,142 @@ def query_is_artist(query: str, artist: str) -> bool:
                           and search_text_similarity(left, right) >= .90))
 
 
+def search_word_distance(a: str, b: str, limit: int = 2) -> int:
+    """Bounded word edits, including adjacent transpositions."""
+    if abs(len(a) - len(b)) > limit:
+        return limit + 1
+    prev2 = None
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        row = [i]
+        for j, cb in enumerate(b, 1):
+            value = min(row[-1] + 1, prev[j] + 1, prev[j - 1] + (ca != cb))
+            if (prev2 is not None and i > 1 and j > 1
+                    and ca == b[j - 2] and a[i - 2] == cb):
+                value = min(value, prev2[j - 2] + 1)
+            row.append(value)
+        prev2, prev = prev, row
+    return prev[-1]
+
+
+def search_typo_equivalent(query: str, candidate: str) -> bool:
+    left, right = search_folded_key(query).split(), search_folded_key(candidate).split()
+    if len(''.join(left)) < 6 or len(left) != len(right):
+        return False
+    changes = [(a, b) for a, b in zip(left, right) if a != b]
+    if not changes or len(changes) > 2:
+        return False
+    if any(min(len(a), len(b)) < (5 if len(left) == 1 else 3) for a, b in changes):
+        return False
+    distances = [search_word_distance(a, b) for a, b in changes]
+    return max(distances) <= 2 and sum(distances) <= 3
+
+
 def track_query_similarity(query: str, title: str, artist: str) -> float:
     """Require title evidence after removing a matched credited artist."""
     q, t, a = map(search_match_key, (query, title, artist))
     score = search_text_similarity(query, title)
+    if search_typo_equivalent(query, title):
+        score = max(score, .94)
+    # Video titles often retain a translated title or a soundtrack descriptor.
+    # A complete phrase is useful retrieval evidence, not an exact ID/credit.
+    def phrase_score(needle):
+        return .96 if len(needle) >= 5 and len(needle.split()) >= 2 and f' {needle} ' in f' {t} ' else 0.0
+    score = max(score, phrase_score(q))
     if not t or not a:
         return score
-    words, credit = q.split(), a.split()
-    for at in range(len(words) - len(credit) + 1):
-        if words[at:at + len(credit)] == credit:
-            residual = ' '.join(words[:at] + words[at + len(credit):])
-            if residual:
-                score = max(score, search_text_similarity(residual, t))
+    words = q.split()
+    credits = [artist, *re.split(r'\s+(?:&|and|feat\.?|featuring|with)\s+|,\s*', artist, flags=re.IGNORECASE)]
+    for name in credits:
+        credit = search_match_key(name).split()
+        if not credit:
+            continue
+        for at in range(len(words) - len(credit) + 1):
+            if words[at:at + len(credit)] == credit:
+                residual = ' '.join(words[:at] + words[at + len(credit):])
+                if residual:
+                    score = max(score, search_text_similarity(residual, t), phrase_score(residual))
+                    if search_typo_equivalent(residual, t):
+                        score = max(score, .94)
     return score
+
+
+def search_title_aliases(item: Dict[str, Any]) -> List[str]:
+    """Intrinsic alternate titles, never inferred queries, tags or artist names."""
+    values = []
+    for field in ("title_aliases", "alternate_titles", "native_title", "original_title",
+                  "romanized_title", "translated_title"):
+        raw = item.get(field) or []
+        for value in raw if isinstance(raw, (list, tuple)) else [raw]:
+            text = _text(value.get("name") or value.get("title")) if isinstance(value, dict) else _text(value)
+            if text and text not in values:
+                values.append(text)
+    return values[:32]
+
+
+def track_query_evidence(query: str, item: Dict[str, Any]) -> Dict[str, float]:
+    """Combine title evidence with bounded, query-scoped provider relationships.
+
+    A provider's top soundtrack result may have a native or different title.
+    Position alone is insufficient: require album/alternate-script evidence,
+    a stable credited artist and meaningful popularity. No identity is inferred.
+    """
+    title = _text(item.get("title") or item.get("name"))
+    artist = _source_name(item)
+    alias = max((track_query_similarity(query, value, artist)
+                 for value in search_title_aliases(item)), default=0.0)
+    title_score = max(track_query_similarity(query, title, artist), alias)
+    album_score = search_text_similarity(query, _text(item.get("album") or item.get("album_title")))
+    try:
+        provider_rank = int(item.get("search_provider_rank") or 0)
+    except (TypeError, ValueError):
+        provider_rank = 0
+    scoped = (item.get("search_provider_query") == search_query_key(query)
+              and item.get("search_provider_kind") in {"songs", "videos"}
+              and 0 < provider_rank <= 5
+              and bool(item.get("artist_id") or item.get("artist_ids")))
+    popular = normalized_popularity(item) >= .5
+    query_words = search_folded_key(query).split()
+    folded_title = search_folded_key(title)
+    native_prefix = (len(query_words) >= 3
+                     and len(" ".join(query_words[:2])) >= 5
+                     and f" {' '.join(query_words[:2])} " in f" {folded_title} "
+                     and any(c.isalpha() and not c.isascii() for c in folded_title))
+    context = (.92 if scoped and popular and title_score < .9
+               and (album_score >= .8 or native_prefix) else 0.0)
+    return {"title": title_score, "alias": alias, "album": album_score, "context": context}
+
+
+def link_provider_title_aliases(items: List[Dict[str, Any]]) -> None:
+    """Link bilingual provider titles only through exact native title + artist ID.
+
+    Alternate titles come from provider text, never the submitted query. An
+    artist name, duration or album match alone cannot bridge two recordings.
+    """
+    groups = {}
+    for item in items:
+        segments = [part.strip() for part in re.split(r"\s+(?:-|–|—|\||/)\s+", _text(item.get("title"))) if part.strip()]
+        if len(segments) < 2:
+            continue
+        artists = set(item.get("artist_ids") or []) | {item.get("artist_id")}
+        for segment in segments[:4]:
+            native = search_folded_key(segment)
+            if len(native) < 6 or sum(c.isalpha() and not c.isascii() for c in native) < 2:
+                continue
+            for artist in artists - {None, ""}:
+                groups.setdefault((artist, native), []).append((item, segments[:4]))
+    for matches in groups.values():
+        if len(matches) < 2:
+            continue
+        aliases = list(dict.fromkeys(title for _, parts in matches for title in parts))[:16]
+        for item, _ in matches:
+            item["title_aliases"] = list(dict.fromkeys([*search_title_aliases(item), *aliases]))[:32]
 
 
 def search_text_similarity(query: str, candidate: str) -> float:
     """Order-tolerant lexical similarity for canonical search entities."""
-    query_key = search_query_key(query)
-    candidate_key = search_query_key(candidate)
+    query_key = search_folded_key(query)
+    candidate_key = search_folded_key(candidate)
     if not query_key or not candidate_key:
         return 0.0
     if query_key == candidate_key:
@@ -682,6 +806,11 @@ def _trusted_catalog_alias(connection, row, alias_key: str, cache=None) -> bool:
         return alias_key in value if isinstance(value, set) else value
     if source == "canonical_search_result":
         item = _json_loads(row["payload_json"])
+        if item.get("metadata_source") == "musicbrainz" and "title_aliases" not in item:
+            # Old recording adapters appended query text and genre tags to
+            # aliases. Neither establishes an intrinsic alternate title.
+            item.pop("aliases", None)
+            item.pop("search_aliases", None)
         title, artist, album = canonical_track_fields(item, query="")
         aliases = set(_catalog_alias_keys(
             "", entity_type=row["entity_type"], item=item,
@@ -1118,12 +1247,14 @@ def load_fuzzy_catalog_entity_memories(
     best_by_entity: Dict[tuple[str, str], Dict[str, Any]] = {}
     for row in rows:
         alias_key = _text(row["alias_key"])
+        payload = _json_loads(row["payload_json"])
         similarity = max(search_text_similarity(query_key, alias_key),
                          track_query_similarity(query_key, row['display_title'], row['display_artist'])
+                         if row['entity_type'] == 'track' else 0.0,
+                         track_query_evidence(query_key, payload)["alias"]
                          if row['entity_type'] == 'track' else 0.0)
         if similarity < 0.62:
             continue
-        payload = _json_loads(row["payload_json"])
         payload["popularity"] = max(
             float(payload.get("popularity") or 0.0),
             float(row["popularity"] or 0.0),
@@ -1710,6 +1841,8 @@ def _item_alias_values(item: Dict[str, Any]) -> List[str]:
         if artist:
             add(f"{artist} {stripped_title}")
             add(f"{stripped_title} {artist}")
+    for alias in search_title_aliases(item):
+        add(alias)
     raw_aliases = item.get("aliases") or item.get("search_aliases") or []
     if isinstance(raw_aliases, str):
         add(raw_aliases)

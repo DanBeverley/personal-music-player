@@ -63,7 +63,7 @@ def lookup_persistent_suggestion_base(server: Any, key: str) -> Any:
     """Best-effort shared cache surviving process restarts."""
     try:
         connection = open_recommendation_store_connection(server)
-        row = connection.execute("SELECT payload_json FROM search_suggestion_cache WHERE cache_key = ?", (key,)).fetchone()
+        row = connection.execute("SELECT payload_json FROM search_suggestion_cache WHERE cache_key = ? AND updated_at >= ?", (key, time.time()-SEARCH_RESULT_CACHE_TTL_SECONDS)).fetchone()
         if not row:
             return None
         return json.loads(row[0])

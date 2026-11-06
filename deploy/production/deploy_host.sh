@@ -80,7 +80,7 @@ trap rollback ERR
 python3 "$release_dir/deploy/production/runtime_backup.py" backup \
   --source /var/lib/neatie/runtime \
   --destination /var/backups/neatie \
-  --retention-days 14
+  --retention-count 3
 
 "${compose[@]}" build --pull
 "${compose[@]}" up -d --remove-orphans
@@ -119,8 +119,11 @@ fi
 ln -sfn "$release_dir" /opt/neatie/current
 install -m 0644 "$release_dir/deploy/production/neatie-backup.service" /etc/systemd/system/neatie-backup.service
 install -m 0644 "$release_dir/deploy/production/neatie-backup.timer" /etc/systemd/system/neatie-backup.timer
+install -m 0644 "$release_dir/deploy/production/neatie-retention.service" /etc/systemd/system/neatie-retention.service
+install -m 0644 "$release_dir/deploy/production/neatie-retention.timer" /etc/systemd/system/neatie-retention.timer
 systemctl daemon-reload
 systemctl enable --now neatie-backup.timer
+systemctl enable --now neatie-retention.timer
 
 trap - ERR
 rm -f "$bundle_path" "$backend_env_path"

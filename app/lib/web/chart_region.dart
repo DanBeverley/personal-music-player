@@ -40,8 +40,9 @@ class ChartRegion extends ChangeNotifier {
       final saved = jsonDecode(store?.read() ?? '{}');
       if (saved is Map && saved['version'] == 1) {
         final choice = '${saved['selection'] ?? 'AUTO'}';
-        if (choice == 'AUTO' || chartCountries.containsKey(choice))
+        if (choice == 'AUTO' || chartCountries.containsKey(choice)) {
           selection = choice;
+        }
         final country = '${saved['country'] ?? 'GLOBAL'}';
         if (chartCountries.containsKey(country)) this.country = country;
         if (selection != 'AUTO') this.country = selection;
@@ -75,8 +76,9 @@ class ChartRegion extends ChangeNotifier {
   }
 
   Future<void> choose(String value) async {
-    if (_disposed || (value != 'AUTO' && !chartCountries.containsKey(value)))
+    if (_disposed || (value != 'AUTO' && !chartCountries.containsKey(value))) {
       return;
+    }
     _version++;
     selection = value;
     detecting = false;

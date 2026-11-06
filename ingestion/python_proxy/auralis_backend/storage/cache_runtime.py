@@ -53,6 +53,37 @@ TTL_CACHE_MAX_ENTRIES = 128
 TTL_CACHE_MAX_BYTES = 32 * 1024 * 1024
 
 
+def _prune_root(root: dict, now: float) -> None:
+    """One byte budget per cache family, rather than one per namespace."""
+    for entries in root.values():
+        _prune_cache(entries, now)
+    total = sum(row.get("size_bytes", 0) for entries in root.values() for row in entries.values())
+    if total <= TTL_CACHE_MAX_BYTES:
+        return
+    oldest = sorted((row.get("accessed_at", 0), name, key)
+                    for name, entries in root.items() for key, row in entries.items())
+    for _, name, key in oldest:
+        total -= root[name].pop(key).get("size_bytes", 0)
+        if total <= TTL_CACHE_MAX_BYTES:
+            break
+
+
+def metadata_cache_stats() -> dict[str, int]:
+    """Numeric retained estimates only; never keys, values or deep heap walks."""
+    result = {}
+    for name, root, lock in (("search", search_result_cache, search_result_cache_lock),
+                             ("detail", detail_result_cache, detail_result_cache_lock),
+                             ("embedding", recommendation_embedding_cache, recommendation_embedding_lock)):
+        if not lock.acquire(blocking=False):
+            continue
+        try:
+            result[name + "Entries"] = sum(map(len, root.values()))
+            result[name + "EstimatedBytes"] = sum(row.get("size_bytes", 0) for entries in root.values() for row in entries.values())
+        finally:
+            lock.release()
+    return result
+
+
 def retained_size(value: Any) -> int:
     """Count Python objects once, including nested containers."""
     seen: set[int] = set()
@@ -83,13 +114,40 @@ def _prune_cache(entries: dict, now: float) -> None:
         total -= entries.pop(oldest).get("size_bytes", 0)
 
 
+def prune_expired_runtime_caches(now: float | None = None) -> None:
+    """Release disposable metadata even when its namespace is never revisited.
+
+    Audio bytes, pinned streams and in-flight work have separate lifetimes and
+    are deliberately not part of this sweep.
+    """
+    now = time.time() if now is None else now
+    for root, lock in ((search_result_cache, search_result_cache_lock),
+                       (detail_result_cache, detail_result_cache_lock),
+                       (recommendation_embedding_cache, recommendation_embedding_lock)):
+        with lock:
+            _prune_root(root, now)
+    with recommendation_track_details_lock:
+        _prune_cache(recommendation_track_details_cache, now)
+    with home_candidates_lock:
+        if home_candidates_cache.get("expires_at", 0) <= now:
+            home_candidates_cache.update(expires_at=0.0, results=[])
+    # Imports stay lazy: constructing a cache must not construct a server.
+    from .session_store import prune_expired_memory_sessions
+    from ..search.service import prune_search_memory
+    prune_expired_memory_sessions(now)
+    prune_search_memory(now)
+    from ..memory_runtime import memory_tick
+    memory_tick()
+
+
 def lookup_ttl_cache(cache_root, lock: Lock, namespace: str, key: str):
     now = time.time()
     with lock:
+        _prune_root(cache_root, now)
         namespace_cache = cache_root.get(namespace) or {}
-        _prune_cache(namespace_cache, now)
         cached = namespace_cache.get(key)
         if cached and cached.get("expires_at", 0) > now:
+            cached["accessed_at"] = time.monotonic()
             return cached.get("value")
         if cached:
             namespace_cache.pop(key, None)
@@ -108,8 +166,9 @@ def store_ttl_cache(cache_root, lock: Lock, namespace: str, key: str, value, ttl
             "value": value,
             "expires_at": time.time() + ttl_seconds,
             "size_bytes": size_bytes,
+            "accessed_at": time.monotonic(),
         }
-        _prune_cache(namespace_cache, time.time())
+        _prune_root(cache_root, time.time())
 
 
 def clear_ttl_namespace(cache_root, lock: Lock, namespace: str) -> None:

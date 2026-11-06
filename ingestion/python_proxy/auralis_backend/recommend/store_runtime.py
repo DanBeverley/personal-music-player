@@ -326,6 +326,10 @@ def init_recommendation_store(server: Any | None = None) -> Any:
                     "CREATE INDEX IF NOT EXISTS idx_catalog_entities_type_popularity "
                     "ON catalog_entities(entity_type, learned_popularity DESC, popularity DESC, updated_at DESC)"
                 )
+                connection.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_catalog_entities_artist "
+                    "ON catalog_entities(entity_type, display_artist, updated_at DESC)"
+                )
                 # Derived text index: no copied payloads or account data. Build
                 # once during store initialization, never during a Search read.
                 indexed = connection.execute(
@@ -395,6 +399,10 @@ def init_recommendation_store(server: Any | None = None) -> Any:
                 connection.execute(
                     "CREATE INDEX IF NOT EXISTS idx_catalog_entity_sources_source "
                     "ON catalog_entity_sources(source_provider, source_key, confidence DESC)"
+                )
+                connection.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_catalog_entity_sources_key "
+                    "ON catalog_entity_sources(source_key, entity_type, entity_key)"
                 )
                 connection.execute(
                     """

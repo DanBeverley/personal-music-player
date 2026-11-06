@@ -16,9 +16,18 @@ services:
     volumes:
       - ./Caddyfile.web:/etc/caddy/Caddyfile:ro
       - ../../app/build/web:/srv:ro
+      - web_access_logs:/var/log/neatie
     depends_on:
       api:
         condition: service_healthy
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
     networks:
       - backend
+
+volumes:
+  web_access_logs:

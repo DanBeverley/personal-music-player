@@ -10,8 +10,7 @@ Map<String, dynamic> _track(String id) => {
     };
 
 void main() {
-  test('stall policy performs at most one bounded recovery per stall',
-      () {
+  test('stall policy performs at most one bounded recovery per stall', () {
     expect(
       playbackStallRecoveryAction(
         stalledFor: const Duration(seconds: 8),
@@ -126,8 +125,7 @@ void main() {
     );
   });
 
-  test('canonical playback routes through backend identity verification',
-      () {
+  test('canonical playback routes through backend identity verification', () {
     final track = {
       'track_key': 'recording:smoke on the water|deep purple',
       'videoId': '6YGQPGBD1uQ',

@@ -55,6 +55,7 @@ class DiscoveryShelves extends StatefulWidget {
       required this.active,
       required this.onOpenAlbum,
       required this.onLike,
+      this.onAddToPlaylist,
       required this.isLiked,
       this.region});
   final CatalogApi api;
@@ -62,6 +63,7 @@ class DiscoveryShelves extends StatefulWidget {
   final bool active;
   final ValueChanged<NewReleaseEntry> onOpenAlbum;
   final Future<void> Function(Map<String, dynamic>) onLike;
+  final Future<void> Function(Map<String, dynamic>)? onAddToPlaylist;
   final bool Function(Map<String, dynamic>) isLiked;
   final ChartRegion? region;
   @override
@@ -151,7 +153,7 @@ class _DiscoveryShelvesState extends State<DiscoveryShelves>
     }
   }
 
-  Future<void> _load(String key) async {
+  Future<void> _load(String key, {bool refresh = false}) async {
     if (!widget.active || !_wanted(key) || pending.contains(key)) return;
     timers.remove(key)?.cancel();
     final version = requestVersion;
@@ -163,7 +165,7 @@ class _DiscoveryShelvesState extends State<DiscoveryShelves>
     bool warming = false;
     try {
       if (key == 'releases') {
-        final value = await widget.api.newReleases();
+        final value = await widget.api.cachedNewReleases(refresh: refresh);
         if (!mounted ||
             version != requestVersion ||
             scope != widget.api.api.userScopeId ||
@@ -171,7 +173,7 @@ class _DiscoveryShelvesState extends State<DiscoveryShelves>
         setState(() => releases = value);
         warming = value.status == 'preparing' || value.status == 'stale';
       } else {
-        final value = await widget.api.charts(ChartQuery(country: key));
+        final value = await widget.api.cachedCharts(ChartQuery(country: key), refresh: refresh);
         if (!mounted ||
             version != requestVersion ||
             scope != widget.api.api.userScopeId ||
@@ -195,7 +197,7 @@ class _DiscoveryShelvesState extends State<DiscoveryShelves>
 
   void _retry(String key) {
     polls[key] = 0;
-    unawaited(_load(key));
+    unawaited(_load(key, refresh: true));
   }
 
   List<NewReleaseEntry> get releaseEntries =>
@@ -222,6 +224,7 @@ class _DiscoveryShelvesState extends State<DiscoveryShelves>
                   title: title,
                   initial: source == 'all' ? charts[country] : null,
                   onLike: widget.onLike,
+                  onAddToPlaylist: widget.onAddToPlaylist,
                   isLiked: widget.isLiked,
                   isActive: () => mounted && widget.active)));
     } finally {
@@ -268,11 +271,6 @@ class _DiscoveryShelvesState extends State<DiscoveryShelves>
                               onPressed: () => Navigator.pop(sheetContext),
                               icon: const Icon(Icons.close_rounded)),
                         ])),
-                    Text(
-                        snapshotLabel(
-                            releases?.generatedAt, releases?.status ?? ''),
-                        style: const TextStyle(
-                            color: NeatieDesign.muted, fontSize: 12)),
                     Expanded(
                         child: ListView.builder(
                             itemCount: entries.length,
@@ -480,17 +478,7 @@ class _DiscoveryShelvesState extends State<DiscoveryShelves>
                                                         fontSize: 12)),
                                               const SizedBox(height: 14),
                                               Row(children: [
-                                                Expanded(
-                                                    child: Text(
-                                                        snapshotLabel(
-                                                            snapshot
-                                                                ?.generatedAt,
-                                                            snapshot?.status ??
-                                                                ''),
-                                                        style: const TextStyle(
-                                                            fontSize: 10,
-                                                            color: NeatieDesign
-                                                                .muted))),
+                                                const Spacer(),
                                                 const Icon(
                                                     Icons.arrow_forward_rounded,
                                                     size: 18)
@@ -524,13 +512,6 @@ class _DiscoveryShelvesState extends State<DiscoveryShelves>
                             if (releaseScroll.hasClients)
                               releaseScroll.jumpTo(0);
                           })),
-                Text(
-                    releases == null
-                        ? 'Recent music · YouTube Music & ListenBrainz'
-                        : snapshotLabel(
-                            releases?.generatedAt, releases?.status ?? ''),
-                    style: const TextStyle(
-                        fontSize: 11, color: NeatieDesign.muted)),
               ]),
           const SizedBox(height: 16),
           if (releases?.refreshStatus == 'partial')

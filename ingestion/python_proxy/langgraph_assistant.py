@@ -212,35 +212,43 @@ def _musicbrainz_artist_search(query: str, limit: int = 5) -> List[Dict[str, Any
     return results
 
 
-def _duckduckgo_search(query: str, limit: int = 5, *, force_refresh: bool = False) -> List[Dict[str, Any]]:
+def _duckduckgo_search(query: str, limit: int = 5, *, force_refresh: bool = False, cache_only: bool = False) -> List[Dict[str, Any]]:
     query = (query or "").strip()
     if not query or DDGS is None:
         return []
     cache_key = f"{query.lower()}::{max(1, min(limit, 8))}"
     cached = _WEB_SEARCH_CACHE.get(cache_key)
     now = time.time()
+    for old,value in list(_WEB_SEARCH_CACHE.items()):
+        if value.get('expires_at',0) <= now:
+            _WEB_SEARCH_CACHE.pop(old,None)
     if (
         not force_refresh
         and cached
         and cached.get("expires_at", 0) > now
     ):
         return list(cached.get("results") or [])
+    if cache_only:
+        return []
     try:
-        with DDGS() as ddgs:
+        with DDGS(timeout=3) as ddgs:
             results = ddgs.text(query, max_results=max(1, min(limit, 8)))
             normalized = []
             for item in results or []:
                 normalized.append(
                     {
-                        "title": item.get("title"),
-                        "body": item.get("body"),
+                        "title": str(item.get("title") or '')[:180],
+                        "body": str(item.get("body") or '')[:1200],
                         "href": item.get("href"),
                     }
                 )
-            _WEB_SEARCH_CACHE[cache_key] = {
-                "results": normalized,
-                "expires_at": now + _WEB_SEARCH_CACHE_TTL_SECONDS,
-            }
+            if normalized:
+                if len(_WEB_SEARCH_CACHE) >= 128:
+                    _WEB_SEARCH_CACHE.pop(next(iter(_WEB_SEARCH_CACHE)),None)
+                _WEB_SEARCH_CACHE[cache_key] = {
+                    "results": normalized,
+                    "expires_at": now + _WEB_SEARCH_CACHE_TTL_SECONDS,
+                }
             return normalized
     except Exception:
         return []

@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 from contextvars import ContextVar
+from concurrent.futures import wait
 import time
 import requests
 
 from ytmusicapi import YTMusic
 
 from .server_adapter import adapt_search_server
+from .intelligence import search_query_key, search_title_aliases
 
 
 _search_http_deadline: ContextVar[float | None] = ContextVar("search_http_deadline", default=None)
@@ -34,11 +36,11 @@ class CompatibleYTMusic(YTMusic):
         return requests_session if isinstance(requests_session, requests.Session) else _ProviderSession()
 
     def search(self, *args, **kwargs):
-        token = _search_http_deadline.set(time.monotonic() + 2.0)
-        try:
-            return super().search(*args, **kwargs)
-        finally:
-            _search_http_deadline.reset(token)
+        # ytmusicapi returns a complete first shelf even with limit=1. Avoid
+        # continuation requests here: a failed later page must not discard it.
+        if kwargs.pop('first_page_only', False):
+            kwargs['limit'] = 1
+        return super().search(*args, **kwargs)
 
     def get_search_suggestions(self, *args, **kwargs):
         token = _search_http_deadline.set(time.monotonic() + 0.8)
@@ -85,6 +87,7 @@ def _search_cache_key(server: Any, query: str, limit: int) -> str:
 
 
 def normalize_song_result(server: Any, entry: Optional[Dict[str, Any]]):
+    from ..domain.catalog import artist_credit
     server = adapt_search_server(server)
     if not entry:
         return None
@@ -134,7 +137,8 @@ def normalize_song_result(server: Any, entry: Optional[Dict[str, Any]]):
             or entry.get("duration")
         ),
         "thumbnail": server.extract_thumbnail(entry),
-        "channel": server.extract_artist(entry),
+        "channel": artist_credit(server.extract_artist(entry), entry.get("artist"),
+                                 entry.get("channel"), primary_artist.get("name")),
         "artist_id": primary_artist.get("id"),
         "artist_ids": [
             artist.get("id")
@@ -155,6 +159,7 @@ def normalize_song_result(server: Any, entry: Optional[Dict[str, Any]]):
         "provider": "ytmusic",
         "source_provider": "youtube",
         "source_name": "ytmusic",
+        "title_aliases": search_title_aliases(entry),
     }
 
 
@@ -162,8 +167,21 @@ def ytmusic_song_search(server: Any, query: str, limit: int, *, first_page_only:
     server = adapt_search_server(server)
     results = []
     seen = set()
+    deadline = time.monotonic() + 2.0
 
-    def add_entry(entry):
+    def submit(kind):
+        def lookup():
+            token = _search_http_deadline.set(deadline)
+            try:
+                return server.ytmusic.search(query, filter=kind, limit=limit)
+            finally:
+                _search_http_deadline.reset(token)
+        return server.submit_search_upstream(lookup, deadline=deadline)
+
+    def add_entry(entry, kind, rank):
+        result_type = str(entry.get("resultType") or entry.get("type") or "").lower()
+        if result_type and result_type not in {"song", "video"}:
+            return
         normalized = normalize_song_result(server, entry)
         if not normalized:
             return
@@ -171,32 +189,41 @@ def ytmusic_song_search(server: Any, query: str, limit: int, *, first_page_only:
         if not track_id or track_id in seen:
             return
         seen.add(track_id)
+        normalized.update(search_provider_kind=kind, search_provider_rank=rank,
+                          search_provider_query=search_query_key(query))
         results.append(normalized)
 
-    raw_results = server.search_upstream_call_with_retry(
-        lambda: server.ytmusic.search(query, filter="songs", limit=limit),
-        default=[],
-    )
-
-    for entry in raw_results:
-        add_entry(entry)
-        if len(results) >= limit:
-            return results
-
-    if len(results) < limit and not (first_page_only and results):
-        fallback_results = server.search_upstream_call_with_retry(
-            lambda: server.ytmusic.search(query, limit=max(limit * 3, 12)),
-            default=[],
-        )
-
-        for entry in fallback_results:
-            result_type = (entry.get("resultType") or entry.get("type") or "").lower()
-            if result_type and result_type not in {"song", "video"}:
-                continue
-            add_entry(entry)
-            if len(results) >= limit:
-                break
-
+    futures = {kind: submit(kind) for kind in ("songs", "videos")}
+    active = [future for future in futures.values() if future is not None]
+    if active:
+        wait(active, timeout=max(0.0, deadline - time.monotonic()))
+    shelves = {}
+    missing = []
+    for kind, future in futures.items():
+        shelves[kind] = []
+        if future is not None:
+            if future.done() and not future.cancelled():
+                try:
+                    shelves[kind] = list(future.result() or [])[:limit]
+                except Exception:
+                    missing.append(kind)
+            else:
+                future.cancel()  # Running calls retain admission until completion.
+                missing.append(kind)
+        else:
+            missing.append(kind)
+    # Interleave before any downstream cap, so a full songs shelf cannot erase
+    # video originals. Ranking, not this merge, decides the best recording.
+    for index in range(max(map(len, shelves.values()), default=0)):
+        for kind, entries in shelves.items():
+            if index < len(entries):
+                add_entry(entries[index], kind, index + 1)
+    if not results and missing:
+        raise TimeoutError("Typed search did not complete")
+    from .intelligence import link_provider_title_aliases
+    link_provider_title_aliases(results)
+    for result in results:
+        result["search_provider_missing"] = missing
     return results
 
 
@@ -242,7 +269,7 @@ def ytdlp_song_search(server: Any, query: str, limit: int):
     return results
 
 
-def search_artists_direct(server: Any, query: str, limit: int):
+def search_artists_direct(server: Any, query: str, limit: int, *, force_refresh: bool = False):
     server = adapt_search_server(server)
     query = (query or "").strip()
     if not query:
@@ -250,7 +277,7 @@ def search_artists_direct(server: Any, query: str, limit: int):
     cache_key = _search_cache_key(server, query, limit)
     from .cache_runtime import lookup_search_result, store_search_result
 
-    cached = lookup_search_result("artists_direct", cache_key)
+    cached = None if force_refresh else lookup_search_result("artists_direct", cache_key)
     if cached:
         return [dict(item) for item in cached]
 

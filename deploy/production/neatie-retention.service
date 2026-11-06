@@ -1,0 +1,17 @@
+[Unit]
+Description=Bounded reference-aware Neatie retention
+After=neatie-backup.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/neatie/current/deploy/production/runtime_maintenance.py
+Nice=15
+IOSchedulingClass=idle
+CPUQuota=50%
+MemoryMax=768M
+TimeoutStartSec=180
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/neatie/runtime
+PrivateTmp=true
+UMask=0077

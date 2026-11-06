@@ -22,10 +22,10 @@ from auralis_backend.home_feed.contracts import (  # noqa: E402
 )
 from auralis_backend.discovery.radio_inventory import (  # noqa: E402
     ArtistRadioInventory,
-    merge_radio_reservoirs,
     select_radio_rotation,
 )
 from auralis_backend.discovery.inventory import (  # noqa: E402
+    CandidateInventory,
     canonicalize_candidate_pools,
 )
 from auralis_backend.discovery.config import ROW_RECIPES  # noqa: E402
@@ -37,11 +37,13 @@ from auralis_backend.discovery.schema import (  # noqa: E402
     TasteProfile,
 )
 from auralis_backend.home_feed.composer import (  # noqa: E402
+    _earned_row_kinds,
     _meaningfully_differs,
     _successor_novelty,
     _preserve_complete_optional_rows,
     artifact_exposure_entries,
 )
+from auralis_backend.home_feed import composer as home_composer  # noqa: E402
 from auralis_backend.storage.artist_artwork import artist_artwork_token  # noqa: E402
 from auralis_backend.home_feed.bundles import (  # noqa: E402
     build_feed_bundle_manifest,
@@ -212,9 +214,10 @@ def _radio_card(index: int, *, discovery: bool) -> dict:
         "id": f"radio:{identity}",
         "seed_artist_identity": identity,
         "seed_affinity": "exploratory" if discovery else "direct",
-        "thumbnail": f"/artist_artwork/{index}",
-        "collage_images": [f"/artist_artwork/{index}"],
-        "tracks": [{"id": f"track:{index}:{track}"} for track in range(12)],
+        "thumbnail": f"/artist_artwork/{artist_artwork_token(identity)}",
+        "collage_images": [f"/artist_artwork/{artist_artwork_token(identity)}"],
+        "tracks": [{"id": f"track:{index}:{track}", "title": f"Work {track}",
+                    "artist": f"Artist {index}", "playable": True} for track in range(12)],
     }
 
 
@@ -224,7 +227,8 @@ def _radio_mix(index: int) -> dict:
         "radio_mode": "multi_artist_mix",
         "seed_artist_identity": f"mix:{index}",
         "seed_artist_identities": [f"artist:{index}", f"artist:{index + 100}"],
-        "collage_images": [f"/artist_artwork/{index}", f"/artist_artwork/{index + 100}"],
+        "collage_images": [f"/artist_artwork/{artist_artwork_token(f'artist:{value}')}"
+                           for value in (index, index + 100)],
     })
     return card
 
@@ -233,7 +237,8 @@ def _qualified_rotation_card(index: int, *, discovery: bool = False) -> dict:
     identity = f"musicbrainz:artist:{index}"
     token = artist_artwork_token(identity)
     artwork = f"/artist_artwork/{token}"
-    tracks = [{"id": f"rotation-track:{index}:{track}"} for track in range(12)]
+    tracks = [{"id": f"rotation-track:{index}:{track}", "title": f"Work {track}",
+               "artist": f"Artist {index}", "playable": True} for track in range(12)]
     return {
         "id": f"radio:artist:{identity}",
         "seed_artist_identity": identity,
@@ -263,6 +268,65 @@ def _qualified_rotation_mix(index: int, left: dict, right: dict) -> dict:
         "tracks": tracks,
         "items": tracks,
     }
+
+
+def test_radio_merges_source_metadata_before_admitting_retained_tracks():
+    from auralis_backend.discovery.radio_inventory import _merge_radio_tracks
+    known = {'id': 'recording:known', 'videoId': '347vCib_lMs', 'title': 'Purple Rain',
+             'artist': 'Prince', 'playable': True}
+    unknown = {'id': 'youtube:347vCib_lMs', 'title': 'Unknown Track',
+               'artist': 'Unknown Artist', 'playable': True}
+    unrelated = {'id': 'another-source', 'title': 'Unknown Track', 'artist': 'Unknown Artist', 'playable': True}
+    for entries in ([unknown, known, unrelated], [known, unknown, unrelated]):
+        tracks = _merge_radio_tracks(entries)
+        assert len(tracks) == 1
+        assert tracks[0]['title'] == 'Purple Rain'
+        assert tracks[0]['artist'] == 'Prince'
+    credit_from_channel = {key: value for key, value in known.items() if key != 'artist'}
+    credit_from_channel['channel'] = 'Prince'
+    assert _merge_radio_tracks([unknown, credit_from_channel])[0]['artist'] == 'Prince'
+    second_source = {**known, 'videoId': 'other-source', 'id': 'another-id'}
+    assert len(_merge_radio_tracks([known, second_source])) == 1
+
+
+def test_persisted_radio_publication_rejects_placeholder_or_duplicate_source():
+    from copy import deepcopy
+    cards = [_radio_mix(0), _radio_mix(1)] + [_radio_card(i + 2, discovery=i < 3) for i in range(10)]
+    unknown = deepcopy(cards)
+    unknown[0]['tracks'][0]['title'] = 'Unknown Track'
+    assert any('metadata_incomplete' in reason for reason in evaluate_popular_radio_contract(unknown).violations)
+    duplicate = deepcopy(cards)
+    duplicate[0]['tracks'][1]['videoId'] = duplicate[0]['tracks'][0]['id']
+    assert any('source_duplicate' in reason for reason in evaluate_popular_radio_contract(duplicate).violations)
+
+
+@pytest.mark.parametrize('has_repair', [False, True])
+def test_radio_index_rewrites_contaminated_global_rows(tmp_path, monkeypatch, has_repair):
+    import json
+    import sqlite3
+    from auralis_backend.discovery import radio_inventory as module
+    path = tmp_path / 'radio.sqlite'
+    def connect(_server):
+        connection = sqlite3.connect(path)
+        connection.row_factory = sqlite3.Row
+        return connection
+    connection = connect(None)
+    connection.execute('CREATE TABLE recommendation_feature_store(namespace TEXT, entity_id TEXT, model_id TEXT, payload_json TEXT, updated_at REAL, PRIMARY KEY(namespace, entity_id))')
+    seed = 'provider:artist:a'
+    unknown = {'id': 'youtube:347vCib_lMs', 'title': 'Unknown Track', 'artist': 'Unknown Artist', 'playable': True}
+    payload = {'version': module.RADIO_CATALOG_INDEX_VERSION, 'seed_key': seed, 'cache_identity': seed, 'tracks': [unknown]}
+    connection.execute('INSERT INTO recommendation_feature_store VALUES(?,?,?,?,?)',
+        [module.RADIO_CATALOG_INDEX_NAMESPACE, f'global:{seed}', 'test', json.dumps(payload), 1])
+    connection.commit(); connection.close()
+    monkeypatch.setattr(module, 'open_recommendation_store_connection', connect)
+    known = {'id': 'recording:known', 'videoId': '347vCib_lMs', 'title': 'Purple Rain', 'artist': 'Prince', 'playable': True}
+    repaired = module._load_radio_catalog_index(None, 'account:a', {seed: [known] if has_repair else []})
+    assert len(repaired[seed]) == int(has_repair)
+    connection = connect(None)
+    rows = connection.execute('SELECT payload_json FROM recommendation_feature_store').fetchall()
+    connection.close()
+    assert len(rows) == 1
+    assert json.loads(rows[0]['payload_json'])['tracks'] == repaired[seed]
 
 
 def test_incomplete_radio_replacement_cannot_copy_the_accepted_parent_row() -> None:
@@ -325,6 +389,117 @@ def test_feed_contract_has_one_ordered_core_and_explicit_earned_policy() -> None
 
     wrong_order = evaluate_feed_contract(list(reversed(_core_rows())))
     assert "row_order_invalid" in wrong_order.violations
+
+
+@pytest.mark.parametrize("count, expected", [(0, False), (1, False), (7, False), (8, True)])
+def test_last_played_is_earned_only_when_builder_minimum_is_met(count, expected) -> None:
+    taste = TasteProfile(
+        user_scope_id="user-1",
+        profile_key="profile-1",
+        signal_tier="known",
+        last_played_tracks=[{"id": f"track-{index}"} for index in range(count)],
+    )
+
+    assert ("last_played" in _earned_row_kinds(taste)) is expected
+
+
+@pytest.mark.parametrize("count, expected", [(0, False), (7, False), (8, True)])
+def test_frequently_listened_earned_threshold_matches_builder(count, expected) -> None:
+    taste = TasteProfile(
+        user_scope_id="user-1",
+        profile_key="profile-1",
+        signal_tier="known",
+        frequent_tracks=[{"id": f"track-{index}"} for index in range(count)],
+    )
+
+    assert ("frequently_listened" in _earned_row_kinds(taste)) is expected
+
+
+def test_because_you_played_remains_earned_on_any_builder_anchor() -> None:
+    taste = TasteProfile(
+        user_scope_id="user-1",
+        profile_key="profile-1",
+        signal_tier="known",
+        recent_tracks=[{"id": "one-anchor"}],
+    )
+
+    assert "because_you_played" in _earned_row_kinds(taste)
+
+
+@pytest.mark.parametrize("history_count, expected_accepted", [(7, True), (8, True)])
+def test_sparse_last_played_composition_skips_earned_requirement_below_minimum(
+    monkeypatch, history_count, expected_accepted
+) -> None:
+    # Keep the production composer and its final contract check intact while
+    # supplying deterministic complete core rows from the row-builder seam.
+    rows = [
+        DiscoveryRow(
+            id=kind,
+            title=kind,
+            kind=kind,
+            item_type="track",
+            items=items,
+        )
+        for kind, items in (
+            ("todays_pick", [{"id": f"daily-{index}"} for index in range(6)]),
+            ("featured_new_albums", [{"id": f"album-{index}"} for index in range(4)]),
+            ("made_for_you", [{"id": f"mix-{index}"} for index in range(5)]),
+            ("recommended_artists", [{"id": f"artist-{index}"} for index in range(10)]),
+            ("quiet_picks", [{"id": f"quiet-{index}"} for index in range(20)]),
+        )
+    ]
+    if history_count == 8:
+        # Eight raw history records can collapse to five distinct playable
+        # items after identity and source eligibility checks.
+        rows.append(
+            DiscoveryRow(
+                id="last_played",
+                title="last_played",
+                kind="last_played",
+                item_type="track",
+                items=[{"id": f"eligible-{index}"} for index in range(5)],
+            )
+        )
+    monkeypatch.setattr(
+        home_composer,
+        "build_rows_from_pools",
+        lambda *_args: (rows, {}, {}, {}),
+    )
+    monkeypatch.setattr(
+        home_composer,
+        "evaluate_quality",
+        lambda **_kwargs: (True, [], "accepted"),
+    )
+    taste = TasteProfile(
+        user_scope_id="user-1",
+        profile_key="profile-1",
+        signal_tier="known",
+        last_played_tracks=[
+            {"id": f"played-{index % 5}"} for index in range(history_count)
+        ],
+    )
+    candidate = CandidateInventory(
+        user_scope_id="user-1",
+        profile_fingerprint="profile-1",
+        generated_at=100,
+        expires_at=1000,
+        generation_id="candidate-1",
+        coverage={"ready": True},
+    )
+
+    artifact = home_composer.compose_snapshot_artifact(
+        taste=taste,
+        candidate=candidate,
+        radio=None,
+        prior_artifacts=[],
+        rotation_epoch=0,
+        reason="test",
+        now=200,
+    )
+
+    assert artifact.accepted is expected_accepted
+    assert "last_played" not in [row.kind for row in artifact.rows]
+    assert "required_row_missing:last_played" not in artifact.quality_reasons
 
 
 def test_independent_rows_are_strict_when_present_and_reuse_is_bounded() -> None:
@@ -478,40 +653,6 @@ def test_radio_rotation_orders_newly_verified_cards_before_older_cards() -> None
     assert timestamps == sorted(timestamps, reverse=True)
 
 
-def test_radio_reservoir_merge_preserves_original_first_verified_time() -> None:
-    existing_card = {
-        **_qualified_rotation_card(1, discovery=True),
-        "first_verified_at": 10.0,
-        "last_verified_at": 10.0,
-    }
-    incoming_card = {
-        **existing_card,
-        "first_verified_at": 20.0,
-        "last_verified_at": 20.0,
-    }
-    existing = ArtistRadioInventory(
-        user_scope_id="user-1",
-        profile_fingerprint="profile-1",
-        generated_at=10,
-        expires_at=1_000,
-        generation_id="existing",
-        cards=[existing_card],
-        reservoir_cards=[existing_card],
-    )
-    incoming = ArtistRadioInventory(
-        user_scope_id="user-1",
-        profile_fingerprint="profile-1",
-        generated_at=20,
-        expires_at=1_000,
-        generation_id="incoming",
-        cards=[incoming_card],
-        reservoir_cards=[incoming_card],
-    )
-
-    merged = merge_radio_reservoirs(existing, incoming)
-
-    assert merged.reservoir_cards[0]["first_verified_at"] == 10.0
-    assert merged.reservoir_cards[0]["last_verified_at"] == 20.0
 
 
 def test_radio_rotation_counts_only_unfamiliar_artists_as_discovery() -> None:
@@ -587,7 +728,11 @@ def test_radio_rotation_prefers_cards_absent_from_current_feed_even_when_all_wer
     # selector still prefers identities absent from the active row and may
     # now replace more than the previous fixed eight-card expectation.
     assert len(selected_ids - active_ids) >= 8
-    assert selected.diagnostics["novel_identity_count"] >= 8
+    selected_artists = {card["seed_artist_identity"] for card in selected.cards
+                        if card.get("radio_mode") != "multi_artist_mix"}
+    assert selected.diagnostics["novel_identity_count"] == len(
+        selected_artists - {card["seed_artist_identity"] for card in cards[:13]}
+    ) == 7
     assert selected.diagnostics["fresh_rotation"] is True
 
 
@@ -684,6 +829,31 @@ def test_successor_novelty_measures_only_the_initial_visible_page() -> None:
 
     assert novelty["accepted"] is False
     assert novelty["new_visible_identities"] == 0
+
+
+def test_small_changes_cannot_promote_a_mostly_recycled_home():
+    previous = _artifact_with_rows('before', unchanged_radio=True)
+    from copy import deepcopy
+    candidate = deepcopy(previous)
+    for row in candidate.rows:
+        if row.kind in {'recommended_albums', 'recommended_artists'}:
+            for index, item in enumerate(row.items):
+                if index < 2:
+                    item['id'] = f'new-{row.kind}-{index}'
+    assert not _successor_novelty(previous, candidate)['accepted']
+
+
+def test_mix_freshness_measures_recordings_not_permanent_card_id():
+    from copy import deepcopy
+    previous = _artifact_with_rows('before', unchanged_radio=True)
+    previous.rows = [DiscoveryRow(id='made_for_you', title='Mixes', kind='made_for_you',
+        item_type='mix', items=[{'id':'daily_mix_1', 'tracks':[{'id':f'old-{i}'} for i in range(8)]}])]
+    candidate = deepcopy(previous)
+    candidate.rows[0].items[0]['tracks'] = [{'id':f'new-{i}'} for i in range(8)]
+    assert _successor_novelty(previous, candidate)['accepted']
+    candidate.rows[0].items[0]['tracks'] = [{'id':f'old-{i}'} for i in range(8)]
+    candidate.rows[0].items[0]['id'] = 'renamed_mix'
+    assert not _successor_novelty(previous, candidate)['accepted']
 
 
 def test_snapshot_and_artifact_ttls_have_distinct_generation_and_serving_rules() -> None:

@@ -121,6 +121,7 @@ class RowRequirement(str, Enum):
 
 class HomeJobType(str, Enum):
     RECONCILE_INTERACTION = "reconcile_interaction"
+    RECONCILE_SUPPLY = "reconcile_supply"
     REFRESH_CANDIDATES = "refresh_candidates"
     REFRESH_RADIO = "refresh_radio"
     REPAIR_ARTWORK = "repair_artwork"
@@ -225,7 +226,8 @@ def evaluate_feed_contract(
     """Evaluate the one final feed-level row contract.
 
     Row-specific semantic/playability checks remain inputs to the row builders.
-    This function owns only presence, order, cardinality, and explicit reuse.
+    This function owns presence, order, cardinality, explicit reuse and the
+    final cross-shelf album identity invariant after optional row restoration.
     """
 
     earned = {str(value).strip() for value in earned_row_kinds if str(value).strip()}
@@ -248,6 +250,15 @@ def evaluate_feed_contract(
         violations.append("row_order_invalid")
 
     row_by_kind = {str(row.get("kind") or "").strip(): row for row in rows}
+    from ..discovery.ranking import _album_identity_keys
+    featured_keys: set[str] = set()
+    for item in row_by_kind.get('featured_new_albums', {}).get('items') or []:
+        if isinstance(item, Mapping):
+            featured_keys.update(_album_identity_keys(item))
+    for item in row_by_kind.get('recommended_albums', {}).get('items') or []:
+        if isinstance(item, Mapping) and _album_identity_keys(item) & featured_keys:
+            violations.append('album_cross_shelf_duplicate')
+            break
     for contract in HOME_ROW_CONTRACTS:
         required = contract.requirement is RowRequirement.CORE or (
             contract.requirement is RowRequirement.EARNED and contract.kind in earned
@@ -462,6 +473,7 @@ class HomeStateRecord:
     active_version: int = 0
     revision: int = 0
     last_launch_token: str = ""
+    active_since: float = 0.0
     updated_at: float = 0.0
 
     def __post_init__(self) -> None:

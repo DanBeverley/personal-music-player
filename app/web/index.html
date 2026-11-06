@@ -26,7 +26,7 @@
     #welcome i { width: 3px; height: 12px; border-radius: 3px; background: #ceddbb; }
     @media (prefers-reduced-motion: no-preference) {
       #welcome { animation: appear .7s ease-out; }
-      #welcome.leaving { animation: none; transition: opacity .8s ease-in-out; }
+      #welcome.leaving { animation: none; transition: opacity .18s ease-out; }
       #welcome i { animation: listen 1.4s ease-in-out infinite alternate; }
       #welcome i:nth-child(2) { animation-delay: -.7s; }
       #welcome i:nth-child(3) { animation-delay: -.3s; }
@@ -45,22 +45,14 @@
   </div>
   <script>
     (() => {
-      let released = false, escape;
-      function reveal(reason) {
-        if (released) return;
-        released = true;
-        clearTimeout(escape);
+      window.addEventListener('flutter-first-frame', () => {
+        performance.mark('neatie:flutter-first-frame');
         const welcome = document.getElementById('welcome');
         if (!welcome) return;
-        welcome.dataset.release = reason;
+        welcome.dataset.release = 'first-frame';
         welcome.classList.add('leaving');
         setTimeout(() => welcome.remove(),
-          matchMedia('(prefers-reduced-motion: reduce)').matches ? 0 : 850);
-      }
-      window.addEventListener('neatie-home-painted', () => reveal('home-painted'));
-      window.addEventListener('flutter-first-frame', () => {
-        // A missing/offline feed must leave Search, account and Retry usable.
-        if (!released) escape = setTimeout(() => reveal('feed-unavailable'), 12000);
+          matchMedia('(prefers-reduced-motion: reduce)').matches ? 0 : 200);
       }, {once: true});
     })();
   </script>

@@ -57,7 +57,9 @@ class SearchHistory {
       if (query.isEmpty ||
           query.length > 200 ||
           time <= clearedAt ||
-          hidden.contains(key(query))) continue;
+          hidden.contains(key(query))) {
+        continue;
+      }
       final prior = combined[key(query)];
       if (prior != null && (prior['selected_at'] as num) >= time) {
         if (prior['track'] != null || entry['track'] is! Map) continue;

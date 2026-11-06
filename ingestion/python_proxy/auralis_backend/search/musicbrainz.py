@@ -6,6 +6,7 @@ import re
 import threading
 import time
 import unicodedata
+from difflib import SequenceMatcher
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -202,15 +203,11 @@ def _aliases_from_payload(payload: Dict[str, Any], *, query: str = "") -> List[s
         if text and text not in aliases:
             aliases.append(text)
 
-    add(query)
-    for key in ("name", "title", "sort-name", "disambiguation"):
+    for key in ("name", "title", "sort-name"):
         add(payload.get(key))
     for alias in payload.get("aliases") or []:
         if isinstance(alias, dict):
             add(alias.get("name") or alias.get("sort-name"))
-    for tag in payload.get("tags") or []:
-        if isinstance(tag, dict):
-            add(tag.get("name"))
     return aliases
 
 
@@ -225,7 +222,6 @@ def _recording_aliases(recording: Dict[str, Any], *, query: str = "") -> List[st
     title = _text(recording.get("title"))
     artist = _artist_credit_name(recording.get("artist-credit"))
     album_fields = _recording_release_fields(recording)
-    add(query)
     add(title)
     if title and artist:
         add(f"{artist} {title}")
@@ -235,9 +231,6 @@ def _recording_aliases(recording: Dict[str, Any], *, query: str = "") -> List[st
     for alias in recording.get("aliases") or []:
         if isinstance(alias, dict):
             add(alias.get("name") or alias.get("sort-name"))
-    for tag in recording.get("tags") or []:
-        if isinstance(tag, dict):
-            add(tag.get("name"))
     return aliases
 
 
@@ -271,6 +264,9 @@ def musicbrainz_recording_to_item(
         "musicbrainz_recording_id": mbid,
         "musicbrainz_artist_id": artist_ids[0] if artist_ids else "",
         "musicbrainz_artist_ids": artist_ids,
+        "musicbrainz_artist_names": list(dict.fromkeys(_text(credit.get("name") or (credit.get("artist") or {}).get("name"))
+            for credit in recording.get("artist-credit") or [] if isinstance(credit, dict)))[:16],
+        "isrcs": list(dict.fromkeys(_text(value) for value in recording.get("isrcs") or [] if _text(value)))[:16],
         "musicbrainz_release_id": release["release_id"],
         "musicbrainz_release_group_id": release["release_group_id"],
         "musicbrainz_release_candidates": list(
@@ -285,6 +281,9 @@ def musicbrainz_recording_to_item(
         "first_release_date": _text(recording.get("first-release-date")),
         "duration": int(float(recording.get("length") or 0) / 1000.0),
         "aliases": aliases,
+        "title_aliases": [alias.get("name") or alias.get("sort-name")
+                          for alias in recording.get("aliases") or []
+                          if isinstance(alias, dict) and (alias.get("name") or alias.get("sort-name"))],
         "popularity": max(0.0, min(score, 1.0)),
         "musicbrainz_score": score,
         "catalog_verified": True,
@@ -470,6 +469,15 @@ class MusicBrainzClient:
         if not isinstance(recordings, list):
             return []
         return [recording for recording in recordings if isinstance(recording, dict)]
+
+    def search_works(self, query: str, *, limit: int = 5) -> List[Dict[str, Any]]:
+        payload = self._get_json("work", {"query": query, "fmt": "json", "limit": min(limit, 10)})
+        return [row for row in payload.get("works") or [] if isinstance(row, dict)]
+
+    def lookup_work(self, work_id: str) -> Dict[str, Any]:
+        if not re.fullmatch(r"[0-9a-fA-F-]{36}", work_id):
+            return {}
+        return self._get_json(f"work/{work_id}", {"inc": "aliases+recording-rels+artist-credits", "fmt": "json"})
 
     def lookup_recordings(
         self,
@@ -804,6 +812,75 @@ def search_musicbrainz_recording_items(
         for item in items
         if _text(item.get("title")) and _text(item.get("artist"))
     ]
+
+
+def search_musicbrainz_work_recording_items(query: str, *, deadline: float,
+                                          force_refresh: bool = False,
+                                          cached_only: bool = False,
+                                          client: MusicBrainzClient | None = None) -> List[Dict[str, Any]]:
+    """Recover credited performances through provider-owned work aliases.
+
+    A work title is shared by its performances; performer IDs and version
+    attributes remain recording-specific. Absence of a cover flag is not an
+    assertion that a recording is original.
+    """
+    from .cache_runtime import lookup_search_result, store_search_result
+    key = "work1::" + _identity_text(query)
+    cached = None if force_refresh else lookup_search_result("musicbrainz_work", key)
+    if cached is not None:
+        return [dict(row) for row in cached]
+    if cached_only:
+        return []
+    if deadline - time.perf_counter() < .15:
+        raise TimeoutError("Work recovery deadline")
+    resolved = client or MusicBrainzClient(timeout_seconds=min(1.8, deadline - time.perf_counter()))
+    works = resolved.search_works(query, limit=5)
+    needle = _identity_text(query)
+
+    def relevance(work):
+        values = [_identity_text(value) for value in _aliases_from_payload(work)]
+        return max((.96 if len(needle) >= 5 and needle in value else
+                    SequenceMatcher(None, needle, value).ratio() for value in values), default=0)
+
+    works = [work for work in works if relevance(work) >= .78]
+    works.sort(key=lambda work: (bool(work.get("iswcs")), relevance(work),
+                                float(work.get("score") or 0)), reverse=True)
+    rows = []
+    for work in works[:2]:
+        remaining = deadline - time.perf_counter()
+        if remaining < .15:
+            break
+        lookup = client or MusicBrainzClient(timeout_seconds=min(1.8, remaining))
+        detail = lookup.lookup_work(_text(work.get("id")))
+        if detail.get("id") != work.get("id"):
+            continue
+        aliases = list(dict.fromkeys([*_aliases_from_payload(work), *_aliases_from_payload(detail)]))[:32]
+        for relation in detail.get("relations") or []:
+            if not isinstance(relation, dict):
+                continue
+            if relation.get("type") != "performance" or relation.get("target-type") != "recording":
+                continue
+            recording = relation.get("recording") or {}
+            if not recording.get("id") or not _artist_credit_ids(recording.get("artist-credit")):
+                continue
+            item = musicbrainz_recording_to_item(recording)
+            attributes = sorted(set(relation.get("attributes") or []))
+            if set(attributes) & {"medley", "partial"}:
+                continue  # A fragment of a work is not an alternate title of the recording.
+            actual_title = _identity_text(item["title"])
+            if not any((len(value) >= 5 and value in actual_title)
+                       or SequenceMatcher(None, value, actual_title).ratio() >= .85
+                       for value in map(_identity_text, aliases)):
+                continue
+            item.update(title_aliases=list(dict.fromkeys([*item["title_aliases"], *aliases]))[:32],
+                        musicbrainz_score=relevance(work), musicbrainz_work_id=detail["id"],
+                        recording_work_attributes=attributes, recording_work_evidence=True)
+            rows.append(item)
+        if rows:
+            break  # One coherent work; never transfer aliases to another work.
+    if rows:
+        store_search_result("musicbrainz_work", key, rows[:40], ttl_seconds=3600)
+    return rows[:40]
 
 
 def search_musicbrainz_artist_items(

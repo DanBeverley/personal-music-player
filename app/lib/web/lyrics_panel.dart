@@ -6,8 +6,18 @@ import 'web_player.dart';
 
 /// Presentation for Android's existing /lyrics contract; shares the live player.
 class LyricsPanel extends StatefulWidget {
-  const LyricsPanel({super.key, required this.player});
+  const LyricsPanel(
+      {super.key,
+      required this.player,
+      this.onClose,
+      this.onAsk,
+      this.active = true,
+      this.minimalHeader = false});
   final WebPlayer player;
+  final VoidCallback? onClose;
+  final VoidCallback? onAsk;
+  final bool active;
+  final bool minimalHeader;
   @override
   State<LyricsPanel> createState() => _LyricsPanelState();
 }
@@ -30,10 +40,12 @@ class _LyricsPanelState extends State<LyricsPanel> {
   void initState() {
     super.initState();
     widget.player.addListener(_changed);
+    widget.player.progress.addListener(_changed);
     unawaited(_load());
   }
 
   void _changed() {
+    if (!widget.active) return;
     if (currentKey != selected) {
       unawaited(_load());
       return;
@@ -58,10 +70,14 @@ class _LyricsPanelState extends State<LyricsPanel> {
   }
 
   void _scroll() {
-    if (!follow || active < 0 || active >= lineKeys.length) return;
+    if (!widget.active || !follow || active < 0 || active >= lineKeys.length)
+      return;
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted || !follow || active < 0 || active >= lineKeys.length)
-        return;
+      if (!mounted ||
+          !widget.active ||
+          !follow ||
+          active < 0 ||
+          active >= lineKeys.length) return;
       final context = lineKeys[active].currentContext;
       if (context != null)
         Scrollable.ensureVisible(context,
@@ -113,9 +129,25 @@ class _LyricsPanelState extends State<LyricsPanel> {
   }
 
   @override
+  void didUpdateWidget(covariant LyricsPanel old) {
+    super.didUpdateWidget(old);
+    if (old.player != widget.player) {
+      old.player.removeListener(_changed);
+      old.player.progress.removeListener(_changed);
+      widget.player.addListener(_changed);
+      widget.player.progress.addListener(_changed);
+    }
+    if (widget.active) {
+      _changed();
+      _scroll();
+    }
+  }
+
+  @override
   void dispose() {
     generation++;
     widget.player.removeListener(_changed);
+    widget.player.progress.removeListener(_changed);
     super.dispose();
   }
 
@@ -124,31 +156,53 @@ class _LyricsPanelState extends State<LyricsPanel> {
     final currentLines = lines;
     final hasLyrics = data['has_lyrics'] == true && currentLines.isNotEmpty;
     return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-      Padding(
-          padding: const EdgeInsets.fromLTRB(24, 12, 16, 12),
-          child: Row(children: [
-            Expanded(
-                child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                  Text('Lyrics', style: NeatieDesign.display(28)),
-                  Text('${widget.player.current?['title'] ?? ''}',
-                      maxLines: 1, overflow: TextOverflow.ellipsis),
-                  if (hasLyrics)
-                    Text(
-                        '${synced ? 'Synced lyrics' : 'Lyrics'}${data['source'] == null ? '' : ' · ${data['source']}'}',
-                        style: const TextStyle(
-                            color: NeatieDesign.muted, fontSize: 12)),
-                ])),
-            IconButton(
-                tooltip: 'Retry lyrics',
-                onPressed: loading ? null : () => _load(refresh: true),
-                icon: const Icon(Icons.refresh)),
-            IconButton(
-                tooltip: 'Close lyrics',
-                onPressed: () => Navigator.pop(context),
-                icon: const Icon(Icons.close)),
-          ])),
+      if (widget.minimalHeader)
+        Align(
+            alignment: Alignment.centerRight,
+            child: Row(mainAxisSize: MainAxisSize.min, children: [
+              if (widget.onAsk != null)
+                IconButton(
+                    tooltip: 'Ask about the lyrics',
+                    iconSize: 18,
+                    onPressed: widget.onAsk,
+                    icon: const Icon(Icons.auto_awesome_outlined)),
+              TooltipVisibility(
+                  visible: widget.active,
+                  child: IconButton(
+                      tooltip: 'Close lyrics',
+                      iconSize: 16,
+                      onPressed: () {
+                        Tooltip.dismissAllToolTips();
+                        (widget.onClose ?? () => Navigator.pop(context))();
+                      },
+                      icon: const Icon(Icons.close)))
+            ]))
+      else
+        Padding(
+            padding: const EdgeInsets.fromLTRB(24, 12, 16, 12),
+            child: Row(children: [
+              Expanded(
+                  child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                    Text('Lyrics', style: NeatieDesign.display(28)),
+                    Text('${widget.player.current?['title'] ?? ''}',
+                        maxLines: 1, overflow: TextOverflow.ellipsis),
+                    if (hasLyrics)
+                      Text(
+                          '${synced ? 'Synced lyrics' : 'Lyrics'}${data['source'] == null ? '' : ' · ${data['source']}'}',
+                          style: const TextStyle(
+                              color: NeatieDesign.muted, fontSize: 12)),
+                  ])),
+              IconButton(
+                  tooltip: 'Retry lyrics',
+                  onPressed: loading ? null : () => _load(refresh: true),
+                  icon: const Icon(Icons.refresh)),
+              IconButton(
+                  tooltip: 'Close lyrics',
+                  onPressed: widget.onClose ?? () => Navigator.pop(context),
+                  icon: const Icon(Icons.close)),
+            ])),
       if (synced && !follow)
         Align(
             alignment: Alignment.centerRight,
@@ -169,7 +223,9 @@ class _LyricsPanelState extends State<LyricsPanel> {
                           padding: const EdgeInsets.all(24),
                           child: Text(
                               failed
-                                  ? 'Lyrics are unavailable right now. Tap Retry to try again.'
+                                  ? (widget.minimalHeader
+                                      ? 'Lyrics are unavailable right now. Please try again later.'
+                                      : 'Lyrics are unavailable right now. Tap Retry to try again.')
                                   : data['lyrics_status'] == 'instrumental'
                                       ? 'This recording is instrumental.'
                                       : 'No lyrics found for this recording.',
@@ -204,7 +260,7 @@ class _LyricsPanelState extends State<LyricsPanel> {
                                               duration: MediaQuery.disableAnimationsOf(context)
                                                   ? Duration.zero
                                                   : const Duration(milliseconds: 250),
-                                              style: TextStyle(fontSize: 24, height: 1.45, fontWeight: active == i ? FontWeight.w700 : FontWeight.w500, color: !synced || active == i ? NeatieDesign.ink : NeatieDesign.muted),
+                                              style: TextStyle(fontFamily: 'NeatieSans', fontSize: 24, height: 1.45, fontWeight: active == i ? FontWeight.w700 : FontWeight.w500, color: !synced || active == i ? NeatieDesign.ink : NeatieDesign.muted),
                                               child: Text('${currentLines[i]['text']}')))),
                               ])))),
     ]);

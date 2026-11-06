@@ -4,7 +4,7 @@ After=docker.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 /opt/neatie/current/deploy/production/runtime_backup.py backup --source /var/lib/neatie/runtime --destination /var/backups/neatie --retention-days 14
+ExecStart=/usr/bin/python3 /opt/neatie/current/deploy/production/runtime_backup.py backup --source /var/lib/neatie/runtime --destination /var/backups/neatie --retention-count 3
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7

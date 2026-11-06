@@ -25,6 +25,8 @@ ACQUISITION_JOB_NAMESPACE = "discovery_acquisition_job"
 ACQUISITION_JOB_MODEL = "structured-acquisition"
 ACQUISITION_RESULT_TTL_SECONDS = 60 * 60 * 24 * 14
 MUSICBRAINZ_RESULT_TTL_SECONDS = 60 * 60 * 24 * 90
+ALBUM_CATALOG_CHECK_SECONDS = 6 * 60 * 60
+ALBUM_CATALOG_MAX_CARDS = 512
 RELEASE_METADATA_NAMESPACE = "canonical_recording_release_metadata"
 RELEASE_METADATA_MODEL = "musicbrainz-release-metadata"
 RELEASE_METADATA_RETRY_SECONDS = 60 * 60 * 24 * 7
@@ -885,6 +887,8 @@ def _unique(values: Iterable[str], *, limit: int) -> List[str]:
 def _request_signature(request: EnrichmentRequest) -> str:
     cursor = int(request.metadata.get("release_group_offset") or request.metadata.get("offset") or 0)
     provider = _request_provider(request)
+    if request.kind == 'album_catalog' and provider == 'ytmusic':
+        return f'album_catalog:ytmusic:v2:{request.pool}:{request.key.casefold()}:{cursor}'
     return (
         f"{request.kind}:{provider}:{request.pool}:"
         f"{request.key.casefold()}:{cursor}"
@@ -899,6 +903,8 @@ def _request_progress_signature(request: EnrichmentRequest) -> str:
     counter and one artist can be paged forever.
     """
 
+    if request.kind == 'album_catalog' and _request_provider(request) == 'ytmusic':
+        return f'album_catalog:ytmusic:v2:{request.pool}:{request.key.casefold()}'
     if request.kind in {"album_catalog", "artist_catalog"}:
         return (
             f"{request.kind}:{_request_provider(request)}:"
@@ -1216,6 +1222,36 @@ def _diverse_history_anchors(taste: TasteProfile, cursor: int) -> tuple[List[Dic
     return output, next_cursor
 
 
+def profile_artist_demand(taste: TasteProfile, ledger: Dict[str, Any]) -> List[str]:
+    """Recent artist identities whose catalog or relationship lane is untried.
+
+    Reuse durable request progress, including terminal empty results. Retryable
+    work remains demand but materialization still owns provider backoff/leases.
+    No timestamp-only profile change invalidates the retained inventory.
+    """
+    progress = dict(ledger.get('request_progress') or {})
+    ids = {**dict(ledger.get('canonical_artist_ids') or {}), **_artist_musicbrainz_ids(taste)}
+    artists = _unique([_artist(track) for track in
+        [*taste.recent_tracks, *taste.last_played_tracks][:64]], limit=32)
+    demand = []
+    for artist in artists:
+        if normalize_artist_name(artist) in {'', 'unknown', 'unknown artist'}:
+            continue
+        def finished(request):
+            state = (progress.get(_request_progress_signature(request))
+                     or progress.get(_request_signature(request)) or {})
+            return state.get('state') in {'resolved', 'exhausted'} or state.get('exhausted') is True
+        catalog = any(finished(EnrichmentRequest('artist_catalog', artist, 'profile_spine',
+            'same_artist_catalog', 16, provider=provider)) for provider in ('ytmusic', 'lastfm'))
+        related = finished(EnrichmentRequest('lastfm_artist_similar', ids.get(artist.casefold()) or artist,
+            'artist_graph', 'artist_neighbor', 8, metadata={'offset': 0}))
+        albums = finished(EnrichmentRequest('album_catalog', artist, 'album',
+            'artist_album_catalog', 3, provider='ytmusic'))
+        if not catalog or not related or not albums:
+            demand.append(artist)
+    return demand
+
+
 def build_enrichment_plan(
     taste: TasteProfile,
     *,
@@ -1233,22 +1269,24 @@ def build_enrichment_plan(
     }
     cursor = max(int(ledger.get("anchor_cursor") or 0), 0)
     anchor_tracks, cursor_next = _diverse_history_anchors(taste, cursor)
-    all_anchor_artists = _unique(
-        [
-            *taste.artist_hints,
-            *taste.top_artists,
-            *taste.listened_artists,
-            *[_artist(track) for track in anchor_tracks],
-        ],
-        limit=32,
-    )
+    demand_artists = profile_artist_demand(taste, ledger)
+    demand_keys = {normalize_artist_name(artist) for artist in demand_artists}
+    familiar = _unique([*taste.artist_hints, *taste.top_artists, *taste.listened_artists,
+                       *[_artist(track) for track in anchor_tracks]], limit=32)
+    artist_cursor = max(int(ledger.get("artist_cursor") or 0), 0)
+    def rotate(values):
+        start = artist_cursor % len(values) if values else 0
+        return [*values[start:], *values[:start]]
+    # Interleave before the bound so new listening cannot sit behind 32 old
+    # favourites; keep familiar seeds and their existing rotating ownership.
+    recent, old = rotate(demand_artists), rotate(familiar)
+    interleaved = [artist for i in range(max(len(recent), len(old)))
+                   for artist in ([recent[i]] if i < len(recent) else []) +
+                                 ([old[i]] if i < len(old) else [])]
+    all_anchor_artists = _unique(interleaved, limit=64)
     all_anchor_artists = [artist for artist in all_anchor_artists
                           if normalize_artist_name(artist) not in {"", "unknown", "unknown artist"}]
-    artist_cursor = max(int(ledger.get("artist_cursor") or 0), 0)
-    rotated_artists = [
-        *all_anchor_artists[artist_cursor:],
-        *all_anchor_artists[:artist_cursor],
-    ]
+    rotated_artists = all_anchor_artists
     anchor_artists = rotated_artists[:8]
     if allowed_pools == {"radio_artist_catalog"}:
         # Radio replenishment is a bounded local shortage repair. Prefer
@@ -1312,8 +1350,10 @@ def build_enrichment_plan(
                     return True
             return False
 
-        # The active seed remains first on retry, while up to four eligible
-        # candidates make progress in the same materialization cycle.
+        # Keep the frontier intact until durable jobs/cache/provider backoffs
+        # are inspected by materialization. Its four-request execution bound
+        # belongs after that inspection; an earlier four-seed cut can starve
+        # later available work behind cooling or cached artists forever.
         active_seed = _text(ledger.get("radio_active_seed"))
         if active_seed:
             candidates = [active_seed, *discovery, *direct_repairs]
@@ -1326,7 +1366,7 @@ def build_enrichment_plan(
             for artist in _unique(candidates, limit=max(len(candidates), 1))
             if has_non_exhausted_radio_request(artist)
         ]
-        anchor_artists = eligible[:4]
+        anchor_artists = eligible
     artist_cursor_next = (
         (artist_cursor + max(len(anchor_artists), 1)) % len(all_anchor_artists)
         if all_anchor_artists
@@ -1508,19 +1548,24 @@ def build_enrichment_plan(
         not album_shortages
         or any(album_shortages.values())
         or album_reserve_shortage > 0
+        or bool(demand_artists)
     )
     album_seed_diagnostics: Dict[str, int] = {}
     if album_work_needed:
         album_artist_counts = {
-            str(key): int(value or 0)
+            normalize_artist_name(key): int(value or 0)
             for key, value in dict(ledger.get("album_artist_counts") or {}).items()
         }
+        album_artist_evidence = {
+            normalize_artist_name(key): value
+            for key, value in dict(ledger.get('album_artist_evidence') or {}).items()
+        }
         album_priority_artists = _unique(
-            list(ledger.get("album_priority_artist_seeds") or []),
+            [*demand_artists, *list(ledger.get("album_priority_artist_seeds") or [])],
             limit=32,
         )
         album_priority_keys = {
-            " ".join(artist.casefold().split())
+            normalize_artist_name(artist)
             for artist in album_priority_artists
         }
         album_seed_artists = _unique(
@@ -1532,16 +1577,21 @@ def build_enrichment_plan(
             ],
             limit=48,
         )
+        if ledger.get('album_profile_assessed'):
+            supported_keys = {normalize_artist_name(value) for value in all_anchor_artists}
+            evidence_keys = set(album_artist_evidence)
+            album_seed_artists = [artist for artist in album_seed_artists
+                if normalize_artist_name(artist) in supported_keys or normalize_artist_name(artist) in evidence_keys]
         seed_order = {
-            " ".join(artist.casefold().split()): index
+            normalize_artist_name(artist): index
             for index, artist in enumerate(album_seed_artists)
         }
         album_seed_artists.sort(
             key=lambda artist: (
-                " ".join(artist.casefold().split()) not in album_priority_keys,
-                album_artist_counts.get(" ".join(artist.casefold().split()), 0) >= 3,
-                album_artist_counts.get(" ".join(artist.casefold().split()), 0),
-                seed_order.get(" ".join(artist.casefold().split()), 0),
+                normalize_artist_name(artist) not in album_priority_keys,
+                album_artist_counts.get(normalize_artist_name(artist), 0) >= 3,
+                album_artist_counts.get(normalize_artist_name(artist), 0),
+                seed_order.get(normalize_artist_name(artist), 0),
             )
         )
         # An empty shelf needs a bounded share of directly supported artists.
@@ -1551,7 +1601,7 @@ def build_enrichment_plan(
             artist for artist in album_seed_artists
             if normalize_artist_name(artist) not in {"", "unknown", "unknown artist"}
             and artist.casefold() in {value.casefold() for value in all_anchor_artists}
-            and album_artist_counts.get(" ".join(artist.casefold().split()), 0) < 3
+            and album_artist_counts.get(normalize_artist_name(artist), 0) < 3
         ]
         if any(album_shortages.values()) and supported:
             discovery = [artist for artist in album_seed_artists if artist not in supported]
@@ -1575,10 +1625,12 @@ def build_enrichment_plan(
                 "musicbrainz_artist_id": artist_mbid,
                 "user_scope_id": taste.user_scope_id,
                 "album_artist_qualified_count": album_artist_counts.get(
-                    artist_key,
+                    normalize_artist_name(artist),
                     0,
                 ),
+                **dict(album_artist_evidence.get(normalize_artist_name(artist)) or {}),
             }
+            yt_progress = request_progress.get(f'album_catalog:ytmusic:v2:album:{artist.casefold()}') or {}
             artist_requests = [
                 EnrichmentRequest(
                     kind="album_catalog",
@@ -1587,7 +1639,9 @@ def build_enrichment_plan(
                     pool="album",
                     relation="artist_album_catalog",
                     limit=3,
-                    metadata={**base_metadata, "provider": "ytmusic"},
+                    metadata={**base_metadata, "provider": "ytmusic",
+                              'provider_artist_id': yt_progress.get('provider_artist_id') or base_metadata.get('provider_artist_id') or '',
+                              'offset': 0 if yt_progress.get('exhausted') else int(yt_progress.get('cursor') or 0)},
                 )
             ]
             if artist_mbid:
@@ -1615,11 +1669,15 @@ def build_enrichment_plan(
             for request in artist_requests:
                 progress = (request_progress.get(_request_progress_signature(request))
                             or request_progress.get(_request_signature(request)) or {})
+                if request.provider == 'ytmusic' and float(progress.get('catalog_next_check_at') or 0) > time.time():
+                    continue
                 if (
                     progress.get("exhausted") is True
                     or _text(progress.get("state")).casefold() == "exhausted"
                 ):
-                    continue
+                    if not (request.provider == 'ytmusic' and
+                            float(progress.get('catalog_next_check_at') or float('inf')) <= time.time()):
+                        continue
                 eligible_requests.append(request)
             if not eligible_requests:
                 exhausted_album_seeds += 1
@@ -1628,8 +1686,6 @@ def build_enrichment_plan(
             # frontiers must not hide later profile artists on every pass.
             requests.extend(eligible_requests)
             selected_album_seeds += 1
-            if selected_album_seeds >= 16:
-                break
         album_seed_diagnostics = {
             "offered_seed_count": len(album_seed_artists),
             "supported_seed_count": len(supported),
@@ -1697,6 +1753,13 @@ def build_enrichment_plan(
     def targets_shortage(request: EnrichmentRequest) -> bool:
         if not has_inventory_coverage:
             return True
+        # Coverage of evolving listening is independent of total item counts.
+        # Only catalog/relationship requests for the uncovered seeds bypass
+        # quantity gates; album/radio keep their separate acquisition owners.
+        if (request.pool in {'profile_spine', 'artist_graph', 'album'}
+                and normalize_artist_name(request.metadata.get('profile_seed_artist') or '')
+                in demand_keys):
+            return True
         # Freshness and quantity are independent contracts. An expired
         # inventory must execute discovery acquisition even when its retained
         # rows still satisfy the low-water marks. Album and radio acquisition
@@ -1712,7 +1775,7 @@ def build_enrichment_plan(
                 not failed_domains and radio_work_needed
             )
         if request.kind == "lastfm_artist_similar":
-            return bool(
+            return bool(album_shortages.get("featured_new_albums") or album_reserve_shortage) or bool(
                 failed_domains
                 & {"recommended_artists", "made_for_you_tracks", "quiet_picks"}
             ) or needs_reserve(
@@ -1761,7 +1824,9 @@ def build_enrichment_plan(
         if (
             signature in seen
             or already_attempted_for_refresh
-            or (progress.get("exhausted") is True and not refresh_request)
+            or (progress.get("exhausted") is True and not refresh_request
+                and not (request.kind == 'album_catalog' and request.provider == 'ytmusic'
+                         and float(progress.get('catalog_next_check_at') or float('inf')) <= time.time()))
             or not targets_shortage(request)
         ):
             continue
@@ -1842,6 +1907,10 @@ def _store_job(
         # retain them for 90 days. Pending/retryable failures keep the normal
         # short acquisition TTL so a stuck job cannot become permanent.
         "expires_at": now + (
+            ALBUM_CATALOG_CHECK_SECONDS
+            if (payload.get('state') in {'resolved', 'exhausted'} and
+                (request.kind == 'album_catalog_index' or (request.kind == 'album_catalog' and request.provider == 'ytmusic')))
+            else
             MUSICBRAINZ_RESULT_TTL_SECONDS
             if _is_musicbrainz_request(request)
             and str(payload.get("state") or "").casefold() in {"resolved", "exhausted"}
@@ -1982,6 +2051,13 @@ def _canonical_recording_rows(
     return output
 
 
+def _album_relationship_metadata(request: EnrichmentRequest) -> Dict[str, Any]:
+    return {key:value for key,value in request.metadata.items() if key in {
+        'related_to_artist','artist_graph_keys','artist_neighborhood','relation_strength',
+        'recommendation_path','provider_artist_id','musicbrainz_artist_id','genres',
+        'discovery_genres','album_relation_origin','relationship_provider','relationship_evidence'}}
+
+
 def _resolve_musicbrainz_album_rows(
     server: Any,
     request: EnrichmentRequest,
@@ -2033,6 +2109,7 @@ def _resolve_musicbrainz_album_rows(
             continue
         album_candidate = {
                 **album,
+                **_album_relationship_metadata(request),
                 "id": f"musicbrainz:release-group:{release_group_id}",
                 "browseId": f"musicbrainz:release-group:{release_group_id}",
                 "canonical_album_identity": (
@@ -2305,6 +2382,85 @@ def _resolve_ytmusic_artist_catalog_rows(
     return _canonical_recording_rows(server, output, request=request)
 
 
+class AlbumCatalogIdentityError(RuntimeError):
+    transient = False
+
+    def __init__(self, code):
+        super().__init__(code)
+        self.cause_type = code
+
+
+class AlbumCatalogPage(list):
+    """Provider page progress travels with results, including empty pages."""
+    def __init__(self, items, *, cursor, exhausted, artist_id, bounded=False):
+        super().__init__(items)
+        self.cursor = cursor
+        self.exhausted = exhausted
+        self.artist_id = artist_id
+        self.bounded = bounded
+
+
+class ArtistGraphPage(list):
+    """Recording results and separate, non-playable artist relationships."""
+    def __init__(self, items, *, artist_edges):
+        super().__init__(items)
+        self.artist_edges = artist_edges
+
+
+def _album_catalog_entries(server: Any, request: EnrichmentRequest):
+    client = server.ytmusic
+    artist = _text(request.metadata.get('profile_seed_artist') or request.key)
+    identity_request = EnrichmentRequest('album_artist_identity', artist, 'album', 'artist_identity', 1, provider='ytmusic')
+    identity = _load_job(server, 'catalog', identity_request) or {}
+    artist_id = _text(request.metadata.get('provider_artist_id'))
+    if not artist_id and float(identity.get('expires_at') or 0) > time.time():
+        artist_id = _text(identity.get('provider_artist_id'))
+    if not artist_id:
+        normalized_artist = normalize_artist_name(artist)
+        matches = {
+            _text(row.get('browseId') or row.get('id'))
+            for row in client.search(artist, filter='artists', limit=8) or []
+            if (_text(row.get('artist') or row.get('name')).casefold() == artist.casefold()
+                or (normalized_artist and
+                    normalize_artist_name(row.get('artist') or row.get('name')) == normalized_artist))
+            and _text(row.get('browseId') or row.get('id')).startswith('UC')
+        }
+        if len(matches) != 1:
+            raise AlbumCatalogIdentityError('album_artist_identity_ambiguous' if matches else 'album_artist_identity_missing')
+        artist_id = matches.pop()
+        _store_job(server, 'catalog', identity_request, {'state':'resolved','provider_artist_id':artist_id})
+    if not artist_id.startswith('UC'):
+        raise AlbumCatalogIdentityError('album_artist_identity_invalid')
+    index_request = EnrichmentRequest('album_catalog_index', artist_id, 'album', 'artist_discography', 1, provider='ytmusic')
+    index = _load_job(server, 'catalog', index_request) or {}
+    offset = max(int(request.metadata.get('offset') or 0), 0)
+    needed = offset + int(request.limit) + 1
+    cards = index.get('results') or []
+    if (float(index.get('expires_at') or 0) <= time.time()
+        or (not index.get('complete') and needed > len(cards))):
+        detail = client.get_artist(artist_id) or {}
+        section = detail.get('albums') or {}
+        bound = min(max(needed, 48), ALBUM_CATALOG_MAX_CARDS)
+        rows = (client.get_artist_albums(section.get('browseId') or artist_id, section['params'], limit=bound)
+                if section.get('params') else section.get('results') or [])
+        # Persist listing facts only; page size is an explicit hard bound even
+        # when ytmusicapi returns an oversized provider page.
+        unique = {}
+        for row in rows or []:
+            key = _text(row.get('browseId') or row.get('id'))
+            if key and key not in unique:
+                unique[key] = {k:row[k] for k in ['browseId','id','title','year','type','thumbnails'] if k in row}
+        cards = list(unique.values())[:ALBUM_CATALOG_MAX_CARDS]
+        index = {'state':'resolved','results':cards,
+                 'complete':not section.get('params') or len(rows or []) < bound}
+        _store_job(server, 'catalog', index_request, index)
+    page = cards[offset:offset + int(request.limit)]
+    cursor = offset + len(page)
+    exhausted = bool(index.get('complete') and cursor >= len(cards))
+    bounded = cursor >= ALBUM_CATALOG_MAX_CARDS and not index.get('complete')
+    return artist_id, page, (0 if bounded else cursor), exhausted, bounded
+
+
 def _resolve_ytmusic_album_rows(
     server: Any,
     request: EnrichmentRequest,
@@ -2313,23 +2469,24 @@ def _resolve_ytmusic_album_rows(
     artist = _text(request.metadata.get("profile_seed_artist") or request.key)
     if client is None or not artist:
         return []
-    results = client.search(
-        artist,
-        filter="albums",
-        limit=max(int(request.limit) * 2, int(request.limit)),
-    ) or []
+    artist_id, results, cursor, exhausted, bounded = _album_catalog_entries(server, request)
     output: List[Dict[str, Any]] = []
     for row in results:
-        if not isinstance(row, dict) or not _artist_catalog_match(row, artist):
+        if not isinstance(row, dict):
             continue
         browse_id = _text(row.get("browseId") or row.get("id"))
         title = _text(row.get("title") or row.get("name"))
         if not browse_id or not title:
             continue
-        try:
+        detail_request = EnrichmentRequest('album_detail', browse_id, 'album', 'album_tracks', 1, provider='ytmusic')
+        cached_detail = _load_job(server, 'catalog', detail_request) or {}
+        if float(cached_detail.get('expires_at') or 0) > time.time():
+            detail = cached_detail.get('detail') or {}
+        else:
             detail = client.get_album(browse_id) or {}
-        except Exception:
-            detail = {}
+            if not detail.get('tracks'):
+                raise RuntimeError('album_catalog_detail_incomplete')
+            _store_job(server, 'catalog', detail_request, {'state':'resolved','detail':detail})
         raw_tracks = detail.get("tracks") or []
         tracks: List[Dict[str, Any]] = []
         for track in raw_tracks:
@@ -2338,7 +2495,7 @@ def _resolve_ytmusic_album_rows(
             track_artist = artist if _artist_catalog_match(track, artist) else _artist(track)
             video_id = _text(track.get("videoId") or track.get("id"))
             track_title = _text(track.get("title") or track.get("name"))
-            if not video_id or not track_title or not track_artist:
+            if not track_title or not track_artist:
                 continue
             tracks.append(
                 {
@@ -2374,19 +2531,27 @@ def _resolve_ytmusic_album_rows(
         output.append(
             {
                 **row,
+                **_album_relationship_metadata(request),
                 "id": f"ytmusic:album:{browse_id}",
                 "browseId": browse_id,
                 "album_id": browse_id,
                 "canonical_album_identity": f"ytmusic:album:{browse_id}",
                 "title": title,
-                "artist": artist,
+                "artist": _artist(detail) or artist,
+                'artists': detail.get('artists') or [],
+                'catalog_artist_id': artist_id,
+                'artist_graph_keys': list(dict.fromkeys([*(request.metadata.get('artist_graph_keys') or []), artist])),
+                'provider_artist_id': next((_text(credit.get('id') or credit.get('browseId'))
+                    for credit in detail.get('artists') or [] if isinstance(credit,dict)
+                    and _text(credit.get('id') or credit.get('browseId'))),
+                    artist_id if not _artist(detail) or _artist(detail).casefold()==artist.casefold() else ''),
                 "thumbnail": _provider_thumbnail(detail or row),
                 "release_year": _text(
                     detail.get("year") or row.get("year") or row.get("release_year")
                 ),
                 "canonical_tracks": canonical_tracks,
                 "track_count": len(canonical_tracks),
-                "canonical_track_count": len(canonical_tracks),
+                "canonical_track_count": max(len(canonical_tracks), len(raw_tracks)),
                 "playable_coverage": 0.0,
                 "playable": False,
                 "source": "ytmusic",
@@ -2399,9 +2564,7 @@ def _resolve_ytmusic_album_rows(
                 "source_provenance": "structured:album_catalog:ytmusic",
             }
         )
-        if len(output) >= int(request.limit):
-            break
-    return output
+    return AlbumCatalogPage(output, cursor=cursor, exhausted=exhausted, artist_id=artist_id, bounded=bounded)
 
 
 def _resolve_artist_catalog_rows(
@@ -2473,15 +2636,26 @@ def _fetch_request(server: Any, request: EnrichmentRequest) -> List[Dict[str, An
             limit=neighbor_offset + neighbor_batch_size,
         )[neighbor_offset : neighbor_offset + neighbor_batch_size]
         rows: List[Dict[str, Any]] = []
+        artist_edges = []
         per_artist = max(2, min(6, (request.limit + max(len(neighbors), 1) - 1) // max(len(neighbors), 1)))
         listenbrainz = ListenBrainzClient(server)
         for neighbor in neighbors:
             neighbor_name = _artist(neighbor)
+            if not neighbor_name:
+                continue
             neighbor_mbid = _resolve_artist_mbid(
                 server,
                 neighbor_name,
                 _text(neighbor.get("musicbrainz_artist_id")),
             )
+            artist_edges.append({
+                "artist": neighbor_name,
+                "musicbrainz_artist_id": neighbor_mbid,
+                "related_to_artist": artist,
+                "relationship_score": neighbor.get("relationship_score"),
+                "relationship_provider": "lastfm",
+                "relationship_evidence": "artist_similarity",
+            })
             if not neighbor_mbid:
                 continue
             for row in listenbrainz.top_recordings(neighbor_mbid, limit=per_artist):
@@ -2495,7 +2669,10 @@ def _fetch_request(server: Any, request: EnrichmentRequest) -> List[Dict[str, An
                         "relationship_evidence": "artist_similarity_catalog",
                     }
                 )
-        return _canonical_recording_rows(server, rows, request=request)
+        return ArtistGraphPage(
+            _canonical_recording_rows(server, rows, request=request),
+            artist_edges=artist_edges,
+        )
     if request.kind == "lastfm_tag_tracks":
         rows = LastFmClient(server).tag_tracks(request.key, limit=request.limit)
         return _canonical_recording_rows(server, rows, request=request)
@@ -2553,7 +2730,10 @@ def materialize_enrichment_plan(
     pending: List[EnrichmentRequest] = []
     completed = 0
     cached = 0
-    for request in plan.requests:
+    retry_deferred = 0
+    exhausted = 0
+    all_requests = plan.requests
+    for request in all_requests:
         job = _load_job(server, plan.user_scope_id, request)
         refresh_generation = _text(request.metadata.get("refresh_generation"))
         cached_refresh_generation = _text(
@@ -2569,6 +2749,17 @@ def materialize_enrichment_plan(
             and float(job.get("expires_at") or 0) > time.time()
         ):
             state = _text(job.get("state"))
+            if request.kind == 'lastfm_artist_similar' and state in {'resolved', 'exhausted'} and job.get('artist_edges'):
+                progress_signature = _request_progress_signature(request)
+                request_progress[progress_signature] = {
+                    **dict(request_progress.get(progress_signature) or {}), **job,
+                }
+                results = [dict(value) for value in job.get('results') or [] if isinstance(value, dict)]
+                if results:
+                    pools.setdefault(request.pool, []).extend(results)
+                cached += 1
+                completed += 1
+                continue
             if state == "retryable":
                 progress_signature = _request_progress_signature(request)
                 prior_progress = dict(request_progress.get(progress_signature) or {})
@@ -2591,6 +2782,10 @@ def materialize_enrichment_plan(
                     },
                 }
             if state == "resolved":
+                progress_signature = _request_progress_signature(request)
+                prior_progress = request_progress.get(progress_signature) or {}
+                if int(job.get('cursor') or 0) >= int(prior_progress.get('cursor') or 0):
+                    request_progress[progress_signature] = {**prior_progress, **job}
                 results = [dict(value) for value in job.get("results") or [] if isinstance(value, dict)]
                 if results:
                     pools.setdefault(request.pool, []).extend(results)
@@ -2599,9 +2794,11 @@ def materialize_enrichment_plan(
                     continue
                 if job.get("exhausted") is True:
                     completed += 1
+                    exhausted += 1
                     continue
             if state == "exhausted":
                 completed += 1
+                exhausted += 1
                 continue
             if (
                 state == "retryable"
@@ -2609,6 +2806,7 @@ def materialize_enrichment_plan(
                 and str(job.get("last_error") or "")
                 != "AcquisitionDeadlineExceeded"
             ):
+                retry_deferred += 1
                 continue
         pending.append(request)
 
@@ -2629,6 +2827,19 @@ def materialize_enrichment_plan(
         for request in pending
         if provider_retry_at.get(_request_provider(request), 0.0) <= now
     ]
+    provider_deferred = pending_total - len(pending)
+    # Keep at most 16 eligible album artists after durable job and provider
+    # cooldown inspection, so cooled seeds do not hide the later frontier.
+    pending_album_seeds = set()
+    bounded_pending = []
+    for request in pending:
+        if request.kind == "album_catalog":
+            seed = normalize_artist_name(request.metadata.get("profile_seed_artist"))
+            if seed not in pending_album_seeds and len(pending_album_seeds) >= 16:
+                continue
+            pending_album_seeds.add(seed)
+        bounded_pending.append(request)
+    pending = bounded_pending
     regular_pending = [
         request
         for request in pending
@@ -2661,7 +2872,7 @@ def materialize_enrichment_plan(
     deferred_count = pending_total - len(scheduled)
     print(
         "[EBB:acquisition] "
-        f"planned={len(plan.requests)} cached={cached} "
+        f"planned={len(all_requests)} cached={cached} "
         f"scheduled={len(scheduled)} deferred={deferred_count} "
         f"pools={','.join(request.pool for request in scheduled)} "
         f"providers={','.join(_request_provider(request) for request in scheduled)}"
@@ -2705,7 +2916,7 @@ def materialize_enrichment_plan(
         pool: {_track_id(item) for item in values if _track_id(item)}
         for pool, values in pools.items()
     }
-    for request in plan.requests:
+    for request in all_requests:
         progress = (
             request_progress.get(_request_progress_signature(request))
             or request_progress.get(_request_signature(request))
@@ -2817,6 +3028,8 @@ def materialize_enrichment_plan(
                 and _is_musicbrainz_request(request)
                 and not results
             ) or no_new >= 2
+            if isinstance(results, AlbumCatalogPage):
+                exhausted = results.exhausted
             cursor_base = int(
                 request.metadata.get("release_group_offset")
                 or request.metadata.get("offset")
@@ -2833,13 +3046,21 @@ def materialize_enrichment_plan(
                 "state": "exhausted" if exhausted else "resolved",
                 "attempts": int(prior.get("attempts") or 0) + 1,
                 "cursor": cursor_base + max(cursor_step, 0),
-                "returned_identities": returned[-128:],
+                "returned_identities": list(dict.fromkeys([*(prior.get('returned_identities') or []), *returned]))[-512:],
                 "last_raw_count": len(results),
                 "last_accepted_count": len(unique_results),
                 "consecutive_no_new": no_new,
                 "exhausted": exhausted,
-                "results": unique_results,
+                # A duplicate-only recheck still contains valid catalog
+                # metadata. Never overwrite its page cache with an empty list.
+                "results": list(results) if request.kind == 'album_catalog' else unique_results,
             }
+            if isinstance(results, AlbumCatalogPage):
+                progress.update(cursor=results.cursor, provider_artist_id=results.artist_id,
+                    catalog_frontier_bounded=results.bounded,
+                    catalog_next_check_at=time.time()+ALBUM_CATALOG_CHECK_SECONDS if exhausted or results.bounded else 0)
+            if isinstance(results, ArtistGraphPage):
+                progress["artist_edges"] = results.artist_edges
             request_progress[progress_signature] = progress
             _store_job(server, plan.user_scope_id, request, progress)
             if deadline is not None and time.perf_counter() >= deadline:
@@ -2909,10 +3130,13 @@ def materialize_enrichment_plan(
     return MaterializedCandidateSupply(
         pools=pools,
         diagnostics={
-            "planned_request_count": len(plan.requests),
+            "planned_request_count": len(all_requests),
             "album_seed_diagnostics": dict(plan.album_seed_diagnostics),
             "completed_request_count": completed,
             "cached_request_count": cached,
+            "retry_deferred_request_count": retry_deferred,
+            "exhausted_request_count": exhausted,
+            "provider_deferred_request_count": provider_deferred,
             "scheduled_request_count": len(scheduled),
             "scheduled_pool_counts": {
                 pool: sum(1 for request in scheduled if request.pool == pool)

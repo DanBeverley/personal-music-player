@@ -5,6 +5,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'audio_provider_recommendation.dart';
 import 'auth_provider.dart';
+import 'assistant_identity.dart';
 import 'cloud_search_queries.dart';
 import 'history_manager.dart';
 import 'interaction_events.dart';
@@ -789,7 +790,7 @@ class LyricsMeaningNotifier extends StateNotifier<LyricsMeaningState> {
       final res = await appHttpClient
           .post(
             buildProxyUri('/lyrics/$resolvedVideoId/meaning'),
-            headers: {'Content-Type': 'application/json'},
+            headers: await assistantHeaders(accessToken: supabaseClientOrNull?.auth.currentSession?.accessToken),
             body: jsonEncode(body),
           )
           .timeout(const Duration(seconds: 50));

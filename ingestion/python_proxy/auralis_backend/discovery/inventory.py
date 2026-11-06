@@ -10,7 +10,7 @@ import uuid
 
 from ..storage.session_store import get_session_store
 from ..storage.inventory_codec import decode_inventory_payload, encode_inventory_payload
-from .candidates import build_candidate_pools
+from .candidates import build_candidate_pools, _album_segment_pools, _freshness_pool
 from .schema import DiscoveryCandidate, TasteProfile
 
 if TYPE_CHECKING:
@@ -173,6 +173,10 @@ def candidate_inventory_content_hash(
                 for track in candidate.item.get("tracks") or candidate.item.get("canonical_tracks") or []
                 if isinstance(track, dict)
             ],
+            {key: candidate.item.get(key) for key in (
+                'artist_graph_keys', 'related_to_artist', 'relation_strength',
+                'genres', 'discovery_genres', 'album_relation_origin',
+                'provider_artist_id', 'musicbrainz_artist_id', 'canonical_artist_id')},
         )
         for candidate in (inventory.pools.get("album") or [] if inventory else [])
         if candidate.item_type == "album"
@@ -676,6 +680,20 @@ def canonical_item_identity(item: Dict[str, Any], *, item_type: str = "track") -
     return f"{item_type}:provider:{provider_id.casefold()}" if provider_id else ""
 
 
+def recommendation_track_identities(item: Dict[str, Any]) -> set[str]:
+    """Exposure aliases, independent of whether the recommendation was played."""
+    identities = {str(item.get('id') or item.get('videoId') or '').strip().casefold(),
+                  canonical_item_identity(item, item_type='track')}
+    title = ' '.join(str(item.get('title') or item.get('name') or '').casefold().split())
+    artist = item.get('artist') or item.get('channel') or item.get('author') or ''
+    if isinstance(artist, dict):
+        artist = artist.get('name') or ''
+    artist = ' '.join(str(artist).casefold().split())
+    if title and artist:
+        identities.add(f'track:{title}|{artist}')
+    return identities - {''}
+
+
 def playable_source_rank(item: Dict[str, Any]) -> int:
     provider = " ".join(
         str(item.get("provider") or item.get("source_provider") or item.get("source") or "")
@@ -935,25 +953,14 @@ def candidate_inventory_coverage(
     # published rows. Raw album identities previously reported 147 available
     # while both visible shelves admitted zero.
     from .config import ROW_RECIPES
-    from .ranking import admitted_artist_candidates, build_personal_mixes, rank_albums
+    from .ranking import admitted_artist_candidates, build_personal_mixes, rank_albums, _album_identity_keys
 
     featured_albums, _ = rank_albums(
         pools,
         taste,
         ROW_RECIPES["featured_new_albums"],
     )
-    featured_album_keys = {
-        " ".join(str(item.get("id") or "").strip().casefold().split())
-        for item in featured_albums
-    } | {
-        " ".join(
-            f"{item.get('title') or ''}|{item.get('artist') or ''}"
-            .strip()
-            .casefold()
-            .split()
-        )
-        for item in featured_albums
-    }
+    featured_album_keys = {key for item in featured_albums for key in _album_identity_keys(item)}
     featured_album_keys.discard("")
     recommended_albums, _ = rank_albums(
         pools,
@@ -1009,7 +1016,7 @@ def candidate_inventory_coverage(
         "because_you_played": union_count("similarity", "artist_graph", "profile_spine", unplayed=True),
         "popular_radio": radio_card_count,
         "recommended_albums": len(recommended_albums),
-        "qualified_album_inventory": len(featured_albums) + len(recommended_albums),
+        "qualified_album_inventory": len({canonical_item_identity(item,item_type='album') for item in [*featured_albums,*recommended_albums]} - {''}),
         "raw_album_identities": len(album_ids),
         "recommended_artists": len(artist_ids),
         "quiet_picks": union_count(*discovery_sources, "profile_spine", unplayed=True),
@@ -1126,6 +1133,19 @@ def refresh_candidate_inventory_coverage(
     )
 
 
+ALBUM_VIEW_POOLS = ('known_artist_albums', 'adjacent_artist_albums', 'genre_album_discovery',
+                    'fresh_or_recent_albums', 'classic_neighbor_albums', 'freshness')
+
+
+def rebuild_album_views(inventory: CandidateInventory) -> CandidateInventory:
+    """Album shelves are projections of the validated base, never stores."""
+    albums = list(inventory.pools.get('album') or [])
+    pools = {key:value for key,value in inventory.pools.items() if key not in ALBUM_VIEW_POOLS}
+    pools.update(_album_segment_pools(albums), freshness=_freshness_pool(albums))
+    return replace(inventory, pools=pools,
+        candidate_counts={**inventory.candidate_counts, **{k:len(v) for k,v in pools.items()}})
+
+
 def merge_candidate_inventories(
     current: CandidateInventory,
     previous: CandidateInventory | None,
@@ -1171,7 +1191,7 @@ def merge_candidate_inventories(
     counts = dict(current.candidate_counts or {})
     counts.update({name: len(values) for name, values in merged_pools.items()})
     counts["inventory_merged_previous_generation"] = 1
-    return replace(
+    return rebuild_album_views(replace(
         current,
         pools=merged_pools,
         candidate_counts=counts,
@@ -1186,7 +1206,7 @@ def merge_candidate_inventories(
             for key in set(previous.canonical_stats if previous else {})
             | set(current.canonical_stats)
         },
-    )
+    ))
 
 
 

@@ -18,11 +18,13 @@ from ..discovery.config import (
     FEED_PROMOTION_CONTRACT_VERSION,
     ROW_ORDER,
     ROW_RECIPES,
+    home_discovery_trial_enabled,
 )
 from ..discovery.inventory import (
     CandidateInventory,
     candidate_inventory_from_payload,
     canonical_item_identity,
+    recommendation_track_identities,
 )
 from ..discovery.radio_inventory import (
     ArtistRadioInventory,
@@ -30,7 +32,7 @@ from ..discovery.radio_inventory import (
     radio_card_candidates,
     select_radio_rotation,
 )
-from ..discovery.ranking import admitted_artist_candidates, build_rows_from_pools
+from ..discovery.ranking import admitted_artist_candidates, build_rows_from_pools, _album_identity_keys
 from ..discovery.schema import DiscoveryArtifact, DiscoveryRow
 from ..search.intelligence import load_catalog_artist_records, normalize_artist_name
 from ..storage.artist_artwork import attach_persisted_artist_artwork
@@ -68,7 +70,6 @@ _MUTABLE_SUCCESSOR_ROWS = {
     "recommended_artists",
     "quiet_picks",
 }
-FEATURED_ALBUM_MIN_NEW_ARTISTS = 3
 
 
 def _earned_row_kinds(taste: Any, rows: Sequence[Any] | None = None) -> set[str]:
@@ -281,6 +282,9 @@ def artifact_exposure_entries(
             item_kind = str(row.item_type or "track").strip() or "track"
             raw_id = str(item.get("id") or item.get("videoId") or "").strip()
             canonical = canonical_item_identity(dict(item), item_type=item_kind)
+            if item_kind == 'track':
+                entries.update((row.kind, 'track', key)
+                               for key in recommendation_track_identities(dict(item)))
             for identity in (raw_id, canonical):
                 if identity:
                     entries.add((row.kind, item_kind, identity.casefold()))
@@ -340,6 +344,8 @@ def artifact_exposure_entries(
                 nested_canonical = canonical_item_identity(
                     dict(nested), item_type="track"
                 )
+                entries.update((row.kind, 'track', key)
+                               for key in recommendation_track_identities(dict(nested)))
                 for identity in (nested_id, nested_canonical):
                     if identity:
                         entries.add((row.kind, "track", identity.casefold()))
@@ -391,15 +397,38 @@ def _radio_exclusions(
 def _preserve_complete_optional_rows(
     rows: list[DiscoveryRow],
     parent: DiscoveryArtifact | None,
+    *,
+    now: float | None = None,
 ) -> tuple[list[DiscoveryRow], list[str]]:
     if parent is None:
         return rows, []
     output = list(rows)
     positions = {row.kind: index for index, row in enumerate(output)}
+    featured_keys = set().union(*(
+        _album_identity_keys(item)
+        for row in rows if row.kind == 'featured_new_albums' for item in row.items
+    ))
     preserved: list[str] = []
     for row in parent.rows or []:
         if row.kind not in _OPTIONAL_ROW_KINDS:
             continue
+        contract = HOME_ROW_CONTRACT_BY_KIND[row.kind]
+        retained_since = float(row.meta.get('retained_since') or parent.generated_at)
+        if (not contract.allow_reuse or
+                (time.time() if now is None else now) - retained_since > contract.max_reuse_age_seconds):
+            continue
+        # Parent restoration happens after ranking. Reapply the cross-shelf
+        # invariant to the final items, including physical/canonical aliases.
+        if row.kind == 'recommended_albums':
+            seen = set(featured_keys)
+            items = []
+            for item in row.items:
+                identities = _album_identity_keys(item)
+                if identities & seen:
+                    continue
+                seen.update(identities)
+                items.append(item)
+            row = replace(row, items=items)
         recipe = ROW_RECIPES.get(row.kind)
         if recipe is None or len(row.items or []) < recipe.min_items:
             continue
@@ -420,6 +449,7 @@ def _preserve_complete_optional_rows(
         )
         if existing_complete:
             continue
+        row = replace(row, meta={**row.meta, 'retained_since': retained_since})
         if existing_index is None:
             positions[row.kind] = len(output)
             output.append(row)
@@ -504,43 +534,59 @@ def _successor_novelty(
     comparable_rows = 0
     total_new = 0
     total_after = 0
-    rows: dict[str, dict[str, int | bool]] = {}
+    row_fractions = []
+    rows: dict[str, dict[str, Any]] = {}
+    def visible_identities(kind: str, items: Sequence[Mapping], limit: int) -> set[str]:
+        if kind == 'made_for_you':
+            # A mix row gets one vote, based on its offered recordings.
+            # Renaming a permanent card must not count as new content.
+            return {canonical_item_identity(dict(track), item_type='track')
+                    for item in list(items)[:limit] if isinstance(item, Mapping)
+                    and str(item.get('id') or '') != 'picked_again'
+                    for track in list(item.get('tracks') or item.get('items') or [])[:8]
+                    if isinstance(track, Mapping)} - {''}
+        return {_successor_item_identity(kind, item) for item in list(items)[:limit]
+                if isinstance(item, Mapping)} - {''}
     for kind in _MUTABLE_SUCCESSOR_ROWS:
         before = previous_rows.get(kind)
         after = candidate_rows.get(kind)
         if before is None or after is None:
             if before is not after:
-                changed_rows += 1
                 after_count = len(after.items or []) if after is not None else 0
+                changed_rows += int(after_count > 0)
+                comparable_rows += 1
+                row_fractions.append(float(after_count > 0))
                 total_new += after_count
                 total_after += after_count
                 rows[kind] = {
                     "before": len(before.items or []) if before is not None else 0,
                     "after": after_count,
                     "new": after_count,
-                    "changed": True,
+                    "changed": after_count > 0,
+                    "new_fraction": float(after_count > 0),
                 }
             continue
         recipe = ROW_RECIPES.get(kind)
         visible_limit = max(int(getattr(recipe, "page_size", 0) or 8), 1)
-        before_ids = {
-            identity
-            for item in list(before.items or [])[:visible_limit]
-            if isinstance(item, Mapping)
-            and (identity := _successor_item_identity(kind, item))
-        }
-        after_ids = {
-            identity
-            for item in list(after.items or [])[:visible_limit]
-            if isinstance(item, Mapping)
-            and (identity := _successor_item_identity(kind, item))
-        }
+        before_ids = visible_identities(kind, before.items or [], visible_limit)
+        after_ids = visible_identities(kind, after.items or [], visible_limit)
         if not before_ids and not after_ids:
             continue
         comparable_rows += 1
         new_count = len(after_ids - before_ids)
-        minimum_new = max(2, (len(after_ids) + 3) // 4)
-        changed = new_count >= minimum_new
+        new_fraction = new_count / max(len(after_ids), 1)
+        if kind in {'featured_new_albums', 'recommended_albums'}:
+            old_artists = set().union(*(artist_identity_aliases(item)
+                                       for item in list(before.items or [])[:visible_limit]))
+            new_artists = sum(not (artist_identity_aliases(item) & old_artists)
+                              for item in list(after.items or [])[:visible_limit])
+            # A new edition by the same artist earns partial novelty, not a
+            # claim that artist discovery improved.
+            new_fraction = (new_fraction + new_artists / max(len(after_ids), 1)) / 2
+        else:
+            new_artists = None
+        row_fractions.append(new_fraction)
+        changed = new_fraction >= .5
         if changed:
             changed_rows += 1
         total_new += new_count
@@ -550,15 +596,15 @@ def _successor_novelty(
             "after": len(after_ids),
             "new": new_count,
             "changed": changed,
+            "new_fraction": round(new_fraction, 4),
+            **({'new_artist_items': new_artists} if new_artists is not None else {}),
         }
-    # Two visibly changed shelves are enough. A broader global change also
-    # qualifies when it is distributed across several shelves below their
-    # individual 25% threshold. This avoids rejecting useful local rotations
-    # while still refusing a mere reorder of identical items.
-    global_minimum = max(8, (total_after + 5) // 6)
+    # Each visible row has equal influence. Deep mix contents cannot swamp
+    # unchanged album rows; removing a row cannot be rewarded as freshness.
+    mean_fraction = sum(row_fractions) / max(len(row_fractions), 1)
     accepted = bool(
-        changed_rows >= min(2, comparable_rows)
-        or total_new >= global_minimum
+        total_after > 0 and mean_fraction >= .5
+        and changed_rows >= min(2, comparable_rows)
     )
     return {
         "accepted": accepted,
@@ -566,7 +612,8 @@ def _successor_novelty(
         "comparable_rows": comparable_rows,
         "new_visible_identities": total_new,
         "visible_identity_count": total_after,
-        "required_global_new": global_minimum,
+        "required_row_novelty_fraction": .5,
+        "row_novelty_fraction": round(mean_fraction, 4),
         "rows": rows,
     }
 
@@ -578,6 +625,7 @@ def compose_snapshot_artifact(
     radio: ArtistRadioInventory | None,
     prior_artifacts: Sequence[DiscoveryArtifact],
     exposure_ids: Iterable[str] = (),
+    exposure_times: Mapping[str, float] | None = None,
     rotation_epoch: int,
     reason: str,
     server: Any = None,
@@ -586,10 +634,11 @@ def compose_snapshot_artifact(
     """Compose an immutable artifact, enriching artist art from local records."""
 
     started = time.perf_counter()
+    stage_ms: dict[str, int] = {}
     generated_at = time.time() if now is None else float(now)
     exposure_values = {
         str(value or "").strip().casefold()
-        for value in exposure_ids
+        for value in [*exposure_ids, *(exposure_times or {})]
         if str(value or "").strip()
     }
     avoid_ids = list(
@@ -606,6 +655,9 @@ def compose_snapshot_artifact(
         taste,
         avoid_ids=avoid_ids,
         hard_avoid_ids=hard_avoid_ids,
+        source_profile={**taste.source_profile,
+                        'recommendation_exposure_at': dict(exposure_times or {}),
+                        'recommendation_exposure_clock': generated_at},
         force_refresh=True,
         rotation_epoch=max(int(rotation_epoch or 0), 0),
         refresh_token=(
@@ -682,11 +734,17 @@ def compose_snapshot_artifact(
     ):
         independent_warnings.append("popular_radio_replacement_unavailable")
 
+    stage_ms['radio_selection'] = int((time.perf_counter() - started) * 1000)
+    row_started = time.perf_counter()
     rows, row_status, lanes, lane_diagnostics = build_rows_from_pools(
         pools,
         rotation_taste,
     )
+    stage_ms['rows'] = int((time.perf_counter() - row_started) * 1000)
+    portrait_started = time.perf_counter()
     _attach_inventory_portraits(rows, radio, server)
+    stage_ms['portraits'] = int((time.perf_counter() - portrait_started) * 1000)
+    quality_started = time.perf_counter()
     # A history list can contain repeated or unplayable records. Only publish
     # the earned row when the builder produced its contracted eligible count.
     rows = [
@@ -694,26 +752,20 @@ def compose_snapshot_artifact(
         if row.kind not in {"last_played", "frequently_listened"}
         or len(row.items or []) >= HOME_ROW_CONTRACT_BY_KIND[row.kind].min_items
     ]
-    if parent is not None:
-        current_featured = next(
-            (row for row in rows if row.kind == "featured_new_albums"),
-            None,
-        )
-        previous_featured = next(
-            (row for row in parent.rows or [] if row.kind == "featured_new_albums"),
-            None,
-        )
-        if previous_featured is not None:
-            new_artist_count = _new_row_artist_count(
-                current_featured,
-                previous_featured,
-            )
-            if new_artist_count < FEATURED_ALBUM_MIN_NEW_ARTISTS:
-                independent_warnings.append(
-                    "featured_new_albums_artist_novelty:"
-                    f"{new_artist_count}/{FEATURED_ALBUM_MIN_NEW_ARTISTS}"
-                )
-    rows, preserved = _preserve_complete_optional_rows(rows, parent)
+    rows, preserved = _preserve_complete_optional_rows(rows, parent, now=generated_at)
+    history_row = DiscoveryRow(id='familiar', title='', kind='', item_type='artist', items=[
+        *taste.full_history_tracks, *taste.frequent_tracks, *taste.recent_tracks,
+        *taste.top_tracks, *taste.last_played_tracks,
+        *({'artist': name} for name in [*taste.listened_artists, *taste.top_artists, *taste.artist_hints])])
+    album_discovery = {
+        row.kind: {
+            'albums': len(row.items),
+            'artists': _new_row_artist_count(row, None),
+            'never_listened_artists': _new_row_artist_count(row, history_row),
+            'different_artists_from_parent': _new_row_artist_count(row, next(
+                (prior for prior in parent.rows if prior.kind == row.kind), None) if parent else None),
+        } for row in rows if row.kind in {'featured_new_albums', 'recommended_albums'}
+    }
     for kind in preserved:
         row = next(value for value in rows if value.kind == kind)
         row_status[kind] = {
@@ -738,6 +790,7 @@ def compose_snapshot_artifact(
         accepted = False
         quality_reasons = [*quality_reasons, *final_contract.violations]
         artifact_quality = "rejected"
+    stage_ms['quality'] = int((time.perf_counter() - quality_started) * 1000)
     candidate_counts = dict(candidate.candidate_counts or {})
     candidate_counts["popular_radio_cards"] = len(
         pools.get("popular_radio_cards") or []
@@ -758,6 +811,9 @@ def compose_snapshot_artifact(
     diagnostics.update(
         {
             "model_version": ENGINE_MODEL_VERSION,
+            "composition_stage_ms": stage_ms,
+            "album_discovery": album_discovery,
+            "discovery_trial": home_discovery_trial_enabled(),
             "feed_promotion_contract": FEED_PROMOTION_CONTRACT_VERSION,
             "candidate_snapshot_id": candidate.generation_id,
             "radio_snapshot_id": (
@@ -959,7 +1015,7 @@ class HomeFeedComposer:
             candidate=candidate,
             radio=radio,
             prior_artifacts=prior_artifacts,
-            exposure_ids=self._repositories.exposures.recent_identities(
+            exposure_times=self._repositories.exposures.recent_exposures(
                 scope,
                 since=time.time() - HOME_DISCOVERY_EXPOSURE_COOLDOWN_SECONDS,
             ),
@@ -982,19 +1038,24 @@ class HomeFeedComposer:
                 radio_snapshot_id=radio_record.snapshot_id if radio_record else "",
                 reason="artifact_unchanged",
             )
-        if prior_artifacts and not _meaningfully_differs(prior_artifacts[-1], artifact):
+        enforce_novelty = not home_discovery_trial_enabled()
+        if prior_artifacts and enforce_novelty and not _meaningfully_differs(prior_artifacts[-1], artifact):
             novelty = _successor_novelty(prior_artifacts[-1], artifact)
             return ComposeOutcome(
                 candidate_snapshot_id=candidate_record.snapshot_id,
                 radio_snapshot_id=radio_record.snapshot_id if radio_record else "",
                 failed_contracts=(
                     "successor_visible_novelty:"
-                    f"{novelty['new_visible_identities']}/"
-                    f"{novelty['required_global_new']}:"
-                    f"rows={novelty['changed_rows']}",
+                    f"row_fraction={novelty['row_novelty_fraction']}/"
+                    f"{novelty['required_row_novelty_fraction']}:"
+                    f"changed_rows={novelty['changed_rows']}",
                 ),
                 reason="artifact_too_similar",
             )
+        artifact.diagnostics.update({
+            'novelty_enforced': enforce_novelty,
+            'novelty_would_reject': bool(prior_artifacts and not _meaningfully_differs(prior_artifacts[-1], artifact)),
+        })
         artifact_payload = with_feed_bundle_manifest(artifact_to_dict(artifact))
         artifact.diagnostics = dict(artifact_payload.get("diagnostics") or {})
         record = FeedArtifactRecord(

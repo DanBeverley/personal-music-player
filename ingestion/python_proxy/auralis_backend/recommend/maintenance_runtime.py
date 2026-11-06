@@ -1,7 +1,12 @@
 ﻿from __future__ import annotations
 
 from functools import wraps
+import os
+import sqlite3
+import time
 from auralis_backend.runtime_context import resolve_server
+
+_HEARTBEAT_BUSY_COUNT = 0
 
 
 def _with_server_globals(fn):
@@ -1452,6 +1457,11 @@ def _recommendation_model_source_signature():
             """
         ).fetchone()
         payload = {
+            "training_contract": "implicit-bpr-v2",
+            "recency_epoch": int(time.time() // max(60, RECOMMENDATION_MODEL_MAX_AGE_SECONDS)),
+            "training_config": [RECOMMENDATION_MODEL_MIN_EVENTS, RECOMMENDATION_MODEL_MAX_EVENTS,
+                                RECOMMENDATION_MODEL_FACTOR_DIM, RECOMMENDATION_MODEL_EPOCHS,
+                                RECOMMENDATION_MODEL_NEIGHBOR_LIMIT],
             "event_count": int(row["event_count"] or 0),
             "max_occurred_at": round(float(row["max_occurred_at"] or 0), 3),
             "user_count": int(row["user_count"] or 0),
@@ -2114,14 +2124,13 @@ def _recommendation_run_maintenance_cycle(
         train_due = (
             force_train
             or signature_changed
-            or (cycle_started_at - last_train_at) >= RECOMMENDATION_TRAIN_INTERVAL_SECONDS
+            or (cycle_started_at - last_train_at) >= RECOMMENDATION_MODEL_MAX_AGE_SECONDS
         )
         if train_due:
-            model = _recommendation_get_collaborative_model(
-                force_refresh=True,
-                force_sync=False,
-            )
-            result["trained"] = True
+            from .model_runtime import refresh_collaborative_model
+            previous_id = _recommendation_sync_state_get("scheduler_last_model_id", "")
+            model = refresh_collaborative_model(resolve_server(), force=force_train)
+            result["trained"] = (model or {}).get("model_id", "") != previous_id
             result["model_ready"] = bool((model or {}).get("ready"))
             result["model_id"] = _recommendation_trim_text((model or {}).get("model_id"))
             _recommendation_sync_state_set("scheduler_last_train_at", str(time.time()))
@@ -2165,17 +2174,46 @@ def _recommendation_run_maintenance_cycle(
 def _recommendation_bootstrap_once():
     _recommendation_run_maintenance_cycle(
         force_sync=bool(RECOMMENDATION_SYNC_DATABASE_DSN),
-        force_train=True,
+        force_train=False,
         run_experiment_evaluation=True,
     )
 
 
 @_with_server_globals
 def _recommendation_worker_heartbeat(worker_mode: str, status: str):
-    _recommendation_sync_state_set("worker_mode", worker_mode)
-    _recommendation_sync_state_set("worker_status", status)
-    _recommendation_sync_state_set("worker_process_id", str(os.getpid()))
-    _recommendation_sync_state_set("worker_last_heartbeat_at", str(time.time()))
+    global _HEARTBEAT_BUSY_COUNT
+    connection = None
+    try:
+        _recommendation_init_store_db()
+        connection = _recommendation_store_connection()
+        connection.execute("PRAGMA busy_timeout=1000")
+        now = time.time()
+        connection.executemany(
+            """INSERT INTO recommendation_sync_state(name, value, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(name) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
+            [(name, value, now) for name, value in (
+                ("worker_mode", worker_mode), ("worker_status", status),
+                ("worker_process_id", str(os.getpid())),
+                ("worker_last_heartbeat_at", str(now)),
+            )],
+        )
+        connection.commit()
+    except sqlite3.OperationalError as exc:
+        # Only SQLite busy contention is transient; surface disk/schema faults.
+        if (getattr(exc, "sqlite_errorcode", -1) & 0xff) != sqlite3.SQLITE_BUSY:
+            raise
+        _HEARTBEAT_BUSY_COUNT += 1
+        if _HEARTBEAT_BUSY_COUNT & (_HEARTBEAT_BUSY_COUNT - 1) == 0:
+            print(f"[recommendation_worker] heartbeat=busy count={_HEARTBEAT_BUSY_COUNT}", flush=True)
+        return False
+    finally:
+        if connection is not None:
+            connection.close()
+    if _HEARTBEAT_BUSY_COUNT:
+        print(f"[recommendation_worker] heartbeat=recovered busy_count={_HEARTBEAT_BUSY_COUNT}", flush=True)
+        _HEARTBEAT_BUSY_COUNT = 0
+    return True
 
 
 @_with_server_globals
@@ -2200,7 +2238,11 @@ def _home_feed_lane_loop(server, stop_event, lane_name, job_types, worker_mode):
         worker_id=f"{worker_mode}:{os.getpid()}:home-feed:{lane_name}",
         job_types=tuple(job_types),
     )
+    from .workload import is_idle
     while not stop_event.is_set():
+        if lane_name in {"candidates", "radio", "artwork"} and is_idle(server):
+            stop_event.wait(5.0)
+            continue
         try:
             result = worker.run_once()
         except Exception as exc:
@@ -2223,11 +2265,16 @@ def _home_feed_lane_loop(server, stop_event, lane_name, job_types, worker_mode):
 def _recommendation_scheduler_loop(worker_mode: str = "embedded"):
     from threading import Thread
     from auralis_backend.home_feed.worker import HOME_WORKER_LANES
+    from .workload import is_idle
+    from .feature_store import prune_hot_runtime_caches
+    from ..storage.cache_runtime import prune_expired_runtime_caches
 
     next_sync_at = 0.0
     next_train_at = 0.0
     next_eval_at = 0.0
     next_charts_at = 0.0
+    next_heartbeat_at = 0.0
+    next_cache_prune_at = 0.0
     minimum_sync_interval = max(30, RECOMMENDATION_SYNC_INTERVAL_SECONDS)
     minimum_train_interval = max(60, RECOMMENDATION_TRAIN_INTERVAL_SECONDS)
     minimum_eval_interval = max(60, RECOMMENDATION_EXPERIMENT_EVAL_INTERVAL_SECONDS)
@@ -2254,7 +2301,17 @@ def _recommendation_scheduler_loop(worker_mode: str = "embedded"):
     try:
         while not recommendation_scheduler_stop.is_set():
             now = time.time()
-            _recommendation_worker_heartbeat(worker_mode, "running")
+            if now >= next_cache_prune_at:
+                prune_hot_runtime_caches()
+                prune_expired_runtime_caches()
+                next_cache_prune_at = now + 60
+            idle = is_idle(server)
+            if now >= next_heartbeat_at:
+                _recommendation_worker_heartbeat(worker_mode, "idle" if idle else "running")
+                next_heartbeat_at = now + 30
+            if idle:
+                recommendation_scheduler_stop.wait(5.0)
+                continue
             should_sync = now >= next_sync_at
             should_train = now >= next_train_at
             should_evaluate = RECOMMENDATION_PROMOTE_WINNER and now >= next_eval_at
@@ -2269,7 +2326,7 @@ def _recommendation_scheduler_loop(worker_mode: str = "embedded"):
             if should_sync or should_train:
                 _recommendation_run_maintenance_cycle(
                     force_sync=should_sync,
-                    force_train=should_train,
+                    force_train=False,
                     run_experiment_evaluation=should_evaluate,
                 )
                 completed_at = time.time()

@@ -64,7 +64,8 @@ class _FakeRecommendationService:
     def __init__(self) -> None:
         self.last_recommend_request = None
 
-    def recommend(self, req):
+    def recommend(self, req, *, background_tasks=None):
+        assert background_tasks is not None
         self.last_recommend_request = req
         if req.session_id and req.row_id:
           return {
@@ -278,6 +279,10 @@ class _FakeRecognitionService:
 
 class ApiContractTests(unittest.TestCase):
     def setUp(self) -> None:
+        # Route-contract fixtures isolate identity verification; auth has its own tests.
+        auth = patch.object(routes, 'assistant_scope', side_effect=lambda request, claimed='guest', **kwargs: claimed)
+        auth.start()
+        self.addCleanup(auth.stop)
         self._original_server = routes._server
         self._original_search_service = routes._search_service
         self._original_recommendation_service = routes._recommendation_service

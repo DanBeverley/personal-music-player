@@ -39,6 +39,14 @@ def _digest(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:20]
 
 
+def _supply_priority(request: Mapping[str, Any], reason: str, default: int) -> int:
+    if reason == "idle_reserve_enrichment":
+        return 30
+    if reason == "foreground_refresh" or request.get("force_refresh") or request.get("promote_ready_on_launch"):
+        return 110
+    return default
+
+
 class HomeJobScheduler:
     """The only entry point for scheduling Home background work."""
 
@@ -100,6 +108,25 @@ class HomeJobScheduler:
                 run_after=run_after,
             )
 
+    def reconcile_supply(self, request: Any, *, state: Any, reason: str) -> HomeJobRecord:
+        req = request_payload(request)
+        req["user_scope_id"] = state.user_scope_id
+        # Coalesce across HTTP workers/restarts; ordinary visits must not hide
+        # a later signal update or explicit refresh.
+        intent = "signals" if reason == "background_prepare" else "refresh" if (
+            reason in {"pull_to_refresh", "launch_missing_successor"}
+            or req.get("force_refresh")
+        ) else "maintenance"
+        enqueue = (self._repositories.jobs.enqueue_singleton if intent == "refresh"
+                   else self._repositories.jobs.enqueue_coalesced)
+        return enqueue(
+            state.user_scope_id, HomeJobType.RECONCILE_SUPPLY,
+            f"check:{state.revision}:{int(time.time() // 30)}:{intent}",
+            payload={"request": req, "reason": reason},
+            priority=105, max_attempts=4,
+            **({"expedite": True} if intent == "refresh" else {}),
+        )
+
     def candidates(
         self,
         request: Any,
@@ -121,13 +148,14 @@ class HomeJobScheduler:
         if not hint:
             hint = f"{int(time.time() // 30)}:{_digest(payload)}"
         generation_key = f"{HomeJobType.REFRESH_CANDIDATES.value}:{hint}"
-        if coalesce_terminal:
+        priority = _supply_priority(req, reason, 90)
+        if coalesce_terminal and priority < 110:
             return self._repositories.jobs.enqueue_coalesced(
                 scope,
                 HomeJobType.REFRESH_CANDIDATES,
                 generation_key,
                 payload=payload,
-                priority=90,
+                priority=priority,
                 max_attempts=4,
                 run_after=run_after,
             )
@@ -136,9 +164,10 @@ class HomeJobScheduler:
             HomeJobType.REFRESH_CANDIDATES,
             generation_key,
             payload=payload,
-            priority=90,
+            priority=priority,
             max_attempts=4,
             run_after=run_after,
+            expedite=priority >= 110,
         )
 
     def radio(
@@ -163,9 +192,10 @@ class HomeJobScheduler:
         hint = str(generation_hint or "").strip()
         if not hint:
             hint = f"{int(time.time() // 30)}:{_digest(payload)}"
+        priority = _supply_priority(req, reason, 95)
         enqueue = (
             self._repositories.jobs.enqueue_coalesced
-            if coalesce_terminal
+            if coalesce_terminal and priority < 110
             else self._repositories.jobs.enqueue_singleton
         )
         return enqueue(
@@ -175,9 +205,10 @@ class HomeJobScheduler:
             payload=payload,
             # A ready radio reservoir unlocks local feed composition and must
             # not sit behind optional candidate enrichment.
-            priority=95,
+            priority=priority,
             max_attempts=6,
             run_after=run_after,
+            **({"expedite": True} if priority >= 110 else {}),
         )
 
     def artwork(

@@ -1,19 +1,24 @@
 # Project Overview
 
-Reconciled October 4, 2026. Neatie has an Android Flutter client and a separate Flutter web client for desktop/iPhone browsers, sharing canonical backend services and cloud accounts. They do not share identical UI/audio implementations. A change in one worktree is not automatically in the other or deployed.
+Neatie is a cross-stack music application with an Android Flutter client and a separate browser client for desktop and phones. Shared backend services supply Search, playable music sources, recommendations, metadata and lyrics conversation. Client UI/audio implementations differ; changes do not automatically cross worktrees.
 
 ## Product
 
-Android exposes Search, durable Home/Popular Radio, source-aware playback/discovery queues, library/downloads, Charts/New Releases, lyrics/Behind the Lyrics, assistant/recognition and signed-update infrastructure. User accepted related-song queues, Search scrolling and New Releases baselines.
+- **Discovery:** canonical Search with songs/artists/albums, artist profiles and playable album details; persisted personalized Home and independent radios; Charts and New Releases.
+- **Listening:** source-aware playback, related-song queues, lyrics and grounded AI conversation. Web uses a vinyl listening panel with cover/list queue views and song search; Android also supports downloads and native player integration.
+- **Library:** accounts, likes and cloud playlists. The November 2 web release exposes named creation, song-to-playlist selection and stored creation dates through the existing guarded cloud editing functions. Guest web Home offers sign-in/Search without building personalized recommendations.
+- **Operations:** bounded diagnostics, background preparation, cache retention/idle policies and protected rollback. Playback reliability, unfamiliar-artist discovery and physical iPhone performance still require acceptance; see NEXT_STEPS for the full queue.
 
-Web exposes responsive navigation, browser audio/local scoped queue persistence, auth/cloud likes/existing playlists, richer canonical Search, artist/album details and Home. It is deployed on AWS; full Android presentation, additional product surfaces, cross-device handoff and PWA/offline remain open. Browser playback is observed; long-session/background reliability is not fully accepted. Current status and all 66 task IDs live in the first two guides below.
+The November 3–4 resource release removes duplicate profile/model ownership and repeated inventory bodies, adds lazy collection rendering and excludes Android-only branding from the web bundle. Local backups and retention now pass; verified compaction reduced the recommendation database from 28.55 to 5.04 GB. This reduces storage/cache work; it does not change the fixed EC2 hourly price. Hosting migration, sustained worker-memory acceptance and off-host/full-system recovery remain separate tasks.
+
+Serving build/test/benchmark details belong in CURRENT_STATUS, not duplicated here. Historical proofs and recovery instructions remain in KNOWN_ISSUES and OPERATIONS.
 
 ## Six-document handoff map and read order
 
 | Order / file | Owns |
 | --- | --- |
 | 1. [CURRENT_STATUS.md](CURRENT_STATUS.md) | Serving version, shipped changes, recorded tests and user acceptance |
-| 2. [NEXT_STEPS.md](NEXT_STEPS.md) | Complete 66-entry queue, stable IDs, status and completion checks |
+| 2. [NEXT_STEPS.md](NEXT_STEPS.md) | Complete task queue, stable IDs, status and completion checks |
 | 3. [ARCHITECTURE.md](ARCHITECTURE.md) | Module ownership, data flow and contracts |
 | 4. [KNOWN_ISSUES.md](KNOWN_ISSUES.md) | Current artwork/UI and account defects, historical causes, diagnostics and cleanup findings |
 | 5. PROJECT_OVERVIEW.md | Product/worktree orientation and this map |
@@ -36,7 +41,7 @@ Dated release/investigation reports were merged into their owning guides rather 
 | runtime/, .env, cookies | Ignored local/private state; Git alone is not a full runtime transfer |
 | Android CMake / managedJniLibs | Current release native build; legacy ignored jniLibs may remain in archives |
 
-The trees intentionally differ: main develop remains committed e720709; the web application checkpoint is 7553f5b, including H01–H14 and the October 5 quiet minimal frontend/refinement. H09 extends verification of existing history; H10–H14 improve presentation/freshness. The user's visual preference is quiet minimal with desktop priority: restrained dark surfaces, warm typography, soft sage accents, generous spacing, artwork and a compact playback dock. Home is the initial web destination; the phone dock expands into the same playback session. Refinement adds gentle motion, continuous forward album looping, paging arrows, Search spacing, equalizer loading and the existing brand mark as browser icons. The user-created neatie.duckdns.org hostname preserves the prior address; origin-local guest/auth state does not migrate automatically. CURRENT_STATUS owns the verified serving build. Fresh supply and device acceptance remain open. Inspect Git status and owning implementation; preserve unrelated changes.
+The main `develop` checkout preserves separate Android playlist delta-sync changes. The `codex/web-app` worktree owns current browser/backend releases. Do not build an Android release from its older native playlist copy or overwrite main's newer changes. Runtime, credentials and cookies are private state outside source control.
 
 ## External services and rules
 

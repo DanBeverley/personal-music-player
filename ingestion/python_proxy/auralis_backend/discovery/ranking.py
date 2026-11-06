@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from dataclasses import replace
-from typing import Any, Dict, Iterable, List, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Sequence, Set, Tuple, TypeVar
 import hashlib
 import re
 
@@ -15,7 +15,40 @@ from .allocation import allocate_home_rows
 from .candidates import album_name, artist_name, item_signature, metadata_text, normalize_text, track_id
 from .config import LANE_ORDER, LANE_RECIPES, ROW_RECIPES
 from ..domain.catalog import normalize_artist_name
-from .schema import DiscoveryCandidate, DiscoveryRow, LaneRecipe, RowRecipe, TasteProfile
+from .schema import DiscoveryCandidate, DiscoveryRow, LaneRecipe, RowRecipe, TasteProfile, composition_fact, composition_facts
+
+
+_RankedItem = TypeVar("_RankedItem")
+
+
+def balance_exposure(
+    scored: Sequence[Tuple[float, _RankedItem]],
+    is_exposed: Callable[[_RankedItem], bool],
+    *,
+    relevance_margin: float | None = 1.0,
+) -> List[Tuple[float, _RankedItem]]:
+    """Prefer a familiar/new balance among similarly relevant eligible items.
+
+    No candidate is discarded or reserved to fill a quota. A materially better
+    head wins, and either partition can fill the remainder of a shallow pool.
+    Admission, canonical deduplication and row diversity remain with callers.
+    Use no score margin when admitted source groups use incomparable scores.
+    """
+    partitions = [deque(), deque()]
+    for entry in sorted(scored, key=lambda value: value[0], reverse=True):
+        partitions[int(is_exposed(entry[1]))].append(entry)
+    counts = [0, 0]
+    output = []
+    while partitions[0] or partitions[1]:
+        preferred = int(counts[1] < counts[0])
+        other = 1 - preferred
+        if not partitions[preferred]:
+            preferred = other
+        elif relevance_margin is not None and partitions[other] and partitions[other][0][0] > partitions[preferred][0][0] + relevance_margin:
+            preferred = other
+        output.append(partitions[preferred].popleft())
+        counts[preferred] += 1
+    return output
 
 
 def _contains_token_phrase(text: str, phrase: Any) -> bool:
@@ -76,6 +109,7 @@ def _number(value: Any) -> float:
         return 0.0
 
 
+@composition_fact
 def _negative_feedback_by_type(taste: TasteProfile) -> Dict[str, Dict[str, float]]:
     profile = dict(taste.source_profile or {})
     raw = profile.get("negative_feedback") or {}
@@ -155,6 +189,7 @@ def _negative_feedback_penalty(item: Dict[str, Any], taste: TasteProfile) -> Tup
     return penalty, hard_suppressed
 
 
+@composition_fact
 def _avoid_ids(taste: TasteProfile) -> Set[str]:
     output: Set[str] = set()
     for value in taste.avoid_ids or []:
@@ -168,6 +203,7 @@ def _avoid_ids(taste: TasteProfile) -> Set[str]:
     return output
 
 
+@composition_fact
 def _hard_avoid_ids(taste: TasteProfile) -> Set[str]:
     output: Set[str] = set()
     for value in getattr(taste, "hard_avoid_ids", []) or []:
@@ -223,7 +259,10 @@ def _album_identity_keys(item: Dict[str, Any]) -> Set[str]:
     )
     keys = {canonical} if canonical else set()
     if not keys:
-        keys.add(normalize_text(f"{title}|{artist}"))
+        if title:
+            keys.add(normalize_text(f"{title}|{artist}"))
+        elif item.get('id'):
+            keys.add(f"album-id:{str(item['id']).strip().casefold()}")
     keys.discard("")
     return keys
 
@@ -283,6 +322,7 @@ def _collect_candidates(
     return list(_candidate_sources(candidates).values())
 
 
+@composition_fact
 def _taste_artist_keys(taste: TasteProfile) -> Set[str]:
     artists = set()
     for artist in (taste.artist_hints + taste.top_artists + taste.listened_artists):
@@ -296,6 +336,7 @@ def _taste_artist_keys(taste: TasteProfile) -> Set[str]:
     return artists
 
 
+@composition_fact
 def _history_track_ids(taste: TasteProfile) -> Set[str]:
     ids = set()
     for track in taste.recent_tracks + taste.top_tracks + taste.last_played_tracks:
@@ -305,6 +346,7 @@ def _history_track_ids(taste: TasteProfile) -> Set[str]:
     return ids
 
 
+@composition_fact
 def _history_track_identity_keys(taste: TasteProfile) -> Set[str]:
     keys: Set[str] = set()
     for track in taste.recent_tracks + taste.top_tracks + taste.last_played_tracks + taste.anchor_tracks:
@@ -326,6 +368,7 @@ def _history_track_identity_keys(taste: TasteProfile) -> Set[str]:
     return keys
 
 
+@composition_fact
 def _listened_album_keys(taste: TasteProfile) -> Tuple[Set[str], Set[str]]:
     titles = {
         normalize_text(value)
@@ -342,6 +385,7 @@ def _listened_album_keys(taste: TasteProfile) -> Tuple[Set[str], Set[str]]:
     return titles, exact
 
 
+@composition_fact
 def _profile_string_set(taste: TasteProfile, *keys: str) -> Set[str]:
     output: Set[str] = set()
     pending: List[Any] = [taste.source_profile]
@@ -363,6 +407,7 @@ def _profile_string_set(taste: TasteProfile, *keys: str) -> Set[str]:
     return output
 
 
+@composition_fact
 def _taste_genre_keys(taste: TasteProfile) -> Set[str]:
     genres: Set[str] = set()
     for track in taste.recent_tracks + taste.top_tracks + taste.last_played_tracks:
@@ -636,7 +681,7 @@ def _album_taste_relation(
     preferred_track_ids = set(preferred_track_ids or set())
 
     if artist_key and artist_key in taste_artists:
-        return True, "known_artist", 1.6
+        return True, "known_artist", 1.0
     if source_track_id and source_track_id in history_ids:
         return True, "history_track_album", 1.25
     if source_track_id and source_track_id in preferred_track_ids:
@@ -839,8 +884,17 @@ def _score_candidate(
         score -= 1.1
     if taste.force_refresh and row.kind in REFRESH_MUTABLE_ROWS:
         avoid = _avoid_ids(taste)
-        if item_id and item_id in avoid:
-            score -= 4.5
+        from .inventory import recommendation_track_identities
+        identities = recommendation_track_identities(candidate.item)
+        if identities & avoid:
+            # As with albums, let older familiar recommendations return before
+            # immediately repeating the same high-scoring tracks. The existing
+            # soft familiar/new balance and all admission rules still apply.
+            exposure = taste.source_profile.get('recommendation_exposure_at') or {}
+            last_seen = max((_number(exposure.get(key)) for key in identities), default=0)
+            clock = _number(taste.source_profile.get('recommendation_exposure_clock'))
+            age = max(0, clock - last_seen) if last_seen and clock else 0
+            score -= 4.5 * max(0.1, 1 - age / (7 * 24 * 60 * 60))
         identity = candidate.item.get("canonical_track_identity") or candidate.item.get("canonical_source_identity")
         score += _refresh_jitter(taste, identity or item_id or item_signature(candidate.item)) * 0.55
     if row.kind == "last_played" and "last_played" in candidate.reasons:
@@ -870,6 +924,7 @@ def _select_diverse(
     exclude_ids = set(exclude_ids or set())
     selected: List[Dict[str, Any]] = []
     seen_signatures: Set[str] = set()
+    artist_reserve: List[DiscoveryCandidate] = []
     artist_counts: Dict[str, int] = defaultdict(int)
     album_counts: Dict[str, int] = defaultdict(int)
     max_same_artist = 3 if row_kind in {"last_played", "frequently_listened"} else 2
@@ -897,9 +952,11 @@ def _select_diverse(
             continue
         artist_key = normalize_text(artist_name(item))
         album_key = normalize_text(album_name(item))
-        if artist_key and artist_counts[artist_key] >= max_same_artist:
-            continue
         if album_key and album_counts[album_key] >= max_same_album:
+            continue
+        if artist_key and artist_counts[artist_key] >= max_same_artist:
+            if row_kind == "because_you_played":
+                artist_reserve.append(candidate)
             continue
         if candidate.reasons:
             item.setdefault("recommendation_reason", candidate.reasons[0])
@@ -911,6 +968,26 @@ def _select_diverse(
             album_counts[album_key] += 1
         if len(selected) >= limit:
             break
+    # Keep the distinct-artist prefix. Fill deeper slots only from candidates
+    # that passed the same admission and anchor relationship checks.
+    if row_kind == "because_you_played" and len(selected) >= min(limit, 8):
+        for candidate in artist_reserve:
+            if len(selected) >= limit:
+                break
+            item = dict(candidate.item)
+            signature = item_signature(item)
+            artist_key = normalize_text(artist_name(item))
+            album_key = normalize_text(album_name(item))
+            if (signature in seen_signatures or artist_counts[artist_key] >= 2
+                    or (album_key and album_counts[album_key] >= max_same_album)):
+                continue
+            if candidate.reasons:
+                item.setdefault("recommendation_reason", candidate.reasons[0])
+            selected.append(item)
+            seen_signatures.add(signature)
+            artist_counts[artist_key] += 1
+            if album_key:
+                album_counts[album_key] += 1
     if row_kind == "quiet_picks" and len(selected) < limit:
         for _score, candidate in scored:
             item = dict(candidate.item)
@@ -993,20 +1070,12 @@ def rank_tracks(
                 collaborative_count += 1
             bounded.append(entry)
         scored = bounded
-    # Previous visible items are a freshness preference, not an absolute
-    # validity rule. Rank unexposed supply first, then use a bounded diverse
-    # backfill when the fresh partition cannot satisfy the row. This prevents
-    # shallow-but-valid supply from turning into a rejected feed loop.
     effective_excludes = set(exclude_ids or set())
     if taste.force_refresh and row.kind in REFRESH_MUTABLE_ROWS:
-        prior_visible = _hard_avoid_ids(taste)
-        fresh = [
-            entry
-            for entry in scored
-            if not (_track_identity_keys(entry[1].item) & prior_visible)
-        ]
-        retained = [entry for entry in scored if entry not in fresh]
-        scored = [*fresh, *retained]
+        from .inventory import recommendation_track_identities
+        prior_visible = _hard_avoid_ids(taste) | _avoid_ids(taste)
+        scored = balance_exposure(scored, lambda candidate: bool(
+            recommendation_track_identities(candidate.item) & prior_visible))
     return _select_diverse(
         scored,
         limit=requested_limit,
@@ -1062,20 +1131,25 @@ def rank_albums(
     lane_id: str = "all",
     preferred_track_ids: Set[str] | None = None,
     exclude_album_keys: Set[str] | None = None,
+    other_shelf_artists: Set[str] | None = None,
 ) -> Tuple[List[Dict[str, Any]], bool]:
     candidates = _collect_candidates(pools, row.candidate_sources, item_type="album")
     taste_artists = _taste_artist_keys(taste)
     history_ids = _history_track_ids(taste)
     scored: List[Tuple[float, DiscoveryCandidate]] = []
-    exposed_scored: List[Tuple[float, DiscoveryCandidate]] = []
     has_release_metadata = False
     seen = set()
     lane = LANE_RECIPES.get(lane_id)
     preferred_track_ids = set(preferred_track_ids or set())
     exclude_album_keys = set(exclude_album_keys or set())
     avoid_identities = _avoid_ids(taste)
-    hard_avoid_identities = _hard_avoid_ids(taste)
     listened_album_titles, listened_album_exact = _listened_album_keys(taste)
+    other_shelf_artists = set(other_shelf_artists or ())
+    familiar_artists = {normalize_text(value) for value in [*taste.listened_artists, *taste.top_artists]} | {
+        normalize_text(artist_name(track)) for track in
+        [*taste.full_history_tracks, *taste.frequent_tracks, *taste.recent_tracks,
+         *taste.top_tracks, *taste.last_played_tracks]
+    }
     for candidate in candidates:
         item = dict(candidate.item)
         if normalize_text(item.get("source_authority")) == "search_only":
@@ -1092,18 +1166,6 @@ def rank_albums(
             continue
         if identity_keys & exclude_album_keys:
             continue
-        previously_visible = bool(
-            taste.force_refresh
-            and row.kind in REFRESH_MUTABLE_ROWS
-            and (
-                identity_keys & hard_avoid_identities
-                or (
-                    row.kind == "featured_new_albums"
-                    and artist_exposure_identity
-                    and artist_exposure_identity in hard_avoid_identities
-                )
-            )
-        )
         release = str(
             item.get("release_year")
             or item.get("release_date")
@@ -1161,8 +1223,6 @@ def rank_albums(
             score += relation_bonus
             if item.get("album_source") == "artist_catalog":
                 score += 1.5
-            if artist and artist in taste_artists:
-                score += 0.35
             if source_track_id and source_track_id in history_ids:
                 score -= 0.35
             if candidate.source in {"freshness", "popularity"}:
@@ -1171,9 +1231,18 @@ def rank_albums(
             score += 0.45
         if release:
             score += 0.35
+        if artist in other_shelf_artists:
+            score -= 1.5
         if taste.force_refresh and row.kind in REFRESH_MUTABLE_ROWS:
             if _album_identity_keys(item) & avoid_identities:
-                score -= 4.5
+                # The durable ledger records last shown time. Prefer albums
+                # resting longest rather than penalizing every old exposure
+                # equally and endlessly recycling the highest base scores.
+                exposure = taste.source_profile.get('recommendation_exposure_at') or {}
+                last_seen = max((_number(exposure.get(key)) for key in identity_keys), default=0)
+                clock = _number(taste.source_profile.get('recommendation_exposure_clock'))
+                age = max(0, clock - last_seen) if last_seen and clock else 0
+                score -= 4.5 * max(0.1, 1 - age / (7 * 24 * 60 * 60))
             if (
                 row.kind == "featured_new_albums"
                 and artist_exposure_identity
@@ -1209,10 +1278,20 @@ def rank_albums(
                 item_type="album",
             ),
         )
-        (exposed_scored if previously_visible else scored).append(entry)
+        scored.append(entry)
     scored.sort(key=lambda item: item[0], reverse=True)
-    exposed_scored.sort(key=lambda item: item[0], reverse=True)
-    scored = [*scored, *exposed_scored]
+    def familiar(candidate):
+        artist = normalize_text(artist_name(candidate.item))
+        return artist in familiar_artists or f"artist:{artist}" in avoid_identities
+    # All entries have passed relation/admission and playable supply checks.
+    # Acquisition scores use different scales; compare them within familiar /
+    # discovery groups, rather than letting a high catalog score erase discovery.
+    # Exposure already has an age-based penalty above, not a second hard tier.
+    scored = balance_exposure(scored, familiar, relevance_margin=None)
+    # Prefer other qualified artists before reusing the first shelf's artists.
+    # Reuse remains possible when the available inventory is shallow.
+    scored = [entry for entry in scored if normalize_text(artist_name(entry[1].item)) not in other_shelf_artists] + [
+        entry for entry in scored if normalize_text(artist_name(entry[1].item)) in other_shelf_artists]
     if row.kind == "recommended_albums":
         fresh_scored: List[Tuple[float, DiscoveryCandidate]] = []
         listened_scored: List[Tuple[float, DiscoveryCandidate]] = []
@@ -1228,35 +1307,18 @@ def rank_albums(
         if fresh_scored:
             scored = [*fresh_scored, *listened_scored]
     output: List[Dict[str, Any]] = []
-    deferred: List[Tuple[float, DiscoveryCandidate]] = []
     artist_counts: Dict[str, int] = defaultdict(int)
     max_per_artist = 1 if row.kind == "featured_new_albums" else 2
     for _score, candidate in scored:
         item = dict(candidate.item)
         artist_key = normalize_text(item.get("artist"))
         if artist_key and artist_counts[artist_key] >= max_per_artist:
-            deferred.append((_score, candidate))
             continue
         output.append(item)
         if artist_key:
             artist_counts[artist_key] += 1
         if len(output) >= row.max_items:
             break
-    # If the ideal diversity pass cannot reach the viable minimum, admit a
-    # bounded deterministic backfill. This keeps shallow inventories useful
-    # without allowing one artist to dominate a full shelf.
-    if len(output) < row.target_items:
-        backfill_cap = max_per_artist + 2
-        for _score, candidate in deferred:
-            item = dict(candidate.item)
-            artist_key = normalize_text(item.get("artist"))
-            if artist_key and artist_counts[artist_key] >= backfill_cap:
-                continue
-            output.append(item)
-            if artist_key:
-                artist_counts[artist_key] += 1
-            if len(output) >= row.max_items:
-                break
     return output, has_release_metadata
 
 
@@ -1505,16 +1567,16 @@ def build_personal_mixes(
     replay_history = rank_tracks(pools, taste, history_recipe, limit=48)
 
     candidate_overrides: Dict[str, List[Dict[str, Any]]] = {}
+    mix_genres: Dict[str, str] = {}
     discovery_visible_budget = max(len(global_discovery) - (4 * min_tracks), 0)
     extra_mix_count = min(
         max(base.max_items - len(definitions), 0),
         discovery_visible_budget // min_tracks,
     )
-    genre_candidates: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for track in global_discovery:
-        structured_genres = {
+    def structured_genres(track: Dict[str, Any]) -> Set[str]:
+        return {
             normalize_text(value)
-            for key in ("genres", "discovery_genres")
+            for key in ("genre", "subgenre", "genres", "discovery_genres", "styles")
             for value in (
                 track.get(key)
                 if isinstance(track.get(key), (list, tuple, set))
@@ -1522,7 +1584,10 @@ def build_personal_mixes(
             )
             if normalize_text(value)
         }
-        for genre in structured_genres:
+
+    genre_candidates: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for track in global_discovery:
+        for genre in structured_genres(track):
             genre_candidates[genre].append(track)
 
     used_genre_signatures: Set[Tuple[str, ...]] = set()
@@ -1558,7 +1623,8 @@ def build_personal_mixes(
                 True,
             )
         )
-        candidate_overrides[mix_id] = [*tracks, *global_discovery]
+        candidate_overrides[mix_id] = tracks
+        mix_genres[mix_id] = genre
         dynamic_index += 1
 
     while dynamic_index <= extra_mix_count:
@@ -1593,6 +1659,7 @@ def build_personal_mixes(
     selected_signatures: Dict[str, Set[str]] = {
         mix_id: set() for mix_id in selected
     }
+    theme_uses: Dict[Tuple[str, str], int] = defaultdict(int)
     for mix_id, _title, _subtitle, sources, discovery_mix in definitions:
         recipe = replace(
             base,
@@ -1626,10 +1693,40 @@ def build_personal_mixes(
                 continue
             seen.add(track_signature)
             merged.append(track)
+        if discovery_mix:
+            themes: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
+            for track in merged:
+                for genre in sorted(structured_genres(track)):
+                    themes[("genre", genre)].append(track)
+                graph_keys = track.get("artist_graph_keys")
+                if isinstance(graph_keys, (list, tuple, set)):
+                    for key in sorted({normalize_text(value) for value in graph_keys} - {""}):
+                        themes[("artist_graph", key)].append(track)
+            named_genre = mix_genres.get(mix_id)
+            if named_genre:
+                theme = ("genre", named_genre)
+            else:
+                viable = [
+                    key for key, tracks in themes.items()
+                    if len(tracks) >= min_tracks and len({
+                        normalize_text(artist_name(track)) for track in tracks
+                        if artist_name(track)
+                    }) >= (min_tracks + 1) // 2
+                ]
+                theme = min(
+                    viable,
+                    key=lambda key: (theme_uses[key], key[0] != "genre"),
+                    default=None,
+                )
+            if theme is None:
+                merged = []
+            else:
+                theme_uses[theme] += 1
+                merged = themes[theme]
         candidate_lists[mix_id] = merged
 
-    # Reserve the visible eight tracks for every card together. This prevents
-    # the first mix from consuming the only viable tracks for later mixes.
+    # Reserve complete previews before filling any mix beyond the preview.
+    # A mix with too little matching supply must not reserve other cards' tracks.
     visible_used: Set[str] = set()
     mix_artist_counts: Dict[str, Counter[str]] = defaultdict(Counter)
     mix_album_counts: Dict[str, Counter[str]] = defaultdict(Counter)
@@ -1644,29 +1741,22 @@ def build_personal_mixes(
         mix_artist_counts[mix_id][normalize_text(artist_name(track))] += 1
         mix_album_counts[mix_id][normalize_text(album_name(track))] += 1
 
-    for _slot in range(min_tracks):
-        for mix_id, _title, _subtitle, _sources, _discovery in definitions:
-            match = next(
-                (
-                    track
-                    for track in candidate_lists[mix_id]
-                    if (track_signature := signature(track))
-                    and track_signature not in visible_used
-                    and track_signature not in selected_signatures[mix_id]
-                    and diversity_allows(mix_id, track, visible=True)
-                ),
-                None,
-            )
-            if match is None:
-                rejection_reasons[mix_id] = (
-                    f"below_min_unique_tracks:{len(selected[mix_id])}/{min_tracks}"
-                )
+    for mix_id, _title, _subtitle, _sources, _discovery in definitions:
+        preview = selected[mix_id]
+        preview_signatures = selected_signatures[mix_id]
+        for track in candidate_lists[mix_id]:
+            track_signature = signature(track)
+            if (track_signature in visible_used or
+                    not diversity_allows(mix_id, track, visible=True)):
                 continue
-            track_signature = signature(match)
-            selected[mix_id].append(match)
-            selected_signatures[mix_id].add(track_signature)
-            visible_used.add(track_signature)
-            count_diversity(mix_id, match)
+            preview.append(track)
+            preview_signatures.add(track_signature)
+            count_diversity(mix_id, track)
+            if len(preview) == min_tracks:
+                visible_used.update(preview_signatures)
+                break
+        if len(preview) < min_tracks:
+            rejection_reasons[mix_id] = f"below_min_unique_tracks:{len(preview)}/{min_tracks}"
 
     occurrence_counts: Counter[str] = Counter(visible_used)
     complete_mix_ids = [
@@ -1946,10 +2036,19 @@ def build_rows_from_pools(
     pools: Dict[str, List[DiscoveryCandidate]],
     taste: TasteProfile,
 ) -> Tuple[List[DiscoveryRow], Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]], Dict[str, Any]]:
+    with composition_facts():
+        return _build_rows_from_pools(pools, taste)
+
+
+def _build_rows_from_pools(
+    pools: Dict[str, List[DiscoveryCandidate]],
+    taste: TasteProfile,
+) -> Tuple[List[DiscoveryRow], Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]], Dict[str, Any]]:
     rows: List[DiscoveryRow] = []
     row_status: Dict[str, Dict[str, Any]] = {}
     selected_recent_ids: Set[str] = set()
     featured_album_keys: Set[str] = set()
+    featured_artists: Set[str] = set()
 
     home_lanes, home_tab_diagnostics = build_home_lanes(pools, taste)
 
@@ -1982,12 +2081,14 @@ def build_rows_from_pools(
                 taste,
                 row,
                 exclude_album_keys=excluded_album_keys,
+                other_shelf_artists=featured_artists if row.kind == 'recommended_albums' else set(),
             )
             title = "Featured new albums" if row.kind == "featured_new_albums" and has_release_metadata else row.title
             if len(items) < row.min_items:
                 row_status[row_kind] = {"status": "filtered_out", "reason": "below_min_items", "count": len(items)}
                 continue
             if row.kind == "featured_new_albums":
+                featured_artists.update(normalize_text(artist_name(item)) for item in items)
                 for item in items:
                     featured_album_keys.update(_album_identity_keys(item))
                 featured_album_keys.discard("")

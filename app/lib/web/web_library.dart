@@ -6,6 +6,13 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../logic/track_metadata.dart';
 
+class _LikeWrite {
+  _LikeWrite(this.confirmed);
+  Map<String, dynamic>? confirmed;
+  int version = 0;
+  int pending = 0;
+}
+
 /// Account-scoped cloud library state for the browser client.
 ///
 /// This class deliberately works only on individual records. In particular,
@@ -35,10 +42,14 @@ class WebLibrary extends ChangeNotifier {
   bool _disposed = false;
   int _refreshGeneration = 0;
   Future<void> _writeQueue = Future<void>.value();
+  final Map<String, _LikeWrite> _likeWrites = {};
+  final Map<String, int> _likeRevisions = {};
+  int _likeRevision = 0;
 
   List<Map<String, dynamic>> get likes => List.unmodifiable(_likes);
   List<Map<String, dynamic>> get playlists => List.unmodifiable(_playlists);
   bool get playlistWritesEnabled => _playlistWritesEnabled;
+  bool get active => !_disposed && _scopeIsCurrent?.call() != false;
   bool get loading => _loading;
   String? get error => _error;
 
@@ -68,6 +79,9 @@ class WebLibrary extends ChangeNotifier {
 
   Future<void> refresh() async {
     final generation = ++_refreshGeneration;
+    // Older refreshes cannot publish after this generation begins.
+    _likeRevisions.clear();
+    final likeRevision = _likeRevision;
     if (!_isCurrent(generation)) return;
     _loading = true;
     _error = null;
@@ -109,7 +123,19 @@ class WebLibrary extends ChangeNotifier {
       final nextLikes = _decodeLikes(likedRows);
       final nextPlaylists = _decodePlaylists(playlistRows, playlistTrackRows);
       if (!_isCurrent(generation)) return;
-      _likes = nextLikes;
+      // A read can finish after a local intent or acknowledgement. Preserve
+      // those tracks while still accepting unrelated changes from the server.
+      final protectedIds = <String>{
+        ..._likeWrites.keys,
+        for (final entry in _likeRevisions.entries)
+          if (entry.value > likeRevision) entry.key,
+      };
+      _likes = [
+        ..._likes
+            .where((track) => protectedIds.contains(extractTrackId(track))),
+        ...nextLikes
+            .where((track) => !protectedIds.contains(extractTrackId(track))),
+      ];
       _playlists = nextPlaylists;
       _loading = false;
       notifyListeners();
@@ -122,39 +148,102 @@ class WebLibrary extends ChangeNotifier {
   }
 
   Future<void> setLiked(Map<String, dynamic> track, bool liked) {
+    final normalized = normalizeTrack(track);
+    final trackId = extractTrackId(normalized)?.trim();
+    if (trackId == null || trackId.isEmpty) {
+      return Future.error(
+          ArgumentError.value(track, 'track', 'A track id is required.'));
+    }
+    if (_disposed || _scopeIsCurrent?.call() == false) {
+      return Future.error(StateError('The account changed. Please retry.'));
+    }
+    final token = _accessToken?.call();
+    if (_accessToken != null && token == null) {
+      return Future.error(StateError('The account changed. Please retry.'));
+    }
+    final state = _likeWrites.putIfAbsent(
+        trackId,
+        () => _LikeWrite(_likes
+            .where((item) => extractTrackId(item) == trackId)
+            .firstOrNull));
+    final version = ++state.version;
+    state.pending++;
+    _setLocalLike(trackId, liked ? normalized : null);
+    _error = null;
+    notifyListeners();
     return _enqueueWrite(() async {
-      final normalized = normalizeTrack(track);
-      final trackId = extractTrackId(normalized)?.trim();
-      if (trackId == null || trackId.isEmpty) {
-        throw ArgumentError.value(track, 'track', 'A track id is required.');
+      try {
+        if (_disposed || _scopeIsCurrent?.call() == false) {
+          throw StateError('The account changed. Please retry.');
+        }
+        if (liked) {
+          final request = _client.from('library_tracks').upsert(
+            {
+              'user_id': _userId,
+              'track_id': trackId,
+              'track_data': normalized,
+              'updated_at': DateTime.now().toUtc().toIso8601String(),
+            },
+            onConflict: 'user_id,track_id',
+          );
+          await (token == null
+              ? request
+              : request.setHeader('Authorization', 'Bearer $token'));
+        } else {
+          final request = _client
+              .from('library_tracks')
+              .delete()
+              .eq('user_id', _userId)
+              .eq('track_id', trackId);
+          await (token == null
+              ? request
+              : request.setHeader('Authorization', 'Bearer $token'));
+        }
+        state.confirmed = liked ? normalized : null;
+        _likeRevisions[trackId] = ++_likeRevision;
+        if (!_disposed &&
+            _scopeIsCurrent?.call() != false &&
+            state.version == version &&
+            _error != null) {
+          _error = null;
+          notifyListeners();
+        }
+      } catch (_) {
+        // An obsolete intent must not report an error over a newer tap.
+        if (state.version != version) return;
+        if (!_disposed &&
+            _scopeIsCurrent?.call() != false &&
+            state.version == version) {
+          _setLocalLike(trackId, state.confirmed);
+          notifyListeners();
+        }
+        rethrow;
+      } finally {
+        state.pending--;
+        if (state.pending == 0) _likeWrites.remove(trackId);
       }
-      if (liked) {
-        await _client.from('library_tracks').upsert(
-          {
-            'user_id': _userId,
-            'track_id': trackId,
-            'track_data': normalized,
-            'updated_at': DateTime.now().toUtc().toIso8601String(),
-          },
-          onConflict: 'user_id,track_id',
-        );
-      } else {
-        await _client
-            .from('library_tracks')
-            .delete()
-            .eq('user_id', _userId)
-            .eq('track_id', trackId);
-      }
-      await refresh();
-    });
+    }, checkScope: false);
   }
 
-  Future<void> createPlaylist(String name) {
-    return _enqueueWrite(() async {
+  void _setLocalLike(String trackId, Map<String, dynamic>? track) {
+    _likeRevisions[trackId] = ++_likeRevision;
+    _likes = [
+      if (track != null) {...track, 'id': trackId, 'track_key': trackId},
+      ..._likes.where((item) => extractTrackId(item) != trackId),
+    ];
+  }
+
+  Future<String> createPlaylist(String name,
+      {Map<String, dynamic>? initialTrack}) async {
+    final id = _newPlaylistId();
+    await _enqueueWrite(() async {
       _requirePlaylistWrites();
-      await _editPlaylist(
-          _newPlaylistId(), 'create', {'name': _validateName(name)});
+      await _editPlaylist(id, 'create', {
+        'name': _validateName(name),
+        if (initialTrack != null) ..._trackPayload(initialTrack)
+      });
     });
+    return id;
   }
 
   Future<void> renamePlaylist(String id, String name, {int? expectedRevision}) {
@@ -176,18 +265,19 @@ class WebLibrary extends ChangeNotifier {
       {int? expectedRevision}) {
     return _enqueueWrite(() async {
       _requirePlaylistWrites();
-      final normalized = normalizeTrack(track);
-      final trackId = extractTrackId(normalized)?.trim();
-      if (trackId == null || trackId.isEmpty) {
-        throw ArgumentError.value(track, 'track', 'A track id is required.');
-      }
-
-      normalized.remove('playlist_entry_id');
-      normalized.remove('playlist_position');
-      await _editPlaylist(
-          id, 'append', {'track_id': trackId, 'track_data': normalized},
+      await _editPlaylist(id, 'append', _trackPayload(track),
           expectedRevision: expectedRevision);
     });
+  }
+
+  Map<String, dynamic> _trackPayload(Map<String, dynamic> track) {
+    final normalized = normalizeTrack(track);
+    final id = extractTrackId(normalized)?.trim();
+    if (id == null || id.isEmpty)
+      throw ArgumentError.value(track, 'track', 'A track id is required.');
+    normalized.remove('playlist_entry_id');
+    normalized.remove('playlist_position');
+    return {'track_id': id, 'track_data': normalized};
   }
 
   Future<void> removeTrack(String id, String entryId, {int? expectedRevision}) {
@@ -242,7 +332,13 @@ class WebLibrary extends ChangeNotifier {
       if (result is! Map ||
           result['id'] != playlistId ||
           (result['deleted'] != true &&
-              (result['revision'] is! num || result['tracks'] is! List))) {
+              (result['revision'] is! num || result['tracks'] is! List)) ||
+          (action == 'create' &&
+              payload['track_id'] != null &&
+              (result['tracks'] is! List ||
+                  !(result['tracks'] as List)
+                      .whereType<Map>()
+                      .any((row) => row['track_id'] == payload['track_id'])))) {
         throw StateError(
             'Could not confirm the saved playlist. Refresh before retrying.');
       }
@@ -281,9 +377,10 @@ class WebLibrary extends ChangeNotifier {
     }
   }
 
-  Future<void> _enqueueWrite(Future<void> Function() write) {
+  Future<void> _enqueueWrite(Future<void> Function() write,
+      {bool checkScope = true}) {
     final scheduled = _writeQueue.then((_) {
-      if (_disposed || _scopeIsCurrent?.call() == false) {
+      if (checkScope && (_disposed || _scopeIsCurrent?.call() == false)) {
         throw StateError('The account changed. Please retry.');
       }
       return write();
@@ -326,7 +423,7 @@ class WebLibrary extends ChangeNotifier {
       _scopeIsCurrent?.call() != false;
 
   void _recordError(Object error) {
-    if (_disposed) return;
+    if (_disposed || _scopeIsCurrent?.call() == false) return;
     _error = _messageFor(error);
     notifyListeners();
   }
@@ -389,6 +486,7 @@ class WebLibrary extends ChangeNotifier {
           return <String, dynamic>{
             'id': id,
             'name': row['name']?.toString() ?? 'Untitled Playlist',
+            'created_at': row['created_at'],
             'revision': (row['revision'] as num?)?.toInt(),
             'tracks': List<Map<String, dynamic>>.unmodifiable(
                 tracksByPlaylist[id] ?? const []),

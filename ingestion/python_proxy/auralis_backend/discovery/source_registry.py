@@ -8,6 +8,7 @@ from concurrent.futures import (
 from dataclasses import replace
 from difflib import SequenceMatcher
 import json
+import html
 import re
 import time
 from typing import Any, Dict, Iterable, List, Tuple
@@ -174,11 +175,20 @@ def _version_is_compatible(
     return not actual_special, expected, actual
 
 
-def playback_source_semantically_compatible(source: Dict[str, Any]) -> bool:
+def playback_source_semantically_compatible(source: Dict[str, Any], canonical: Dict[str, Any] | None = None) -> bool:
     """Reject known wrong editions before a persisted source reaches playback."""
 
     if _text(source.get("source_match_version")) == _SOURCE_MATCH_VERSION:
-        return source.get("match_compatible") is True
+        if source.get('match_compatible') is not True:
+            return False
+        if canonical and 'canonical_duration' in source:
+            recording = CanonicalRecording.from_item(canonical)
+            if (recording.duration_seconds and
+                    _duration(source.get('canonical_duration')) != recording.duration_seconds):
+                # A proof made before duration was known cannot certify a later
+                # duration. Reuse the existing matcher, without provider I/O.
+                return bool(_duration(source.get('duration')) and _match_source(recording, source))
+        return True
     # Old rows only proved that a physical stream once resolved. They did not
     # prove that it represented this canonical recording, so force them back
     # through the current title/artist/version matcher on demand.
@@ -360,7 +370,7 @@ def _verified_source(
         compatible: List[Dict[str, Any]] = []
         for source in verified:
             if not _text(source.get("title")) or not _text(source.get("channel")):
-                if playback_source_semantically_compatible(source):
+                if playback_source_semantically_compatible(source, item):
                     compatible.append(source)
                 continue
             match = _match_source(recording, source)
@@ -371,6 +381,10 @@ def _verified_source(
 
 
 def _source_retry_at(source: Dict[str, Any]) -> float:
+    # Admission pressure says nothing about the source. Recover legacy rows
+    # without a migration or extending their mistaken cooldown.
+    if source.get("failure_reason") == "preparation_busy":
+        return 0.0
     retry_at = float(source.get("retry_at") or 0.0)
     # Old generic resolver failures were incorrectly persisted as terminal.
     if source.get("verification_state") == "unavailable" and source.get("failure_reason") in {
@@ -382,13 +396,17 @@ def _source_retry_at(source: Dict[str, Any]) -> float:
 
 def _source_is_terminal(source: Dict[str, Any]) -> bool:
     return source.get("verification_state") == "unavailable" and source.get("failure_reason") not in {
-        "stream_failed", "format_unavailable", "source_blocked",
+        "stream_failed", "format_unavailable", "source_blocked", "preparation_busy",
     }
 
 
 def _source_can_verify(source: Dict[str, Any], *, now: float) -> bool:
     state = source.get("verification_state")
     return state == "pending" or (
+        state == 'verified'
+        and now - float(source.get('verified_at') or 0) >= _VERIFIED_TTL_SECONDS - 24*60*60
+        and _source_retry_at(source) <= now
+    ) or (
         state in {"temporarily_blocked", "unavailable"}
         and not _source_is_terminal(source)
         and _source_retry_at(source) <= now
@@ -536,18 +554,51 @@ def record_youtube_background_failures(
         _set_provider_health(server, blocked=True, failures=blocked)
 
 
-def _youtube_api_get(server: Any, endpoint: str, params: Dict[str, Any]) -> Dict[str, Any]:
+def _youtube_api_get(server: Any, endpoint: str, params: Dict[str, Any], *, timeout_seconds: float = 8) -> Dict[str, Any]:
     key = configured_provider_value("YOUTUBE_DATA_API_KEY")
     if not key:
         return {}
     response = server.upstream_http.get(
         f"https://www.googleapis.com/youtube/v3/{endpoint}",
         params={**params, "key": key},
-        timeout=8,
+        timeout=max(.05, min(8, timeout_seconds)),
     )
     response.raise_for_status()
     payload = response.json()
     return dict(payload) if isinstance(payload, dict) else {}
+
+
+def search_youtube_video_items(server: Any, query: str, *, deadline: float) -> List[Dict[str, Any]]:
+    """Public metadata coverage only; never borrow a recording's performer."""
+    from ..search.cache_runtime import lookup_search_result, store_search_result
+    remaining = deadline - time.monotonic()
+    if remaining <= .05 or not configured_provider_value("YOUTUBE_DATA_API_KEY"):
+        return []
+    if lookup_search_result("provider_health", "youtube_search_cooldown"):
+        raise TimeoutError("Metadata provider cooldown")
+    try:
+        payload = _youtube_api_get(server, "search", {"part": "snippet", "q": query,
+            "type": "video", "maxResults": 12}, timeout_seconds=min(1.5, remaining))
+    except Exception as exc:
+        status = int(getattr(getattr(exc, "response", None), "status_code", 0) or 0)
+        if status in {429, 503}:
+            store_search_result("provider_health", "youtube_search_cooldown", True, ttl_seconds=60)
+        raise
+    rows = []
+    for item in payload.get("items") or []:
+        source_id = _text((item.get("id") or {}).get("videoId"))
+        snippet = item.get("snippet") or {}
+        if not _YOUTUBE_ID_RE.fullmatch(source_id):
+            continue
+        thumbnails = snippet.get("thumbnails") or {}
+        rows.append({"id": source_id, "videoId": source_id,
+            "playback": {"provider": "youtube", "source_id": source_id},
+            "title": html.unescape(_text(snippet.get("title"))), "channel": html.unescape(_text(snippet.get("channelTitle"))),
+            "artist_id": _text(snippet.get("channelId")), "channel_id": _text(snippet.get("channelId")),
+            "thumbnail": _text(((thumbnails.get("high") or thumbnails.get("medium") or {}).get("url"))),
+            "provider": "youtube", "source_provider": "youtube", "source_authority": "user_upload",
+            "result_type": "video", "search_provider_kind": "videos"})
+    return rows
 
 
 def _youtube_metadata(server: Any, video_ids: Iterable[str]) -> List[Dict[str, Any]]:
@@ -958,6 +1009,8 @@ def resolve_user_requested_playback_source(
         if _text(candidate.get("source_id")) in rejected_ids:
             continue
         verified, outcome = _verify_source(server, entity_key, candidate)
+        if outcome == "preparation_busy":
+            break
         if verified is not None:
             _store_sources(server, [(entity_key, verified)])
         if verified is not None and outcome in {
@@ -1016,6 +1069,8 @@ def _verify_source(server: Any, entity_key: str, source: Dict[str, Any]) -> Tupl
     except Exception as exc:
         failure = classify_stream_failure(exc)
         code = failure.get("code") or "stream_failed"
+        if code == "preparation_busy":
+            return None, "preparation_busy"
         blocked = code == "source_blocked"
         transient = code != "video_unavailable"
         failed = {
@@ -1141,7 +1196,34 @@ def _shortlist(
         relation_score = float(item.get("relationship_score") or item.get("listen_count") or 0.0)
         return (1 if key in history_keys else 0, -canonical_quality, -relation_score, key)
 
-    album_groups: List[Tuple[int, int, List[Tuple[Tuple[int, float, float, str], str, Dict[str, Any]]]]] = []
+    # Spend the bounded proof budget on albums eligible for this listener
+    # before unrelated retained metadata, using composition's same relationship
+    # evidence. This changes verification order, never proof/admission rules.
+    from .ranking import _album_taste_relation, _history_track_ids
+    from .schema import DiscoveryCandidate, composition_facts
+    related_albums: set[int] = set()
+    with composition_facts():
+        album_history = _history_track_ids(taste)
+        for index, album in enumerate(supply.pools.get("album") or []):
+            if taste.is_cold_start or _album_taste_relation(
+                DiscoveryCandidate(dict(album), "album", item_type="album"),
+                dict(album), taste, history_ids=album_history,
+            )[0]:
+                related_albums.add(index)
+    played_artists = {
+        _text(name).casefold()
+        for name in [*taste.listened_artists, *taste.top_artists]
+        if _text(name)
+    }
+    played_artists.update(
+        _artist(track).casefold()
+        for track in [
+            *taste.full_history_tracks, *taste.recent_tracks, *taste.last_played_tracks,
+            *taste.top_tracks, *taste.frequent_tracks,
+        ]
+        if isinstance(track, dict) and _artist(track)
+    )
+    album_groups = []
     radio_groups: Dict[str, List[Dict[str, Any]]] = {}
     radio_group_order: Dict[str, int] = {}
     for pool, items in supply.pools.items():
@@ -1152,10 +1234,11 @@ def _shortlist(
                     for item in album.get("canonical_tracks") or []
                     if isinstance(item, dict)
                 ]
+                canonical_count = max(len(canonical_tracks), int(album.get('canonical_track_count') or 0))
                 required = (
-                    len(canonical_tracks)
-                    if len(canonical_tracks) < 6
-                    else max(6, int(len(canonical_tracks) * 0.8 + 0.999))
+                    canonical_count
+                    if canonical_count < 6
+                    else max(6, int(canonical_count * 0.8 + 0.999))
                 )
                 verified_count = sum(
                     _recording_key(item) in verified_by_key for item in canonical_tracks
@@ -1177,7 +1260,9 @@ def _shortlist(
                         unresolved.append((rank, key, item))
                 unresolved.sort(key=lambda row: row[0])
                 if unresolved:
-                    album_groups.append((missing, album_index, unresolved))
+                    artist_key = _artist(album).casefold()
+                    album_groups.append((int(album_index not in related_albums), missing, album_index,
+                                         artist_key, artist_key in played_artists, unresolved))
             continue
         if pool == "radio_artist_catalog":
             for item in items or []:
@@ -1209,12 +1294,52 @@ def _shortlist(
         queue.sort(key=lambda row: row[0])
 
     if album_groups:
-        album_groups.sort(key=lambda value: (value[0], value[1]))
-        queues["album"] = [
-            row
-            for _missing, _album_index, unresolved in album_groups
-            for row in unresolved
-        ]
+        required_rows = []
+        extra_rows = []
+        funded_keys: set[str] = set()
+        artist_counts: Dict[str, int] = {}
+        last_familiar: bool | None = None
+        album_reserve = min(16, max(POPULAR_RADIO_CARD_TARGET_TRACKS, max(int(limit), 0) // 6),
+                            max(int(limit), 0))
+        while album_groups:
+            # First prefer eligible and completable releases, then alternate
+            # familiar and discovery artists when both have useful work. A
+            # group stays together so the budget can cross an album threshold.
+            def group_rank(group: Any) -> Tuple[int, int, int, int, int, int, int]:
+                unrelated, missing, index, artist_key, familiar, unresolved = group
+                keys = {row[1] for row in unresolved}
+                remaining = max(missing - len(keys & funded_keys), 0)
+                completable = len(keys - funded_keys) >= remaining
+                budget_left = max(album_reserve - len(required_rows), 0)
+                return (unrelated, int(not completable),
+                        int(bool(budget_left) and remaining > budget_left),
+                        int(last_familiar is not None and familiar == last_familiar),
+                        artist_counts.get(artist_key, 0), remaining, index)
+
+            group = min(album_groups, key=group_rank)
+            album_groups.remove(group)
+            _unrelated, missing, _album_index, artist_key, familiar, unresolved = group
+            # Shared recordings already funded for another album count here;
+            # extras must not strand an otherwise affordable album below its
+            # unchanged minimum proof coverage.
+            unique_rows = list({row[1]: row for row in unresolved}.values())
+            remaining = max(missing - sum(row[1] in funded_keys for row in unique_rows), 0)
+            if len([row for row in unique_rows if row[1] not in funded_keys]) < remaining:
+                extra_rows.extend(row for row in unique_rows if row[1] not in funded_keys)
+                continue
+            if remaining:
+                artist_counts[artist_key] = artist_counts.get(artist_key, 0) + 1
+                last_familiar = familiar
+            for row in unique_rows:
+                if row[1] in funded_keys:
+                    continue
+                if remaining:
+                    required_rows.append(row)
+                    funded_keys.add(row[1])
+                    remaining -= 1
+                else:
+                    extra_rows.append(row)
+        queues["album"] = [*required_rows, *extra_rows]
 
     radio_queue: List[Tuple[Tuple[int, float, float, str], str, Dict[str, Any]]] = []
     ordered_radio_groups = []
@@ -1377,13 +1502,23 @@ def verify_materialized_supply(
         for item in all_items
         if _recording_key(item)
     }
-    stored_by_key = _load_sources(server, entity_keys)
+    stored_by_key = {key:list(values) for key,values in _load_sources(server, entity_keys).items()}
     verified_by_key = {
         key: source
         for key, sources in stored_by_key.items()
         if (source := _verified_source(sources, item_by_key.get(key))) is not None
     }
     registry_hits = len(verified_by_key)
+    renewal_keys = {
+        _recording_key(track) for album in supply.pools.get('album') or []
+        if float(album.get('source_recheck_after') or float('inf')) <= time.time()
+        for track in album.get('canonical_tracks') or []
+        if (source := verified_by_key.get(_recording_key(track))) is not None
+        and time.time() - float(source.get('verified_at') or 0) >= _VERIFIED_TTL_SECONDS - 24*60*60
+        and _source_retry_at(source) <= time.time()
+    } if max_new_verifications != 0 else set()
+    for key in renewal_keys:
+        verified_by_key.pop(key, None)
     verified_new = 0
     unavailable = 0
     blocked_failures = 0
@@ -1414,13 +1549,13 @@ def verify_materialized_supply(
     source_lookup_misses = 0
     source_lookup_deferred = preverification_rejections.get("lookup_cooldown", 0)
     timed_out_tasks = 0
+    capacity_deferred = 0
+    shortlist_order = {key: index for index, (_pool, key, _item) in enumerate(shortlist)}
     if not _provider_is_blocked(server):
         pending_tasks: List[Tuple[str, str, Dict[str, Any], Dict[str, Any]]] = []
         lookup_tasks: List[Tuple[str, str, Dict[str, Any], set[str]]] = []
         now = time.time()
         for pool, entity_key, item in shortlist:
-            if len(pending_tasks) >= verification_limit:
-                break
             known_sources = stored_by_key.get(entity_key) or []
             recording = CanonicalRecording.from_item(item)
             candidates = sorted(
@@ -1455,7 +1590,7 @@ def verify_materialized_supply(
                 lookup_tasks.append((pool, entity_key, item, rejected_ids))
 
         worker_count = max(1, min(int(max_workers), _MAX_VERIFICATION_WORKERS))
-        if lookup_tasks and len(pending_tasks) < verification_limit:
+        if lookup_tasks and verification_limit:
             executor = ThreadPoolExecutor(
                 max_workers=worker_count,
                 thread_name_prefix="auralis-source-lookup",
@@ -1466,8 +1601,12 @@ def verify_materialized_supply(
                 lookup_wave_size = worker_count * 2
                 while (
                     lookup_cursor < len(lookup_tasks)
-                    and len(pending_tasks) < verification_limit
                 ):
+                    pending_tasks.sort(key=lambda task: shortlist_order[task[1]])
+                    if (len(pending_tasks) >= verification_limit
+                        and shortlist_order[lookup_tasks[lookup_cursor][1]]
+                        > shortlist_order[pending_tasks[verification_limit - 1][1]]):
+                        break
                     remaining = remaining_seconds()
                     if remaining is not None and remaining <= 0:
                         break
@@ -1541,8 +1680,6 @@ def verify_materialized_supply(
                         store_initialized=True,
                     )
                     for pool, entity_key, item, _rejected_ids in wave:
-                        if len(pending_tasks) >= verification_limit:
-                            break
                         result = lookup_results.get(entity_key)
                         if result is None:
                             source_lookup_misses += 1
@@ -1567,17 +1704,21 @@ def verify_materialized_supply(
                     if not future.done():
                         future.cancel()
                 executor.shutdown(wait=False, cancel_futures=True)
+        pending_tasks.sort(key=lambda task: shortlist_order[task[1]])
+        pending_tasks = pending_tasks[:verification_limit]
+        from ..api.stream_core_runtime import BACKGROUND_EXTRACTION_CAPACITY
+        resolution_workers = min(worker_count, BACKGROUND_EXTRACTION_CAPACITY)
         executor = ThreadPoolExecutor(
-            max_workers=worker_count,
+            max_workers=resolution_workers,
             thread_name_prefix="auralis-source-verify",
         )
         futures = {}
         try:
-            for start in range(0, min(len(pending_tasks), verification_limit), worker_count):
+            for start in range(0, len(pending_tasks), resolution_workers):
                 remaining = remaining_seconds()
                 if remaining is not None and remaining <= 0:
                     break
-                batch = pending_tasks[start : start + worker_count]
+                batch = pending_tasks[start : start + resolution_workers]
                 futures = {
                     executor.submit(_verify_source, server, entity_key, source): (
                         pool,
@@ -1598,16 +1739,28 @@ def verify_materialized_supply(
                         ),
                     ):
                         pool, entity_key, source_authority = futures[future]
+                        try:
+                            source, outcome = future.result()
+                        except Exception:
+                            source, outcome = None, "unavailable"
+                        if outcome == "preparation_busy":
+                            # Leave source records and failure budgets alone.
+                            # The durable supply job owns the next attempt;
+                            # do not spin through the remaining busy tasks.
+                            capacity_deferred += len(pending_tasks) - start
+                            continue
                         attempted += 1
                         attempted_by_pool[pool] = attempted_by_pool.get(pool, 0) + 1
                         attempted_by_authority[source_authority] = (
                             attempted_by_authority.get(source_authority, 0) + 1
                         )
-                        try:
-                            source, outcome = future.result()
-                        except Exception:
-                            source, outcome = None, "unavailable"
                         if source is not None:
+                            old = _verified_source(stored_by_key.get(entity_key) or [], item_by_key.get(entity_key))
+                            if entity_key in renewal_keys and old is not None and source.get('verification_state') == 'temporarily_blocked':
+                                # Transient renewal failure does not extend or
+                                # revoke a still-valid proof. Retry is bounded.
+                                source = {**source, 'verification_state':'verified', 'verified_at':old['verified_at']}
+                            stored_by_key[entity_key] = [s for s in stored_by_key.get(entity_key) or [] if s.get('source_id') != source.get('source_id')] + [source]
                             completed_sources.append((entity_key, source))
                         if source is not None and outcome in {
                             "verified_cache",
@@ -1638,7 +1791,7 @@ def verify_materialized_supply(
                     or format_failures >= _FORMAT_FAILURE_CIRCUIT_THRESHOLD
                 ):
                     break
-                if batch_timed_out:
+                if batch_timed_out or capacity_deferred:
                     break
         finally:
             for future in futures:
@@ -1656,6 +1809,13 @@ def verify_materialized_supply(
             )
         elif attempted and not blocked_failures:
             _set_provider_health(server, blocked=False)
+
+    # Renewal is best effort until the original proof expires. A capacity
+    # deferral/deadline must not revoke or extend still-valid evidence.
+    for key in renewal_keys - verified_by_key.keys():
+        old = _verified_source(stored_by_key.get(key) or [], item_by_key.get(key))
+        if old is not None:
+            verified_by_key[key] = old
 
     radio_artwork_items = [
         item
@@ -1788,10 +1948,11 @@ def verify_materialized_supply(
             canonical_tracks = [
                 item for item in album.get("canonical_tracks") or [] if isinstance(item, dict)
             ]
+            matched_tracks = [(item, source_for_item(item)) for item in canonical_tracks]
             playable_tracks = [
                 _apply_source(item, source)
-                for item in canonical_tracks
-                if (source := source_for_item(item)) is not None
+                for item, source in matched_tracks
+                if source is not None
             ]
             # Different canonical rows can resolve to the same physical song.
             # Keep the strongest match in track-list order; repeated bytes
@@ -1824,6 +1985,8 @@ def verify_materialized_supply(
                     "canonical_track_count": canonical_count,
                     "playable_coverage": round(len(playable_tracks) / max(canonical_count, 1), 4),
                     "playable": bool(canonical_tracks and len(playable_tracks) >= required),
+                    'source_recheck_after': min((float(source.get('verified_at') or 0) + _VERIFIED_TTL_SECONDS - 24*60*60
+                                                for _,source in matched_tracks if source is not None), default=0),
                     "thumbnail": album_thumbnail,
                     "image": album_thumbnail,
                 }
@@ -1834,12 +1997,14 @@ def verify_materialized_supply(
         **dict(supply.diagnostics or {}),
         "source_registry_candidates": len(set(entity_keys) - {""}),
         "source_registry_hits": registry_hits,
+        'source_renewal_due': len(renewal_keys),
         "source_verification_limit": verification_limit,
         "source_verification_shortlisted": len(shortlist),
         "source_preverification_rejections": preverification_rejections,
         "source_lookup_misses": source_lookup_misses,
         "source_lookup_deferred": source_lookup_deferred,
         "source_verification_timed_out": timed_out_tasks,
+        "source_verification_deferred": capacity_deferred,
         "source_verification_attempted": attempted,
         "source_verification_verified": verified_new,
         "source_verification_attempted_by_pool": attempted_by_pool,
@@ -1858,6 +2023,7 @@ def verify_materialized_supply(
         f"shortlisted={len(shortlist)} lookup_misses={source_lookup_misses} "
         f"lookup_deferred={source_lookup_deferred} "
         f"timed_out={timed_out_tasks} "
+        f"capacity_deferred={capacity_deferred} "
         f"prefiltered={sum(preverification_rejections.values())} "
         f"attempted={attempted} verified={verified_new} "
         f"unavailable={unavailable} format_unavailable={format_failures} blocked={blocked_failures} "

@@ -681,7 +681,7 @@ def _album_pool(
         if isinstance(item, dict)
     ]
     started = time.perf_counter()
-    for index, raw in enumerate(supplied_albums):
+    for raw in supplied_albums:
         if not isinstance(raw, dict):
             continue
         if (
@@ -718,6 +718,8 @@ def _album_pool(
             },
         )
         album["album_source"] = "artist_catalog"
+        album['artist_graph_keys'] = list(dict.fromkeys([
+            *(album.get('artist_graph_keys') or []), *(raw.get('artist_graph_keys') or [])]))
         if (
             not _recommendation_eligible(album, allow_unknown=False)
             or float(album["discovery_quality_penalty"] or 0.0) >= 2.5
@@ -736,7 +738,8 @@ def _album_pool(
             _set_album_segment(DiscoveryCandidate(
                 item=album,
                 source="album",
-                score=max(4.2 - (index * 0.06), 1.2),
+                # Catalog iteration order is not evidence of relevance.
+                score=4.2,
                 reasons=["materialized_artist_catalog"],
                 item_type="album",
             ), taste, segment)

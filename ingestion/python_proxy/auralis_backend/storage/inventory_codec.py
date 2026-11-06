@@ -11,10 +11,12 @@ from typing import Any
 
 COMPACT_WRITES_ENV = "NEATIE_COMPACT_INVENTORY_WRITES"
 MAX_JSON_BYTES = 64 * 1024 * 1024
+MAX_LOGICAL_BYTES = 128 * 1024 * 1024
 _MIN_JSON_BYTES = 16 * 1024
 _MARKER = "_neatie_inventory_storage"
 _VERSION = "zlib-json-v1"
 _REF_VERSION = "zlib-json-refs-v2"
+_POOL_VERSION = "zlib-json-pools-v3"
 _FIELDS = {_MARKER, "kind", "json_bytes", "json_sha256", "data"}
 _REF_FIELDS = _FIELDS | {"storage_json_bytes", "storage_json_sha256"}
 _KINDS = {"candidate", "radio"}
@@ -26,6 +28,8 @@ def _same_json(left: Any, right: Any) -> bool:
     """Strict JSON equality: bool/int and differently represented floats differ."""
     if type(left) is not type(right):
         return False
+    if left is right:
+        return True
     if isinstance(left, dict):
         return left.keys() == right.keys() and all(_same_json(value, right[key]) for key, value in left.items())
     if isinstance(left, list):
@@ -79,10 +83,39 @@ def _deduplicate_inventory(payload: dict[str, Any], kind: str) -> dict[str, Any]
     return reduced
 
 
+def _json_fragments(value: Any):
+    # C-encode individual list items instead of either materializing the whole
+    # inventory string or using Python's per-leaf encoder for every track field.
+    # Canonical punctuation/order stays byte-identical to json.dumps.
+    encoder = json.JSONEncoder(ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    def fragments(item):
+        if isinstance(item, dict) and all(isinstance(key, str) for key in item):
+            yield "{"
+            for index, key in enumerate(sorted(item)):
+                if index:
+                    yield ","
+                yield encoder.encode(key)
+                yield ":"
+                yield from fragments(item[key])
+            yield "}"
+        elif isinstance(item, list):
+            yield "["
+            for index, member in enumerate(item):
+                if index:
+                    yield ","
+                yield encoder.encode(member)
+            yield "]"
+        else:
+            yield encoder.encode(item)
+
+    for fragment in fragments(value):
+        yield fragment.encode('utf-8')
+
+
 def _json_digest(value: Any, maximum: int) -> tuple[int, str]:
     size, digest = 0, hashlib.sha256()
-    for fragment in json.JSONEncoder(ensure_ascii=False, sort_keys=True, separators=(",", ":")).iterencode(value):
-        data = fragment.encode("utf-8")
+    for data in _json_fragments(value):
         size += len(data)
         if size > maximum:
             raise InventoryStorageError("inventory_storage_expanded_size_exceeded")
@@ -90,7 +123,81 @@ def _json_digest(value: Any, maximum: int) -> tuple[int, str]:
     return size, digest.hexdigest()
 
 
-def _expand_inventory(payload: dict[str, Any], kind: str, size: int, checksum: str, storage_size: int) -> dict[str, Any]:
+def _intern_pools(payload: dict[str, Any]) -> dict[str, Any]:
+    """One exact item body; membership wrappers keep their scores/provenance.
+
+    Identity alone is insufficient: editions, source proofs and historical
+    metadata can differ for the same album. Only byte-equivalent bodies share.
+    """
+    bodies, positions, memberships, pools = [], {}, {}, {}
+    for name, candidates in payload.get('pools', {}).items():
+        if not isinstance(candidates, list):
+            pools[name] = candidates
+            continue
+        revised, indices = [], []
+        for candidate in candidates:
+            item = candidate.get('item') if isinstance(candidate, dict) else None
+            index = None
+            if isinstance(item, dict):
+                signature = _json_digest(item, MAX_LOGICAL_BYTES)
+                index = positions.get(signature)
+                if index is None:
+                    index = len(bodies)
+                    bodies.append(item)
+                    positions[signature] = index
+                elif not _same_json(item, bodies[index]):
+                    raise InventoryStorageError('inventory_item_digest_collision')
+                candidate = {key: value for key, value in candidate.items() if key != 'item'}
+            revised.append(candidate)
+            indices.append(index)
+        pools[name], memberships[name] = revised, indices
+    return {'inventory': {**payload, 'pools': pools}, 'items': bodies,
+            'memberships': memberships}
+
+
+def _restore_pools(wrapper: dict[str, Any], size: int, checksum: str, *, copy_references: bool) -> dict[str, Any]:
+    if set(wrapper) != {'inventory', 'items', 'memberships', 'track_refs'}:
+        raise InventoryStorageError('invalid_inventory_pool_reference')
+    payload, bodies, memberships = wrapper['inventory'], wrapper['items'], wrapper['memberships']
+    if (not isinstance(payload, dict) or _MARKER in payload
+            or not isinstance(payload.get('pools'), dict) or not isinstance(bodies, list)
+            or not all(isinstance(body, dict) for body in bodies)
+            or not isinstance(memberships, dict) or type(wrapper['track_refs']) is not bool
+            or set(memberships) != {k for k,v in payload['pools'].items() if isinstance(v,list)}):
+        raise InventoryStorageError('invalid_inventory_pool_reference')
+    # Bound amplification before serializing the referenced logical tree.
+    lengths = [_json_digest(body, MAX_JSON_BYTES)[0] for body in bodies]
+    projected = _json_digest(payload, MAX_JSON_BYTES)[0]
+    references = []
+    for name, indices in memberships.items():
+        candidates = payload['pools'][name]
+        if not isinstance(indices, list) or len(indices) != len(candidates):
+            raise InventoryStorageError('invalid_inventory_pool_reference')
+        for candidate, index in zip(candidates, indices):
+            if index is None:
+                continue
+            if (type(index) is not int or not 0 <= index < len(bodies)
+                    or not isinstance(candidate, dict) or 'item' in candidate):
+                raise InventoryStorageError('invalid_inventory_pool_reference')
+            projected += 7 + lengths[index] + bool(candidate)  # "item": plus comma
+            if projected > size:
+                raise InventoryStorageError('inventory_storage_expanded_size_exceeded')
+            candidate['item'] = dict(bodies[index])
+            references.append(candidate)
+    if wrapper['track_refs']:
+        payload = _expand_inventory(payload, 'candidate', size, checksum, projected,
+                                    copy_references=copy_references)
+    elif _json_digest(payload, size) != (size, checksum):
+        raise InventoryStorageError('invalid_inventory_storage_logical_checksum')
+    # Historical callers may mutate an occurrence: sharing is storage-only.
+    if copy_references:
+        for candidate in references:
+            candidate['item'] = copy.deepcopy(candidate['item'])
+    return payload
+
+
+def _expand_inventory(payload: dict[str, Any], kind: str, size: int, checksum: str, storage_size: int,
+                      *, copy_references: bool = True) -> dict[str, Any]:
     copies = []
     projected_size = storage_size
     def json_size(value: Any) -> int:
@@ -128,13 +235,13 @@ def _expand_inventory(payload: dict[str, Any], kind: str, size: int, checksum: s
     # or copying. Repeated indices cannot amplify a small stored object unchecked.
     if projected_size != size:
         raise InventoryStorageError("inventory_storage_expanded_size_exceeded")
-    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    if len(raw) != size or hashlib.sha256(raw).hexdigest() != checksum:
+    logical_size, logical_checksum = _json_digest(payload, size)
+    if logical_size != size or logical_checksum != checksum:
         raise InventoryStorageError("invalid_inventory_storage_logical_checksum")
-    del raw
-    for container, key in copies:
-        container[key] = ([copy.deepcopy(card) for card in container[key]]
-                          if key == "cards" else copy.deepcopy(container[key]))
+    if copy_references:
+        for container, key in copies:
+            container[key] = ([copy.deepcopy(card) for card in container[key]]
+                              if key == "cards" else copy.deepcopy(container[key]))
     return payload
 
 
@@ -147,7 +254,8 @@ def encode_inventory_payload(
 ) -> dict[str, Any]:
     """Encode future writes only when enabled and demonstrably smaller.
 
-    Disabled, small, oversized and reserved-field payloads remain literal.
+    Disabled, small and reserved-field payloads remain literal. Enabled writes
+    exceeding the explicit bounds fail instead of silently writing huge JSON.
     Existing records are never converted by this function.
     """
     if kind not in _KINDS:
@@ -158,22 +266,23 @@ def encode_inventory_payload(
         return payload
     compact = _deduplicate_inventory(payload, kind)
     logical_stats = None
-    if compact is not payload:
-        try:
-            logical_stats = _json_digest(payload, MAX_JSON_BYTES)
-        except InventoryStorageError:
-            return payload
+    pool_references = kind == 'candidate' and isinstance(payload.get('pools'), dict)
+    if pool_references:
+        logical_stats = _json_digest(payload, MAX_LOGICAL_BYTES)
+        wrapper = _intern_pools(compact)
+        wrapper['track_refs'] = compact is not payload
+        compact = wrapper
+    elif compact is not payload:
+        logical_stats = _json_digest(payload, MAX_JSON_BYTES)
     compressor = zlib.compressobj(level=1)
     digest = hashlib.sha256()
     size = 0
     packed_parts: list[bytes] = []
     buffer = bytearray()
-    encoder = json.JSONEncoder(ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    for fragment in encoder.iterencode(compact):
-        data = fragment.encode("utf-8")
+    for data in _json_fragments(compact):
         size += len(data)
         if size > MAX_JSON_BYTES:
-            return payload
+            raise InventoryStorageError('inventory_storage_size_exceeded')
         digest.update(data)
         buffer.extend(data)
         if len(buffer) >= 65536:
@@ -187,9 +296,11 @@ def encode_inventory_payload(
     packed = b"".join(packed_parts)
     # Base64 plus bounded envelope overhead must save at least ten percent.
     if 4 * ((len(packed) + 2) // 3) + 512 > logical_size * 0.9:
+        if logical_size > MAX_JSON_BYTES:
+            raise InventoryStorageError('inventory_storage_size_exceeded')
         return payload
     stored = {
-        _MARKER: _REF_VERSION if logical_stats else _VERSION,
+        _MARKER: _POOL_VERSION if pool_references else _REF_VERSION if logical_stats else _VERSION,
         "kind": kind,
         "json_bytes": logical_size,
         "json_sha256": logical_stats[1] if logical_stats else digest.hexdigest(),
@@ -200,8 +311,12 @@ def encode_inventory_payload(
     return stored
 
 
-def decode_inventory_payload(payload: Any, expected_kind: str) -> Any:
-    """Expand storage envelopes before comparison, merge or logical projection."""
+def decode_inventory_payload(payload: Any, expected_kind: str, *, copy_references: bool = True) -> Any:
+    """Validate/expand envelopes; maintenance may borrow a shared read-only view.
+
+    Normal callers retain independent mutable occurrences. Disabling copies
+    never skips bounds, reference checks or either logical/storage checksum.
+    """
     if expected_kind not in _KINDS:
         raise ValueError("invalid_inventory_kind")
     if not isinstance(payload, dict) or _MARKER not in payload:
@@ -214,8 +329,9 @@ def decode_inventory_payload(payload: Any, expected_kind: str) -> Any:
         "radio_inventory_version" in payload and isinstance(payload.get("cards"), list)
     ):
         return payload
-    references = payload.get(_MARKER) == _REF_VERSION
-    if set(payload) != (_REF_FIELDS if references else _FIELDS) or payload.get(_MARKER) not in {_VERSION, _REF_VERSION}:
+    pool_references = payload.get(_MARKER) == _POOL_VERSION
+    references = payload.get(_MARKER) in {_REF_VERSION, _POOL_VERSION}
+    if set(payload) != (_REF_FIELDS if references else _FIELDS) or payload.get(_MARKER) not in {_VERSION, _REF_VERSION, _POOL_VERSION}:
         raise InventoryStorageError("invalid_inventory_storage_version_or_envelope")
     size = payload["json_bytes"]
     checksum = payload["json_sha256"]
@@ -225,7 +341,8 @@ def decode_inventory_payload(payload: Any, expected_kind: str) -> Any:
     if (
         payload["kind"] != expected_kind
         or type(size) is not int
-        or not 0 < size <= MAX_JSON_BYTES
+        or not 0 < size <= (MAX_LOGICAL_BYTES if pool_references else MAX_JSON_BYTES)
+        or (pool_references and expected_kind != 'candidate')
         or not isinstance(checksum, str)
         or len(checksum) != 64
         or not isinstance(data, str)
@@ -256,4 +373,10 @@ def decode_inventory_payload(payload: Any, expected_kind: str) -> Any:
         raise InventoryStorageError("invalid_inventory_storage_json") from None
     if not isinstance(logical, dict) or _MARKER in logical:
         raise InventoryStorageError("invalid_inventory_storage_logical_payload")
-    return _expand_inventory(logical, expected_kind, size, checksum, storage_size) if references else logical
+    # The parsed tree owns its strings; decompressed bytes and inflater buffers
+    # are no longer needed while references and their checksum are expanded.
+    del raw, packed, inflater
+    if pool_references:
+        return _restore_pools(logical, size, checksum, copy_references=copy_references)
+    return _expand_inventory(logical, expected_kind, size, checksum, storage_size,
+                             copy_references=copy_references) if references else logical

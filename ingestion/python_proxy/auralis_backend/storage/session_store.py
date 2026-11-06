@@ -72,6 +72,10 @@ class MemorySessionStore(SessionStore):
         with self._lock:
             self._remove(key)
 
+    def prune_expired(self, now: float) -> None:
+        with self._lock:
+            self._expire(now)
+
 
 class RedisSessionStore(SessionStore):
     def __init__(self, url: str) -> None:
@@ -96,6 +100,12 @@ class RedisSessionStore(SessionStore):
 
 
 _SESSION_STORE: Optional[SessionStore] = None
+
+
+def prune_expired_memory_sessions(now: float) -> None:
+    # Do not instantiate a store or contact Redis during local RAM maintenance.
+    if isinstance(_SESSION_STORE, MemorySessionStore):
+        _SESSION_STORE.prune_expired(now)
 
 
 def get_session_store() -> SessionStore:

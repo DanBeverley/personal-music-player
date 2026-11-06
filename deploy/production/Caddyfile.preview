@@ -1,8 +1,59 @@
 import /etc/caddy/api.caddy
 
 {$AURALIS_WEB_HOST} {
+    log {
+        output file /data/neatie-web-access.jsonl {
+            roll_size 10MiB
+            roll_keep 5
+            roll_keep_for 48h
+        }
+        format filter {
+            wrap json
+            fields {
+                request>headers delete
+                request>uri delete
+                resp_headers delete
+            }
+        }
+    }
+    @notPlayback not path /playback/stream/* /search /recommend
+    log_skip @notPlayback
+    log_append <edge_request {http.request.uuid}
+    log_append <proxy_hop web_edge
+    log_append <request_path {http.request.uri.path}
+    log_append <trace {query.diag}
+    log_append <range {http.request.header.Range}
+    log_append <fetch_mode {http.request.header.Sec-Fetch-Mode}
+    log_append <cache_version {query.cache_version}
+    log_append <cache_variant {query.cache_variant}
+    log_append upstream_total_ms {rp.upstream.duration_ms}
+    log_append <proxy_started_ms {time.now.unix_ms}
     encode zstd gzip
-    reverse_proxy web-preview:8080 {
-        flush_interval -1
+    @audio {
+        method GET HEAD
+        path /playback/stream/* /playback/diagnostics/*
+    }
+    handle @audio {
+        header {
+            X-Content-Type-Options "nosniff"
+            Referrer-Policy "no-referrer"
+        }
+        @traceReport path /playback/diagnostics/*
+        header @traceReport Cache-Control "no-store"
+        reverse_proxy api:8000 {
+            header_up X-Neatie-Edge-Request {http.request.uuid}
+            flush_interval -1
+            handle_response {
+                log_append <playback_request {rp.header.X-Neatie-Playback-Request}
+                log_append <upstream_headers_ms {rp.upstream.latency_ms}
+                log_append <expected_body_bytes {rp.header.Content-Length}
+                copy_response
+            }
+        }
+    }
+    handle {
+        reverse_proxy web-preview:8080 {
+            flush_interval -1
+        }
     }
 }

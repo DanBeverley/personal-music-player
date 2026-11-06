@@ -56,7 +56,7 @@ with check (auth.uid() = user_id and exists (
 
 create or replace function public.neatie_playlist_snapshot(p_playlist_id text)
 returns jsonb language sql stable security invoker set search_path = '' as $$
-  select jsonb_build_object('id', p.id, 'name', p.name, 'revision', p.revision,
+  select jsonb_build_object('id', p.id, 'name', p.name, 'revision', p.revision, 'created_at', p.created_at,
       'tracks', coalesce((select jsonb_agg(jsonb_build_object(
         'id', t.id, 'position', t.position, 'track_id', t.track_id, 'track_data', t.track_data)
         order by t.position, t.id) from public.playlist_tracks t
@@ -96,7 +96,13 @@ begin
       raise exception using errcode = '22023', message = 'invalid_playlist_name';
     end if;
     insert into public.playlists(id, user_id, name) values (p_playlist_id, v_user, v_name);
-    return public.neatie_playlist_snapshot(p_playlist_id);
+    if not (p_payload ? 'track_id') then
+      return public.neatie_playlist_snapshot(p_playlist_id);
+    end if;
+    -- Reuse append validation/locking in this transaction; invalid tracks
+    -- roll back creation too, rather than leaving an empty playlist.
+    p_action := 'append';
+    p_expected_revision := 0;
   end if;
 
   select revision into v_revision from public.playlists

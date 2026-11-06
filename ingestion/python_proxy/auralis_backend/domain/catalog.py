@@ -28,7 +28,7 @@ _COMPACT_NUMBER_RE = re.compile(
     re.IGNORECASE,
 )
 _YOUTUBE_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
-_YOUTUBE_THUMBNAIL_ID_RE = re.compile(r"/vi/([^/]+)/", re.IGNORECASE)
+_YOUTUBE_THUMBNAIL_ID_RE = re.compile(r"/vi(?:_webp)?/([^/]+)/", re.IGNORECASE)
 _UNOFFICIAL_SOURCE_RE = re.compile(
     r"\b(tribute|karaoke|soundalike|lounge|juke[- ]?box|fitness mix|"
     r"workout mix|background music|coffee shop music|relaxing piano|"
@@ -139,6 +139,12 @@ def _display_text(*values: Any) -> str:
         if text:
             return text
     return ""
+
+
+def artist_credit(*values: Any) -> str:
+    """Synthetic missing credits cannot hide a supplied credit. Compilations stay valid."""
+    return next((text for value in values if (text := _text(value))
+                 and text.casefold() not in {"unknown artist", "[unknown artist]"}), "")
 
 
 def parse_compact_number(value: Any, default: float = 0.0) -> float:
@@ -787,7 +793,7 @@ def _shared_catalog_metadata(item: Dict[str, Any], *, entity_type: str) -> Dict[
 
 
 def normalized_track_payload(track: Dict[str, Any]) -> Dict[str, Any]:
-    artist_name = _display_text(track.get("channel"), track.get("artist"), track.get("author"))
+    artist_name = artist_credit(track.get("channel"), track.get("artist"), track.get("artist_name"), track.get("author"))
     album_title = _display_text(track.get("album"))
     payload = dict(track)
     payload.update(
@@ -802,6 +808,10 @@ def normalized_track_payload(track: Dict[str, Any]) -> Dict[str, Any]:
             **_shared_catalog_metadata(track, entity_type="track"),
         }
     )
+    if artist_name:
+        for field in ("artist", "channel"):
+            if not artist_credit(payload.get(field)):
+                payload[field] = artist_name
     playback = verified_playback_source(payload)
     if playback:
         payload["playback"] = {
@@ -895,7 +905,7 @@ def normalized_artist_payload(artist: Dict[str, Any]) -> Dict[str, Any]:
 
 def normalized_album_payload(album: Dict[str, Any]) -> Dict[str, Any]:
     title = _display_text(album.get("title"), album.get("album"))
-    artist_name = _display_text(album.get("artist"), album.get("channel"), album.get("artist_name"))
+    artist_name = artist_credit(album.get("artist"), album.get("channel"), album.get("artist_name"))
     payload = dict(album)
     payload.update(
         {

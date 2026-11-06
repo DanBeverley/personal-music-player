@@ -25,6 +25,7 @@ import tempfile
 import time
 import traceback
 import uuid
+import urllib.parse
 
 import requests
 import yt_dlp
@@ -199,15 +200,28 @@ def _bind_server(fn):
     return _wrapped
 
 def extract_thumbnail(data):
-    if not data: return None
-    video_id = data.get("videoId") or data.get("video_id") or data.get("id")
-    if video_id:
-        return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+    if not isinstance(data, dict): return None
     thumbs = data.get("thumbnails") or data.get("thumbnail")
-    if isinstance(thumbs, list) and len(thumbs) > 0:
-        return thumbs[-1].get("url")
-    elif isinstance(thumbs, dict):
-        return thumbs.get("url")
+    if isinstance(thumbs, str) and thumbs.strip():
+        return thumbs.strip()
+    if isinstance(thumbs, dict):
+        thumbs = [thumbs]
+    if isinstance(thumbs, list):
+        candidates = [item for item in thumbs if isinstance(item, dict) and item.get('url')]
+        if candidates:
+            def size(item):
+                try:
+                    return int(item.get('width') or 0) * int(item.get('height') or 0)
+                except (TypeError, ValueError):
+                    return 0
+            return max(reversed(candidates), key=size)['url']
+    # Browse/artist/album IDs are not video IDs. Only explicit video identity
+    # (or a typed track with a valid legacy ID) may use YouTube's fallback.
+    video_id = data.get('videoId') or data.get('video_id')
+    if not video_id and data.get('resultType') in {'song', 'video'}:
+        video_id = data.get('id')
+    if isinstance(video_id, str) and re.fullmatch(r'[A-Za-z0-9_-]{11}', video_id):
+        return f'https://i.ytimg.com/vi/{video_id}/hqdefault.jpg'
     return None
 
 
@@ -325,7 +339,7 @@ def extract_album_info(data):
         if title:
             return {"id": album_id, "title": title}
     elif isinstance(album, str) and album.strip():
-        return {"id": None, "title": album.strip()}
+        return {"id": data.get("album_id") or data.get("albumId"), "title": album.strip()}
 
     albums = data.get("albums")
     if isinstance(albums, list) and albums:
@@ -399,6 +413,8 @@ def _normalize_artist_song_entries(raw_results, fallback_artist: str = ""):
     songs = []
     seen = set()
     for entry in raw_results or []:
+        if not isinstance(entry, dict) or entry.get("isAvailable") is False:
+            continue
         normalized = _normalize_song_result(entry)
         if not normalized:
             continue
@@ -416,6 +432,8 @@ def _normalize_artist_album_entries(raw_results, fallback_artist: str = ""):
     albums = []
     seen = set()
     for entry in raw_results or []:
+        if not isinstance(entry, dict):
+            continue
         browse_id = entry.get("browseId") or entry.get("id")
         title = entry.get("title") or entry.get("name")
         if not browse_id or not title or browse_id in seen:
@@ -430,7 +448,9 @@ def _normalize_artist_album_entries(raw_results, fallback_artist: str = ""):
                 if _normalize_text(entry_artist) == "unknown artist"
                 else entry_artist,
                 "thumbnail": extract_thumbnail(entry),
-                "year": entry.get("year") or "",
+                "year": next((str(value) for value in (entry.get("year"), entry.get("type"))
+                              if re.fullmatch(r"\d{4}", str(value))), ""),
+                "release_date": entry.get("release_date") or entry.get("releaseDate") or "",
                 "track_count": entry.get("trackCount") or entry.get("track_count") or 0,
             }
         )
@@ -1187,6 +1207,7 @@ def _call_ollama_chat(
     temperature=0.2,
     timeout_seconds=None,
     model_override=None,
+    max_output_tokens=None,
 ):
     payload = {
         "model": (model_override or OLLAMA_MODEL),
@@ -1194,17 +1215,30 @@ def _call_ollama_chat(
         "stream": False,
         "options": {"temperature": temperature},
     }
+    direct_cloud = urllib.parse.urlsplit(OLLAMA_BASE_URL).hostname in {'ollama.com', 'api.ollama.com'}
+    if direct_cloud:
+        # The direct API uses model names without the local daemon's cloud alias.
+        payload['model'] = re.sub(r'(?::cloud|-cloud)$', '', payload['model'])
     if OLLAMA_KEEP_ALIVE:
         payload["keep_alive"] = OLLAMA_KEEP_ALIVE
     if schema is not None:
-        payload["format"] = schema
+        # Cloud supports chat but not the native structured-output format.
+        # Keep one call and validate the requested JSON in the existing parser.
+        cloud = direct_cloud or ':cloud' in payload['model'] or '-cloud' in payload['model']
+        if cloud:
+            payload['messages'] = [*messages, {'role':'system','content':
+                'Return only JSON matching this schema: '+json.dumps(schema)}]
+        else:
+            payload["format"] = schema
+    if max_output_tokens is not None:
+        payload['options']['num_predict'] = min(1200,max(64,int(max_output_tokens)))
 
     response = ollama_http.post(
         f"{OLLAMA_BASE_URL}/chat",
         headers=_ollama_headers(),
         json=payload,
         timeout=(
-            OLLAMA_CONNECT_TIMEOUT_SECONDS,
+            min(3,OLLAMA_CONNECT_TIMEOUT_SECONDS) if max_output_tokens is not None else OLLAMA_CONNECT_TIMEOUT_SECONDS,
             timeout_seconds or OLLAMA_READ_TIMEOUT_SECONDS,
         ),
     )
@@ -1255,6 +1289,7 @@ def _call_ollama_structured(
     max_attempts=3,
     timeout_seconds=None,
     model_override=None,
+    max_output_tokens=None,
 ):
     last_error = None
     for attempt in range(max_attempts):
@@ -1276,6 +1311,7 @@ def _call_ollama_structured(
             temperature=temperature,
             timeout_seconds=timeout_seconds,
             model_override=model_override,
+            **({'max_output_tokens':max_output_tokens} if max_output_tokens is not None else {}),
         )
         try:
             parsed = _extract_json_from_llm_text(raw)
@@ -1506,7 +1542,7 @@ def _recommendation_worker_runtime_unhealthy() -> bool:
         return True
     worker_status = str(runtime.get("worker_status") or "").strip().lower()
     last_heartbeat_at = float(runtime.get("worker_last_heartbeat_at") or 0.0)
-    if worker_status != "running" or last_heartbeat_at <= 0:
+    if worker_status not in {"running", "idle"} or last_heartbeat_at <= 0:
         return True
     heartbeat_age_seconds = max(0.0, time.time() - last_heartbeat_at)
     max_heartbeat_age_seconds = max(
@@ -1535,12 +1571,21 @@ def _start_recommendation_bootstrap_thread() -> bool:
 
 def startup_recommendation_runtime():
     _recommendation_init_store_db()
+    from auralis_backend.recommend.workload import initialize_demand
+    initialize_demand(sys.modules[__name__])
+    from auralis_backend.recommend.feature_store import prune_hot_runtime_caches
+    from auralis_backend.storage.cache_runtime import prune_expired_runtime_caches
+    def maintain_caches():
+        while not recommendation_scheduler_stop.wait(60):
+            prune_hot_runtime_caches()
+            prune_expired_runtime_caches()
+    Thread(target=maintain_caches, name="feature-cache-expiry", daemon=True).start()
     if RECOMMENDATION_ENABLE_SCHEDULER and not RECOMMENDATION_EXTERNAL_WORKER:
         _recommendation_start_scheduler()
         return
     if RECOMMENDATION_EXTERNAL_WORKER:
-        if _recommendation_worker_runtime_unhealthy():
-            _start_recommendation_bootstrap_thread()
+        # The dedicated worker owns training. A starting/idle/unavailable worker
+        # must not make every API process start another trainer.
         return
     _start_recommendation_bootstrap_thread()
 
@@ -1669,7 +1714,7 @@ UPSTREAM_RETRY_BACKOFF_SECONDS = float(
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434/api").rstrip("/")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "minimax-m2.7:cloud")
 OLLAMA_THINKING_MODEL = os.environ.get("OLLAMA_THINKING_MODEL", OLLAMA_MODEL).strip() or OLLAMA_MODEL
-OLLAMA_FAST_MODEL = os.environ.get("OLLAMA_FAST_MODEL", "rnj-1:8b-cloud").strip() or "rnj-1:8b-cloud"
+OLLAMA_FAST_MODEL = os.environ.get("OLLAMA_FAST_MODEL", OLLAMA_MODEL if urllib.parse.urlsplit(OLLAMA_BASE_URL).hostname in {'ollama.com', 'api.ollama.com'} else "rnj-1:8b-cloud").strip() or OLLAMA_MODEL
 OLLAMA_PLANNER_MODEL = os.environ.get("OLLAMA_PLANNER_MODEL", OLLAMA_FAST_MODEL).strip() or OLLAMA_FAST_MODEL
 OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "").strip()
 OLLAMA_EMBED_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", OLLAMA_MODEL).strip()
@@ -1719,6 +1764,9 @@ RECOMMENDATION_STORE_DB_PATH = _server_runtime_path(
 RECOMMENDATION_MODEL_CACHE_TTL_SECONDS = int(
     os.environ.get("RECOMMENDATION_MODEL_CACHE_TTL_SECONDS", "180")
 )
+NEATIE_BACKGROUND_IDLE = os.environ.get("NEATIE_BACKGROUND_IDLE", "0").lower() in {"1", "true", "yes"}
+NEATIE_BACKGROUND_IDLE_SECONDS = int(os.environ.get("NEATIE_BACKGROUND_IDLE_SECONDS", "1800"))
+RECOMMENDATION_MODEL_MAX_AGE_SECONDS = int(os.environ.get("RECOMMENDATION_MODEL_MAX_AGE_SECONDS", "21600"))
 RECOMMENDATION_MODEL_STALE_REFRESH_ENABLED = os.environ.get(
     "RECOMMENDATION_MODEL_STALE_REFRESH_ENABLED",
     "1",

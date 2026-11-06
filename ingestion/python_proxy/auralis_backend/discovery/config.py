@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 from typing import Dict, List
+import os
 
 from .schema import LaneRecipe, RowRecipe
+
+
+def home_discovery_trial_enabled() -> bool:
+    """One reversible controlled pass; admission/playability remain enforced."""
+    return os.environ.get('NEATIE_HOME_DISCOVERY_TRIAL', '').strip().lower() in {'1', 'true', 'yes'}
 
 
 ENGINE_NAME = "discovery_engine"

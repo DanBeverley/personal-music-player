@@ -455,8 +455,10 @@ def assistant_fallback_chat_reply(server: Any, req: Any, model_override=None):
         messages,
         temperature=0.6,
         model_override=model_override,
+        timeout_seconds=25,
+        max_output_tokens=700,
     )
     reply = (reply or "").strip()
     if reply:
         return reply
-    return "I'm here with you. Tell me a little more and I'll stay with you."
+    raise ValueError('empty_assistant_answer')

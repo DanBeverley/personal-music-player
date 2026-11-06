@@ -7,6 +7,7 @@ services:
     environment:
       AURALIS_BROWSER_AUDIO_URL: ""
   browser-audio:
+    profiles: ["capture-rollback"]
     init: true
     build:
       context: ../../ingestion/browser_audio

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from concurrent.futures import TimeoutError as FutureTimeoutError
 import json
 import re
 import time
@@ -12,7 +13,7 @@ from .cache_runtime import (
     lookup_persistent_suggestion_base,
     schedule_suggestion_base_write,
 )
-from .intelligence import load_fuzzy_catalog_entity_memories, search_spacing_equivalent
+from .intelligence import load_fuzzy_catalog_entity_memories, search_spacing_equivalent, search_folded_key
 from .server_adapter import SearchServerAdapter, adapt_search_server
 from .upstream_runtime import (
     search_artists as resolve_search_artists,
@@ -44,58 +45,8 @@ def _search_upstream_executor(server: Any):
     return executor if executor is not None else _search_executor(server)
 
 
-def search_query_intent(query: str, *, server: Any | None = None) -> str:
-    server = _resolve_server(server)
-    normalized = server.normalize_text(query)
-    if not normalized:
-        return "mixed"
-    query_tokens = server.query_tokens(query)
-    if re.search(r"(youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/shorts\/)", normalized):
-        return "track"
-    if any(token in normalized for token in ("album", "ep", "ost", "soundtrack")):
-        return "album"
-    if any(token in normalized for token in ("artist", "band", "singer")):
-        return "artist"
-    if any(token in normalized for token in ("song", "track", "lyrics")):
-        return "track"
-    if len(query_tokens) <= 2 and not any(char.isdigit() for char in normalized):
-        return "mixed"
-    return "mixed"
 
 
-def search_artist_seed_tracks(query: str, limit: int, *, server: Any | None = None):
-    server = _resolve_server(server)
-    artists = resolve_search_artists(server, query, 2)
-    if not artists:
-        return []
-    normalized_query = server.normalize_text(query)
-    query_tokens = server.query_tokens(query)
-    tracks = []
-    seen = set()
-    for artist in artists:
-        artist_name = server.normalize_text(artist.get("name"))
-        if normalized_query and artist_name:
-            if normalized_query not in artist_name and not any(
-                token in artist_name for token in query_tokens
-            ):
-                continue
-        artist_id = trim_text(artist.get("id"))
-        if not artist_id:
-            continue
-        try:
-            payload = server.build_artist_details_payload(artist_id)
-        except Exception:
-            payload = {}
-        for track in payload.get("top_songs") or []:
-            normalized = server.normalize_track(track)
-            track_id = trim_text((normalized or {}).get("id"))
-            if not track_id or track_id in seen:
-                continue
-            seen.add(track_id)
-            tracks.append(normalized)
-            if len(tracks) >= limit:
-                return tracks
-    return tracks
 
 
 def _search_cache_key(query: str, limit: int, *, server: Any | None = None) -> str:
@@ -118,7 +69,7 @@ def _resolved_albums(server: Any, albums: Any) -> List[Dict[str, Any]]:
 
 
 def search_tracks_direct(query: str, limit: int, *, server: Any | None = None,
-                         first_page_only: bool = False):
+                         first_page_only: bool = False, force_refresh: bool = False):
     server = _resolve_server(server)
     query = (query or "").strip()
     # Search pages ask for 24 visible tracks and need headroom for canonical
@@ -127,11 +78,11 @@ def search_tracks_direct(query: str, limit: int, *, server: Any | None = None,
     limit = max(1, min(limit, 48))
     if not query:
         return []
-    cache_key = _search_cache_key(query, limit, server=server)
+    cache_key = "quality3::" + _search_cache_key(query, limit, server=server)
     if first_page_only:
         cache_key = f"preview::{cache_key}"
-    cached = lookup_search_result("tracks_direct", cache_key)
-    if cached:
+    cached = None if force_refresh else lookup_search_result("tracks_direct", cache_key)
+    if cached and not any(item.get("search_provider_missing") for item in cached):
         return [dict(item) for item in cached]
 
     ytmusic_started = time.perf_counter()
@@ -143,8 +94,11 @@ def search_tracks_direct(query: str, limit: int, *, server: Any | None = None,
         f"results={len(results or [])}",
         flush=True,
     )
-    final_results = [dict(item) for item in list(results or [])[:limit] if isinstance(item, dict)]
-    if final_results:
+    # Keep the small coverage branch until canonical ranking. Truncating here
+    # discarded every video whenever the songs shelf already filled the limit.
+    candidate_limit = limit * 2
+    final_results = [dict(item) for item in list(results or [])[:candidate_limit] if isinstance(item, dict)]
+    if final_results and not any(item.get("search_provider_missing") for item in final_results):
         store_search_result("tracks_direct", cache_key, final_results)
     return [dict(item) for item in final_results]
 
@@ -197,18 +151,18 @@ def _normalize_playlist_entries(
     return output
 
 
-def search_artists_direct_cached(query: str, limit: int, *, server: Any | None = None):
+def search_artists_direct_cached(query: str, limit: int, *, server: Any | None = None, force_refresh: bool = False):
     server = _resolve_server(server)
     query = (query or "").strip()
     limit = max(1, min(limit, 18))
     if not query:
         return []
     cache_key = _search_cache_key(query, limit, server=server)
-    cached = lookup_search_result("artists_direct", cache_key)
+    cached = None if force_refresh else lookup_search_result("artists_direct", cache_key)
     if cached:
         return [dict(item) for item in cached]
 
-    results = resolve_search_artists_direct(server, query, limit)
+    results = resolve_search_artists_direct(server, query, limit, **({'force_refresh': True} if force_refresh else {}))
     final_results = [dict(item) for item in list(results or [])[:limit] if isinstance(item, dict)]
     # `resolve_search_artists_direct` owns this cache namespace. Do not store
     # the same response twice, and never turn a transient empty provider call
@@ -216,14 +170,14 @@ def search_artists_direct_cached(query: str, limit: int, *, server: Any | None =
     return [dict(item) for item in final_results]
 
 
-def search_albums_direct(query: str, limit: int, *, server: Any | None = None):
+def search_albums_direct(query: str, limit: int, *, server: Any | None = None, force_refresh: bool = False):
     server = _resolve_server(server)
     query = (query or "").strip()
     limit = max(1, min(limit, 18))
     if not query:
         return []
     cache_key = _search_cache_key(query, limit, server=server)
-    cached = lookup_search_result("albums_direct", cache_key)
+    cached = None if force_refresh else lookup_search_result("albums_direct", cache_key)
     if cached:
         return _resolved_albums(server, cached)[:limit]
 
@@ -326,12 +280,12 @@ def search_canonical_album_for_track(
 
 def semantic_search_lexical_score(query: str, *texts, server: Any | None = None) -> float:
     server = _resolve_server(server)
-    normalized_query = server.normalize_text(query)
-    tokens = server.query_tokens(query)
+    normalized_query = search_folded_key(query)
+    tokens = [search_folded_key(token) for token in server.query_tokens(query)]
     normalized_texts = [
-        server.normalize_text(text)
+        search_folded_key(text)
         for text in texts
-        if server.normalize_text(text)
+        if search_folded_key(text)
     ]
     if not normalized_query and not tokens:
         return 0.0
@@ -360,91 +314,8 @@ def semantic_search_lexical_score(query: str, *texts, server: Any | None = None)
     return score
 
 
-def semantic_search_anchor_tracks(
-    req,
-    direct_pool,
-    blended_pool,
-    *,
-    limit: int = 4,
-    server: Any | None = None,
-):
-    server = _resolve_server(server)
-    provided = server.recommendation_unique_snapshot_tracks(
-        req.anchor_track_snapshots or [],
-        limit,
-    )
-    if provided:
-        return provided
-
-    normalized_query = server.normalize_text(req.query)
-    query_tokens = server.query_tokens(req.query)
-    seen_signatures = set()
-    ranked = []
-
-    def add_anchor(raw_track, index: int, base_score: float) -> None:
-        normalized = server.normalize_track(raw_track)
-        if normalized is None:
-            return
-        signature = server.recommendation_track_signature(normalized)
-        if not signature or signature in seen_signatures:
-            return
-        seen_signatures.add(signature)
-        title_text = server.normalize_text(normalized.get("title") or "")
-        artist_text = server.normalize_text(
-            normalized.get("channel") or normalized.get("artist") or ""
-        )
-        if not title_text and not artist_text:
-            return
-        score = float(base_score)
-        if normalized_query and title_text == normalized_query:
-            score += 6.2
-        elif normalized_query and normalized_query in title_text:
-            score += 4.8
-        elif query_tokens and all(token in title_text for token in query_tokens[:5]):
-            score += 3.7
-        elif query_tokens and any(token in title_text for token in query_tokens[:5]):
-            score += 1.45
-        if normalized_query and artist_text == normalized_query:
-            score -= 0.85
-        score -= index * 0.05
-        ranked.append((score, normalized))
-
-    for index, track in enumerate(direct_pool or []):
-        add_anchor(track, index, 1.4)
-    for index, track in enumerate(blended_pool or []):
-        add_anchor(track, index, 1.1)
-
-    ranked.sort(key=lambda item: item[0], reverse=True)
-    anchors = [track for score, track in ranked if score > 0][:limit]
-    if anchors:
-        return anchors
-
-    fallback = []
-    fallback_seen = set()
-    for raw_track in list(direct_pool or []) + list(blended_pool or []):
-        normalized = server.normalize_track(raw_track)
-        if normalized is None:
-            continue
-        signature = server.recommendation_track_signature(normalized)
-        if not signature or signature in fallback_seen:
-            continue
-        fallback_seen.add(signature)
-        fallback.append(normalized)
-        if len(fallback) >= limit:
-            break
-    return fallback
 
 
-def semantic_search_anchor_artist_names(anchor_tracks, limit: int = 6, *, server: Any | None = None):
-    server = _resolve_server(server)
-    return unique_strings(
-        [
-            artist_name
-            for track in anchor_tracks or []
-            for artist_name in server.extract_artist_names(track)
-        ],
-        limit,
-    )
 
 
 def _semantic_suggestion_text(value: Optional[str]) -> str:
@@ -685,6 +556,25 @@ def semantic_search_suggestion_items(
             if isinstance(item, dict):
                 add_candidate(item.get("text"), float(item.get("source_score") or 0.0), "suggestion_cache", item.get("suggestion_type") or "query")
 
+    # Use the existing request pool, with the provider's own admission and
+    # timeout intact. Network work overlaps the indexed local lookup rather
+    # than starting after it. A queued job must not get a fresh time budget.
+    upstream_started_at = time.perf_counter()
+    upstream_deadline = upstream_started_at + _SUGGEST_UPSTREAM_TIMEOUT_SECONDS
+    def fetch_suggestions():
+        remaining = upstream_deadline - time.perf_counter()
+        if remaining <= 0:
+            return []
+        return server.search_upstream_call_with_retry(
+            lambda: server.ytmusic.get_search_suggestions(query),
+            default=[], timeout_seconds=remaining,
+        )
+    upstream_future = None
+    needs_upstream = cached is None and hasattr(server, "ytmusic")
+    executor = getattr(server, "search_executor", None)
+    if needs_upstream and executor is not None:
+        upstream_future = executor.submit(fetch_suggestions)
+
     catalog_started_at = time.perf_counter()
     for memory in ([] if cached is not None else load_fuzzy_catalog_entity_memories(
         server,
@@ -715,14 +605,19 @@ def semantic_search_suggestion_items(
     # put upstream latency back on the critical path merely because a provider
     # returned fewer than the requested cap on its first successful fetch.
     try:
-        upstream_suggestions = (
-            server.search_upstream_call_with_retry(
-                lambda: server.ytmusic.get_search_suggestions(query),
-                default=[], timeout_seconds=_SUGGEST_UPSTREAM_TIMEOUT_SECONDS,
-            ) if cached is None and hasattr(server, "ytmusic") else []
-        )
+        upstream_suggestions = []
+        if upstream_future is not None:
+            upstream_suggestions = upstream_future.result(
+                timeout=max(0.0, upstream_deadline - time.perf_counter())
+            )
+        elif needs_upstream:
+            upstream_suggestions = fetch_suggestions()
+    except FutureTimeoutError:
+        upstream_future.cancel()
+        upstream_suggestions = []
     except Exception:
         upstream_suggestions = []
+    upstream_ms = int((time.perf_counter() - upstream_started_at) * 1000)
     for index, raw_suggestion in enumerate(upstream_suggestions[:8]):
         suggestion_text = (
             raw_suggestion.get("text", "")
@@ -755,9 +650,6 @@ def semantic_search_suggestion_items(
             "recent_query_history",
             "query",
         )
-
-    if not candidates and not direct_play_items:
-        return []
 
     ranking_started_at = time.perf_counter()
     ranked = []
@@ -822,7 +714,7 @@ def semantic_search_suggestion_items(
     # intentionally overlaid above and never cached for another account.
     canonical_base = [item for item in results[:limit]
                       if item.get("source_name") != "recent_query_history"]
-    if cached is None:
+    if cached is None and canonical_base:
         store_search_result("suggestions", cache_key, canonical_base)
         schedule_suggestion_base_write(server, cache_key, canonical_base)
     output = []
@@ -848,7 +740,7 @@ def semantic_search_suggestion_items(
         "memory_cache": memory_cache_ms,
         "persistent_cache": persistent_cache_ms,
         "catalog": catalog_ms,
-        "upstream": int((time.perf_counter() - search_started_at) * 1000),
+        "upstream": upstream_ms if needs_upstream else 0,
         "ranking": int((time.perf_counter() - ranking_started_at) * 1000),
         "source_counts": source_counts,
         "memory_cache_hit": memory_cache_hit,

@@ -5,14 +5,7 @@ import 'catalog_api.dart';
 import 'design_system.dart';
 import 'home_widgets.dart';
 import 'web_player.dart';
-
-String snapshotLabel(DateTime? at, String status) {
-  if (at == null) return 'Preparing the latest edition';
-  final local = at.toLocal();
-  final stamp = '${local.day}/${local.month} · '
-      '${local.hour.toString().padLeft(2, '0')}:${local.minute.toString().padLeft(2, '0')}';
-  return '${status == 'stale' ? 'Saved edition' : 'Updated'} $stamp';
-}
+import '../widgets/chart_rank_history.dart';
 
 /// Ranks and movement always come from the selected server-owned chart.
 class ChartDetail extends StatefulWidget {
@@ -24,6 +17,7 @@ class ChartDetail extends StatefulWidget {
       required this.title,
       this.initial,
       required this.onLike,
+      this.onAddToPlaylist,
       required this.isLiked,
       required this.isActive});
   final CatalogApi api;
@@ -32,6 +26,7 @@ class ChartDetail extends StatefulWidget {
   final String title;
   final ChartsSnapshot? initial;
   final Future<void> Function(Map<String, dynamic>) onLike;
+  final Future<void> Function(Map<String, dynamic>)? onAddToPlaylist;
   final bool Function(Map<String, dynamic>) isLiked;
   final bool Function() isActive;
   @override
@@ -118,7 +113,7 @@ class _ChartDetailState extends State<ChartDetail> {
             Expanded(
                 child: Text(
                     error ??
-                        snapshotLabel(data?.generatedAt, data?.status ?? ''),
+                        '${entries.length} songs · ${query.range == 'week' ? 'Weekly ranking' : query.range}',
                     style: const TextStyle(
                         color: NeatieDesign.muted, fontSize: 12))),
             IconButton(
@@ -165,6 +160,12 @@ class _ChartDetailState extends State<ChartDetail> {
             padding: EdgeInsets.all(24),
             child: Text(
                 'This edition is not available yet. Check again shortly.')),
+      if (entries.any((entry) => entry.history.length > 1))
+        _ChartHistory(
+            entries: entries
+                .where((entry) => entry.history.length > 1)
+                .take(8)
+                .toList()),
       Expanded(
           child: ListView.builder(
               padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
@@ -213,10 +214,16 @@ class _ChartDetailState extends State<ChartDetail> {
                               widget.player.playNext(entry.track);
                             if (action == 'like')
                               unawaited(widget.onLike(entry.track));
+                            if (action == 'playlist')
+                              unawaited(widget.onAddToPlaylist!(entry.track));
                           },
                           itemBuilder: (_) => [
                                 const PopupMenuItem(
                                     value: 'next', child: Text('Play next')),
+                                if (widget.onAddToPlaylist != null)
+                                  const PopupMenuItem(
+                                      value: 'playlist',
+                                      child: Text('Add to playlist')),
                                 PopupMenuItem(
                                     value: 'like',
                                     child: Text(widget.isLiked(entry.track)
@@ -233,5 +240,55 @@ class _ChartDetailState extends State<ChartDetail> {
     version++;
     poll?.cancel();
     super.dispose();
+  }
+}
+
+class _ChartHistory extends StatefulWidget {
+  const _ChartHistory({required this.entries});
+  final List<ChartEntry> entries;
+  @override
+  State<_ChartHistory> createState() => _ChartHistoryState();
+}
+
+class _ChartHistoryState extends State<_ChartHistory> {
+  String? selected;
+  @override
+  Widget build(BuildContext context) {
+    final entry = widget.entries.firstWhere(
+        (e) => e.playableSourceId == selected,
+        orElse: () => widget.entries.first);
+    final history = entry.history;
+    String date(DateTime at) => '${at.day}/${at.month}';
+    return Padding(
+        padding: const EdgeInsets.fromLTRB(24, 12, 24, 16),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Text('Ranking history', style: NeatieDesign.eyebrow),
+          DropdownButton<String>(
+              isExpanded: true,
+              value: entry.playableSourceId,
+              items: [
+                for (final track in widget.entries)
+                  DropdownMenuItem(
+                      value: track.playableSourceId,
+                      child: Text(track.title,
+                          maxLines: 1, overflow: TextOverflow.ellipsis))
+              ],
+              onChanged: (value) => setState(() => selected = value)),
+          Semantics(
+              label:
+                  'Rank history for ${entry.title}: ${history.map((p) => '#${p.rank} on ${date(p.at)}').join(', ')}',
+              child: RepaintBoundary(
+                  child: SizedBox(
+                      height: 90,
+                      width: double.infinity,
+                      child: CustomPaint(
+                          painter: RankHistoryPainter(history, 1))))),
+          const SizedBox(height: 8),
+          Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+            Text(date(history.first.at)),
+            Text('#${history.last.rank}'),
+            Text(date(history.last.at)),
+          ]),
+        ]));
   }
 }

@@ -52,7 +52,7 @@ services:
 
   api:
     <<: *backend-common
-    mem_limit: 1536m
+    mem_limit: 2304m
     environment:
       AURALIS_RUNTIME_DIR: /var/lib/neatie/runtime
       AURALIS_PROXY_RUNTIME_DIR: /var/lib/neatie/runtime
@@ -65,9 +65,11 @@ services:
       NEATIE_DIRECT_CONTEXT_TTL: "900"
       NEATIE_RETAIN_STARTUP_READ: "1"
       NEATIE_PLAYBACK_STARTUP: "1"
+      NEATIE_MEMORY_DIAGNOSTICS: "1"
       NODE_OPTIONS: "--max-old-space-size=384"
       RECOMMENDATION_ENABLE_SCHEDULER: "0"
       RECOMMENDATION_EXTERNAL_WORKER: "1"
+      NEATIE_BACKGROUND_IDLE: "1"
     healthcheck:
       test:
         - CMD
@@ -98,9 +100,11 @@ services:
       NEATIE_DIRECT_CLIENT: mweb
       NEATIE_DIRECT_POOL: "1"
       NEATIE_DIRECT_CONTEXT_TTL: "900"
+      NEATIE_MEMORY_DIAGNOSTICS: "1"
       NODE_OPTIONS: "--max-old-space-size=384"
       RECOMMENDATION_ENABLE_SCHEDULER: "1"
       RECOMMENDATION_EXTERNAL_WORKER: "1"
+      NEATIE_BACKGROUND_IDLE: "1"
     depends_on:
       pot-provider:
         condition: service_healthy

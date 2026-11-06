@@ -26,6 +26,35 @@ _context_lock = Lock()
 _CONTEXT_TTL = 180
 _extractor_pool = []
 _extractor_pool_lock = Lock()
+_rejected_cookies = set()
+_rejected_cookies_lock = Lock()
+
+
+def _cookie_fingerprint(path):
+    if not path:
+        return None
+    try:
+        with open(path, 'rb') as source:
+            return hashlib.file_digest(source, 'sha256').hexdigest()
+    except OSError:
+        return None  # Keep the existing cookie-load error for missing files.
+
+
+def cookie_session(path):
+    fingerprint = _cookie_fingerprint(path)
+    with _rejected_cookies_lock:
+        rejected = fingerprint and fingerprint in _rejected_cookies
+    return (None, None) if rejected else (path, fingerprint)
+
+
+def reject_cookie_session(fingerprint):
+    # Reject the lease that failed, even if the mounted file was refreshed
+    # while that request was still running. Never modify the private jar.
+    if fingerprint:
+        with _rejected_cookies_lock:
+            if len(_rejected_cookies) >= 8:
+                _rejected_cookies.pop()
+            _rejected_cookies.add(fingerprint)
 
 
 def _context_ttl():
@@ -33,6 +62,16 @@ def _context_ttl():
         return min(900, max(30, int(os.environ.get('NEATIE_DIRECT_CONTEXT_TTL', _CONTEXT_TTL))))
     except ValueError:
         return _CONTEXT_TTL
+
+
+def generic_session_refresh_due(ydl) -> bool:
+    """Refresh generic configuration shortly before its original lease expires."""
+    if getattr(ydl, '_neatie_fast_acquisition', False) is not True:
+        return False
+    scope = getattr(ydl, '_neatie_session_scope', '')
+    with _context_lock:
+        cached = _contexts.get(scope)
+        return cached is None or cached[0]-time.monotonic() <= min(60, _context_ttl()/3)
 
 
 def _close_extractor(entry):
@@ -59,22 +98,28 @@ def reuse_extractor(factory, options, cookie_path, *, refresh=False):
     except OSError as error:
         error._auralis_failure_stage = 'cookie_load'
         raise
+    credential_scope = hashlib.sha256(credential).hexdigest()
     key = hashlib.sha256(json.dumps([stable, yt_dlp.version.__version__], sort_keys=True, default=str).encode()+credential).hexdigest()
     now = time.monotonic()
     entry, retired = None, []
     with _extractor_pool_lock:
         for candidate in list(_extractor_pool):
-            if refresh or candidate['key'] != key or now-candidate['idle_at'] >= 900:
+            if (candidate.get('credential_scope') != credential_scope
+                    or refresh and candidate['key'] == key
+                    or now-candidate['idle_at'] >= 900):
                 _extractor_pool.remove(candidate)
                 retired.append(candidate)
-        if _extractor_pool:
-            entry = _extractor_pool.pop()
+        entry = next((candidate for candidate in _extractor_pool
+                      if candidate['key'] == key), None)
+        if entry is not None:
+            _extractor_pool.remove(entry)
     for old in retired:
         _close_extractor(old)
     reused = entry is not None
     if entry is None:
         manager = factory()
-        entry = {'key': key, 'manager': manager, 'ydl': manager.__enter__()}
+        entry = {'key': key, 'credential_scope': credential_scope,
+                 'manager': manager, 'ydl': manager.__enter__()}
     ydl = entry['ydl']
     ydl.params['logger'] = options.get('logger')
     ydl._neatie_bootstrap_reused = False
@@ -85,7 +130,9 @@ def reuse_extractor(factory, options, cookie_path, *, refresh=False):
         _close_extractor(entry)
         raise
     else:
-        if getattr(ydl, '_neatie_fast_acquisition', False) is not True:
+        if ('cookies_invalid' in getattr(options.get('logger'), 'flags', set())
+                or getattr(ydl, '_neatie_fast_acquisition', False) is not True):
+            invalidate_context(getattr(ydl, '_neatie_session_scope', ''))
             _close_extractor(entry)
             return
         ydl.params['logger'] = None
@@ -201,18 +248,43 @@ class _DirectMusicIE(YoutubeIE):
             for provider in self._jsc_director.providers.values():
                 if provider.PROVIDER_NAME != 'node':
                     continue
+                construct = provider._construct_stdin
+                def measured_stdin(player, preprocessed, requests, _construct=construct):
+                    timings = getattr(self._downloader.params.get('logger'), 'stages_ms', None)
+                    if timings is not None:
+                        key = 'solver_prepared' if preprocessed else 'solver_raw'
+                        timings[key] = timings.get(key, 0) + 1
+                    return _construct(player, preprocessed, requests)
+                provider._construct_stdin = measured_stdin
                 run = provider._run_js_runtime
                 def measured_run(stdin, _run=run):
                     at = time.perf_counter()
+                    python_at = time.thread_time()
+                    timings = getattr(self._downloader.params.get('logger'), 'stages_ms', None)
+                    if timings is not None:
+                        timings['solver_calls'] = timings.get('solver_calls', 0) + 1
                     try:
-                        return _run(stdin)
+                        from ..memory_runtime import memory_operation
+                        with memory_operation('solver', correlation=getattr(self._downloader, '_neatie_resolution_id', None)):
+                            return _run(stdin)
                     finally:
                         _record_stage(self._downloader, 'solver', at)
+                        if timings is not None:
+                            # Caller-thread CPU only, explicitly not Node CPU.
+                            timings['solver_python'] = timings.get('solver_python', 0) + round(
+                                (time.thread_time()-python_at)*1000)
                 provider._run_js_runtime = measured_run
         finally:
             _record_stage(self._downloader, 'initialize', started)
 
     def _download_initial_webpage(self, url, client, video_id):
+        started = time.perf_counter()
+        try:
+            return self._session_webpage(url, client, video_id)
+        finally:
+            _record_stage(self._downloader, 'bootstrap', started)
+
+    def _session_webpage(self, url, client, video_id):
         key = self._neatie_scope
         with _context_lock:
             now = time.monotonic()
@@ -290,6 +362,7 @@ def install_direct_extractor(ydl, *, refresh=False) -> bool:
     NodeJCP._ENABLE_PREPROCESSED_PLAYER_CACHE = True
     extractor = _DirectMusicIE(ydl)
     extractor._neatie_scope = _session_key(ydl)
+    ydl._neatie_session_scope = extractor._neatie_scope
     if refresh:
         invalidate_context(extractor._neatie_scope)
     ydl.add_info_extractor(extractor)

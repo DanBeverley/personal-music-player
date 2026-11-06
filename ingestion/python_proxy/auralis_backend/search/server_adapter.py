@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Iterable, Optional
+import time
 
 from ..runtime_context import resolve_server
 
@@ -59,6 +60,27 @@ class SearchServerAdapter:
             backoff_seconds=self.raw.UPSTREAM_RETRY_BACKOFF_SECONDS,
             default=default,
         )
+
+    def submit_search_upstream(self, fn, *, deadline):
+        """Share existing admission/worker limits without nested blocking jobs."""
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        admission = self.raw.search_upstream_admission
+        wait_seconds = min(remaining, max(0.0, float(
+            getattr(self.raw, "search_admission_wait_seconds", 0) or 0)))
+        if not admission.acquire(timeout=wait_seconds):
+            return None
+        try:
+            if time.monotonic() >= deadline:
+                admission.release()
+                return None
+            future = self.raw.search_upstream_executor.submit(fn)
+        except Exception:
+            admission.release()
+            raise
+        future.add_done_callback(lambda _future: admission.release())
+        return future
 
     def normalize_track(self, track: Any) -> dict[str, Any] | None:
         return self.raw.normalize_recommendation_track(track)

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Set
 
 from .candidates import artist_name, normalize_text, track_id
-from .schema import DiscoveryCandidate, TasteProfile
+from .schema import DiscoveryCandidate, TasteProfile, composition_fact
 
 
 TRUSTED_AUTHORITIES = {
@@ -127,6 +127,7 @@ def _track_language_values(taste: TasteProfile, key: str) -> Set[str]:
     return output
 
 
+@composition_fact
 def accepted_languages(taste: TasteProfile) -> Set[str]:
     profile = taste.source_profile or {}
     values = _profile_values(
@@ -139,6 +140,7 @@ def accepted_languages(taste: TasteProfile) -> Set[str]:
     return values | _track_language_values(taste, "language")
 
 
+@composition_fact
 def accepted_regions(taste: TasteProfile) -> Set[str]:
     profile = taste.source_profile or {}
     values = _profile_values(
@@ -152,6 +154,7 @@ def accepted_regions(taste: TasteProfile) -> Set[str]:
     return values | _track_language_values(taste, "region")
 
 
+@composition_fact
 def accepted_audience_profiles(taste: TasteProfile) -> Set[str]:
     profile = taste.source_profile or {}
     values = _profile_values(
@@ -205,14 +208,15 @@ def _candidate_audience(candidate: DiscoveryCandidate) -> tuple[str, float, str]
     return audience, confidence, source
 
 
+@composition_fact
+def _direct_history_ids(taste: TasteProfile) -> Set[str]:
+    return {identity for track in taste.recent_tracks + taste.top_tracks + taste.last_played_tracks
+            if (identity := track_id(track))}
+
+
 def _is_direct_history(candidate: DiscoveryCandidate, taste: TasteProfile) -> bool:
     item_id = track_id(candidate.item)
-    if not item_id:
-        return False
-    for track in taste.recent_tracks + taste.top_tracks + taste.last_played_tracks:
-        if track_id(track) == item_id:
-            return True
-    return False
+    return bool(item_id and item_id in _direct_history_ids(taste))
 
 
 def _evaluate_candidate_profile_compatibility(

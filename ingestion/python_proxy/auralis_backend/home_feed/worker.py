@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 import logging
+import json
 import os
 import socket
 import threading
@@ -12,10 +13,11 @@ import time
 from ..contracts import SearchRequest
 from ..discovery.signals import build_taste_profile
 from ..discovery.inventory import candidate_inventory_from_payload
-from .candidate_supply import CandidateSupplyService
+from .candidate_supply import CandidateSupplyService, exposure_aware_candidate_supply_status
 from .composer import ComposeOutcome, HomeFeedComposer, candidate_artist_artwork_repairs
 from .contracts import (
     QUEUE_TARGET_DEPTH,
+    CANDIDATE_REFRESH_RETRY_SECONDS,
     SUPPLY_IDLE_NO_PROGRESS_RECHECK_SECONDS,
     SUPPLY_IDLE_PROGRESS_RECHECK_SECONDS,
     HomeJobRecord,
@@ -24,7 +26,8 @@ from .contracts import (
     home_supply_profile_fingerprint,
     with_home_supply_profile,
 )
-from .radio_supply import ArtworkSupplyService, RadioSupplyService
+from .radio_supply import ArtworkSupplyService, RadioSupplyService, _radio_expansion_needed
+from ..discovery.radio_inventory import artist_radio_inventory_from_payload
 from .repositories import HomeRepositorySet, LeaseLost
 from .scheduler import HomeJobScheduler
 
@@ -37,9 +40,12 @@ _inventory_work_slot = threading.BoundedSemaphore(1)
 
 
 class RetryableHomeJob(RuntimeError):
-    def __init__(self, message: str, *, delay_seconds: float | None = None) -> None:
+    def __init__(self, message: str, *, delay_seconds: float | None = None,
+                 payload: dict[str, Any] | None = None, preserve_attempt: bool = False) -> None:
         super().__init__(message)
         self.delay_seconds = delay_seconds
+        self.payload = payload
+        self.preserve_attempt = preserve_attempt
 
 
 @dataclass(frozen=True)
@@ -53,7 +59,7 @@ class HomeWorkerResult:
 HOME_WORKER_LANES: tuple[tuple[str, tuple[HomeJobType, ...]], ...] = (
     ("interactions", (HomeJobType.RECONCILE_INTERACTION,)),
     ("compose", (HomeJobType.COMPOSE_FEED,)),
-    ("candidates", (HomeJobType.REFRESH_CANDIDATES,)),
+    ("candidates", (HomeJobType.RECONCILE_SUPPLY, HomeJobType.REFRESH_CANDIDATES)),
     ("radio", (HomeJobType.REFRESH_RADIO,)),
     ("artwork", (HomeJobType.REPAIR_ARTWORK,)),
 )
@@ -82,6 +88,7 @@ class HomeFeedWorker:
         self._job_types = tuple(job_types)
         self._handlers: dict[HomeJobType, Callable[[HomeJobRecord], None]] = {
             HomeJobType.RECONCILE_INTERACTION: self._reconcile_interaction,
+            HomeJobType.RECONCILE_SUPPLY: self._reconcile_supply,
             HomeJobType.REFRESH_CANDIDATES: self._refresh_candidates,
             HomeJobType.REFRESH_RADIO: self._refresh_radio,
             HomeJobType.REPAIR_ARTWORK: self._repair_artwork,
@@ -100,6 +107,15 @@ class HomeFeedWorker:
             handler_result = self._run_with_lease_renewal(
                 job, self._handlers[job.job_type]
             )
+            if (job.job_type is HomeJobType.COMPOSE_FEED
+                    and getattr(handler_result, "reason", "") in {
+                        "artifact_too_similar", "artifact_unchanged", "artifact_contract_rejected"}):
+                reason = handler_result.reason
+                details = ",".join(handler_result.failed_contracts or ())
+                self._repositories.jobs.fail(job.job_id, job.lease_token,
+                                             reason + (":" + details if details else ""))
+                return HomeWorkerResult(claimed=True, job_id=job.job_id,
+                                        job_type=job.job_type.value, outcome="blocked")
             self._repositories.jobs.complete(job.job_id, job.lease_token)
             if (
                 job.job_type is HomeJobType.COMPOSE_FEED
@@ -142,6 +158,8 @@ class HomeFeedWorker:
                 job.lease_token,
                 str(exc),
                 delay_seconds=exc.delay_seconds,
+                **({"payload": exc.payload} if exc.payload is not None else {}),
+                **({"preserve_attempt": True} if exc.preserve_attempt else {}),
             )
             return HomeWorkerResult(
                 claimed=True,
@@ -202,7 +220,7 @@ class HomeFeedWorker:
         )
         heartbeat.start()
         try:
-            if job.job_type in {HomeJobType.REFRESH_CANDIDATES, HomeJobType.REFRESH_RADIO}:
+            if job.job_type in {HomeJobType.RECONCILE_SUPPLY, HomeJobType.REFRESH_CANDIDATES, HomeJobType.REFRESH_RADIO}:
                 # Snapshot expansion is memory-heavy. Renew waiting leases,
                 # serialize bulk refreshes. Compose, artwork and interactions
                 # retain their independent lanes and never wait on providers.
@@ -245,6 +263,199 @@ class HomeFeedWorker:
             str(job.payload["event_id"]), retry_errors=True,
         )
 
+    def _reconcile_supply(self, job: HomeJobRecord) -> None:
+        from ..memory_runtime import memory_operation
+        with memory_operation("inventory", correlation=job.job_id):
+            self._check_supply(
+                self._request(job),
+                self._repositories.state.reconcile(job.user_scope_id),
+                reason=str(job.payload.get("reason") or "serve_replenish"),
+            )
+
+    def _check_supply(self, request: Any, state: Any, *, reason: str) -> None:
+        scope = state.user_scope_id
+        profile = home_supply_profile_fingerprint(scope)
+        foreground = reason in {"pull_to_refresh", "launch_missing_successor"}
+        if foreground and not state.ready_artifact_ids:
+            # A user's missing feed outranks optional account/guest maintenance.
+            # Reprioritize the same singleton; provider cooldowns remain owned
+            # by acquisition, not this HTTP request.
+            self._scheduler.candidates(
+                request, reason="foreground_refresh", profile_fingerprint=profile,
+                generation_hint=f"demand:{getattr(request, 'refresh_token', '') or int(time.time() // 300)}",
+            )
+        # Never compose a post-cutover feed from a request-profile fragment.
+        # If the stable account supply does not exist yet, its consolidation
+        # job is the only valid next step.
+        fresh_candidate = self._repositories.candidates.latest_fresh(
+            scope,
+            profile_fingerprint=profile,
+        )
+        candidate = fresh_candidate or self._repositories.candidates.latest_usable(
+            scope,
+            profile_fingerprint=profile,
+        )
+        candidate_inventory = (
+            candidate_inventory_from_payload(dict(candidate.payload or {}))
+            if candidate is not None
+            else None
+        )
+        if candidate is None or candidate_inventory is None or not candidate_inventory.is_ready:
+            active = self._repositories.jobs.has_active(
+                scope,
+                job_types=(HomeJobType.REFRESH_CANDIDATES,),
+                ignore_delayed_idle=True,
+            )
+            retry_initial = (not state.active_artifact_id and
+                             bool(getattr(request, "force_refresh", False)) and
+                             not self._repositories.jobs.has_runnable(
+                                 scope, job_types=(HomeJobType.REFRESH_CANDIDATES,)))
+            if not active or retry_initial:
+                # Explicit Retry on a never-published Home must consume the
+                # current signals instead of waiting on a delayed stale job.
+                # Singleton replacement preserves leased work; the provider
+                # circuit/backoff still governs every acquisition request.
+                self._scheduler.candidates(
+                    request,
+                    reason="candidate_inventory_refresh",
+                    profile_fingerprint=profile,
+                    generation_hint=(f"initial-retry:{int(time.time() // 300)}"
+                                     if retry_initial else ""),
+                )
+            return
+        if reason == "background_prepare" and any(
+            getattr(request, key, None)
+            for key in ("recent_track_ids", "top_track_ids", "last_played_tracks",
+                        "library_track_ids", "artist_hints", "playlist_names")
+        ) and not self._repositories.jobs.has_active(
+            scope, job_types=(HomeJobType.REFRESH_CANDIDATES,), ignore_delayed_idle=True,
+        ):
+            # Listening/library changes need to enter durable supply even
+            # while the old inventory is fresh and the ready queue is full.
+            # Coalesce terminal attempts too: one refresh per five-minute
+            # window, no provider work or active-feed promotion here.
+            self._scheduler.candidates(
+                request, reason="signal_reconcile", profile_fingerprint=profile,
+                generation_hint=f"signals:{int(time.time() // (5 * 60))}",
+                coalesce_terminal=True,
+            )
+        if fresh_candidate is None and not self._repositories.jobs.has_active(
+            scope,
+            job_types=(HomeJobType.REFRESH_CANDIDATES,),
+            ignore_delayed_idle=True,
+        ):
+            # Verified facts remain usable, but expiry is a real refresh
+            # deadline. Coalesce all requests in one bounded retry window so
+            # stale supply cannot either suppress acquisition or flood it.
+            refresh_window = int(time.time() // CANDIDATE_REFRESH_RETRY_SECONDS)
+            self._scheduler.candidates(
+                request,
+                reason="candidate_revalidation_due",
+                profile_fingerprint=profile,
+                generation_hint=(
+                    f"revalidate:{candidate.snapshot_id}:{refresh_window}"
+                ),
+                coalesce_terminal=True,
+            )
+        elif (
+            fresh_candidate is not None
+            and bool(
+                exposure_aware_candidate_supply_status(
+                    candidate_inventory,
+                    repositories=self._repositories,
+                    user_scope_id=scope,
+                )["expansion_needed"]
+            )
+            and not self._repositories.jobs.has_active(
+                scope,
+                job_types=(HomeJobType.REFRESH_CANDIDATES,),
+                ignore_delayed_idle=True,
+            )
+        ):
+            expansion_window = int(time.time() // (15 * 60))
+            self._scheduler.candidates(
+                request,
+                reason="candidate_reserve_replenish",
+                profile_fingerprint=profile,
+                generation_hint=(
+                    f"reserve:{candidate.snapshot_id}:{expansion_window}"
+                ),
+                coalesce_terminal=True,
+            )
+        fresh_radio = self._repositories.radio.latest_fresh(
+            scope,
+            profile_fingerprint=profile,
+        )
+        if fresh_radio is None:
+            self._scheduler.radio(
+                request,
+                reason="radio_snapshot_refresh",
+                profile_fingerprint=profile,
+                candidate_snapshot_id=candidate.snapshot_id,
+                generation_hint=f"candidate:{candidate.snapshot_id}",
+            )
+        elif (
+            (radio_inventory := artist_radio_inventory_from_payload(
+                dict(fresh_radio.payload or {})
+            )) is not None
+            and _radio_expansion_needed(radio_inventory)
+            and not self._repositories.jobs.has_active(
+                scope,
+                job_types=(HomeJobType.REFRESH_RADIO,),
+                ignore_delayed_idle=True,
+            )
+        ):
+            radio_window = int(time.time() // (15 * 60))
+            self._scheduler.radio(
+                request,
+                reason="radio_reserve_replenish",
+                profile_fingerprint=profile,
+                candidate_snapshot_id=candidate.snapshot_id,
+                generation_hint=f"reserve:{fresh_radio.snapshot_id}:{radio_window}",
+                coalesce_terminal=True,
+            )
+        reusable_radio = (
+            fresh_radio
+            or self._repositories.radio.latest_usable(
+                scope,
+                profile_fingerprint=profile,
+            )
+            or self._repositories.radio.latest_usable(scope)
+        )
+        # Initial publication still waits for the first complete independent
+        # radio row. Once an accepted active feed exists, radio replacement is
+        # no longer allowed to block improvements in the other rows.
+        if reusable_radio is None and not state.active_artifact_id:
+            return
+        if len(state.ready_artifact_ids) >= QUEUE_TARGET_DEPTH:
+            return
+        radio_snapshot_id = (
+            reusable_radio.snapshot_id if reusable_radio is not None else ""
+        )
+        allocation_epoch = (
+            state.active_version + len(state.ready_artifact_ids) + 1
+        )
+        materialized = self._repositories.artifacts.get_by_supply(
+            scope,
+            candidate.snapshot_id,
+            radio_snapshot_id,
+            allocation_epoch=allocation_epoch,
+        )
+        state_ids = {
+            state.active_artifact_id,
+            *state.ready_artifact_ids,
+        }
+        if materialized is not None and materialized.artifact_id in state_ids:
+            return
+        self._scheduler.compose(
+            request,
+            reason=reason,
+            profile_fingerprint=profile,
+            candidate_snapshot_id=candidate.snapshot_id,
+            radio_snapshot_id=radio_snapshot_id,
+            allocation_epoch=allocation_epoch,
+        )
+
     def _refresh_candidates(self, job: HomeJobRecord) -> Any:
         started = time.perf_counter()
         request = self._request(job)
@@ -261,6 +472,8 @@ class HomeFeedWorker:
                 "signal_reconcile",
                 "release_metadata_replenish",
                 "idle_reserve_enrichment",
+                "foreground_refresh",
+                "compose_novelty_replenish",
             },
         )
         print(
@@ -278,7 +491,7 @@ class HomeFeedWorker:
                     outcome.reason,
                     delay_seconds=(
                         outcome.retry_after_seconds
-                        if not outcome.made_progress
+                        if outcome.retry_after_seconds or not outcome.made_progress
                         else None
                     ),
                 )
@@ -317,10 +530,10 @@ class HomeFeedWorker:
                     ),
                 )
             return outcome
-        radio = self._repositories.radio.latest_usable(
+        radio = self._repositories.radio.latest_reference(
             job.user_scope_id,
             profile_fingerprint=taste.profile_key,
-        ) or self._repositories.radio.latest_usable(job.user_scope_id)
+        ) or self._repositories.radio.latest_reference(job.user_scope_id)
         # Every ready immutable candidate revision is handed off once. Exact
         # supply-pair coalescing makes this safe, while avoiding the previous
         # stranded state where consolidation reported no provider progress.
@@ -354,9 +567,7 @@ class HomeFeedWorker:
         if outcome.expansion_needed and job.attempts < job.max_attempts:
             raise RetryableHomeJob(
                 "candidate_reserve_replenish",
-                delay_seconds=(
-                    0.0 if outcome.made_progress else outcome.retry_after_seconds
-                ),
+                delay_seconds=outcome.retry_after_seconds,
             )
         return outcome
 
@@ -412,12 +623,12 @@ class HomeFeedWorker:
             (job.payload or {}).get("candidate_snapshot_id") or ""
         )
         candidate_record = (
-            self._repositories.candidates.get(candidate_snapshot_id)
+            self._repositories.candidates.reference(candidate_snapshot_id)
             if candidate_snapshot_id
             else None
         )
         if candidate_record is None:
-            candidate_record = self._repositories.candidates.latest_usable(
+            candidate_record = self._repositories.candidates.latest_reference(
                 job.user_scope_id,
                 profile_fingerprint=home_supply_profile_fingerprint(
                     job.user_scope_id
@@ -430,7 +641,7 @@ class HomeFeedWorker:
             candidate_record is not None
             and candidate_record.profile_fingerprint != taste.profile_key
         ):
-            stable_candidate = self._repositories.candidates.latest_usable(
+            stable_candidate = self._repositories.candidates.latest_reference(
                 job.user_scope_id,
                 profile_fingerprint=taste.profile_key,
             )
@@ -456,6 +667,7 @@ class HomeFeedWorker:
             f"seeds={outcome.seed_candidates_offered} "
             f"verified={outcome.source_verification_verified} "
             f"new_cards={outcome.new_card_count} "
+            f"funnel={json.dumps(dict(outcome.funnel), separators=(',', ':'), sort_keys=True)} "
             f"outcome={outcome.reason} "
             f"elapsed_ms={int((time.perf_counter() - started) * 1000)}",
             flush=True,
@@ -500,7 +712,14 @@ class HomeFeedWorker:
         if outcome.artwork_records:
             return outcome
         if job.attempts < job.max_attempts:
-            raise RetryableHomeJob(outcome.reason)
+            # Empty/blocked acquisition does not become useful five seconds
+            # later. Keep the same durable job, but back off its expensive
+            # inventory scan. New interactive demand can still expedite it.
+            delay = None if outcome.made_progress else min(
+                SUPPLY_IDLE_PROGRESS_RECHECK_SECONDS * (2 ** max(job.attempts - 1, 0)),
+                SUPPLY_IDLE_NO_PROGRESS_RECHECK_SECONDS,
+            )
+            raise RetryableHomeJob(outcome.reason, delay_seconds=delay)
         return outcome
 
     def _schedule_idle_supply_replenishment(
@@ -523,6 +742,12 @@ class HomeFeedWorker:
         snapshot_id = str(getattr(outcome, "snapshot_id", "") or "").strip()
         generation = f"idle:{snapshot_id or job.job_id}:{int(run_after)}"
         request = self._request(job)
+        # Maintenance must not inherit a completed UI refresh and promote its
+        # downstream candidate/radio jobs as fresh interactive demand.
+        request.force_refresh = False
+        request.prefer_fresh_rows = False
+        request.promote_ready_on_launch = False
+        request.refresh_token = ""
         profile = home_supply_profile_fingerprint(job.user_scope_id)
         if job.job_type is HomeJobType.REFRESH_CANDIDATES:
             self._scheduler.candidates(
@@ -533,7 +758,7 @@ class HomeFeedWorker:
                 run_after=run_after,
             )
             return
-        candidate = self._repositories.candidates.latest_usable(
+        candidate = self._repositories.candidates.latest_reference(
             job.user_scope_id,
             profile_fingerprint=profile,
         )
@@ -551,18 +776,24 @@ class HomeFeedWorker:
         request = self._request(job)
         taste = build_taste_profile(self._server, request)
         record = dict((job.payload or {}).get("artist") or {})
-        if not self._artwork_supply.repair(record):
+        outcome = self._artwork_supply.repair(record)
+        if not outcome:
             # Artwork cannot block radio acquisition. Keep its own durable,
             # slow retry while the radio supplier immediately advances to the
             # next seed.
+            retry_after = getattr(outcome, "retry_after", None)
+            delay = max(float(retry_after) - time.time(), 1.0) if retry_after else 15 * 60
+            payload = dict(job.payload or {})
+            payload["artist"] = getattr(outcome, "record", record)
             raise RetryableHomeJob(
-                "artist_artwork_unavailable",
-                delay_seconds=15 * 60,
+                "artist_artwork_" + str(getattr(outcome, "stage", "unavailable")),
+                delay_seconds=delay, payload=payload,
+                preserve_attempt=bool(getattr(outcome, "deferred", False)),
             )
         # Only a persisted artwork change may trigger radio reconciliation.
         # Coalescing includes terminal jobs, so dozens of artist repairs in
         # one batch cannot manufacture an endless chain of radio work.
-        candidate = self._repositories.candidates.latest_usable(
+        candidate = self._repositories.candidates.latest_reference(
             job.user_scope_id,
             profile_fingerprint=home_supply_profile_fingerprint(
                 job.user_scope_id
@@ -583,7 +814,7 @@ class HomeFeedWorker:
             coalesce_terminal=True,
         )
         if candidate is not None:
-            radio = self._repositories.radio.latest_usable(
+            radio = self._repositories.radio.latest_reference(
                 job.user_scope_id,
                 profile_fingerprint=candidate.profile_fingerprint,
             )
@@ -619,15 +850,16 @@ class HomeFeedWorker:
         # available when it actually runs rather than the snapshot that first
         # noticed the missing slot.
         candidate_record = (
-            self._repositories.candidates.latest_fresh(
+            self._repositories.candidates.latest_reference(
+                job.user_scope_id,
+                profile_fingerprint=stable_profile,
+                require_fresh=True,
+            )
+            or self._repositories.candidates.latest_reference(
                 job.user_scope_id,
                 profile_fingerprint=stable_profile,
             )
-            or self._repositories.candidates.latest_usable(
-                job.user_scope_id,
-                profile_fingerprint=stable_profile,
-            )
-            or self._repositories.candidates.get(requested_candidate_snapshot_id)
+            or self._repositories.candidates.reference(requested_candidate_snapshot_id)
         )
         if (
             candidate_record is not None
@@ -646,15 +878,16 @@ class HomeFeedWorker:
             candidate_record.snapshot_id if candidate_record is not None else ""
         )
         radio_record = (
-            self._repositories.radio.latest_fresh(
+            self._repositories.radio.latest_reference(
+                job.user_scope_id,
+                profile_fingerprint=stable_profile,
+                require_fresh=True,
+            )
+            or self._repositories.radio.latest_reference(
                 job.user_scope_id,
                 profile_fingerprint=stable_profile,
             )
-            or self._repositories.radio.latest_usable(
-                job.user_scope_id,
-                profile_fingerprint=stable_profile,
-            )
-            or self._repositories.radio.get(requested_radio_snapshot_id)
+            or self._repositories.radio.reference(requested_radio_snapshot_id)
         )
         radio_snapshot_id = (
             radio_record.snapshot_id if radio_record is not None else ""
@@ -683,7 +916,7 @@ class HomeFeedWorker:
             # fall back to a legacy-profile payload merely because it was the
             # first request that noticed the missing queue slot.
             if (
-                self._repositories.candidates.latest_usable(
+                self._repositories.candidates.latest_reference(
                     job.user_scope_id,
                     profile_fingerprint=stable_profile,
                 )
@@ -709,7 +942,7 @@ class HomeFeedWorker:
                 for row in ("featured_new_albums", "recommended_albums")
             )
             if needs_radio and outcome.candidate_snapshot_id:
-                candidate = self._repositories.candidates.get(
+                candidate = self._repositories.candidates.reference(
                     outcome.candidate_snapshot_id
                 )
                 self._scheduler.radio(
@@ -722,7 +955,7 @@ class HomeFeedWorker:
                     generation_hint=f"required:{outcome.candidate_snapshot_id}",
                 )
             if needs_candidates:
-                candidate = self._repositories.candidates.get(
+                candidate = self._repositories.candidates.reference(
                     outcome.candidate_snapshot_id
                 )
                 self._scheduler.candidates(
@@ -740,16 +973,17 @@ class HomeFeedWorker:
             return outcome
         if outcome.reason in {"artifact_unchanged", "artifact_too_similar"}:
             latest_candidate = (
-                self._repositories.candidates.latest_fresh(
+                self._repositories.candidates.latest_reference(
                     job.user_scope_id,
                     profile_fingerprint=stable_profile,
+                    require_fresh=True,
                 )
-                or self._repositories.candidates.latest_usable(
+                or self._repositories.candidates.latest_reference(
                     job.user_scope_id,
                     profile_fingerprint=stable_profile,
                 )
             )
-            latest_radio = self._repositories.radio.latest_usable(
+            latest_radio = self._repositories.radio.latest_reference(
                 job.user_scope_id,
                 profile_fingerprint=stable_profile,
             )
@@ -767,8 +1001,15 @@ class HomeFeedWorker:
                 # same durable job once with the newer immutable inputs rather
                 # than enqueueing another compose generation.
                 raise RetryableHomeJob("compose_supply_advanced", delay_seconds=0.0)
-            # The newest supply genuinely cannot form a different successor.
-            # Wait for background supply progress; do not spin composition.
+            # Publish no weak artifact. Wake the existing bounded acquisition
+            # owner rather than waiting on an unrelated idle timer or spinning
+            # composition against unchanged inputs.
+            self._scheduler.candidates(
+                request, reason="compose_novelty_replenish",
+                profile_fingerprint=stable_profile,
+                generation_hint=f"novelty:{candidate_snapshot_id}:{allocation_epoch}",
+                coalesce_terminal=True,
+            )
             return outcome
         if outcome.reason == "state_commit_conflict":
             raise RetryableHomeJob(outcome.reason)
@@ -782,11 +1023,12 @@ class HomeFeedWorker:
             return
         stable_profile = home_supply_profile_fingerprint(job.user_scope_id)
         candidate = (
-            self._repositories.candidates.latest_fresh(
+            self._repositories.candidates.latest_reference(
                 job.user_scope_id,
                 profile_fingerprint=stable_profile,
+                require_fresh=True,
             )
-            or self._repositories.candidates.latest_usable(
+            or self._repositories.candidates.latest_reference(
                 job.user_scope_id,
                 profile_fingerprint=stable_profile,
             )
@@ -798,7 +1040,7 @@ class HomeFeedWorker:
         )
         if not candidate_snapshot_id:
             return
-        radio = self._repositories.radio.latest_usable(
+        radio = self._repositories.radio.latest_reference(
             job.user_scope_id,
             profile_fingerprint=stable_profile,
         )

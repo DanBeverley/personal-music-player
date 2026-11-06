@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Mapping
+from collections import OrderedDict
 import threading
 import time
 import uuid
@@ -12,27 +13,17 @@ from ..discovery.adapters import (
     home_response_from_artifact,
     row_page_response_from_artifact,
 )
-from ..discovery.inventory import (
-    candidate_inventory_from_payload,
-)
-from ..discovery.radio_inventory import (
-    RADIO_EXPOSURE_LEDGER_MAX_ENTRIES,
-    artist_radio_inventory_from_payload,
-    merge_radio_exposure,
-)
 from .composer import artifact_exposure_entries, artifact_from_record, _attach_inventory_portraits
-from .candidate_supply import exposure_aware_candidate_supply_status
 from .bundles import is_complete_feed_bundle_payload
 from .contracts import (
-    CANDIDATE_REFRESH_RETRY_SECONDS,
     HomeJobType,
+    HomeJobStatus,
     HomeStateRecord,
     QUEUE_TARGET_DEPTH,
     home_supply_profile_fingerprint,
 )
 from .repositories import HomeRepositorySet, InvalidArtifactReference, StaleRevision
 from .scheduler import HomeJobScheduler
-from .radio_supply import _radio_expansion_needed
 
 
 def _home_stage(trace, name, started):
@@ -53,6 +44,7 @@ class HomeFeedApi:
         self._impression_lock = threading.Lock()
         self._replenishment_lock = threading.Lock()
         self._replenishing_scopes: set[str] = set()
+        self._replenished: OrderedDict[tuple[str, int], float] = OrderedDict()
 
     def recommend(
         self,
@@ -75,10 +67,15 @@ class HomeFeedApi:
         state = self._repositories.state.reconcile(scope)
         _home_stage(trace, 'state_reconcile', reconcile_started)
         if request_mode == "background_prepare":
-            self._ensure_successors(request, state, reason="background_prepare")
-            return self._serve_or_prepare(
-                request, state, request_id=request_id, action="served_active", trace=trace
-            )
+            self._replenish_after_delivery(request, state, reason="background_prepare",
+                                          background_tasks=background_tasks)
+            diagnostics = {"engine": "discovery_engine", "feed_action": "background_prepare",
+                           **self._queue_diagnostics(state)}
+            return {"status": "success", "request_id": request_id,
+                    "session_id": state.active_artifact_id, "feed_version": state.active_version,
+                    "feed_action": "background_prepare", "rows": [], "has_more": False,
+                    "next_offset": 0, "preparation_state": diagnostics['preparation_state'],
+                    "diagnostics": diagnostics}
 
         force = bool(
             getattr(request, "force_refresh", False)
@@ -88,15 +85,26 @@ class HomeFeedApi:
         launch = bool(getattr(request, "promote_ready_on_launch", False))
         promoted = ""
         action = "served_active"
+        refresh_from_version = getattr(request, 'refresh_from_version', None)
+        asynchronous_refresh = force and refresh_from_version is not None
+        if asynchronous_refresh and state.active_version != refresh_from_version:
+            return self._serve_or_prepare(
+                request, state, request_id=request_id, action='served_active',
+                reason='refresh_version_advanced', trace=trace,
+            )
         promotion_started = time.perf_counter()
 
         if force and state.ready_artifact_ids:
-            state, promoted = self._promote(state)
+            state, promoted = self._promote(state,
+                launch_token=str(getattr(request, 'refresh_token', '') or ''),
+                expected_active_version=refresh_from_version)
             action = "promoted_prepared" if promoted else "unchanged_no_rotation"
         elif launch and not session_intent and state.ready_artifact_ids:
             launch_token = str(getattr(request, "launch_token", "") or "").strip()
             if not launch_token or launch_token != state.last_launch_token:
-                state, promoted = self._promote(state, launch_token=launch_token)
+                state, promoted = self._promote(
+                    state, launch_token=launch_token, minimum_active_age=30 * 60
+                )
                 action = "promoted_prepared" if promoted else "served_active"
         elif not state.active_artifact_id and state.ready_artifact_ids:
             state, promoted = self._promote(state)
@@ -104,11 +112,6 @@ class HomeFeedApi:
 
         _home_stage(trace, 'promotion', promotion_started)
         if promoted:
-            radio_started = time.perf_counter()
-            artifact = artifact_from_record(self._repositories.artifacts.get(promoted))
-            if artifact is not None:
-                self._record_radio_exposure(artifact)
-            _home_stage(trace, 'radio_exposure', radio_started)
             self._replenish_after_delivery(request, state, reason="post_promotion",
                                           background_tasks=background_tasks)
             return self._serve_or_prepare(
@@ -121,8 +124,12 @@ class HomeFeedApi:
             )
 
         if force and state.active_artifact_id and not state.ready_artifact_ids:
-            self._ensure_successors(request, state, reason="pull_to_refresh")
-            wait_ms = self._refresh_wait_ms(request)
+            # New clients retain the user's intent and follow metadata status.
+            # Preparation uses the existing post-response owner, not a second
+            # job or an eight-second blocking request on every poll.
+            if not asynchronous_refresh:
+                self._ensure_successors(request, state, reason="pull_to_refresh")
+            wait_ms = 0 if asynchronous_refresh else self._refresh_wait_ms(request)
             deadline = time.monotonic() + wait_ms / 1000.0
             while wait_ms > 0 and time.monotonic() < deadline:
                 time.sleep(min(0.1, max(deadline - time.monotonic(), 0.0)))
@@ -130,11 +137,6 @@ class HomeFeedApi:
                 if state.ready_artifact_ids:
                     state, promoted = self._promote(state)
                     if promoted:
-                        artifact = artifact_from_record(
-                            self._repositories.artifacts.get(promoted)
-                        )
-                        if artifact is not None:
-                            self._record_radio_exposure(artifact)
                         self._replenish_after_delivery(request, state, reason="post_promotion",
                                                       background_tasks=background_tasks)
                         return self._serve_or_prepare(
@@ -151,7 +153,8 @@ class HomeFeedApi:
         self._replenish_after_delivery(
             request,
             state,
-            reason=("launch_missing_successor" if launch else "serve_replenish"),
+            reason=('pull_to_refresh' if asynchronous_refresh else
+                    "launch_missing_successor" if launch else "serve_replenish"),
             background_tasks=background_tasks,
         )
         return self._serve_or_prepare(
@@ -160,7 +163,8 @@ class HomeFeedApi:
             request_id=request_id,
             action=action,
             changed=False,
-            reason=("refresh_preparing_timeout" if force else ""),
+            reason=('refresh_preparing' if asynchronous_refresh else
+                    "refresh_preparing_timeout" if force else ""),
             trace=trace,
         )
 
@@ -193,9 +197,17 @@ class HomeFeedApi:
             self._replenishing_scopes.add(scope)
         try:
             state = self._repositories.state.reconcile(scope)
-            from ..recommend.feature_store import request_store_runtime
-            with request_store_runtime(allow_persistent_reads=False):
-                self._ensure_successors(request, state, reason=reason)
+            key = (scope, state.revision)
+            with self._replenishment_lock:
+                if time.monotonic() - self._replenished.get(key, float('-inf')) < 30:
+                    return
+            completed = self._ensure_successors(request, state, reason=reason)
+            if completed:
+                with self._replenishment_lock:
+                    self._replenished[key] = time.monotonic()
+                    self._replenished.move_to_end(key)
+                    while len(self._replenished) > 128:
+                        self._replenished.popitem(last=False)
         except Exception:
             # Existing durable jobs and the next request can recover this work.
             # Never include profile data or external error text in this warning.
@@ -205,197 +217,27 @@ class HomeFeedApi:
                 self._replenishing_scopes.discard(scope)
 
     def _ensure_successors(
-        self,
-        request: Any,
-        state: HomeStateRecord,
-        *,
-        reason: str,
-    ) -> None:
-        scope = state.user_scope_id
-        profile = home_supply_profile_fingerprint(scope)
-        # Never compose a post-cutover feed from a request-profile fragment.
-        # If the stable account supply does not exist yet, its consolidation
-        # job is the only valid next step.
-        fresh_candidate = self._repositories.candidates.latest_fresh(
-            scope,
-            profile_fingerprint=profile,
-        )
-        candidate = fresh_candidate or self._repositories.candidates.latest_usable(
-            scope,
-            profile_fingerprint=profile,
-        )
-        candidate_inventory = (
-            candidate_inventory_from_payload(dict(candidate.payload or {}))
-            if candidate is not None
-            else None
-        )
-        if candidate is None or candidate_inventory is None or not candidate_inventory.is_ready:
-            active = self._repositories.jobs.has_active(
-                scope,
-                job_types=(HomeJobType.REFRESH_CANDIDATES,),
-                ignore_delayed_idle=True,
-            )
-            retry_initial = (not state.active_artifact_id and
-                             bool(getattr(request, "force_refresh", False)) and
-                             not self._repositories.jobs.has_runnable(
-                                 scope, job_types=(HomeJobType.REFRESH_CANDIDATES,)))
-            if not active or retry_initial:
-                # Explicit Retry on a never-published Home must consume the
-                # current signals instead of waiting on a delayed stale job.
-                # Singleton replacement preserves leased work; the provider
-                # circuit/backoff still governs every acquisition request.
-                self._scheduler.candidates(
-                    request,
-                    reason="candidate_inventory_refresh",
-                    profile_fingerprint=profile,
-                    generation_hint=(f"initial-retry:{int(time.time() // 300)}"
-                                     if retry_initial else ""),
-                )
-            return
-        if reason == "background_prepare" and any(
-            getattr(request, key, None)
-            for key in ("recent_track_ids", "top_track_ids", "last_played_tracks",
-                        "library_track_ids", "artist_hints", "playlist_names")
-        ) and not self._repositories.jobs.has_active(
-            scope, job_types=(HomeJobType.REFRESH_CANDIDATES,), ignore_delayed_idle=True,
-        ):
-            # Listening/library changes need to enter durable supply even
-            # while the old inventory is fresh and the ready queue is full.
-            # Coalesce terminal attempts too: one refresh per five-minute
-            # window, no provider work or active-feed promotion here.
-            self._scheduler.candidates(
-                request, reason="signal_reconcile", profile_fingerprint=profile,
-                generation_hint=f"signals:{int(time.time() // (5 * 60))}",
-                coalesce_terminal=True,
-            )
-        if fresh_candidate is None and not self._repositories.jobs.has_active(
-            scope,
-            job_types=(HomeJobType.REFRESH_CANDIDATES,),
-            ignore_delayed_idle=True,
-        ):
-            # Verified facts remain usable, but expiry is a real refresh
-            # deadline. Coalesce all requests in one bounded retry window so
-            # stale supply cannot either suppress acquisition or flood it.
-            refresh_window = int(time.time() // CANDIDATE_REFRESH_RETRY_SECONDS)
-            self._scheduler.candidates(
-                request,
-                reason="candidate_revalidation_due",
-                profile_fingerprint=profile,
-                generation_hint=(
-                    f"revalidate:{candidate.snapshot_id}:{refresh_window}"
-                ),
-                coalesce_terminal=True,
-            )
-        elif (
-            fresh_candidate is not None
-            and bool(
-                exposure_aware_candidate_supply_status(
-                    candidate_inventory,
-                    repositories=self._repositories,
-                    user_scope_id=scope,
-                )["expansion_needed"]
-            )
-            and not self._repositories.jobs.has_active(
-                scope,
-                job_types=(HomeJobType.REFRESH_CANDIDATES,),
-                ignore_delayed_idle=True,
-            )
-        ):
-            expansion_window = int(time.time() // (15 * 60))
-            self._scheduler.candidates(
-                request,
-                reason="candidate_reserve_replenish",
-                profile_fingerprint=profile,
-                generation_hint=(
-                    f"reserve:{candidate.snapshot_id}:{expansion_window}"
-                ),
-                coalesce_terminal=True,
-            )
-        fresh_radio = self._repositories.radio.latest_fresh(
-            scope,
-            profile_fingerprint=profile,
-        )
-        if fresh_radio is None:
-            self._scheduler.radio(
-                request,
-                reason="radio_snapshot_refresh",
-                profile_fingerprint=profile,
-                candidate_snapshot_id=candidate.snapshot_id,
-                generation_hint=f"candidate:{candidate.snapshot_id}",
-            )
-        elif (
-            (radio_inventory := artist_radio_inventory_from_payload(
-                dict(fresh_radio.payload or {})
-            )) is not None
-            and _radio_expansion_needed(radio_inventory)
-            and not self._repositories.jobs.has_active(
-                scope,
-                job_types=(HomeJobType.REFRESH_RADIO,),
-                ignore_delayed_idle=True,
-            )
-        ):
-            radio_window = int(time.time() // (15 * 60))
-            self._scheduler.radio(
-                request,
-                reason="radio_reserve_replenish",
-                profile_fingerprint=profile,
-                candidate_snapshot_id=candidate.snapshot_id,
-                generation_hint=f"reserve:{fresh_radio.snapshot_id}:{radio_window}",
-                coalesce_terminal=True,
-            )
-        reusable_radio = (
-            fresh_radio
-            or self._repositories.radio.latest_usable(
-                scope,
-                profile_fingerprint=profile,
-            )
-            or self._repositories.radio.latest_usable(scope)
-        )
-        # Initial publication still waits for the first complete independent
-        # radio row. Once an accepted active feed exists, radio replacement is
-        # no longer allowed to block improvements in the other rows.
-        if reusable_radio is None and not state.active_artifact_id:
-            return
-        if len(state.ready_artifact_ids) >= QUEUE_TARGET_DEPTH:
-            return
-        radio_snapshot_id = (
-            reusable_radio.snapshot_id if reusable_radio is not None else ""
-        )
-        allocation_epoch = (
-            state.active_version + len(state.ready_artifact_ids) + 1
-        )
-        materialized = self._repositories.artifacts.get_by_supply(
-            scope,
-            candidate.snapshot_id,
-            radio_snapshot_id,
-            allocation_epoch=allocation_epoch,
-        )
-        state_ids = {
-            state.active_artifact_id,
-            *state.ready_artifact_ids,
-        }
-        if materialized is not None and materialized.artifact_id in state_ids:
-            return
-        self._scheduler.compose(
-            request,
-            reason=reason,
-            profile_fingerprint=profile,
-            candidate_snapshot_id=candidate.snapshot_id,
-            radio_snapshot_id=radio_snapshot_id,
-            allocation_epoch=allocation_epoch,
-        )
+        self, request: Any, state: HomeStateRecord, *, reason: str,
+    ) -> bool:
+        # Inventory decoding belongs to the durable worker, never the API.
+        self._scheduler.reconcile_supply(request, state=state, reason=reason)
+        return True
 
     def _promote(
         self,
         state: HomeStateRecord,
         *,
         launch_token: str = "",
+        minimum_active_age: float = 0.0,
+        expected_active_version: int | None = None,
     ) -> tuple[HomeStateRecord, str]:
         try:
             return self._repositories.state.promote_ready(
                 state.user_scope_id,
                 expected_revision=state.revision,
                 launch_token=launch_token,
+                minimum_active_age=minimum_active_age,
+                expected_active_version=expected_active_version,
             )
         except (InvalidArtifactReference, StaleRevision):
             return self._repositories.state.reconcile(state.user_scope_id), ""
@@ -407,15 +249,30 @@ class HomeFeedApi:
                 HomeJobType.REFRESH_CANDIDATES,
                 HomeJobType.REFRESH_RADIO,
                 HomeJobType.COMPOSE_FEED,
+                HomeJobType.RECONCILE_SUPPLY,
             ),
         )
         # Reconciliation/promotion already validate these immutable references.
         # Status must not decode the same full bundles a second time.
         complete_bundle_ids = list(state.ready_artifact_ids)
         depth = len(complete_bundle_ids)
+        compose_active = self._repositories.jobs.has_runnable(
+            state.user_scope_id, job_types=(HomeJobType.COMPOSE_FEED,))
+        latest_compose = self._repositories.jobs.latest_for_type(
+            state.user_scope_id, HomeJobType.COMPOSE_FEED)
+        blocked_reason = ""
+        if (latest_compose is not None and latest_compose.status is HomeJobStatus.FAILED
+                and latest_compose.updated_at >= state.active_since):
+            code = latest_compose.last_error.split(":", 1)[0]
+            if code in {"artifact_too_similar", "artifact_unchanged", "artifact_contract_rejected"}:
+                blocked_reason = code
         phase = (
             "ready"
-            if depth >= QUEUE_TARGET_DEPTH
+            if depth
+            else "building"
+            if compose_active
+            else "blocked"
+            if blocked_reason
             else "building"
             if active_jobs
             else "idle"
@@ -424,12 +281,20 @@ class HomeFeedApi:
             "user_scope_id": state.user_scope_id,
             "feed_state_version": "home-repository-v2",
             "feed_version": state.active_version,
+            "active_since": state.active_since,
+            "auto_promotion_min_age_seconds": 1800,
+            "auto_promotion_eligible": bool(depth and (
+                not state.active_artifact_id or not state.active_since
+                or time.time() - state.active_since >= 1800
+            )),
             "queue_revision": state.revision,
             "ready_feed_count": depth,
             "ready_feed_depth": depth,
             "ready_feed_target_depth": QUEUE_TARGET_DEPTH,
             "ready_feed_session_ids": complete_bundle_ids,
-            "queue_build_inflight": active_jobs,
+            "queue_build_inflight": phase == "building",
+            "background_supply_inflight": active_jobs,
+            "preparation_blocked_reason": blocked_reason if phase == "blocked" else "",
             "queue_phase": phase,
             "preparation_state": phase,
             "prepared_candidate_available": bool(state.ready_artifact_ids),
@@ -635,30 +500,6 @@ class HomeFeedApi:
             raise HTTPException(status_code=404, detail="Discovery row is not available")
         return response
 
-    def _record_radio_exposure(self, artifact: Any) -> None:
-        identities: list[str] = []
-        for row in artifact.rows or []:
-            if row.kind != "popular_radio":
-                continue
-            for card in row.items or []:
-                if not isinstance(card, Mapping):
-                    continue
-                identity = str(
-                    card.get("seed_artist_identity")
-                    or card.get("seed_artist_key")
-                    or card.get("artist_name")
-                    or ""
-                ).strip().casefold()
-                if identity and identity not in identities:
-                    identities.append(identity)
-        if identities:
-            merge_radio_exposure(
-                self._server,
-                artifact.user_scope_id,
-                identities,
-                max_entries=RADIO_EXPOSURE_LEDGER_MAX_ENTRIES,
-            )
-
     def _record_impressions_once(
         self,
         artifact: Any,
@@ -676,6 +517,8 @@ class HomeFeedApi:
                 self._impressed_artifact_ids = {impression_key}
         self._repositories.exposures.record(
             artifact.user_scope_id,
+            # This includes radio seed identities, already consumed by radio
+            # supply. Promotion needs no second exposure writer/inventory CAS.
             artifact_exposure_entries(
                 artifact,
                 visible_only=True,

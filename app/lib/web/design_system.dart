@@ -28,10 +28,10 @@ class NeatieNavigation extends StatelessWidget {
               key: const ValueKey('navigation-highlight'),
               duration: duration,
               curve: Curves.easeInOutCubic,
-              left: vertical ? 0 : selected * slot + 8,
+              left: vertical ? 0 : selected * slot + 4,
               top: vertical ? selected * 58.0 : 6,
-              width: vertical ? constraints.maxWidth : slot - 16,
-              height: vertical ? 52 : 42,
+              width: vertical ? constraints.maxWidth : slot - 8,
+              height: vertical ? 52 : 56,
               child: IgnorePointer(
                   child: DecoratedBox(
                       decoration: BoxDecoration(
@@ -59,6 +59,7 @@ class NeatieNavigation extends StatelessWidget {
                                 child: AnimatedDefaultTextStyle(
                                     duration: duration,
                                     style: TextStyle(
+                                        fontFamily: 'NeatieSans',
                                         fontSize: 12,
                                         fontWeight: FontWeight.w600,
                                         color: selected == i
@@ -264,8 +265,10 @@ class EditorialHeading extends StatelessWidget {
                   child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                    Text(eyebrow, style: NeatieDesign.eyebrow),
-                    const SizedBox(height: 12),
+                    if (eyebrow.isNotEmpty) ...[
+                      Text(eyebrow, style: NeatieDesign.eyebrow),
+                      const SizedBox(height: 12)
+                    ],
                     Text(title, style: NeatieDesign.display(compact ? 34 : 46)),
                     const SizedBox(height: 12),
                     Text(subtitle,
@@ -281,9 +284,11 @@ class EditorialSurface extends StatefulWidget {
       {super.key,
       required this.child,
       this.radius = 20,
+      this.outlined = true,
       this.color = NeatieDesign.surface});
   final Widget child;
   final double radius;
+  final bool outlined;
   final Color color;
   @override
   State<EditorialSurface> createState() => _EditorialSurfaceState();
@@ -300,13 +305,17 @@ class _EditorialSurfaceState extends State<EditorialSurface> {
               ? Duration.zero
               : const Duration(milliseconds: 180),
           curve: Curves.easeOutCubic,
-          transform: Matrix4.translationValues(0, hovered ? -2 : 0, 0),
+          transform: Matrix4.translationValues(0,
+              hovered && !MediaQuery.disableAnimationsOf(context) ? -2 : 0, 0),
           decoration: BoxDecoration(
               color: hovered ? NeatieDesign.raised : widget.color,
               borderRadius: BorderRadius.circular(widget.radius),
-              border: Border.all(
-                  color:
-                      hovered ? const Color(0xff465548) : NeatieDesign.line)),
+              border: !widget.outlined
+                  ? null
+                  : Border.all(
+                      color: hovered
+                          ? const Color(0xff465548)
+                          : NeatieDesign.line)),
           clipBehavior: Clip.antiAlias,
           child: widget.child));
 }
@@ -361,8 +370,10 @@ class _NeatieLoadingState extends State<NeatieLoading>
                     animate ? animation.value : 0, widget.color))),
         if (widget.showLabel) ...[
           const SizedBox(width: 10),
-          Text(widget.label,
-              style: const TextStyle(fontSize: 12, color: NeatieDesign.muted))
+          Flexible(
+              child: Text(widget.label,
+                  style:
+                      const TextStyle(fontSize: 12, color: NeatieDesign.muted)))
         ],
       ])));
   @override
@@ -416,13 +427,58 @@ class BrowseMoreButton extends StatelessWidget {
   final String label;
   final VoidCallback? onPressed;
   @override
-  Widget build(BuildContext context) => IconButton.outlined(
+  Widget build(BuildContext context) => IconButton(
       tooltip: label,
       onPressed: onPressed,
-      style: IconButton.styleFrom(
-          minimumSize: const Size(42, 42),
-          side: const BorderSide(color: NeatieDesign.line)),
+      style: IconButton.styleFrom(minimumSize: const Size(42, 42)),
       icon: const Icon(Icons.arrow_forward_rounded, size: 19));
+}
+
+/// Morph the submit arrow into a clear cross without swapping hit targets.
+class SearchFieldActionIcon extends StatelessWidget {
+  const SearchFieldActionIcon({super.key, required this.clear});
+  final bool clear;
+  @override
+  Widget build(BuildContext context) => ExcludeSemantics(
+          child: TweenAnimationBuilder<double>(
+        tween: Tween(begin: 0, end: clear ? 1 : 0),
+        duration: MediaQuery.disableAnimationsOf(context)
+            ? Duration.zero
+            : const Duration(milliseconds: 220),
+        curve: Curves.easeInOutCubic,
+        builder: (_, value, __) => CustomPaint(
+            size: const Size.square(24),
+            painter: _SearchActionPainter(
+                value, IconTheme.of(context).color ?? NeatieDesign.muted)),
+      ));
+}
+
+class _SearchActionPainter extends CustomPainter {
+  const _SearchActionPainter(this.progress, this.color);
+  final double progress;
+  final Color color;
+  @override
+  void paint(Canvas canvas, Size size) {
+    canvas.scale(size.width / 24, size.height / 24);
+    final pen = Paint()
+      ..color = color
+      ..strokeWidth = 1.8
+      ..strokeCap = StrokeCap.round;
+    canvas.drawLine(
+        Offset.lerp(const Offset(10, 5), const Offset(6, 6), progress)!,
+        Offset.lerp(const Offset(17, 12), const Offset(18, 18), progress)!,
+        pen);
+    canvas.drawLine(
+        Offset.lerp(const Offset(17, 12), const Offset(18, 6), progress)!,
+        Offset.lerp(const Offset(10, 19), const Offset(6, 18), progress)!,
+        pen);
+    pen.color = color.withValues(alpha: color.a * (1 - progress));
+    canvas.drawLine(const Offset(4, 12), const Offset(17, 12), pen);
+  }
+
+  @override
+  bool shouldRepaint(covariant _SearchActionPainter old) =>
+      old.progress != progress || old.color != color;
 }
 
 /// Animate tab entry while keeping the page subtree, scroll and requests alive.

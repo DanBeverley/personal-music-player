@@ -203,6 +203,8 @@ class LyricsService:
         self._resolve_locks = [RLock() for _ in range(16)]
 
     def get(self, track_key: str, **metadata) -> dict[str, Any]:
+        if metadata.get('cache_only'):
+            return self._resolve(track_key, **metadata)
         # Panel opens and background prefetch share one provider lookup.
         identity = (track_key, metadata.get('title'), metadata.get('artist'),
                     metadata.get('album'), metadata.get('duration'), metadata.get('source_id'))
@@ -219,6 +221,7 @@ class LyricsService:
         duration: int | None = None,
         source_id: str = "",
         force_refresh: bool = False,
+        cache_only: bool = False,
     ) -> dict[str, Any]:
         normalized_key = _clean(track_key)
         normalized_title = _clean(title)
@@ -237,6 +240,10 @@ class LyricsService:
         if cached is not None:
             cached["cache_hit"] = True
             return cached
+        if cache_only:
+            # Interpretation must not start another provider chain alongside
+            # the player/panel's existing lyrics owner. A miss is not persisted.
+            return _response(track_key=normalized_key, lyrics_status='not_found')
 
         source_ids = self._youtube_source_ids(
             normalized_key,

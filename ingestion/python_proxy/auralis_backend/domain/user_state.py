@@ -40,7 +40,7 @@ _NOISY_QUERY_TOKENS = {
 }
 
 _HISTORY_SNAPSHOT_NAMESPACE = "history_profile_snapshot"
-_HISTORY_SNAPSHOT_MODEL = "history-profile-snapshot-v2"
+_HISTORY_SNAPSHOT_MODEL = "history-profile-snapshot-v3"
 _HISTORY_SNAPSHOT_CACHE: Dict[str, Dict[str, Any]] = {}
 _HISTORY_SNAPSHOT_LOCK = threading.RLock()
 _HISTORY_SNAPSHOT_BUILDS: Dict[str, threading.RLock] = {}
@@ -284,31 +284,64 @@ def _merge_history_metadata(older: Dict[str, Any], newer: Dict[str, Any]) -> Dic
     return merged
 
 
+def _history_recording_identity(snapshot: Dict[str, Any]) -> str:
+    """Use recording/owned catalog evidence; display names are not identity."""
+    for key in ("musicbrainz_recording_id", "canonical_recording_id", "recording_mbid"):
+        value = trim_text(snapshot.get(key)).casefold()
+        if value:
+            return value.removeprefix("musicbrainz:recording:").removeprefix("recording:")
+    isrc = trim_text(snapshot.get("isrc"))
+    if isrc:
+        return isrc.upper().replace("-", "").replace(" ", "")
+    value = trim_text(snapshot.get("canonical_entity_id") or snapshot.get("canonical_track_identity"))
+    for prefix in ("musicbrainz:recording:", "recording:"):
+        if value.casefold().startswith(prefix):
+            return value[len(prefix):].casefold()
+    return value
+
+
 def _persisted_history_tracks(server: DomainServerAdapter, track_ids: List[str]) -> Dict[str, Dict[str, Any]]:
     """Recover display metadata by exact catalog/source identity, without providers."""
     connection = open_recommendation_store_connection(server)
     output: Dict[str, Dict[str, Any]] = {}
     try:
-        for track_id in track_ids[:180]:
-            rows = connection.execute(
-                """SELECT e.payload_json, e.display_title, e.display_artist,
-                          e.display_album FROM catalog_entities e
-                   LEFT JOIN catalog_entity_sources s
-                     ON s.entity_type=e.entity_type AND s.entity_key=e.entity_key
-                   WHERE e.entity_type='track' AND (e.entity_key=? OR s.source_key=?)
-                   ORDER BY e.confidence DESC, e.updated_at DESC LIMIT 4""",
-                [track_id, track_id],
-            ).fetchall()
-            for row in rows:
-                payload = json.loads(row["payload_json"] or "{}")
-                title = _history_display_value(payload.get("title")) or _history_display_value(row["display_title"])
-                artist = _history_display_value(payload.get("artist") or payload.get("channel")) or _history_display_value(row["display_artist"])
-                if not title or not artist:
-                    continue
-                output[track_id] = {**payload, "id": track_id, "title": title,
-                                    "artist": artist, "channel": artist,
-                                    "album": payload.get("album") or row["display_album"]}
-                break
+        keys = list(dict.fromkeys(track_ids[:180]))
+        if not keys:
+            return output
+        # Direct owner and physical-source lookups have separate indexed joins.
+        # The old OR/LEFT JOIN scanned the catalog once for every history ID.
+        requested = ",".join("(?)" for _ in keys)
+        rows = connection.execute(f"""
+            WITH requested(track_id) AS (VALUES {requested}), owners AS (
+              SELECT r.track_id,e.entity_key,e.confidence,e.updated_at
+              FROM requested r JOIN catalog_entities e
+                ON e.entity_type='track' AND e.entity_key=r.track_id
+              UNION
+              SELECT r.track_id,s.entity_key,e.confidence,e.updated_at
+              FROM requested r JOIN catalog_entity_sources s
+                ON s.entity_type='track' AND s.source_key=r.track_id
+              JOIN catalog_entities e ON e.entity_type='track' AND e.entity_key=s.entity_key
+            ), ranked AS (
+              SELECT *,ROW_NUMBER() OVER (PARTITION BY track_id
+                ORDER BY confidence DESC,updated_at DESC,entity_key) AS position FROM owners
+            )
+            SELECT r.track_id,e.entity_key,e.payload_json,e.display_title,e.display_artist,e.display_album
+            FROM ranked r JOIN catalog_entities e ON e.entity_type='track' AND e.entity_key=r.entity_key
+            WHERE r.position<=4 ORDER BY r.track_id,r.position
+            """, keys).fetchall()
+        for row in rows:
+            track_id = row["track_id"]
+            if track_id in output:
+                continue
+            payload = json.loads(row["payload_json"] or "{}")
+            title = _history_display_value(payload.get("title")) or _history_display_value(row["display_title"])
+            artist = _history_display_value(payload.get("artist") or payload.get("channel")) or _history_display_value(row["display_artist"])
+            if not title or not artist:
+                continue
+            output[track_id] = {**payload, "id": track_id, "title": title,
+                                "artist": artist, "channel": artist,
+                                "canonical_entity_id": payload.get("canonical_entity_id") or row["entity_key"],
+                                "album": payload.get("album") or row["display_album"]}
     except (sqlite3.Error, ValueError, TypeError):
         # Older stores may predate the catalog tables. Event metadata remains
         # usable; absence never turns an upstream skeleton into display facts.
@@ -326,6 +359,7 @@ def _build_scope_history_seed_from_events(
     pending_play_keys: frozenset[str] = frozenset(),
     strict_errors: bool = False,
 ) -> Dict[str, Any]:
+    started = time.perf_counter()
     normalized_scope = trim_text(user_scope_id or "guest") or "guest"
     if normalized_scope == "guest":
         return {}
@@ -374,9 +408,11 @@ def _build_scope_history_seed_from_events(
         "persisted_search_event_count": len(list(search_rows or [])),
         "persisted_scope": normalized_scope,
     }
+    events_done = time.perf_counter()
     persisted_tracks = _persisted_history_tracks(
         server, server.unique_track_ids([row["track_id"] for row in event_rows], 180)
     )
+    catalog_done = time.perf_counter()
     if allow_remote_metadata:
         missing = [track_id for track_id in server.unique_track_ids(
             [row["track_id"] for row in event_rows], 24
@@ -397,6 +433,31 @@ def _build_scope_history_seed_from_events(
                                         learn_query_alias=False)
         except Exception:
             pass
+    # Hydration changes metadata, not the identity or count of earlier plays.
+    # Reuse the latest exact-source facts for every event, including bare older
+    # events. Persisted source aliases supply owned catalog identity; titles
+    # alone must not merge different recordings or renditions.
+    metadata_by_track: Dict[str, Dict[str, Any]] = {}
+    for row in reversed(event_rows):
+        track_id = trim_text(row["track_id"])
+        try:
+            payload = json.loads(row["metadata_json"] or "{}")
+        except (ValueError, TypeError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        snapshot = _snapshot_from_event_payload(
+            track_id=track_id, artist_name=trim_text(row["artist_name"]), payload=payload,
+        )
+        metadata_by_track[track_id] = _merge_history_metadata(
+            metadata_by_track.get(track_id) or {}, snapshot or {},
+        )
+    for track_id, snapshot in persisted_tracks.items():
+        metadata_by_track[track_id] = _merge_history_metadata(
+            snapshot, metadata_by_track.get(track_id) or {},
+        )
+        if snapshot.get("canonical_entity_id"):
+            metadata_by_track[track_id]["canonical_entity_id"] = snapshot["canonical_entity_id"]
     recent_track_ids: List[str] = []
     top_track_scores: Dict[str, float] = defaultdict(float)
     library_track_ids: List[str] = []
@@ -416,13 +477,13 @@ def _build_scope_history_seed_from_events(
     now = max(
         [float(row["occurred_at"] or 0.0) for row in list(event_rows or [])] or [0.0]
     )
-    for index, row in enumerate(list(event_rows or [])):
+    for index, row in enumerate(event_rows):
         track_id = trim_text(row["track_id"])
         if not track_id:
             continue
         try:
             payload = json.loads(row["metadata_json"] or "{}")
-        except Exception:
+        except (ValueError, TypeError):
             payload = {}
         if not isinstance(payload, dict):
             payload = {}
@@ -446,41 +507,29 @@ def _build_scope_history_seed_from_events(
             continue
         if event_type in {"impression", "tab_tap"}:
             continue
-        if track_id in seen_negative_ids:
-            continue
+        suppressed = track_id in seen_negative_ids
         if base_weight == 0.0:
             base_weight = 1.0
-        top_track_scores[track_id] += base_weight * recency_bonus
-        if track_id not in seen_recent_ids:
+        if not suppressed:
+            top_track_scores[track_id] += base_weight * recency_bonus
+        if not suppressed and track_id not in seen_recent_ids:
             seen_recent_ids.add(track_id)
             recent_track_ids.append(track_id)
-        if _history_display_value(artist_name):
+        if not suppressed and _history_display_value(artist_name):
             artist_hints.append(artist_name)
-        snapshot = _snapshot_from_event_payload(
-            track_id=track_id,
-            artist_name=artist_name,
-            payload=payload,
-        )
-        snapshot = _merge_history_metadata(persisted_tracks.get(track_id) or {}, snapshot or {})
+        snapshot = dict(metadata_by_track.get(track_id) or {})
         if not (_history_display_value(snapshot.get("title")) and
                 _history_display_value(snapshot.get("artist") or snapshot.get("channel"))):
             snapshot = None
         if snapshot is not None:
-            canonical_identity = trim_text(
-                snapshot.get("canonical_entity_id")
-                or snapshot.get("canonical_track_identity")
-                or snapshot.get("musicbrainz_recording_id")
-                or snapshot.get("canonical_recording_id")
-                or snapshot.get("recording_mbid")
-                or snapshot.get("isrc")
-            )
-            if not canonical_identity:
-                title_key = " ".join(trim_text(snapshot.get("title")).casefold().split())
-                artist_key = " ".join(
-                    trim_text(snapshot.get("artist") or snapshot.get("channel")).casefold().split()
-                )
-                canonical_identity = f"{title_key}|{artist_key}" if title_key and artist_key else track_id
-            snapshot["canonical_entity_id"] = canonical_identity
+            canonical_identity = _history_recording_identity(snapshot) or track_id
+            # Normalize only the counting key; preserve the established public
+            # recording identifier (including its namespace) in snapshots.
+            snapshot["canonical_entity_id"] = trim_text(
+                snapshot.get("musicbrainz_recording_id") or snapshot.get("canonical_recording_id")
+                or snapshot.get("recording_mbid") or snapshot.get("isrc")
+                or snapshot.get("canonical_entity_id") or snapshot.get("canonical_track_identity")
+            ) or track_id
             if canonical_identity not in history_snapshot_by_identity:
                 history_snapshot_by_identity[canonical_identity] = dict(snapshot)
             else:
@@ -507,8 +556,9 @@ def _build_scope_history_seed_from_events(
                 snapshot, track_payload_by_id.get(track_id) or {}
             )
             recent_track_snapshots.append(snapshot)
-            artist_hints.extend(server.extract_artist_names(snapshot))
-        if event_type in {"library", "download", "save"} and track_id not in seen_library_ids:
+            if not suppressed:
+                artist_hints.extend(server.extract_artist_names(snapshot))
+        if not suppressed and event_type in {"library", "download", "save"} and track_id not in seen_library_ids:
             seen_library_ids.add(track_id)
             library_track_ids.append(track_id)
 
@@ -546,7 +596,7 @@ def _build_scope_history_seed_from_events(
         reverse=True,
     ):
         enriched = dict(snapshot)
-        enriched["canonical_entity_id"] = identity
+        enriched["canonical_entity_id"] = snapshot.get("canonical_entity_id") or identity
         enriched["play_count"] = int(play_count_by_identity.get(identity, 0))
         enriched["last_played_at"] = float(latest_play_by_identity.get(identity, 0.0))
         history_track_snapshots.append(enriched)
@@ -561,10 +611,10 @@ def _build_scope_history_seed_from_events(
     # Preserve profile evidence from saves/likes, but attach actual listening
     # clocks/counts to recent snapshots as well as the frequent list.
     listening_by_identity = {
-        item["canonical_entity_id"]: item for item in history_track_snapshots
+        _history_recording_identity(item) or item["id"]: item for item in history_track_snapshots
     }
     for item in [*recent_track_snapshots, *top_track_snapshots, *last_played_tracks]:
-        evidence = listening_by_identity.get(item.get("canonical_entity_id"), {})
+        evidence = listening_by_identity.get(_history_recording_identity(item) or item.get("id"), {})
         item["play_count"] = int(evidence.get("play_count") or 0)
         item["last_played_at"] = float(evidence.get("last_played_at") or 0)
     anchor_track_snapshots = unique_snapshot_tracks(
@@ -579,6 +629,10 @@ def _build_scope_history_seed_from_events(
         [row["query"] for row in list(search_rows or []) if int(row["result_count"] or 0) > 0],
         limit=8,
     )
+    diagnostics.update(history_event_read_ms=round((events_done-started)*1000,2),
+        history_catalog_lookup_ms=round((catalog_done-events_done)*1000,2),
+        history_count_ms=round((time.perf_counter()-catalog_done)*1000,2),
+        history_total_ms=round((time.perf_counter()-started)*1000,2))
     return {
         "recent_track_ids": recent_track_ids,
         "top_track_ids": top_track_ids,

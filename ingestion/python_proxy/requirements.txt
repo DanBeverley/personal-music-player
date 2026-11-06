@@ -12,3 +12,4 @@ ddgs
 psycopg[binary]
 psycopg_pool>=3.2,<4
 boto3
+Pillow>=11.3,<13

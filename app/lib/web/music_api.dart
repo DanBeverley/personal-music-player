@@ -1,31 +1,283 @@
 import 'dart:async';
 import 'dart:convert';
 import 'package:http/http.dart' as http;
+import '../logic/assistant_identity.dart';
 import '../logic/track_metadata.dart';
+
+class SongDiscussionException implements Exception {
+  const SongDiscussionException(this.status);
+  final int status;
+  String get message => switch (status) {
+        401 || 403 => 'Please sign in again to ask about this song.',
+        429 => 'The song assistant is busy. Try again in a moment.',
+        _ => 'The song assistant is unavailable. Please try again later.',
+      };
+  @override
+  String toString() => message;
+}
+
+class PlaybackPreparationException extends StateError {
+  final String code;
+  PlaybackPreparationException(this.code) : super('Audio preparation: $code');
+  @override
+  String toString() => 'PlaybackPreparationException($code)';
+}
 
 class MusicApi {
   final Uri base;
+  final Uri mediaBase;
+  final Uri? storageBase;
   final http.Client client;
   DateTime Function() clock = DateTime.now;
+  // Enabled by the browser shell; optional metadata never gates a catalog result
+  // or the native Play call. Byte warming remains owned by queue preparation.
+  bool catalogMediaHints = false;
+  String preferredCachedVariant = '';
+  bool _loadingCachedMedia = false;
+  Completer<void>? _cachedMediaAbort;
+  final Set<String> _cachedMediaQueue = {};
+  final Set<String> _priorityMediaQueue = {};
+  final Set<String> _preparingMedia = {};
+  final Map<(String, bool), Future<Uri>> _preparationTasks = {};
+  Timer? _startupHold;
+  int _startupTicket = 0;
+
+  /// Only optional cache hints wait; native Play and interactive API calls do not.
+  int beginPlaybackStartup() {
+    final ticket = ++_startupTicket;
+    _startupHold?.cancel();
+    _startupHold =
+        Timer(const Duration(seconds: 2), () => endPlaybackStartup(ticket));
+    final pending = _cachedMediaAbort;
+    if (pending != null && !pending.isCompleted) pending.complete();
+    return ticket;
+  }
+
+  void endPlaybackStartup(int? ticket, {bool resume = true}) {
+    if (ticket == null || ticket != _startupTicket) return;
+    _startupHold?.cancel();
+    _startupHold = null;
+    if (resume) unawaited(_loadCachedMedia());
+  }
+
+  final Map<String, DateTime> _cachedMediaRetryAfter = {};
   String _userScopeId = 'guest';
   int _scopeRevision = 0;
   final Map<String, DateTime> _preparationExpiry = {};
   DateTime? preparedUntil(String id) => _preparationExpiry[id];
-  final Map<String, ({Uri uri, String mimeType, DateTime until})>
+  bool startupPrepared(String id) {
+    final margin = clock().add(const Duration(seconds: 60));
+    return (_preparationExpiry[id]?.isAfter(margin) ?? false) ||
+        (preparedMedia(id)?.deliveryUntil?.isAfter(margin) ?? false);
+  }
+  final Map<String,
+          ({Uri uri, String mimeType, DateTime until, double? duration,
+            Uri? deliveryUri, DateTime? deliveryUntil})>
       _preparedMedia = {};
-  ({Uri uri, String mimeType, DateTime until})? preparedMedia(String id) {
+  ({Uri uri, String mimeType, DateTime until, double? duration,
+    Uri? deliveryUri, DateTime? deliveryUntil})? preparedMedia(
+      String id) {
     final value = _preparedMedia[id];
+    if (preferredCachedVariant == 'opus-v1' &&
+        value?.uri.queryParameters['cache_variant'] == 'aac-v1') {
+      _preparedMedia.remove(id);
+      return null;
+    }
+    // An immutable cached file has no expiring provider lease. Keep its proven
+    // format while the metadata lane discovers a newer representation. Never
+    // extend live-source/session URLs or a resource explicitly forgotten.
+    final immutable =
+        value?.uri.queryParameters.containsKey('cache_version') == true;
     if (value != null &&
-        value.until.isAfter(clock().add(const Duration(seconds: 60)))) {
+        (immutable
+            ? value.until.add(const Duration(hours: 12)).isAfter(clock())
+            : value.until.isAfter(clock().add(const Duration(seconds: 60))))) {
       return value;
     }
     _preparedMedia.remove(id);
     return null;
   }
 
-  void forgetPreparedMedia(String id) => _preparedMedia.remove(id);
+  void forgetPreparedMedia(String id) {
+    _preparedMedia.remove(id);
+    _preparationExpiry.remove(id);
+  }
 
-  bool _rememberMedia(String id, Uri uri, String mime, DateTime until) {
+  void preloadCachedMedia(Iterable<Map<String, dynamic>> tracks,
+      {bool priority = false}) {
+    if (!catalogMediaHints) return;
+    final previous = priority ? _cachedMediaQueue.toList() : <String>[];
+    if (priority) {
+      _cachedMediaQueue.clear();
+      _priorityMediaQueue.clear();
+    }
+    for (final track in tracks.take(48)) {
+      final id = extractTrackId(track);
+      if (id == null ||
+          id.length > 256 ||
+          _preparingMedia.contains(id) ||
+          track['playable'] == false ||
+          preparedMedia(id) != null && !needsRepresentationRefresh(id) ||
+          (_cachedMediaRetryAfter[id]?.isAfter(clock()) ?? false)) continue;
+      if (_cachedMediaQueue.length >= 64) break;
+      _cachedMediaQueue.add(id);
+      if (priority) _priorityMediaQueue.add(id);
+    }
+    for (final id in previous) {
+      if (_cachedMediaQueue.length >= 64) break;
+      _cachedMediaQueue.add(id);
+    }
+    unawaited(_loadCachedMedia());
+  }
+
+  bool needsRepresentationRefresh(String id) {
+    final media = preparedMedia(id);
+    return storageBase != null && media != null &&
+            const {'aac-v1', 'opus-v1'}.contains(media.uri.queryParameters['cache_variant']) &&
+            (media.deliveryUri == null ||
+                !media.deliveryUntil!.isAfter(clock().add(const Duration(seconds: 60)))) ||
+        preferredCachedVariant == 'aac-v1' &&
+            media?.uri.queryParameters.containsKey('cache_version') == true &&
+            media?.uri.queryParameters['cache_variant'] != 'aac-v1' ||
+        const {'legacy', 'seek-v1', 'seek-v2'}
+            .contains(media?.uri.queryParameters['cache_variant']);
+  }
+
+  void _preloadCatalogMedia(Map<String, dynamic> payload) {
+    var visited = 0;
+    final tracks = <Map<String, dynamic>>[];
+    void visit(dynamic value, int depth) {
+      if (++visited > 512 || depth > 8 || tracks.length >= 48) return;
+      if (value is List) {
+        for (final item in value.take(32)) visit(item, depth + 1);
+      } else if (value is Map<String, dynamic>) {
+        final id = extractTrackId(value) ?? '';
+        if (value['title'] is String &&
+            (id.startsWith('recording:') ||
+                id.startsWith('musicbrainz:recording:') ||
+                RegExp(r'^[A-Za-z0-9_-]{11}$').hasMatch(id) ||
+                value['playback'] is Map)) tracks.add(value);
+        for (final entry in value.entries.take(24)) {
+          if (entry.key != 'diagnostics' && entry.key != 'playback')
+            visit(entry.value, depth + 1);
+        }
+      }
+    }
+
+    visit(payload, 0);
+    preloadCachedMedia(tracks);
+  }
+
+  Future<void> _loadCachedMedia() async {
+    if (_loadingCachedMedia ||
+        _cachedMediaQueue.isEmpty ||
+        _startupHold != null) return;
+    _loadingCachedMedia = true;
+    try {
+      while (_cachedMediaQueue.isNotEmpty && _startupHold == null) {
+        _cachedMediaQueue.removeWhere((id) =>
+            _preparingMedia.contains(id) ||
+            preparedMedia(id) != null && !needsRepresentationRefresh(id));
+        _priorityMediaQueue
+            .removeWhere((id) => !_cachedMediaQueue.contains(id));
+        if (_cachedMediaQueue.isEmpty) break;
+        final revision = _scopeRevision;
+        final priority = _priorityMediaQueue.isNotEmpty;
+        final ids = (priority ? _priorityMediaQueue : _cachedMediaQueue)
+            .take(12)
+            .toList();
+        _cachedMediaQueue.removeAll(ids);
+        _priorityMediaQueue.removeAll(ids);
+        for (final id in ids) {
+          if (_cachedMediaRetryAfter.length >= 256)
+            _cachedMediaRetryAfter.remove(_cachedMediaRetryAfter.keys.first);
+          _cachedMediaRetryAfter[id] = clock().add(const Duration(seconds: 60));
+        }
+        final remembered = {
+          for (final id in ids) id: (_preparedMedia[id], _preparationExpiry[id])
+        };
+        final abort = _cachedMediaAbort = Completer<void>();
+        try {
+          final result = await post(
+              '/prepare_session',
+              {
+                'track_keys': ids,
+                'cached_only': true,
+                if (preferredCachedVariant.isNotEmpty)
+                  'preferred_cached_variant': preferredCachedVariant,
+                if (priority) 'active_queue': true,
+              },
+              timeout: const Duration(seconds: 4),
+              cancel: abort.future);
+          if (revision != _scopeRevision) continue;
+          _rememberCachedMedia(result['prepared'], ids.where((id) =>
+              remembered[id] == (_preparedMedia[id], _preparationExpiry[id])));
+        } catch (error) {
+          if (revision == _scopeRevision &&
+              error is http.RequestAbortedException) {
+            // A startup pause is not a failed hint. Retain bounded queued intent.
+            for (final id in ids) {
+              _cachedMediaRetryAfter.remove(id);
+              if (_cachedMediaQueue.length < 64 &&
+                  !_preparingMedia.contains(id)) {
+                _cachedMediaQueue.add(id);
+                if (priority) _priorityMediaQueue.add(id);
+              }
+            }
+          }
+        } finally {
+          if (identical(_cachedMediaAbort, abort)) _cachedMediaAbort = null;
+        }
+      }
+    } finally {
+      _loadingCachedMedia = false;
+    }
+  }
+
+  void _rememberCachedMedia(dynamic prepared, Iterable<String> ids) {
+    if (prepared is! Map) return;
+    for (final id in ids.take(24)) {
+      final data = prepared[id];
+      if (data is! Map || data['cache_tier'] != 'r2_full') continue;
+      final path = data['playback_path'], expiry = data['expires_at'];
+      if (path is! String ||
+          path.length > 1024 ||
+          expiry is! num ||
+          !expiry.isFinite ||
+          expiry <= 0 ||
+          expiry >
+              clock().add(const Duration(days: 1)).millisecondsSinceEpoch /
+                  1000) continue;
+      final uri = base.resolve(path);
+      // Only verified immutable files can supply format hints before Play.
+      if (!uri.queryParameters.containsKey('cache_version')) continue;
+      _rememberMedia(
+          id,
+          uri,
+          '${data['mime_type'] ?? ''}'.split(';').first.trim().toLowerCase(),
+          DateTime.fromMillisecondsSinceEpoch((expiry * 1000).round()),
+          sourceDuration: data['duration'], delivery: data);
+    }
+  }
+
+  bool _rememberMedia(String id, Uri uri, String mime, DateTime until,
+      {dynamic sourceDuration, Map? delivery}) {
+    final cached = RegExp(r'^v1-[a-f0-9]{32}$')
+            .hasMatch(uri.queryParameters['cache_version'] ?? '') &&
+        const {'legacy', 'seek-v1', 'seek-v2', 'opus-v1', 'aac-v1'}
+            .contains(uri.queryParameters['cache_variant']) &&
+        (mime != 'audio/mp4' ||
+            const {'seek-v2', 'aac-v1'}
+                .contains(uri.queryParameters['cache_variant'])) &&
+        !uri.queryParameters.containsKey('playback_session') &&
+        !uri.queryParameters.containsKey('stream_version');
+    final pinned = RegExp(r'^[a-f0-9]{64}$')
+            .hasMatch(uri.queryParameters['stream_version'] ?? '') &&
+        RegExp(r'^[a-f0-9]{32}$')
+            .hasMatch(uri.queryParameters['playback_session'] ?? '') &&
+        !uri.queryParameters.containsKey('cache_version') &&
+        !uri.queryParameters.containsKey('cache_variant') &&
+        !until.isAfter(clock().add(const Duration(minutes: 21)));
     if (id.isEmpty ||
         id.length > 256 ||
         uri.origin != base.origin ||
@@ -36,12 +288,11 @@ class MusicApi {
               'resolve',
               'source_id',
               'cache_variant',
-              'cache_version'
+              'cache_version',
+              'playback_session',
+              'stream_version'
             }.contains(key)) ||
-        !RegExp(r'^v1-[a-f0-9]{32}$')
-            .hasMatch(uri.queryParameters['cache_version'] ?? '') ||
-        !const {'legacy', 'seek-v1'}
-            .contains(uri.queryParameters['cache_variant']) ||
+        !(cached || pinned) ||
         !const {
           'audio/mp4',
           'audio/webm',
@@ -51,21 +302,79 @@ class MusicApi {
         }.contains(mime) ||
         !until.isAfter(clock().add(const Duration(seconds: 60))) ||
         until.isAfter(clock().add(const Duration(days: 1)))) return false;
-    if (_preparedMedia.length >= 256)
+    final previous = _preparedMedia[id];
+    if (_preparedMedia.length >= 256 && previous == null)
       _preparedMedia.remove(_preparedMedia.keys.first);
-    _preparedMedia[id] = (uri: uri, mimeType: mime, until: until);
+    if (previous != null && previous.uri != uri) {
+      _preparationExpiry.remove(id);
+    }
+    // Keep a healthy capability's URL stable so returning to a recording can
+    // reuse the browser's bytes. Metadata polling must not churn cache identity.
+    final retained = previous != null && previous.uri == uri &&
+        previous.mimeType == mime && previous.deliveryUri != null &&
+        previous.deliveryUntil!.isAfter(clock().add(const Duration(seconds: 60)))
+        ? (uri: previous.deliveryUri!, until: previous.deliveryUntil!) : null;
+    final transport = cached ? retained ?? _directDelivery(uri, delivery) : null;
+    _preparedMedia[id] = (
+      uri: uri,
+      mimeType: mime,
+      until: until,
+      duration:
+          sourceDuration is num && sourceDuration.isFinite && sourceDuration > 0
+              ? sourceDuration.toDouble()
+              : null,
+      deliveryUri: transport?.uri,
+      deliveryUntil: transport?.until,
+    );
     return true;
+  }
+
+  ({Uri uri, DateTime until})? _directDelivery(Uri canonical, Map? data) {
+    if (storageBase == null || data == null ||
+        data['delivery_version'] != canonical.queryParameters['cache_version'] ||
+        !const {'aac-v1', 'opus-v1'}.contains(canonical.queryParameters['cache_variant'])) return null;
+    final raw = data['delivery_url'], expiry = data['delivery_expires_at'];
+    if (raw is! String || raw.length > 4096 || expiry is! num || !expiry.isFinite ||
+        expiry * 1000 <= clock().add(const Duration(seconds: 60)).millisecondsSinceEpoch ||
+        expiry * 1000 > clock().add(const Duration(days: 1, seconds: 2)).millisecondsSinceEpoch) return null;
+    final uri = Uri.tryParse(raw);
+    final until = DateTime.fromMillisecondsSinceEpoch((expiry * 1000).round());
+    if (uri == null || uri.scheme != 'https' || uri.origin != storageBase!.origin ||
+        uri.userInfo.isNotEmpty || uri.hasFragment ||
+        !until.isAfter(clock().add(const Duration(seconds: 60))) ||
+        until.isAfter(clock().add(const Duration(days: 1, seconds: 2)))) return null;
+    final source = canonical.queryParameters['source_id'] ?? canonical.pathSegments.last;
+    final variant = canonical.queryParameters['cache_variant'];
+    final query = uri.queryParameters;
+    final ttl = int.tryParse(query['X-Amz-Expires'] ?? '') ?? 0;
+    final stamp = query['X-Amz-Date'] ?? '';
+    if (!uri.path.endsWith('/$source.bin.$variant') ||
+        query['response-content-disposition'] !=
+            'inline; filename="${data['delivery_version']}.$variant"' ||
+        query['X-Amz-Algorithm'] != 'AWS4-HMAC-SHA256' || ttl < 60 || ttl > 86400 ||
+        !RegExp(r'^[a-f0-9]{64}$').hasMatch(query['X-Amz-Signature'] ?? '') ||
+        !RegExp(r'^\d{8}T\d{6}Z$').hasMatch(stamp)) return null;
+    final signedAt = DateTime.utc(int.parse(stamp.substring(0, 4)),
+        int.parse(stamp.substring(4, 6)), int.parse(stamp.substring(6, 8)),
+        int.parse(stamp.substring(9, 11)), int.parse(stamp.substring(11, 13)),
+        int.parse(stamp.substring(13, 15)));
+    final signedUntil = signedAt.add(Duration(seconds: ttl));
+    if (until.difference(signedUntil).abs() > const Duration(seconds: 2)) return null;
+    return (uri: uri, until: signedUntil.isBefore(until) ? signedUntil : until);
   }
 
   List<Map<String, dynamic>> savedPreparedMedia() => [
         for (final entry in _preparedMedia.entries.toList().reversed.take(64))
-          if (entry.value.until
-              .isAfter(clock().add(const Duration(seconds: 60))))
+          if (entry.value.uri.queryParameters.containsKey('cache_version') &&
+              entry.value.until
+                  .isAfter(clock().add(const Duration(seconds: 60))))
             {
               'id': entry.key,
               'uri': entry.value.uri.toString(),
               'mime': entry.value.mimeType,
-              'until': entry.value.until.millisecondsSinceEpoch
+              'until': entry.value.until.millisecondsSinceEpoch,
+              if (entry.value.duration != null)
+                'duration': entry.value.duration,
             },
       ];
 
@@ -79,7 +388,8 @@ class MusicApi {
           (value['uri'] as String).length > 1024) continue;
       try {
         _rememberMedia(value['id'], Uri.parse(value['uri']), value['mime'],
-            DateTime.fromMillisecondsSinceEpoch(value['until']));
+            DateTime.fromMillisecondsSinceEpoch(value['until']),
+            sourceDuration: value['duration']);
       } catch (_) {
         /* Invalid saved metadata falls back to isolated playback. */
       }
@@ -96,8 +406,18 @@ class MusicApi {
     final next = value.trim().isEmpty ? 'guest' : value.trim();
     if (next != _userScopeId) {
       _scopeRevision++;
+      if (_cachedMediaAbort case final pending? when !pending.isCompleted)
+        pending.complete();
       _preparationExpiry.clear();
       _preparedMedia.clear();
+      _cachedMediaQueue.clear();
+      _priorityMediaQueue.clear();
+      _cachedMediaRetryAfter.clear();
+      _preparingMedia.clear();
+      _preparationTasks.clear();
+      _startupHold?.cancel();
+      _startupHold = null;
+      _startupTicket++;
       clearSearchContext();
     }
     _userScopeId = next;
@@ -112,7 +432,46 @@ class MusicApi {
   bool Function()? online;
   String transportRoute = 'unspecified';
   int _requestSerial = 0;
-  MusicApi(this.base, {http.Client? client}) : client = client ?? http.Client();
+  MusicApi(this.base, {http.Client? client, Uri? mediaBase, Uri? storageBase})
+      : mediaBase = _mediaOrigin(base, mediaBase),
+        storageBase = storageBase == null ? null : _mediaOrigin(base, storageBase),
+        client = client ?? http.Client();
+
+  static Uri _mediaOrigin(Uri base, Uri? configured) {
+    if (configured == null) return Uri.parse(base.origin);
+    final loopback = const {'localhost', '127.0.0.1', '::1'};
+    if ((configured.scheme != 'https' &&
+            !(configured.scheme == 'http' &&
+                base.scheme == 'http' &&
+                loopback.contains(base.host) &&
+                loopback.contains(configured.host))) ||
+        configured.host.isEmpty ||
+        configured.userInfo.isNotEmpty ||
+        (configured.path.isNotEmpty && configured.path != '/') ||
+        configured.hasQuery ||
+        configured.hasFragment)
+      throw ArgumentError(
+          'Media configuration must be a trusted HTTPS origin.');
+    return Uri.parse(configured.origin);
+  }
+
+  /// Only application-owned stream paths move; metadata and saved descriptors
+  /// retain the canonical API origin and their existing validation.
+  Uri playbackUri(Uri uri) {
+    if (uri.origin != base.origin && uri.origin != mediaBase.origin ||
+        !uri.path.startsWith('/playback/stream/') ||
+        uri.userInfo.isNotEmpty ||
+        uri.hasFragment) throw ArgumentError('Unexpected playback resource.');
+    final canonical = uri.replace(scheme: base.scheme, host: base.host, port: base.port);
+    for (final media in _preparedMedia.values) {
+      if (media.uri == canonical && media.deliveryUri != null &&
+          media.deliveryUntil!.isAfter(clock().add(const Duration(seconds: 60)))) {
+        return media.deliveryUri!;
+      }
+    }
+    return uri.replace(
+        scheme: mediaBase.scheme, host: mediaBase.host, port: mediaBase.port);
+  }
 
   Uri endpoint(String path) => base.resolve(path);
 
@@ -225,7 +584,23 @@ class MusicApi {
 
   List<String> artworkUrls(Map<String, dynamic> item, String type) {
     final track = type == 'track' || type == 'tracks';
-    final source = track ? extractPlaybackSourceId(item) : null;
+    var source = track ? extractPlaybackSourceId(item) : null;
+    // Old album detail rows kept a physical ID and its matching picture but
+    // no playback object. Accept that picture's ownership without changing
+    // playback routing or treating arbitrary catalog IDs as video sources.
+    final legacy = '${item['id'] ?? ''}';
+    final provider = item['source_provider'] ?? item['provider'];
+    if (track &&
+        source == null &&
+        item['playback'] == null &&
+        (provider == null || provider == 'youtube' || provider == 'ytmusic') &&
+        RegExp(r'^[A-Za-z0-9_-]{11}$').hasMatch(legacy)) {
+      final image = Uri.tryParse('${item['thumbnail'] ?? ''}');
+      if (image != null &&
+          const {'i.ytimg.com', 'img.youtube.com'}.contains(image.host) &&
+          RegExp(r'/vi(?:_webp)?/([^/]+)/').firstMatch(image.path)?.group(1) ==
+              legacy) source = legacy;
+    }
     final youtube = source != null &&
         extractPlaybackProvider(item) == 'youtube' &&
         item['playable'] != false &&
@@ -288,7 +663,11 @@ class MusicApi {
         purpose = 'row_page';
       }
     } else if (path == '/prepare_session') {
-      purpose = (body?['background'] == true) ? 'background_cache' : 'upcoming';
+      purpose = body?['cached_only'] == true
+          ? 'cache_metadata'
+          : (body?['background'] == true)
+              ? 'background_cache'
+              : 'upcoming';
     }
     final endpointPath = Uri.parse(path).path;
     final requestId =
@@ -317,6 +696,13 @@ class MusicApi {
           'Authorization': 'Bearer $token',
         'X-Neatie-Request': requestId,
       };
+      if (endpointPath.startsWith('/assistant/') ||
+          endpointPath.startsWith('/lyrics/') &&
+              endpointPath.endsWith('/meaning')) {
+        headers
+            .addAll(await assistantHeaders(accessToken: accessToken?.call()));
+        if (revision != _scopeRevision) throw StateError('Account changed.');
+      }
       final request = http.AbortableRequest(
           body == null ? 'GET' : 'POST', endpoint(path),
           abortTrigger: cancel == null
@@ -355,20 +741,73 @@ class MusicApi {
       }
       rethrow;
     }
-    if (revision == _scopeRevision) {
-      onDiagnostic?.call('api-response', {
-        ...details,
-        'status': response.statusCode,
-        'ms': timer.elapsedMilliseconds,
-      });
-    }
     if (response.statusCode != 200) {
+      if (revision == _scopeRevision)
+        onDiagnostic?.call('api-response', {
+          ...details,
+          'status': response.statusCode,
+          'ms': timer.elapsedMilliseconds,
+          'responseBytes': response.bodyBytes.length
+        });
+      if (endpointPath.startsWith('/assistant/')) {
+        throw SongDiscussionException(response.statusCode);
+      }
       throw StateError(
           'Music service returned ${response.statusCode}. Please retry.');
     }
     try {
+      final decode = Stopwatch()..start();
       final decoded = jsonDecode(response.body);
       if (decoded is! Map) throw const FormatException('Invalid payload');
+      decode.stop();
+      if (revision == _scopeRevision) {
+        final diagnostics = decoded['diagnostics'] is Map
+            ? decoded['diagnostics'] as Map
+            : const {};
+        onDiagnostic?.call('api-response', {
+          ...details,
+          'status': response.statusCode,
+          'ms': timer.elapsedMilliseconds,
+          'responseBytes': response.bodyBytes.length,
+          'jsonDecodeMs': decode.elapsedMicroseconds / 1000,
+          'serverMs': double.tryParse(RegExp(r'api;dur=([\d.]+)')
+                  .firstMatch(response.headers['server-timing'] ?? '')
+                  ?.group(1) ??
+              ''),
+          if (endpointPath == '/history_seed') ...{
+            'historyEventReadMs': diagnostics['history_event_read_ms'],
+            'historyRouteWaitMs': diagnostics['history_route_wait_ms'],
+            'historyCatalogLookupMs': diagnostics['history_catalog_lookup_ms'],
+            'historyCountMs': diagnostics['history_count_ms'],
+            'historyTotalMs': diagnostics['history_total_ms'],
+          },
+        });
+      }
+      if (revision == _scopeRevision && endpointPath == '/recommend') {
+        final diagnostics = decoded['diagnostics'] is Map
+            ? decoded['diagnostics'] as Map
+            : const {};
+        onDiagnostic?.call('home-response', {
+          ...details,
+          'serverRequestId': decoded['request_id'],
+          'forceRefresh': body?['force_refresh'] == true,
+          'refreshFromVersion': body?['refresh_from_version'],
+          'feedAction': decoded['feed_action'] ?? diagnostics['feed_action'],
+          'feedReason': diagnostics['feed_action_reason'],
+          'sessionId': decoded['session_id'],
+          'feedVersion': decoded['feed_version'] ?? diagnostics['feed_version'],
+          'queueRevision': diagnostics['queue_revision'],
+          'readyFeedCount': diagnostics['ready_feed_count'],
+          'queueBuildInflight': diagnostics['queue_build_inflight'],
+          'preparationState': diagnostics['preparation_state'],
+          'preparationBlockedReason': diagnostics['preparation_blocked_reason'],
+          'backgroundSupplyInflight': diagnostics['background_supply_inflight'],
+          'noveltyEnforced': diagnostics['novelty_enforced'],
+          'noveltyWouldReject': diagnostics['novelty_would_reject'],
+          'serverMs': diagnostics['request_ms'],
+          'ms': timer.elapsedMilliseconds,
+        });
+      }
       if (revision == _scopeRevision &&
           (endpointPath == '/search' || endpointPath == '/suggest') &&
           (body?['revision'] as num? ?? 0) == 0) {
@@ -399,6 +838,12 @@ class MusicApi {
               if (diagnostics is Map) ...{
                 'snapshotHit': diagnostics['search_snapshot_hit'] == true,
                 'searchOutcome': diagnostics['search_outcome']?.toString(),
+                'searchRefreshRetained': diagnostics['search_refresh_retained'] == true,
+                if (diagnostics['search_failed_sources'] is List)
+                  'searchProviderFailures': (diagnostics['search_failed_sources'] as List).length,
+                if (diagnostics['provider_counts'] case final Map counts)
+                  for (final key in ['songs', 'videos', 'artists', 'top'])
+                    if (counts[key] is num) 'searchProvider_$key': counts[key],
                 for (final stage in [
                   'retrieval',
                   'ranking',
@@ -420,7 +865,23 @@ class MusicApi {
               },
             });
       }
-      return Map<String, dynamic>.from(decoded);
+      final payload = Map<String, dynamic>.from(decoded);
+      if (catalogMediaHints &&
+          revision == _scopeRevision &&
+          (const {
+                '/search',
+                '/recommend',
+                '/related_tracks',
+                '/history_seed',
+                '/recent_search_picks',
+                '/charts',
+                '/new_releases'
+              }.contains(endpointPath) ||
+              endpointPath.startsWith('/artist/') ||
+              endpointPath.startsWith('/album/'))) {
+        _preloadCatalogMedia(payload);
+      }
+      return payload;
     } on FormatException {
       if (revision == _scopeRevision) {
         onDiagnostic?.call('api-failure', {
@@ -474,26 +935,97 @@ class MusicApi {
   Uri streamUri(Map<String, dynamic> track) {
     final data = identity(track);
     final id = data.remove('track_key') as String;
-    return endpoint('/playback/stream/${Uri.encodeComponent(id)}')
+    return playbackUri(endpoint('/playback/stream/${Uri.encodeComponent(id)}'))
         .replace(queryParameters: {
       'resolve': '1',
+      if (storageBase != null) 'direct_cached': '1',
+      if (preferredCachedVariant.isNotEmpty)
+        'preferred_cached_variant': preferredCachedVariant,
       for (final entry in data.entries) entry.key: entry.value.toString()
     });
   }
 
+  Future<Map<String, dynamic>> queueCacheStatus(String token, int revision) async {
+    final scope = _scopeRevision;
+    final remembered = {
+      for (final id in _preparedMedia.keys)
+        id: (_preparedMedia[id], _preparationExpiry[id])
+    };
+    final result = await post('/prepare_session', {
+        'queue_cache_id': token,
+        'queue_cache_revision': revision,
+        'queue_cache_status_only': true,
+        'queue_cache_metadata': true,
+        if (preferredCachedVariant.isNotEmpty)
+          'preferred_cached_variant': preferredCachedVariant,
+      });
+    if (scope == _scopeRevision && result['prepared'] is Map) {
+      final ids = (result['prepared'] as Map).keys.whereType<String>().take(5);
+      _rememberCachedMedia(result['prepared'], ids.where((id) =>
+          (remembered[id] ?? (null, null)) ==
+          (_preparedMedia[id], _preparationExpiry[id])));
+    }
+    return result;
+  }
+
   Future<Map<String, dynamic>> cacheQueue(
       String token, int revision, List<Map<String, dynamic>> tracks,
-      {bool cancel = false}) {
-    return post('/prepare_session', {
+      {bool cancel = false}) async {
+    final scope = _scopeRevision;
+    final ids =
+        tracks.map(extractTrackId).whereType<String>().take(100).toList();
+    final remembered = {
+      for (final id in ids) id: (_preparedMedia[id], _preparationExpiry[id])
+    };
+    final result = await post('/prepare_session', {
       'queue_cache_id': token,
       'queue_cache_revision': revision,
       'cancel_queue_cache': cancel,
-      'track_keys':
-          tracks.map(extractTrackId).whereType<String>().take(100).toList(),
+      'queue_cache_metadata': !cancel,
+      if (preferredCachedVariant.isNotEmpty)
+        'preferred_cached_variant': preferredCachedVariant,
+      'track_keys': ids,
     });
+    if (scope == _scopeRevision && !cancel) {
+      _rememberCachedMedia(result['prepared'], ids.where((id) =>
+          remembered[id] == (_preparedMedia[id], _preparationExpiry[id])));
+    }
+    return result;
   }
 
   Future<Uri> prepare(Map<String, dynamic> track,
+      {bool activeQueue = false, bool cacheFull = false}) {
+    final id = extractTrackId(track)!;
+    final ready = preparedMedia(id);
+    if (!cacheFull && ready != null && startupPrepared(id)) {
+      // Format upgrades belong to the existing background metadata lane. A
+      // playable cached source must never wait for an optional replacement.
+      if (needsRepresentationRefresh(id))
+        preloadCachedMedia([track], priority: activeQueue);
+      return Future.value(ready.uri);
+    }
+    final key = (id, cacheFull);
+    final pending = _preparationTasks[key];
+    if (pending != null) return pending;
+    final scope = _scopeRevision;
+    _preparingMedia.add(id);
+    _cachedMediaQueue.remove(id);
+    _priorityMediaQueue.remove(id);
+    late final Future<Uri> task;
+    task = _prepareTrack(track, activeQueue: activeQueue, cacheFull: cacheFull)
+        .whenComplete(() {
+      if (scope == _scopeRevision && identical(_preparationTasks[key], task)) {
+        _preparationTasks.remove(key);
+        if (!_preparationTasks.keys.any((key) => key.$1 == id))
+          _preparingMedia.remove(id);
+        unawaited(_loadCachedMedia());
+      }
+    });
+    _preparationTasks[key] = task;
+    return task;
+  }
+
+  Future<Uri> _prepareTrack(Map<String, dynamic> track,
       {bool activeQueue = false, bool cacheFull = false}) async {
     final id = extractTrackId(track)!;
     final revision = _scopeRevision;
@@ -506,11 +1038,14 @@ class MusicApi {
           'lookahead': 1,
           'cache_full': cacheFull,
           'background': cacheFull,
+          if (preferredCachedVariant.isNotEmpty)
+            'preferred_cached_variant': preferredCachedVariant,
         },
         timeout: const Duration(seconds: 90));
     if (revision == _scopeRevision) {
-      _preparedMedia.remove(id);
-      final expiry = ((result['prepared'] as Map?)?[id] as Map?)?['expires_at'];
+      if ((result['prepared'] as Map?)?[id] != null) _preparedMedia.remove(id);
+      final data = (result['prepared'] as Map?)?[id] as Map?;
+      final expiry = data?['expires_at'];
       _preparationExpiry.remove(id);
       if (expiry is num &&
           expiry.isFinite &&
@@ -521,15 +1056,33 @@ class MusicApi {
         if (_preparationExpiry.length >= 256) {
           _preparationExpiry.remove(_preparationExpiry.keys.first);
         }
-        _preparationExpiry[id] = DateTime.fromMillisecondsSinceEpoch(
-            (expiry * 1000).round(),
-            isUtc: true);
+        final cached = const {'r2_full', 'local_full'}.contains(_cacheTier(data));
+        final warmed = data?['startup_ready_until'];
+        // A catalog descriptor proves file/type identity, not byte readiness.
+        // Older servers with a real prefix retain a short compatibility lease.
+        final readyUntil = warmed is num && warmed.isFinite
+            ? warmed.toDouble()
+            : !cached || (data?['cached_prefix_bytes'] as num? ?? 0) > 0
+                ? expiry.toDouble().clamp(0, clock().add(const Duration(minutes: 5)).millisecondsSinceEpoch / 1000)
+                : 0.0;
+        if (readyUntil > 0) {
+          _preparationExpiry[id] = DateTime.fromMillisecondsSinceEpoch(
+              (readyUntil.clamp(0, expiry) * 1000).round(), isUtc: true);
+        }
       }
+    }
+    void reportPreparation() {
+      if (revision != _scopeRevision) return;
+      final media = preparedMedia(id);
       final failed = (result['failed'] as Map?)?[id] as Map?;
       final facts = failed?['diagnostics'] as Map?;
       final tier = _cacheTier((result['prepared'] as Map?)?[id]);
       onDiagnostic?.call('prepare-result', {
         'requestedTrack': id,
+        'preparedSourceId': ((result['prepared'] as Map?)?[id] as Map?)?['source_id'],
+        'preparedVariant': media?.uri.queryParameters['cache_variant'],
+        'preparedVersion': media?.uri.queryParameters['cache_version'] ?? media?.uri.queryParameters['stream_version'],
+        'preparedDirect': media?.deliveryUri != null,
         'requestPurpose': cacheFull ? 'background_cache' : 'upcoming',
         'failureCode': _failureCode(
             ((result['failed'] as Map?)?[id] as Map?)?['code'] ??
@@ -558,6 +1111,7 @@ class MusicApi {
             ((result['prepared'] as Map?)?[id] as Map?)?['cached_prefix_bytes'],
         'chunkDeferred':
             ((result['prepared'] as Map?)?[id] as Map?)?['chunk_deferred'],
+        'startupBytesReady': startupPrepared(id),
         'prepared': (result['prepared'] as Map?)?[id] != null,
         'fullyCached': const {'r2_full', 'local_full'}.contains(tier) ||
             ((result['prepared'] as Map?)?[id] as Map?)?['fully_cached'] ==
@@ -566,7 +1120,10 @@ class MusicApi {
       });
     }
     if ((result['prepared'] as Map?)?[id] == null) {
-      throw StateError('Next track is not prepared yet.');
+      reportPreparation();
+      throw PlaybackPreparationException(
+          _failureCode(((result['failed'] as Map?)?[id] as Map?)?['code']) ??
+              'stream_failed');
     }
     final path = ((result['prepared'] as Map?)?[id] as Map?)?['playback_path']
         ?.toString();
@@ -581,16 +1138,26 @@ class MusicApi {
       final data = (result['prepared'] as Map)[id] as Map;
       final mime =
           '${data['mime_type'] ?? ''}'.split(';').first.trim().toLowerCase();
-      final until = _preparationExpiry[id];
+      final expiry = data['expires_at'];
+      final until = expiry is num && expiry.isFinite && expiry > 0 &&
+              expiry <= clock().add(const Duration(days: 1)).millisecondsSinceEpoch / 1000
+          ? DateTime.fromMillisecondsSinceEpoch((expiry * 1000).round(), isUtc: true)
+          : null;
       final version = uri.queryParameters['cache_version'] ?? '';
-      if (const {'r2_full', 'local_full'}.contains(_cacheTier(data)) &&
-          until != null) _rememberMedia(id, uri, mime, until);
-      if (version.isNotEmpty && !_preparedMedia.containsKey(id)) {
+      if ((const {'r2_full', 'local_full'}.contains(_cacheTier(data)) ||
+              uri.queryParameters.containsKey('stream_version')) &&
+          until != null)
+        _rememberMedia(id, uri, mime, until, sourceDuration: data['duration'], delivery: data);
+      reportPreparation();
+      if ((version.isNotEmpty ||
+              uri.queryParameters.containsKey('stream_version')) &&
+          !_preparedMedia.containsKey(id)) {
         // Incomplete/untrusted descriptors keep the ordinary isolated path.
         return streamUri(track);
       }
       return uri;
     }
+    reportPreparation();
     return streamUri(track);
   }
 
@@ -641,6 +1208,23 @@ class MusicApi {
     if (result['status'] == 'temporarily_unavailable') {
       throw StateError(
           'Related songs are temporarily unavailable. Retry to continue.');
+    }
+    if (result['recommendation_diagnostics'] is Map) {
+      onDiagnostic?.call('queue-recommendations', {
+        for (final key in const [
+          'candidate_count',
+          'fresh_count',
+          'repeated_count',
+          'selected_count',
+          'selected_artist_count',
+          'selected_album_count',
+          'catalog_candidate_count',
+          'provider_depth',
+          'fresh_supply_exhausted'
+        ])
+          if ((result['recommendation_diagnostics'] as Map)[key] != null)
+            key: (result['recommendation_diagnostics'] as Map)[key],
+      });
     }
     return (
       tracks: tracks(result['tracks']),

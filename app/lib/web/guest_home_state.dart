@@ -41,16 +41,44 @@ class GuestHomeState {
     return items.take(maxSnapshots).toList();
   }
 
-  static String _identity(Map<String, dynamic> track) =>
-      '${track['canonical_entity_id'] ?? track['canonical_track_identity'] ?? track['musicbrainz_recording_id'] ?? track['canonical_recording_id'] ?? '${track['title']}|${track['artist'] ?? track['channel']}'}'
-          .toLowerCase()
-          .replaceAll(RegExp(r'\s+'), ' ')
-          .trim();
+  static String _identity(Map<String, dynamic> track) {
+    for (final key in const [
+      'musicbrainz_recording_id',
+      'canonical_recording_id',
+      'recording_mbid'
+    ]) {
+      var value = '${track[key] ?? ''}'.trim().toLowerCase();
+      if (value.isEmpty) continue;
+      value = value.replaceFirst(RegExp(r'^(musicbrainz:)?recording:'), '');
+      return 'recording:$value';
+    }
+    final isrc =
+        '${track['isrc'] ?? ''}'.replaceAll(RegExp(r'[\s-]'), '').toUpperCase();
+    if (isrc.isNotEmpty) return 'isrc:$isrc';
+    for (final key in const [
+      'canonical_entity_id',
+      'canonical_track_identity'
+    ]) {
+      final value = '${track[key] ?? ''}'.trim();
+      if (value.isEmpty) continue;
+      final recording =
+          RegExp(r'^(musicbrainz:)?recording:', caseSensitive: false);
+      if (recording.hasMatch(value)) {
+        return 'recording:${value.replaceFirst(recording, '').toLowerCase()}';
+      }
+      return 'canonical:$value';
+    }
+    // Equal display names cannot prove two sources are the same recording.
+    return 'source:${extractTrackId(track)}';
+  }
 
   List<Map<String, dynamic>> _accountItems() {
     final items = <String, Map<String, dynamic>>{};
+    final identityBySource = <String, String>{};
     for (final item in [..._serverFrequent, ..._snapshots]) {
       final key = _identity(item), old = items[_identity(item)];
+      final source = extractTrackId(item);
+      if (source != null) identityBySource[source] = key;
       items[key] = {
         ...?old,
         ...item,
@@ -60,7 +88,10 @@ class GuestHomeState {
     }
     for (final event in _pendingPlays) {
       final track = Map<String, dynamic>.from(event['track'] as Map);
-      final key = _identity(track), old = items[_identity(track)];
+      // Server hydration can add identity after this play was queued. Exact
+      // source ownership joins its pending overlay without guessing by title.
+      final key = identityBySource[extractTrackId(track)] ?? _identity(track);
+      final old = items[key];
       final newer = (event['occurred_at'] as num) >=
           (old?['last_played_at'] as num? ?? 0);
       items[key] = {
@@ -145,7 +176,10 @@ class GuestHomeState {
         'album_id',
         'canonical_recording_id',
         'musicbrainz_recording_id',
+        'recording_mbid',
         'canonical_entity_id',
+        'canonical_track_identity',
+        'isrc',
         'videoId',
         'source_id',
         'playable',

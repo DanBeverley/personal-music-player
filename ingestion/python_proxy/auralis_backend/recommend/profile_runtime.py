@@ -8,22 +8,23 @@ import json
 import time
 
 from ..storage.session_store import get_session_store
-from .model_runtime import get_collaborative_model
+from .model_runtime import get_collaborative_model, cached_profile_model
 from .taste_runtime import build_taste_profile
 
 
-_PROFILE_CACHE: Dict[str, Dict[str, Any]] = {}
 _PROFILE_LOCK = Lock()
-_PROFILE_STORE_PREFIX = "auralis:recommend:profile:"
+_PROFILE_EPOCH = 0
+_PROFILE_STORE_PREFIX = "auralis:recommend:profile:v2:"
 
 
 def _profile_store_key(profile_key: str) -> str:
-    return f"{_PROFILE_STORE_PREFIX}{profile_key}"
+    return f"{_PROFILE_STORE_PREFIX}{_PROFILE_EPOCH}:{profile_key}"
 
 
 def invalidate_profile_cache() -> None:
+    global _PROFILE_EPOCH
     with _PROFILE_LOCK:
-        _PROFILE_CACHE.clear()
+        _PROFILE_EPOCH += 1
 
 
 def build_profile_key(server: Any, req) -> str:
@@ -68,7 +69,8 @@ def _ttl_seconds(server: Any) -> int:
 
 
 def _with_runtime_meta(profile: Dict[str, Any], *, cache_hit: bool, source: str) -> Dict[str, Any]:
-    payload = deepcopy(profile)
+    model = (profile.get('collaborative') or {}).get('model')
+    payload = deepcopy(profile, {id(model): model} if isinstance(model, dict) else None)
     payload["profile_runtime"] = {
         "cache_hit": bool(cache_hit),
         "source": source,
@@ -81,25 +83,19 @@ def get_cached_profile(server: Any, profile_key: str) -> Optional[Dict[str, Any]
     normalized_key = server._recommendation_trim_text(profile_key)
     if not normalized_key:
         return None
-    now = time.time()
-    with _PROFILE_LOCK:
-        cached = _PROFILE_CACHE.get(normalized_key)
-        if cached and float(cached.get("expires_at") or 0.0) > now:
-            return _with_runtime_meta(
-                cached.get("profile") or {},
-                cache_hit=True,
-                source="memory",
-            )
     try:
         stored = get_session_store().get(_profile_store_key(normalized_key))
     except Exception:
         stored = None
     if isinstance(stored, dict):
-        with _PROFILE_LOCK:
-            _PROFILE_CACHE[normalized_key] = {
-                "profile": deepcopy(stored),
-                "expires_at": now + _ttl_seconds(server),
-            }
+        collaborative = stored.get('collaborative') or {}
+        if collaborative.get('model_ready'):
+            model = cached_profile_model(collaborative.get('model_id'), collaborative.get('source_signature'))
+            if model is None:
+                return None  # Recompute against a new model, never mix versions.
+            collaborative['model'] = model
+        stored['collaborative_profile'] = collaborative
+        stored['embedding_profile'] = stored.get('vectors') or {}
         return _with_runtime_meta(stored, cache_hit=True, source="session_store")
     return None
 
@@ -109,18 +105,17 @@ def store_cached_profile(server: Any, profile: Dict[str, Any]) -> Dict[str, Any]
     if not profile_key:
         return _with_runtime_meta(profile, cache_hit=False, source="computed")
     ttl_seconds = _ttl_seconds(server)
-    payload = deepcopy(profile)
-    payload.pop("profile_runtime", None)
-    with _PROFILE_LOCK:
-        _PROFILE_CACHE[profile_key] = {
-            "profile": deepcopy(payload),
-            "expires_at": time.time() + ttl_seconds,
-        }
+    # The existing session store owns TTL, eviction and its byte/entry bounds.
+    # Store aliases once and borrow the process model only when returning data.
+    payload = {key: value for key, value in profile.items()
+               if key not in {'profile_runtime', 'embedding_profile', 'collaborative_profile'}}
+    payload['collaborative'] = {key: value for key, value in (profile.get('collaborative') or {}).items()
+                                if key != 'model'}
     try:
         get_session_store().set(_profile_store_key(profile_key), payload, ttl_seconds)
     except Exception:
         pass
-    return _with_runtime_meta(payload, cache_hit=False, source="computed")
+    return _with_runtime_meta(profile, cache_hit=False, source="computed")
 
 
 def build_collaborative_profile(

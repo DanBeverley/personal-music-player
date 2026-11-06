@@ -1,5 +1,17 @@
 {$AURALIS_API_HOST} {
 	encode zstd gzip
+	@playback path /playback/stream/*
+	log_append @playback <edge_request {http.request.uuid}
+	log_append @playback <trace {query.diag}
+	log_append @playback <range {http.request.header.Range}
+	log_append @playback <cache_version {query.cache_version}
+	log_append @playback <cache_variant {query.cache_variant}
+	log_append @playback upstream_total_ms {rp.upstream.duration_ms}
+	log_append @playback <proxy_hop api
+	log_append @playback <proxy_started_ms {time.now.unix_ms}
+	@notObserved not path /playback/stream/* /search /recommend
+	log_skip @notObserved
+	log_append <request_path {http.request.uri.path}
 
 	header {
 		Strict-Transport-Security "max-age=31536000; includeSubDomains"
@@ -9,13 +21,33 @@
 	}
 
 	reverse_proxy api:8000 {
+		header_up X-Neatie-Edge-Request {http.request.uuid}
 		# Audio streams and progressive search/feed responses should not be
 		# accumulated by the reverse proxy before being sent to the client.
 		flush_interval -1
+		handle_response {
+			# Capture before body copy: a cancelled transfer can unwind past
+			# late log_append handlers and otherwise lose its correlation.
+			log_append <playback_request {rp.header.X-Neatie-Playback-Request}
+			log_append <upstream_headers_ms {rp.upstream.latency_ms}
+			log_append <expected_body_bytes {rp.header.Content-Length}
+			copy_response
+		}
 	}
 
 	log {
-		output stdout
-		format json
+		output file /data/neatie-api-access.jsonl {
+			roll_size 10MiB
+			roll_keep 5
+			roll_keep_for 48h
+		}
+		format filter {
+			wrap json
+			fields {
+				request>headers delete
+				request>uri delete
+				resp_headers delete
+			}
+		}
 	}
 }

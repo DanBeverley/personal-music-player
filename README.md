@@ -1,87 +1,51 @@
 # Neatie
 
-**[Try the live demo](https://neatie.duckdns.org)** · [Architecture](docs/handoff/ARCHITECTURE.md) · [Roadmap](docs/handoff/NEXT_STEPS.md)
+**[Open the live web app](https://neatie.duckdns.org)** · [Architecture](docs/handoff/ARCHITECTURE.md) · [Release status](docs/handoff/CURRENT_STATUS.md)
 
-## Overview
+Neatie is a music discovery and listening app for **Android** and **desktop and mobile browsers**. Find a recording, explore an artist’s work, build a queue and keep a personal library. Both clients share the same catalogue, recommendation and playback backend. Android also supports downloads and device-local audio.
 
-Neatie brings music discovery, playback and a personal library to Android and the web. Start with a song, artist or album, explore related music, shape your queue and keep favourites. Recommendations, lyrics, charts and an Android music assistant connect discovery with everyday listening.
+The web preview currently serves build `2026-11-06-artist-home`. Guests can search and listen. Sign in to use personalized Home, cloud likes and playlists. Background playback and cross-device playlist edits are still being validated on real devices. [Known issues](docs/handoff/KNOWN_ISSUES.md) · [Roadmap](docs/handoff/NEXT_STEPS.md)
 
-Android combines streaming with downloads and local playback. A separate Flutter web client serves desktop/mobile browsers through the shared backend. Browse as a guest, or use Google/email accounts for cloud likes, playlists and listening records.
+## Features
 
-**Status:** active development. The demo is a working preview. Playback/search latency, iPhone background and resume reliability, and cross-device playlist consistency remain under validation.
-
-## What Neatie offers
-
-- **Find music:** suggestions, search history and playable history cards; Top, Songs, Artists and Albums results with detail pages. Web results update as you type.
-- **Discover your next listen:** Today's Pick, featured albums, recommended artists, personal mixes, Popular Radio, recently played and frequently listened shelves. Listening and library activity inform recommendations.
-- **Shape your queue:** play from search, albums, playlists or radio; add, remove, reorder and play next. Related songs extend sessions; upcoming audio is prepared and cached in the background.
-- **Keep your music:** liked songs, playlists and listening history, with separate guest/account storage and cloud-backed account data.
-- **Explore:** provider-backed charts and new releases, with country, period and source filters where available. Web supports approximate country detection and saved region choices.
-- **Follow the words:** synchronized lyrics with line highlighting, or plain lyrics when timestamps are unavailable. Web prefetches lyrics and reuses cached results.
-
-## Platform support
-
-Both clients use the shared discovery and playback services. Interface capabilities differ:
-
-| Capability | Android | Web |
-| --- | --- | --- |
-| Search interaction | Live suggestions; submit or select to load results | Live suggestions and results while typing |
-| Playlist editing | Create, rename, delete, add/remove songs and customize covers | Existing playlists open/play; editing is gated |
-| Queue song search | Search the catalogue and enqueue songs | Top song results with add-to-queue controls |
-| Downloads and local playback | Download manager and device-local audio | Not implemented |
-| Player controls | Seek/repeat, shuffle, sleep timer and ten-second skips | Seek/repeat; persistent desktop dock/mobile player |
-| Library extras | Follow artists; save albums, mixes and radios | Cloud liked songs and existing playlists |
-| Recommendation controls | Remove from feed; Neatie, blended or ListenBrainz-first taste modes | Listening/like signals; no taste-settings UI |
-| Ask Neatie | Music chat, playable recommendations and playlist drafts; saved/pinned/archived chats | Not implemented |
-| Song recognition | Record a snippet or import/share audio/video to find a song | Not implemented |
-| Behind the Lyrics | Song interpretations and themes | Not implemented |
-| Updates and diagnostics | Signed APK self-update and playback logging | Browser delivery; share/download compact playback reports |
-
-Assistant/interpretation need a configured model provider; recognition needs ACRCloud. Downloaded audio and locally chosen covers remain device-local. `WEB_PLAYLIST_WRITES` stays disabled pending the SQL migration, Android sync compatibility and concurrent-edit acceptance.
-
-## Architecture
-
-- **Clients:** Flutter/Dart; Android uses Riverpod, `just_audio` and `audio_service`. Web uses HTML audio and Media Session controls, with separate UI/playback implementations.
-- **API:** FastAPI/Python owns search, details, playback, lyrics and discovery. Providers include MusicBrainz, YouTube Music, Last.fm, ListenBrainz and LRCLIB.
-- **Discovery:** durable background jobs enrich persisted inventory and compose Home feeds; normal responses serve prepared data.
-- **Storage:** SQLite retains catalogue metadata, verified source links, search and recommendation state. Supabase owns authentication and cloud library/history data; local storage or Cloudflare R2 caches audio separately.
-- **Audio delivery:** yt-dlp source resolution, bounded preparation and verified byte-range delivery. Production uses Docker/Caddy on AWS.
-- **Optional services:** LangGraph/Ollama assistant integration and ACRCloud recognition.
-
-The original C++17/miniaudio engine retains Dart FFI/CMake integration; pitch/rate effects and chorus detection remain prototypes. Internal `Auralis`/`EBB` names reflect the project's earlier branding.
-
-## Repository layout
-
-| Path | Responsibility |
+| Area | Capabilities |
 | --- | --- |
-| `app/lib/logic/`, `app/lib/main_*.dart` | Android playback, account state and application screens |
-| `app/lib/web/` | Browser interface, player, library and diagnostics |
-| `core_native/` | Native audio library and FFI-facing C API |
-| `ingestion/python_proxy/` | FastAPI entry point, shared backend services and worker |
-| `ingestion/browser_audio/` | Legacy browser transport; authenticated playback fallback is disabled |
-| `supabase/` | Account schema and playlist migration SQL |
-| `deploy/production/`, `tools/` | Deployment, backup, release and verification utilities |
-| `docs/` | Architecture, operations, release guidance and tracked work |
+| **Search and catalogue** | Search for songs, artists and albums. Browse artist releases and appearances, related artists and playable album track lists. Release dates and provider play counts appear where verified metadata is available. |
+| **Discovery** | Personalized mixes, featured albums, related artists, artist and track radio, listening history and frequently played songs. Browse charts by supported regions and sources, and explore new releases. |
+| **Playback** | Seek, repeat, play next and reorder the queue. Start an artist’s catalogue from a selected song, or extend a session with related tracks. Upcoming tracks can be prepared in the background. |
+| **Library** | Like songs and create, rename, reorder and edit cloud playlists on supported builds. Android also saves catalogue collections. The desktop web sidebar provides quick access to playlists and followed artists. |
+| **Lyrics and AI** | Follow synchronized lyrics when timings are available, or read plain lyrics. Ask about a song in the web vinyl player, browse playable suggestions or draft and edit playlists in the Library assistant. Android has a music assistant with saved conversations. AI features require a configured model and account access where enabled. |
+
+**Web** has a vinyl player with cover and list queue views, queue search and shareable playback diagnostics. Search suggestions appear while typing. Submit the query to load the full results.
+
+**Android** adds downloads, device-local playback, a sleep timer and song recognition from a recording or imported media when ACRCloud is configured. Signed APK releases and in-app update support are documented in the [Android release guide](docs/ANDROID_RELEASE.md).
+
+## How it works
+
+- **Clients** live in [`app/`](app/). Flutter shares models and contracts across clients. Android uses Riverpod, `just_audio` and `audio_service`. Web uses HTML audio and Media Session controls.
+- **Catalogue and recommendations** live in [`ingestion/python_proxy/`](ingestion/python_proxy/). FastAPI serves provider-backed search, metadata, lyrics and playback. A recommendation worker prepares Home feeds from persisted candidate inventories.
+- **Media and account data** have separate storage. SQLite holds catalogue and recommendation state. Supabase handles authentication and cloud library data. Local storage or Cloudflare R2 caches audio. The playback service resolves sources with yt-dlp and supports byte-range delivery.
+- **Native audio and hosting** live in [`core_native/`](core_native/) and [`deploy/production/`](deploy/production/). The C++ audio library uses Dart FFI and CMake. Production runs Docker services behind Caddy on AWS. [Operations and rollback](docs/handoff/OPERATIONS.md)
 
 ## Run locally
 
-Install Flutter with a compatible Dart SDK (`>=3.4.0 <4.0.0`), Python 3.11, Node.js 22 and FFmpeg. Android builds also need the Android SDK/NDK, JDK 17 and CMake 3.22.1.
+Install Flutter, Python 3.11, FFmpeg and Node.js 22 for YouTube source resolution. Android builds also need the Android SDK and NDK, JDK 17 and CMake 3.22.1.
 
-From the repository root, create a backend environment:
+From the repository root, prepare the API environment.
 
 ```sh
 cd ingestion/python_proxy
 python -m venv .venv
 ```
 
-Activate it with `.venv\Scripts\Activate.ps1` in PowerShell or `source .venv/bin/activate` in a POSIX shell, then start the API:
+Activate it with `.venv\Scripts\Activate.ps1` in PowerShell or `source .venv/bin/activate` in a POSIX shell. Then start the API from the same directory.
 
 ```sh
 python -m pip install -r requirements.txt
 python -m uvicorn api_app:app --host 127.0.0.1 --port 8000
 ```
 
-In a second terminal, from the repository root:
+In a second terminal, start the web client from the repository root.
 
 ```sh
 cd app
@@ -89,24 +53,12 @@ flutter pub get
 flutter run -d chrome --dart-define=AURALIS_PROXY_URL=http://127.0.0.1:8000 --dart-define=NEATIE_SAME_ORIGIN_API=false
 ```
 
-Guest browsing needs no Supabase configuration. For sign-in, set `SUPABASE_URL`/`SUPABASE_ANON_KEY` build defines, schema and callbacks: [authentication setup](supabase/README.md). See [operations](docs/handoff/OPERATIONS.md) for provider configuration. Keep credentials, cookies, runtime databases and downloads outside Git.
+Guest web browsing works without Supabase. For sign-in and cloud playlists, follow the [Supabase setup](supabase/README.md) and use public client build defines. The live web build enables playlist editing through `WEB_PLAYLIST_WRITES` and the installed playlist SQL. Keep private environment files, cookies, databases and downloaded media outside Git.
 
-The API starts an embedded recommendation scheduler by default. For a separate worker, run `python worker_main.py` from `ingestion/python_proxy/`, sharing `AURALIS_RUNTIME_DIR` with the API. Set `RECOMMENDATION_EXTERNAL_WORKER=1` in both processes and `RECOMMENDATION_ENABLE_SCHEDULER=0` in the API.
+For Android on Windows, use [`start_dev.ps1`](start_dev.ps1) with an emulator or configured device. See [operations](docs/handoff/OPERATIONS.md) for the standalone worker, providers and AWS configuration.
 
-Android on Windows: configure an emulator and run [`start_dev.ps1`](start_dev.ps1), which loads `.env` and starts backend/worker. See [Android releases](docs/ANDROID_RELEASE.md) for signed builds.
+## Checks and release process
 
-## Verification and contribution
-
-Run focused checks for the component you change:
-
-| Working directory | Command |
-| --- | --- |
-| `ingestion/python_proxy/` | `python -m pytest -q test_api_contracts.py test_lyrics_service.py` (install `pytest` and `httpx` first) |
-| `app/` | `flutter test` |
-| `app/` | `flutter build web --release` |
-
-Use focused feature-branch commits and integrate through `develop`; `main` promotion and deployment require separate review. The legacy deployment workflow requires explicit opt-in.
-
-Web diagnostics record startup, resume, queue-transition and API timings, failures and cache evidence. Performance claims require device measurements; fixtures/server timings alone cannot establish audible playback speed or reliability.
-
-See [known issues](docs/handoff/KNOWN_ISSUES.md) and [next steps](docs/handoff/NEXT_STEPS.md) for dated evidence and the task queue; [operations](docs/handoff/OPERATIONS.md) covers hosting, backups and rollback.
+- **Backend** — From `ingestion/python_proxy/`, install `pytest` and `httpx` in the active environment, then run focused tests such as `python -m pytest -q test_search_latency.py`.
+- **Flutter** — From `app/`, run `flutter test` and `flutter build web --release` for the affected client. Validate audible playback and background controls on target devices.
+- **Release** — Integrate feature branches through `develop` and review before promoting to `main`. Follow the [deployment guide](docs/PRODUCTION_DEPLOYMENT.md) and [live runbook](docs/handoff/OPERATIONS.md) for an AWS rollout.

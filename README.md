@@ -59,6 +59,7 @@ For Android on Windows, use [`start_dev.ps1`](start_dev.ps1) with an emulator or
 
 ## Checks and release process
 
+- **CI** — The [GitHub Actions workflow](.github/workflows/ci.yml) checks a focused set of backend API, Search, playback and Home contracts, plus Flutter unit and widget tests, scoped lint and formatting checks, and a web release build. It uses synthetic data and needs no production credentials. Physical-device playback and cross-device account flows have separate acceptance checks.
 - **Backend** — From `ingestion/python_proxy/`, install `pytest` and `httpx` in the active environment, then run focused tests such as `python -m pytest -q test_search_latency.py`.
-- **Flutter** — From `app/`, run `flutter test` and `flutter build web --release` for the affected client. Validate audible playback and background controls on target devices.
+- **Flutter** — From `app/`, run `flutter test test/catalog_detail_test.dart test/web_player_test.dart` for focused web regressions or `flutter build web --release` to build the app.
 - **Release** — Integrate feature branches through `develop` and review before promoting to `main`. Follow the [deployment guide](docs/PRODUCTION_DEPLOYMENT.md) and [live runbook](docs/handoff/OPERATIONS.md) for an AWS rollout.

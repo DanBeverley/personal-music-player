@@ -9,6 +9,7 @@ if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
 
 from auralis_backend.domain.catalog import (
+    catalog_artwork_source_urls,
     catalog_thumbnail_url,
     catalog_source_authority,
     catalog_artist_graph_keys,
@@ -31,6 +32,34 @@ from auralis_backend.domain.catalog import (
 
 
 class CatalogNormalizationTests(unittest.TestCase):
+    def test_track_artwork_skips_artist_portrait_when_cover_exists(self) -> None:
+        portrait = "https://example.test/artist.jpg"
+        cover = "https://example.test/album-cover.jpg"
+        persisted_track = {
+            "id": "track-one",
+            "title": "Track One",
+            "artist": "Artist One",
+            "artist_thumbnail": portrait,
+            "thumbnail": portrait,
+            "artwork_source_url": portrait,
+            "artwork_source_urls": [portrait],
+            "thumbnails": [{"url": cover}],
+        }
+
+        self.assertEqual(
+            catalog_artwork_source_urls(persisted_track, entity_type="track"),
+            [cover],
+        )
+        self.assertEqual(catalog_thumbnail_url(persisted_track, entity_type="track"), cover)
+        self.assertEqual(
+            catalog_artwork_source_urls(persisted_track, entity_type="album")[0],
+            portrait,
+        )
+        self.assertEqual(
+            catalog_artwork_source_urls(persisted_track, entity_type="artist")[0],
+            portrait,
+        )
+
     def test_entity_thumbnail_does_not_treat_album_id_as_video_id(self) -> None:
         album = normalized_album_payload(
             {

@@ -8,22 +8,23 @@ import json
 import time
 
 from ..storage.session_store import get_session_store
-from .model_runtime import get_collaborative_model
+from .model_runtime import get_collaborative_model, cached_profile_model
 from .taste_runtime import build_taste_profile
 
 
-_PROFILE_CACHE: Dict[str, Dict[str, Any]] = {}
 _PROFILE_LOCK = Lock()
-_PROFILE_STORE_PREFIX = "auralis:recommend:profile:"
+_PROFILE_EPOCH = 0
+_PROFILE_STORE_PREFIX = "auralis:recommend:profile:v2:"
 
 
 def _profile_store_key(profile_key: str) -> str:
-    return f"{_PROFILE_STORE_PREFIX}{profile_key}"
+    return f"{_PROFILE_STORE_PREFIX}{_PROFILE_EPOCH}:{profile_key}"
 
 
 def invalidate_profile_cache() -> None:
+    global _PROFILE_EPOCH
     with _PROFILE_LOCK:
-        _PROFILE_CACHE.clear()
+        _PROFILE_EPOCH += 1
 
 
 def build_profile_key(server: Any, req) -> str:
@@ -68,7 +69,8 @@ def _ttl_seconds(server: Any) -> int:
 
 
 def _with_runtime_meta(profile: Dict[str, Any], *, cache_hit: bool, source: str) -> Dict[str, Any]:
-    payload = deepcopy(profile)
+    model = (profile.get('collaborative') or {}).get('model')
+    payload = deepcopy(profile, {id(model): model} if isinstance(model, dict) else None)
     payload["profile_runtime"] = {
         "cache_hit": bool(cache_hit),
         "source": source,
@@ -81,25 +83,19 @@ def get_cached_profile(server: Any, profile_key: str) -> Optional[Dict[str, Any]
     normalized_key = server._recommendation_trim_text(profile_key)
     if not normalized_key:
         return None
-    now = time.time()
-    with _PROFILE_LOCK:
-        cached = _PROFILE_CACHE.get(normalized_key)
-        if cached and float(cached.get("expires_at") or 0.0) > now:
-            return _with_runtime_meta(
-                cached.get("profile") or {},
-                cache_hit=True,
-                source="memory",
-            )
     try:
         stored = get_session_store().get(_profile_store_key(normalized_key))
     except Exception:
         stored = None
     if isinstance(stored, dict):
-        with _PROFILE_LOCK:
-            _PROFILE_CACHE[normalized_key] = {
-                "profile": deepcopy(stored),
-                "expires_at": now + _ttl_seconds(server),
-            }
+        collaborative = stored.get('collaborative') or {}
+        if collaborative.get('model_ready'):
+            model = cached_profile_model(collaborative.get('model_id'), collaborative.get('source_signature'))
+            if model is None:
+                return None  # Recompute against a new model, never mix versions.
+            collaborative['model'] = model
+        stored['collaborative_profile'] = collaborative
+        stored['embedding_profile'] = stored.get('vectors') or {}
         return _with_runtime_meta(stored, cache_hit=True, source="session_store")
     return None
 
@@ -109,18 +105,17 @@ def store_cached_profile(server: Any, profile: Dict[str, Any]) -> Dict[str, Any]
     if not profile_key:
         return _with_runtime_meta(profile, cache_hit=False, source="computed")
     ttl_seconds = _ttl_seconds(server)
-    payload = deepcopy(profile)
-    payload.pop("profile_runtime", None)
-    with _PROFILE_LOCK:
-        _PROFILE_CACHE[profile_key] = {
-            "profile": deepcopy(payload),
-            "expires_at": time.time() + ttl_seconds,
-        }
+    # The existing session store owns TTL, eviction and its byte/entry bounds.
+    # Store aliases once and borrow the process model only when returning data.
+    payload = {key: value for key, value in profile.items()
+               if key not in {'profile_runtime', 'embedding_profile', 'collaborative_profile'}}
+    payload['collaborative'] = {key: value for key, value in (profile.get('collaborative') or {}).items()
+                                if key != 'model'}
     try:
         get_session_store().set(_profile_store_key(profile_key), payload, ttl_seconds)
     except Exception:
         pass
-    return _with_runtime_meta(payload, cache_hit=False, source="computed")
+    return _with_runtime_meta(profile, cache_hit=False, source="computed")
 
 
 def build_collaborative_profile(
@@ -438,164 +433,3 @@ def hydrate_state_profile(
         int((taste_profile.get("negative_feedback") or {}).get("count") or 0) > 0
     )
     return store_cached_profile(server, hydrated)
-
-
-def build_profile(server: Any, req) -> Dict[str, Any]:
-    profile_key = build_profile_key(server, req)
-    if not bool(getattr(req, "force_refresh", False)):
-        cached = get_cached_profile(server, profile_key)
-        if isinstance(cached, dict):
-            return cached
-
-    recent_track_snapshots = server._recommendation_unique_snapshot_tracks(
-        [*(req.last_played_tracks or []), *(req.recent_track_snapshots or [])],
-        16,
-    )
-    top_track_snapshots = server._recommendation_unique_snapshot_tracks(
-        req.top_track_snapshots,
-        16,
-    )
-    last_played_tracks = server._recommendation_unique_snapshot_tracks(
-        req.last_played_tracks,
-        12,
-    )
-    anchor_track_snapshots = server._recommendation_unique_snapshot_tracks(
-        req.anchor_track_snapshots,
-        8,
-    )
-
-    recent_track_ids = server._recommendation_unique_track_ids(
-        [
-            req.seed_id,
-            *(track.get("id") for track in recent_track_snapshots),
-            *(req.seed_ids or []),
-            *(req.recent_track_ids or []),
-        ],
-        16,
-    )
-    top_track_ids = server._recommendation_unique_track_ids(
-        [
-            *(track.get("id") for track in top_track_snapshots),
-            *(req.top_track_ids or []),
-            *(req.seed_ids or []),
-            req.seed_id,
-        ],
-        16,
-    )
-    recent_queries = server._recommendation_unique_strings(
-        [*(req.recent_queries or []), req.query, *(req.taste_queries or [])],
-        12,
-    )
-    anchor_artist_hints = server._recommendation_unique_strings(
-        [
-            *(req.anchor_artist_hints or []),
-            *(
-                track.get("channel")
-                for track in anchor_track_snapshots
-                if isinstance(track, dict) and track.get("channel")
-            ),
-        ],
-        8,
-    )
-    snapshot_artist_hints = [
-        track.get("channel")
-        for track in [
-            *anchor_track_snapshots,
-            *top_track_snapshots,
-            *recent_track_snapshots,
-            *last_played_tracks,
-        ]
-        if track.get("channel")
-    ]
-    snapshot_album_hints = [
-        track.get("album")
-        for track in [
-            *anchor_track_snapshots,
-            *top_track_snapshots,
-            *recent_track_snapshots,
-            *last_played_tracks,
-        ]
-        if track.get("album")
-    ]
-    artist_hints = server._recommendation_unique_strings(
-        [*anchor_artist_hints, *(req.artist_hints or []), *snapshot_artist_hints],
-        12,
-    )
-    album_hints = server._recommendation_unique_strings(
-        [*(req.album_hints or []), *snapshot_album_hints],
-        12,
-    )
-    playlist_names = server._recommendation_unique_strings(req.playlist_names, 12)
-    library_track_ids = server._recommendation_unique_track_ids(req.library_track_ids, 28)
-    offline_track_ids = server._recommendation_unique_track_ids(req.offline_track_ids, 28)
-
-    artist_weights = {}
-    for index, track in enumerate(top_track_snapshots):
-        artist_name = server._recommendation_trim_text(track.get("channel"))
-        if not artist_name:
-            continue
-        artist_weights[artist_name] = artist_weights.get(artist_name, 0.0) + max(
-            1.8 - (index * 0.14),
-            0.55,
-        )
-    for index, track in enumerate(recent_track_snapshots):
-        artist_name = server._recommendation_trim_text(track.get("channel"))
-        if not artist_name:
-            continue
-        artist_weights[artist_name] = artist_weights.get(artist_name, 0.0) + max(
-            1.25 - (index * 0.1),
-            0.35,
-        )
-    ranked_artist_names = [
-        item[0]
-        for item in sorted(
-            artist_weights.items(),
-            key=lambda item: item[1],
-            reverse=True,
-        )
-    ]
-
-    top_artist_names = (ranked_artist_names + artist_hints)[:6]
-    listened_artist_names = server._recommendation_unique_strings(
-        [*ranked_artist_names, *artist_hints],
-        12,
-    )
-    top_album_names = album_hints[:6]
-    repeat_intensity = min(1.0, len(top_track_ids) / 10.0)
-    novelty_tolerance = max(
-        0.25,
-        min(0.75, 0.38 + (len(recent_queries) * 0.04) + (len(artist_hints) * 0.02)),
-    )
-
-    profile = {
-        "profile_key": profile_key,
-        "user_scope_id": server._recommendation_trim_text(req.user_scope_id or "guest") or "guest",
-        "surface": server._recommendation_trim_text(req.surface or "home_feed") or "home_feed",
-        "recent_track_ids": recent_track_ids,
-        "top_track_ids": top_track_ids,
-        "recent_track_snapshots": recent_track_snapshots,
-        "top_track_snapshots": top_track_snapshots,
-        "anchor_track_snapshots": anchor_track_snapshots,
-        "last_played_tracks": last_played_tracks,
-        "recent_queries": recent_queries,
-        "taste_queries": server._recommendation_unique_strings(req.taste_queries, 12),
-        "anchor_artist_hints": anchor_artist_hints,
-        "artist_hints": artist_hints,
-        "album_hints": album_hints,
-        "playlist_names": playlist_names,
-        "library_track_ids": library_track_ids,
-        "offline_track_ids": offline_track_ids,
-        "top_artists": top_artist_names,
-        "listened_artists": listened_artist_names,
-        "top_albums": top_album_names,
-        "repeat_intensity": repeat_intensity,
-        "novelty_tolerance": novelty_tolerance,
-        "experiment_variant": server._recommendation_assignment_for_user(
-            server._recommendation_trim_text(req.user_scope_id or "guest") or "guest"
-        ),
-    }
-    return hydrate_state_profile(
-        server,
-        profile,
-        force_refresh=bool(getattr(req, "force_refresh", False)),
-    )

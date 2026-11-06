@@ -7,14 +7,18 @@ import server as server_runtime
 
 from auralis_backend.api import configure_router, router
 from auralis_backend.storage.postgres import ensure_backend_schema
+from auralis_backend.api.stream_core_runtime import start_playback_tools, stop_playback_tools
+from auralis_backend.api.stream_runtime import PlaybackTraceMiddleware, PLAYBACK_EXPOSE_HEADERS
 
 app = FastAPI(title="Auralis Python Proxy API", version="2.0")
+app.add_middleware(PlaybackTraceMiddleware, server=server_runtime)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=PLAYBACK_EXPOSE_HEADERS,
 )
 configure_router(server_runtime)
 app.include_router(router)
@@ -22,10 +26,12 @@ app.include_router(router)
 
 @app.on_event("startup")
 def startup() -> None:
+    start_playback_tools(server_runtime)
     ensure_backend_schema()
     server_runtime.startup_recommendation_runtime()
 
 
 @app.on_event("shutdown")
 def shutdown() -> None:
+    stop_playback_tools()
     server_runtime.shutdown_recommendation_runtime()

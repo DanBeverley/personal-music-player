@@ -8,7 +8,7 @@ from concurrent.futures import (
     as_completed,
     wait,
 )
-from threading import Event, Lock, Thread
+from threading import BoundedSemaphore, Event, Lock, Thread
 from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException, Request
@@ -25,10 +25,11 @@ import tempfile
 import time
 import traceback
 import uuid
+import urllib.parse
 
 import requests
 import yt_dlp
-from ytmusicapi import YTMusic
+from auralis_backend.search.upstream_runtime import CompatibleYTMusic as YTMusic
 
 from auralis_backend.contracts import (
     RecommendationInteractionEventRequest,
@@ -53,6 +54,8 @@ from auralis_backend.storage.cache_runtime import (
     stream_chunk_inflight,
     stream_chunk_inflight_lock,
     stream_chunk_lock,
+    stream_failure_cache,
+    stream_failure_lock,
     stream_info_cache,
     stream_info_inflight,
     stream_info_lock,
@@ -80,6 +83,7 @@ from auralis_backend.details.detail_runtime import (
     build_artist_details_payload as _detail_build_artist_details_payload,
     build_track_details_payload as _detail_build_track_details_payload,
 )
+from auralis_backend.domain.catalog import catalog_thumbnail_url
 import auralis_backend.assistant_core_runtime as _assistant_core_runtime
 import auralis_backend.assistant_tool_runtime as _assistant_tool_runtime
 from auralis_backend.recommend import (
@@ -96,55 +100,10 @@ try:
     from auralis_backend.domain.ranking import (
         HOME_GLOBAL_DEFAULT_WEIGHTS,
         defaults_for_model as _ranking_defaults_for_model,
-        SEARCH_ALBUM_DEFAULT_WEIGHTS,
-        SEARCH_ARTIST_DEFAULT_WEIGHTS,
-        SEARCH_TRACK_DEFAULT_WEIGHTS,
         model_version as _ranking_model_version,
         score_features as _ranking_score_features,
     )
 except Exception:
-    SEARCH_TRACK_DEFAULT_WEIGHTS = {
-        "source_score": 0.34,
-        "retrieval_votes": 0.58,
-        "lexical": 0.74,
-        "title_lexical": 0.48,
-        "query_similarity": 8.0,
-        "semantic_query_similarity": 6.0,
-        "context_similarity": 2.5,
-        "taste_similarity": 1.4,
-        "artist_similarity": 2.0,
-        "short_similarity": 0.9,
-        "long_similarity": 0.5,
-        "collab_latent": 5.1,
-        "collab_neighbor": 0.9,
-        "collab_artist": 0.2,
-        "anchor_artist_match": 1.4,
-        "popularity": 0.25,
-    }
-    SEARCH_ARTIST_DEFAULT_WEIGHTS = {
-        "source_score": 0.35,
-        "retrieval_votes": 0.62,
-        "lexical": 0.54,
-        "query_similarity": 5.4,
-        "semantic_query_similarity": 4.4,
-        "context_similarity": 1.8,
-        "taste_similarity": 1.1,
-        "artist_similarity": 2.6,
-        "anchor_artist_similarity": 5.8,
-        "anchor_track_similarity": 3.4,
-        "collab_artist": 0.34,
-    }
-    SEARCH_ALBUM_DEFAULT_WEIGHTS = {
-        "source_score": 0.3,
-        "retrieval_votes": 0.55,
-        "lexical": 0.6,
-        "query_similarity": 7.6,
-        "semantic_query_similarity": 4.2,
-        "context_similarity": 1.9,
-        "taste_similarity": 1.25,
-        "artist_similarity": 1.6,
-        "collab_artist": 0.2,
-    }
     HOME_GLOBAL_DEFAULT_WEIGHTS = {
         "source_score": 0.36,
         "source_votes": 0.68,
@@ -234,27 +193,6 @@ except Exception:
     def _pg_list_rollout_events(*, model_key: str = "", limit: int = 50):
         return []
 
-try:
-    from auralis_backend.recommend.precompute import (
-        invalidate_user as _nearline_invalidate_user,
-        invalidate_user_query as _nearline_invalidate_user_query,
-        run_precompute_cycle as _nearline_run_precompute_cycle,
-        runtime_snapshot as _nearline_runtime_snapshot,
-    )
-except Exception:
-    def _nearline_invalidate_user(user_scope_id: str) -> None:
-        return
-
-    def _nearline_invalidate_user_query(user_scope_id: str, query: str) -> None:
-        return
-
-    def _nearline_run_precompute_cycle(*, server=None, force: bool = False) -> Dict[str, Any]:
-        return {"enabled": False, "reason": "nearline_precompute_unavailable"}
-
-    def _nearline_runtime_snapshot() -> Dict[str, Any]:
-        return {"enabled": False}
-
-
 def _bind_server(fn):
     def _wrapped(*args, **kwargs):
         return fn(sys.modules[__name__], *args, **kwargs)
@@ -262,16 +200,30 @@ def _bind_server(fn):
     return _wrapped
 
 def extract_thumbnail(data):
-    if not data: return None
-    video_id = data.get("videoId") or data.get("video_id") or data.get("id")
-    if video_id:
-        return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+    if not isinstance(data, dict): return None
     thumbs = data.get("thumbnails") or data.get("thumbnail")
-    if isinstance(thumbs, list) and len(thumbs) > 0:
-        return thumbs[-1].get("url")
-    elif isinstance(thumbs, dict):
-        return thumbs.get("url")
+    if isinstance(thumbs, str) and thumbs.strip():
+        return thumbs.strip()
+    if isinstance(thumbs, dict):
+        thumbs = [thumbs]
+    if isinstance(thumbs, list):
+        candidates = [item for item in thumbs if isinstance(item, dict) and item.get('url')]
+        if candidates:
+            def size(item):
+                try:
+                    return int(item.get('width') or 0) * int(item.get('height') or 0)
+                except (TypeError, ValueError):
+                    return 0
+            return max(reversed(candidates), key=size)['url']
+    # Browse/artist/album IDs are not video IDs. Only explicit video identity
+    # (or a typed track with a valid legacy ID) may use YouTube's fallback.
+    video_id = data.get('videoId') or data.get('video_id')
+    if not video_id and data.get('resultType') in {'song', 'video'}:
+        video_id = data.get('id')
+    if isinstance(video_id, str) and re.fullmatch(r'[A-Za-z0-9_-]{11}', video_id):
+        return f'https://i.ytimg.com/vi/{video_id}/hqdefault.jpg'
     return None
+
 
 def extract_artist(data):
     if not data: return "Unknown Artist"
@@ -387,7 +339,7 @@ def extract_album_info(data):
         if title:
             return {"id": album_id, "title": title}
     elif isinstance(album, str) and album.strip():
-        return {"id": None, "title": album.strip()}
+        return {"id": data.get("album_id") or data.get("albumId"), "title": album.strip()}
 
     albums = data.get("albums")
     if isinstance(albums, list) and albums:
@@ -416,7 +368,7 @@ def normalize_album_results(raw_results):
             "id": browse_id,
             "title": entry.get("title"),
             "artist": extract_artist(entry),
-            "thumbnail": extract_thumbnail(entry),
+            "thumbnail": catalog_thumbnail_url(entry, entity_type="album"),
             "year": entry.get("year") or "",
             "track_count": entry.get("trackCount") or entry.get("track_count") or 0,
         })
@@ -444,7 +396,8 @@ def normalize_artist_results(raw_results):
             {
                 "id": browse_id,
                 "name": name,
-                "thumbnail": extract_thumbnail(entry),
+                "thumbnail": catalog_thumbnail_url(entry, entity_type="artist"),
+                "subscribers": entry.get("subscribers") or "",
                 "description": (
                     entry.get("subscribers")
                     or entry.get("description")
@@ -460,6 +413,8 @@ def _normalize_artist_song_entries(raw_results, fallback_artist: str = ""):
     songs = []
     seen = set()
     for entry in raw_results or []:
+        if not isinstance(entry, dict) or entry.get("isAvailable") is False:
+            continue
         normalized = _normalize_song_result(entry)
         if not normalized:
             continue
@@ -477,18 +432,25 @@ def _normalize_artist_album_entries(raw_results, fallback_artist: str = ""):
     albums = []
     seen = set()
     for entry in raw_results or []:
+        if not isinstance(entry, dict):
+            continue
         browse_id = entry.get("browseId") or entry.get("id")
         title = entry.get("title") or entry.get("name")
         if not browse_id or not title or browse_id in seen:
             continue
         seen.add(browse_id)
+        entry_artist = extract_artist(entry)
         albums.append(
             {
                 "id": browse_id,
                 "title": title,
-                "artist": extract_artist(entry) or fallback_artist,
+                "artist": fallback_artist
+                if _normalize_text(entry_artist) == "unknown artist"
+                else entry_artist,
                 "thumbnail": extract_thumbnail(entry),
-                "year": entry.get("year") or "",
+                "year": next((str(value) for value in (entry.get("year"), entry.get("type"))
+                              if re.fullmatch(r"\d{4}", str(value))), ""),
+                "release_date": entry.get("release_date") or entry.get("releaseDate") or "",
                 "track_count": entry.get("trackCount") or entry.get("track_count") or 0,
             }
         )
@@ -721,11 +683,17 @@ def _rank_artist_detail_related_artists(
     return ranked[:12]
 
 
-def _build_artist_details_payload(artist_id: str, *, enrich_related: bool = True):
+def _build_artist_details_payload(
+    artist_id: str,
+    *,
+    enrich_related: bool = True,
+    lightweight: bool = False,
+):
     return _detail_build_artist_details_payload(
         sys.modules[__name__],
         artist_id,
         enrich_related=enrich_related,
+        lightweight=lightweight,
     )
 
 def _recommended_artist_anchor_penalty(anchor_names, candidate_name: str) -> float:
@@ -1195,7 +1163,11 @@ def normalize_recommendation_track(data):
         or "Unknown Track"
     )
     artist = extract_artist(data)
-    return {
+    # Keep provider/canonical evidence attached. Recommendation acquisition
+    # normalizes more than once; returning only display fields here previously
+    # erased the authority used by home admission and dropped every lane result.
+    normalized = dict(data)
+    normalized.update({
         "id": video_id,
         "title": title,
         "duration": parse_duration_seconds(
@@ -1209,7 +1181,8 @@ def normalize_recommendation_track(data):
         "channel": artist,
         "album": album_info.get("title"),
         "album_id": album_info.get("id"),
-    }
+    })
+    return normalized
 
 def _normalize_text(value: Optional[str]) -> str:
     return re.sub(r"\s+", " ", (value or "").strip().lower())
@@ -1234,6 +1207,7 @@ def _call_ollama_chat(
     temperature=0.2,
     timeout_seconds=None,
     model_override=None,
+    max_output_tokens=None,
 ):
     payload = {
         "model": (model_override or OLLAMA_MODEL),
@@ -1241,17 +1215,30 @@ def _call_ollama_chat(
         "stream": False,
         "options": {"temperature": temperature},
     }
+    direct_cloud = urllib.parse.urlsplit(OLLAMA_BASE_URL).hostname in {'ollama.com', 'api.ollama.com'}
+    if direct_cloud:
+        # The direct API uses model names without the local daemon's cloud alias.
+        payload['model'] = re.sub(r'(?::cloud|-cloud)$', '', payload['model'])
     if OLLAMA_KEEP_ALIVE:
         payload["keep_alive"] = OLLAMA_KEEP_ALIVE
     if schema is not None:
-        payload["format"] = schema
+        # Cloud supports chat but not the native structured-output format.
+        # Keep one call and validate the requested JSON in the existing parser.
+        cloud = direct_cloud or ':cloud' in payload['model'] or '-cloud' in payload['model']
+        if cloud:
+            payload['messages'] = [*messages, {'role':'system','content':
+                'Return only JSON matching this schema: '+json.dumps(schema)}]
+        else:
+            payload["format"] = schema
+    if max_output_tokens is not None:
+        payload['options']['num_predict'] = min(1200,max(64,int(max_output_tokens)))
 
     response = ollama_http.post(
         f"{OLLAMA_BASE_URL}/chat",
         headers=_ollama_headers(),
         json=payload,
         timeout=(
-            OLLAMA_CONNECT_TIMEOUT_SECONDS,
+            min(3,OLLAMA_CONNECT_TIMEOUT_SECONDS) if max_output_tokens is not None else OLLAMA_CONNECT_TIMEOUT_SECONDS,
             timeout_seconds or OLLAMA_READ_TIMEOUT_SECONDS,
         ),
     )
@@ -1302,6 +1289,7 @@ def _call_ollama_structured(
     max_attempts=3,
     timeout_seconds=None,
     model_override=None,
+    max_output_tokens=None,
 ):
     last_error = None
     for attempt in range(max_attempts):
@@ -1323,6 +1311,7 @@ def _call_ollama_structured(
             temperature=temperature,
             timeout_seconds=timeout_seconds,
             model_override=model_override,
+            **({'max_output_tokens':max_output_tokens} if max_output_tokens is not None else {}),
         )
         try:
             parsed = _extract_json_from_llm_text(raw)
@@ -1488,15 +1477,29 @@ def _executor_call_with_retry(
     backoff_seconds: float = 0.12,
     timeout_seconds: float | None = None,
     default=None,
+    admission=None,
+    admission_wait_seconds: float = 0,
 ):
     for attempt in range(max(1, int(attempts or 1))):
         future = None
+        if admission is not None and not admission.acquire(timeout=max(0, admission_wait_seconds)):
+            return default
         try:
             future = executor.submit(fn)
+            if admission is not None:
+                future.add_done_callback(lambda _future: admission.release())
             if timeout_seconds is None:
                 return future.result()
             return future.result(timeout=max(0.05, float(timeout_seconds)))
+        except FutureTimeoutError:
+            if future is not None:
+                future.cancel()
+            # Cancellation cannot stop a running HTTP call. Keep its slot
+            # until completion and never overlap it with another attempt.
+            return default
         except Exception:
+            if future is None and admission is not None:
+                admission.release()
             if future is not None:
                 future.cancel()
             if attempt + 1 >= max(1, int(attempts or 1)):
@@ -1508,10 +1511,11 @@ def _executor_call_with_retry(
 def _search_upstream_call_with_retry(
     fn,
     *,
-    attempts: int = 2,
+    attempts: int = 1,
     backoff_seconds: float = 0.12,
     timeout_seconds: float | None = None,
     default=None,
+    admission_wait_seconds: float = 0,
 ):
     return _executor_call_with_retry(
         fn,
@@ -1520,6 +1524,8 @@ def _search_upstream_call_with_retry(
         backoff_seconds=backoff_seconds,
         timeout_seconds=timeout_seconds or SEARCH_UPSTREAM_TIMEOUT_SECONDS,
         default=default,
+        admission=search_upstream_admission,
+        admission_wait_seconds=admission_wait_seconds,
     )
 
 
@@ -1536,7 +1542,7 @@ def _recommendation_worker_runtime_unhealthy() -> bool:
         return True
     worker_status = str(runtime.get("worker_status") or "").strip().lower()
     last_heartbeat_at = float(runtime.get("worker_last_heartbeat_at") or 0.0)
-    if worker_status != "running" or last_heartbeat_at <= 0:
+    if worker_status not in {"running", "idle"} or last_heartbeat_at <= 0:
         return True
     heartbeat_age_seconds = max(0.0, time.time() - last_heartbeat_at)
     max_heartbeat_age_seconds = max(
@@ -1565,12 +1571,21 @@ def _start_recommendation_bootstrap_thread() -> bool:
 
 def startup_recommendation_runtime():
     _recommendation_init_store_db()
+    from auralis_backend.recommend.workload import initialize_demand
+    initialize_demand(sys.modules[__name__])
+    from auralis_backend.recommend.feature_store import prune_hot_runtime_caches
+    from auralis_backend.storage.cache_runtime import prune_expired_runtime_caches
+    def maintain_caches():
+        while not recommendation_scheduler_stop.wait(60):
+            prune_hot_runtime_caches()
+            prune_expired_runtime_caches()
+    Thread(target=maintain_caches, name="feature-cache-expiry", daemon=True).start()
     if RECOMMENDATION_ENABLE_SCHEDULER and not RECOMMENDATION_EXTERNAL_WORKER:
         _recommendation_start_scheduler()
         return
     if RECOMMENDATION_EXTERNAL_WORKER:
-        if _recommendation_worker_runtime_unhealthy():
-            _start_recommendation_bootstrap_thread()
+        # The dedicated worker owns training. A starting/idle/unavailable worker
+        # must not make every API process start another trainer.
         return
     _start_recommendation_bootstrap_thread()
 
@@ -1581,11 +1596,40 @@ DOWNLOAD_DIR = os.path.join(os.getcwd(), "downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 ytmusic = YTMusic()
 STREAM_INFO_TTL_SECONDS = 21600
+STREAM_FAILURE_COOLDOWN_SECONDS = int(os.environ.get("STREAM_FAILURE_COOLDOWN_SECONDS", "900"))
+AURALIS_YTDLP_COOKIES_PATH = os.environ.get("AURALIS_YTDLP_COOKIES_PATH", "").strip()
+AURALIS_YTDLP_JS_RUNTIME = os.environ.get("AURALIS_YTDLP_JS_RUNTIME", "node").strip()
+AURALIS_YTDLP_JS_RUNTIME_PATH = os.environ.get("AURALIS_YTDLP_JS_RUNTIME_PATH", "").strip()
+AURALIS_YTDLP_PO_PROVIDER_URL = os.environ.get(
+    "AURALIS_YTDLP_PO_PROVIDER_URL",
+    "",
+).strip()
+AURALIS_STREAM_CACHE_BACKEND = os.environ.get("AURALIS_STREAM_CACHE_BACKEND", "none").strip().lower()
+AURALIS_STREAM_CACHE_BUCKET = os.environ.get("AURALIS_STREAM_CACHE_BUCKET", "").strip()
+AURALIS_STREAM_CACHE_PREFIX = os.environ.get("AURALIS_STREAM_CACHE_PREFIX", "streams").strip()
+AURALIS_STREAM_CACHE_MIN_BYTES = int(os.environ.get("AURALIS_STREAM_CACHE_MIN_BYTES", "65536"))
+AURALIS_STREAM_CACHE_MAX_BYTES = int(os.environ.get("AURALIS_STREAM_CACHE_MAX_BYTES", str(80 * 1024 * 1024)))
+AURALIS_STREAM_CACHE_TMP_DIR = os.environ.get("AURALIS_STREAM_CACHE_TMP_DIR", "").strip()
+STREAM_CACHE_HEAD_HIT_TTL_SECONDS = int(
+    os.environ.get("STREAM_CACHE_HEAD_HIT_TTL_SECONDS", "45")
+)
+STREAM_CACHE_HEAD_MISS_TTL_SECONDS = int(
+    os.environ.get("STREAM_CACHE_HEAD_MISS_TTL_SECONDS", "8")
+)
+AURALIS_R2_ACCOUNT_ID = os.environ.get("AURALIS_R2_ACCOUNT_ID", "").strip()
+AURALIS_R2_ACCESS_KEY_ID = os.environ.get("AURALIS_R2_ACCESS_KEY_ID", "").strip()
+AURALIS_R2_SECRET_ACCESS_KEY = os.environ.get("AURALIS_R2_SECRET_ACCESS_KEY", "").strip()
+AURALIS_R2_ENDPOINT_URL = os.environ.get("AURALIS_R2_ENDPOINT_URL", "").strip()
 STREAM_WARM_CHUNK_BYTES = int(os.environ.get("STREAM_WARM_CHUNK_BYTES", "786432"))
 STREAM_CHUNK_TTL_SECONDS = 1800
 STREAM_WARM_WORKERS = int(os.environ.get("STREAM_WARM_WORKERS", "8"))
 PREPARE_SESSION_WORKERS = int(os.environ.get("PREPARE_SESSION_WORKERS", "4"))
+if "AURALIS_STREAM_PREWARM_CONCURRENCY" in os.environ:
+    PREPARE_SESSION_WORKERS = int(os.environ.get("AURALIS_STREAM_PREWARM_CONCURRENCY") or PREPARE_SESSION_WORKERS)
 PREPARE_SESSION_MAX_LOOKAHEAD = int(os.environ.get("PREPARE_SESSION_MAX_LOOKAHEAD", "18"))
+PREPARE_BACKGROUND_MAX_LOOKAHEAD = int(
+    os.environ.get("PREPARE_BACKGROUND_MAX_LOOKAHEAD", "3")
+)
 RECOMMENDATION_CACHE_TTL_SECONDS = int(os.environ.get("RECOMMENDATION_CACHE_TTL_SECONDS", "180"))
 RECOMMENDATION_FEED_SESSION_TTL_SECONDS = int(os.environ.get("RECOMMENDATION_FEED_SESSION_TTL_SECONDS", "900"))
 RECOMMENDATION_PROFILE_CACHE_TTL_SECONDS = int(os.environ.get("RECOMMENDATION_PROFILE_CACHE_TTL_SECONDS", "300"))
@@ -1670,7 +1714,7 @@ UPSTREAM_RETRY_BACKOFF_SECONDS = float(
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434/api").rstrip("/")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "minimax-m2.7:cloud")
 OLLAMA_THINKING_MODEL = os.environ.get("OLLAMA_THINKING_MODEL", OLLAMA_MODEL).strip() or OLLAMA_MODEL
-OLLAMA_FAST_MODEL = os.environ.get("OLLAMA_FAST_MODEL", "rnj-1:8b-cloud").strip() or "rnj-1:8b-cloud"
+OLLAMA_FAST_MODEL = os.environ.get("OLLAMA_FAST_MODEL", OLLAMA_MODEL if urllib.parse.urlsplit(OLLAMA_BASE_URL).hostname in {'ollama.com', 'api.ollama.com'} else "rnj-1:8b-cloud").strip() or OLLAMA_MODEL
 OLLAMA_PLANNER_MODEL = os.environ.get("OLLAMA_PLANNER_MODEL", OLLAMA_FAST_MODEL).strip() or OLLAMA_FAST_MODEL
 OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "").strip()
 OLLAMA_EMBED_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", OLLAMA_MODEL).strip()
@@ -1720,6 +1764,9 @@ RECOMMENDATION_STORE_DB_PATH = _server_runtime_path(
 RECOMMENDATION_MODEL_CACHE_TTL_SECONDS = int(
     os.environ.get("RECOMMENDATION_MODEL_CACHE_TTL_SECONDS", "180")
 )
+NEATIE_BACKGROUND_IDLE = os.environ.get("NEATIE_BACKGROUND_IDLE", "0").lower() in {"1", "true", "yes"}
+NEATIE_BACKGROUND_IDLE_SECONDS = int(os.environ.get("NEATIE_BACKGROUND_IDLE_SECONDS", "1800"))
+RECOMMENDATION_MODEL_MAX_AGE_SECONDS = int(os.environ.get("RECOMMENDATION_MODEL_MAX_AGE_SECONDS", "21600"))
 RECOMMENDATION_MODEL_STALE_REFRESH_ENABLED = os.environ.get(
     "RECOMMENDATION_MODEL_STALE_REFRESH_ENABLED",
     "1",
@@ -1848,6 +1895,7 @@ recommendation_executor = ThreadPoolExecutor(
 precompute_executor = ThreadPoolExecutor(max_workers=PRECOMPUTE_EXECUTOR_WORKERS)
 search_executor = ThreadPoolExecutor(max_workers=SEARCH_EXECUTOR_WORKERS)
 search_upstream_executor = ThreadPoolExecutor(max_workers=SEARCH_UPSTREAM_WORKERS)
+search_upstream_admission = BoundedSemaphore(SEARCH_UPSTREAM_WORKERS)
 recommendation_row_executor = ThreadPoolExecutor(
     max_workers=RECOMMENDATION_ROW_BUILD_WORKERS
 )
@@ -2115,46 +2163,6 @@ def recommendation_search_interaction(req: RecommendationSearchEventRequest):
     return search_interaction(sys.modules[__name__], req)
 
 
-def _fallback_home_candidates(limit: int):
-    cached = _cache_lookup_home_candidates(limit)
-    if cached:
-        return cached
-
-    results = []
-    try:
-        home_feed = ytmusic.get_home(limit=limit)
-    except Exception:
-        home_feed = []
-
-    for carousel in home_feed:
-        for item in carousel.get("contents", []):
-            track = normalize_recommendation_track(item)
-            if track is None:
-                continue
-            results.append((track, 1.0))
-            if len(results) >= limit + 10:
-                return results
-
-    if len(results) < 5:
-        try:
-            backup = ytmusic.search("trending hit songs", filter="songs", limit=limit)
-        except Exception:
-            backup = []
-        for entry in backup:
-            track = normalize_recommendation_track(entry)
-            if track is None:
-                continue
-            results.append((track, 0.7))
-            if len(results) >= limit + 10:
-                break
-
-    if results:
-        _cache_store_home_candidates(
-            results,
-            ttl_seconds=RECOMMENDATION_CACHE_TTL_SECONDS,
-            limit=limit,
-        )
-    return results
 _recommendation_trim_text = _recommendation_helper_runtime._recommendation_trim_text
 
 _recommendation_unique_strings = _recommendation_helper_runtime._recommendation_unique_strings

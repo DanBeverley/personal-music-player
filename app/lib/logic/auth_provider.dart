@@ -42,7 +42,7 @@ String? get currentAuthenticatedUserId =>
 String? get rememberedStorageScopeId => _rememberedStorageScopeId;
 
 String get activeStorageScopeId => _sanitizeScopeSegment(
-      currentAuthenticatedUserId ?? 'guest',
+      currentAuthenticatedUserId ?? _rememberedStorageScopeId ?? 'guest',
     );
 
 Future<void> initSupabase() async {
@@ -315,6 +315,7 @@ class AppAuthState {
   final User? user;
   final String? rememberedScopeId;
   final bool isBusy;
+  final bool isRedirectSettling;
   final String? error;
 
   const AppAuthState({
@@ -324,16 +325,19 @@ class AppAuthState {
     this.user,
     this.rememberedScopeId,
     this.isBusy = false,
+    this.isRedirectSettling = false,
     this.error,
   });
 
   bool get isAuthenticated => user != null;
   bool get isRestoring => isConfigured && !isInitialized;
+  bool get isAuthRedirectSettling =>
+      isConfigured && isRedirectSettling && !isAuthenticated;
   bool get hasRememberedScope =>
       rememberedScopeId?.trim().isNotEmpty == true;
   bool get canUseApp => user != null || !isConfigured;
   bool get requiresAuthGate => isConfigured && isInitialized && !canUseApp;
-  String get storageScopeId => user?.id ?? 'guest';
+  String get storageScopeId => user?.id ?? rememberedScopeId ?? 'guest';
 
   AppAuthState copyWith({
     bool? isConfigured,
@@ -342,6 +346,7 @@ class AppAuthState {
     Object? user = _authStateUnset,
     Object? rememberedScopeId = _authStateUnset,
     bool? isBusy,
+    bool? isRedirectSettling,
     Object? error = _authStateUnset,
     bool clearError = false,
   }) {
@@ -356,6 +361,7 @@ class AppAuthState {
           ? this.rememberedScopeId
           : rememberedScopeId as String?,
       isBusy: isBusy ?? this.isBusy,
+      isRedirectSettling: isRedirectSettling ?? this.isRedirectSettling,
       error: clearError
           ? null
           : identical(error, _authStateUnset)
@@ -368,6 +374,7 @@ class AppAuthState {
 class AuthNotifier extends StateNotifier<AppAuthState> {
   final Ref ref;
   StreamSubscription<AuthState>? _authSubscription;
+  Timer? _redirectSettleTimer;
   bool _sawInitialAuthSignal = false;
 
   AuthNotifier(this.ref)
@@ -388,9 +395,21 @@ class AuthNotifier extends StateNotifier<AppAuthState> {
 
     _authSubscription = client.auth.onAuthStateChange.listen((authState) {
       _sawInitialAuthSignal = true;
-      final user = authState.session?.user;
+      final explicitlySignedOut =
+          authState.event == AuthChangeEvent.signedOut &&
+              client.auth.currentSession == null &&
+              client.auth.currentUser == null;
+      final session = explicitlySignedOut
+          ? null
+          : authState.session ?? client.auth.currentSession ?? state.session;
+      final user = explicitlySignedOut
+          ? null
+          : session?.user ?? client.auth.currentUser ?? state.user;
       if (user != null) {
         unawaited(_rememberStorageScope(user.id));
+      }
+      if (user != null || explicitlySignedOut) {
+        _clearRedirectSettling(reason: 'auth_event');
       }
       final rememberedScope = user?.id ?? state.rememberedScopeId;
       debugPrint(
@@ -398,11 +417,13 @@ class AuthNotifier extends StateNotifier<AppAuthState> {
         'remembered=${rememberedScope ?? ''}',
       );
       state = state.copyWith(
-        session: authState.session,
+        session: session,
         user: user,
         rememberedScopeId: rememberedScope,
-        isInitialized: user != null ? true : state.isInitialized,
+        isInitialized:
+            user != null || explicitlySignedOut ? true : state.isInitialized,
         isBusy: false,
+        isRedirectSettling: false,
         clearError: true,
       );
       if (user != null) {
@@ -410,6 +431,48 @@ class AuthNotifier extends StateNotifier<AppAuthState> {
       }
     });
     unawaited(_restoreInitialSession(client));
+    _scheduleSessionReconciliation(client);
+  }
+
+  void _scheduleSessionReconciliation(SupabaseClient client) {
+    for (final delay in const <Duration>[
+      Duration(milliseconds: 600),
+      Duration(seconds: 2),
+      Duration(seconds: 5),
+    ]) {
+      unawaited(
+        Future<void>.delayed(delay)
+            .then((_) => _syncCurrentSession(client, reason: 'delayed_check')),
+      );
+    }
+  }
+
+  Future<void> _syncCurrentSession(
+    SupabaseClient client, {
+    required String reason,
+  }) async {
+    if (!mounted) return;
+    final session = client.auth.currentSession;
+    final user = client.auth.currentUser ?? session?.user;
+    if (user == null) return;
+    _clearRedirectSettling(reason: reason);
+    if (state.user?.id == user.id && state.isInitialized && !state.isBusy) {
+      return;
+    }
+    unawaited(_rememberStorageScope(user.id));
+    state = state.copyWith(
+      session: session ?? state.session,
+      user: user,
+      rememberedScopeId: user.id,
+      isInitialized: true,
+      isBusy: false,
+      isRedirectSettling: false,
+      clearError: true,
+    );
+    debugPrint(
+      '[EBB:auth] session reconciled reason=$reason user=${user.id}',
+    );
+    unawaited(_handleSignedInUser(user));
   }
 
   Future<void> _restoreInitialSession(SupabaseClient client) async {
@@ -432,6 +495,7 @@ class AuthNotifier extends StateNotifier<AppAuthState> {
     final rememberedScope = user?.id ?? state.rememberedScopeId;
     if (user != null) {
       unawaited(_rememberStorageScope(user.id));
+      _clearRedirectSettling(reason: 'restore_initial_session');
     }
     state = state.copyWith(
       isInitialized: true,
@@ -439,11 +503,13 @@ class AuthNotifier extends StateNotifier<AppAuthState> {
       user: user,
       rememberedScopeId: rememberedScope,
       isBusy: false,
+      isRedirectSettling: false,
       clearError: true,
     );
     if (user != null) {
       unawaited(_handleSignedInUser(user));
     }
+    unawaited(_syncCurrentSession(client, reason: 'restore_followup'));
     debugPrint(
       '[EBB:auth] restore complete user=${user?.id ?? ''} '
       'remembered=${state.rememberedScopeId ?? ''} '
@@ -492,41 +558,199 @@ class AuthNotifier extends StateNotifier<AppAuthState> {
   Future<void> signInWithOAuth(OAuthProvider provider) async {
     final client = supabaseClientOrNull;
     if (client == null) return;
-    state = state.copyWith(isBusy: true, clearError: true);
+    final activeSession = client.auth.currentSession;
+    final activeUser = client.auth.currentUser ?? activeSession?.user;
+    if (activeUser != null || state.canUseApp) {
+      debugPrint(
+        '[EBB:auth] oauth_ignored provider=$provider reason=already_authenticated',
+      );
+      _clearRedirectSettling(reason: 'already_authenticated');
+      if (activeUser != null && state.user?.id != activeUser.id) {
+        state = state.copyWith(
+          session: activeSession ?? state.session,
+          user: activeUser,
+          rememberedScopeId: activeUser.id,
+          isInitialized: true,
+          isBusy: false,
+          isRedirectSettling: false,
+          clearError: true,
+        );
+      }
+      return;
+    }
+    if (state.isBusy || state.isRedirectSettling) {
+      debugPrint(
+        '[EBB:auth] oauth_ignored provider=$provider reason=redirect_inflight',
+      );
+      return;
+    }
+    _beginRedirectSettling(provider.name);
+    state = state.copyWith(
+      isBusy: true,
+      isRedirectSettling: true,
+      clearError: true,
+    );
     try {
       await client.auth.signInWithOAuth(
         provider,
         redirectTo: kIsWeb ? null : supabaseRedirectUrl,
       );
     } catch (error) {
+      _clearRedirectSettling(reason: 'oauth_error');
       state = state.copyWith(
         isBusy: false,
+        isRedirectSettling: false,
         error: error.toString(),
       );
     }
+  }
+
+  void _beginRedirectSettling(String provider) {
+    _redirectSettleTimer?.cancel();
+    debugPrint('[EBB:auth] redirect_start provider=$provider');
+    _redirectSettleTimer = Timer(const Duration(seconds: 25), () {
+      if (!mounted || state.isAuthenticated) return;
+      debugPrint('[EBB:auth] redirect_timeout');
+      state = state.copyWith(
+        isBusy: false,
+        isRedirectSettling: false,
+        error: 'Sign-in is taking longer than expected. Please try again.',
+      );
+    });
+  }
+
+  void _clearRedirectSettling({required String reason}) {
+    if (_redirectSettleTimer == null && !state.isRedirectSettling) return;
+    _redirectSettleTimer?.cancel();
+    _redirectSettleTimer = null;
+    debugPrint('[EBB:auth] redirect_resolved reason=$reason');
   }
 
   Future<void> signInWithGoogle() => signInWithOAuth(OAuthProvider.google);
 
   Future<void> signInWithGitHub() => signInWithOAuth(OAuthProvider.github);
 
-  Future<void> sendMagicLink(String email) async {
+  void clearError() {
+    if (state.error == null) return;
+    state = state.copyWith(clearError: true);
+  }
+
+  Future<void> signInWithPassword(String email, String password) async {
     final client = supabaseClientOrNull;
     if (client == null) return;
+    final normalizedEmail = email.trim();
+    if (normalizedEmail.isEmpty || password.isEmpty) {
+      state = state.copyWith(
+        isBusy: false,
+        error: 'Enter your email address and password.',
+      );
+      return;
+    }
     state = state.copyWith(isBusy: true, clearError: true);
     try {
-      await client.auth.signInWithOtp(
-        email: email,
+      await client.auth.signInWithPassword(
+        email: normalizedEmail,
+        password: password,
+      );
+      state = state.copyWith(isBusy: false, clearError: true);
+    } catch (error) {
+      state = state.copyWith(
+        isBusy: false,
+        error: _friendlyAuthError(error),
+      );
+    }
+  }
+
+  Future<void> signUpWithPassword({
+    required String fullName,
+    required String email,
+    required String password,
+    required String confirmPassword,
+  }) async {
+    final client = supabaseClientOrNull;
+    if (client == null) return;
+    final normalizedName = fullName.trim();
+    final normalizedEmail = email.trim();
+    if (normalizedName.isEmpty || normalizedEmail.isEmpty || password.isEmpty) {
+      state = state.copyWith(
+        isBusy: false,
+        error: 'Enter your name, email address, and password.',
+      );
+      return;
+    }
+    if (password != confirmPassword) {
+      state = state.copyWith(
+        isBusy: false,
+        error: 'Your passwords do not match.',
+      );
+      return;
+    }
+    state = state.copyWith(isBusy: true, clearError: true);
+    try {
+      final response = await client.auth.signUp(
+        email: normalizedEmail,
+        password: password,
+        data: <String, dynamic>{'full_name': normalizedName},
         emailRedirectTo: kIsWeb ? null : supabaseRedirectUrl,
       );
       state = state.copyWith(
         isBusy: false,
-        error: 'Magic link sent to $email',
+        error: response.session == null
+            ? 'Account created. Check your email to verify it, then sign in.'
+            : null,
+        clearError: response.session != null,
       );
     } catch (error) {
       state = state.copyWith(
         isBusy: false,
-        error: error.toString(),
+        error: _friendlyAuthError(error),
+      );
+    }
+  }
+
+  String _friendlyAuthError(Object error) {
+    final message = error.toString();
+    final lowerMessage = message.toLowerCase();
+    if (lowerMessage.contains('invalid login credentials')) {
+      return 'The email or password is incorrect.';
+    }
+    if (lowerMessage.contains('email not confirmed')) {
+      return 'Please verify your email before signing in.';
+    }
+    if (lowerMessage.contains('user already registered')) {
+      return 'An account with this email already exists. Try signing in.';
+    }
+    if (lowerMessage.contains('password should be at least')) {
+      return 'Your password must be at least 6 characters.';
+    }
+    return message;
+  }
+
+  Future<void> sendMagicLink(String email) async {
+    final client = supabaseClientOrNull;
+    if (client == null) return;
+    final normalizedEmail = email.trim();
+    if (normalizedEmail.isEmpty) {
+      state = state.copyWith(
+        isBusy: false,
+        error: 'Enter your email address first.',
+      );
+      return;
+    }
+    state = state.copyWith(isBusy: true, clearError: true);
+    try {
+      await client.auth.signInWithOtp(
+        email: normalizedEmail,
+        emailRedirectTo: kIsWeb ? null : supabaseRedirectUrl,
+      );
+      state = state.copyWith(
+        isBusy: false,
+        error: 'Magic link sent to $normalizedEmail',
+      );
+    } catch (error) {
+      state = state.copyWith(
+        isBusy: false,
+        error: _friendlyAuthError(error),
       );
     }
   }
@@ -537,6 +761,7 @@ class AuthNotifier extends StateNotifier<AppAuthState> {
     state = state.copyWith(isBusy: true, clearError: true);
     try {
       await client.auth.signOut();
+      _clearRedirectSettling(reason: 'sign_out');
       await _rememberStorageScope(null);
       await _setExplicitSignOutMarker(true);
       state = state.copyWith(
@@ -544,6 +769,7 @@ class AuthNotifier extends StateNotifier<AppAuthState> {
         user: null,
         rememberedScopeId: null,
         isBusy: false,
+        isRedirectSettling: false,
       );
     } catch (error) {
       state = state.copyWith(
@@ -555,6 +781,7 @@ class AuthNotifier extends StateNotifier<AppAuthState> {
 
   @override
   void dispose() {
+    _redirectSettleTimer?.cancel();
     _authSubscription?.cancel();
     super.dispose();
   }

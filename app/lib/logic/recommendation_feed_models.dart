@@ -7,11 +7,10 @@ const Set<String> activeHomeFeedRowKinds = <String>{
   'frequently_listened',
   'made_for_you',
   'because_you_played',
-  'trending_by_genre',
+  'popular_radio',
   'recommended_albums',
   'recommended_artists',
   'quiet_picks',
-  'hidden_gems',
 };
 
 bool isActiveHomeFeedRowKind(String rowKind) =>
@@ -140,7 +139,9 @@ class RecommendationFeedRowState {
         ? 'album'
         : kind == 'recommended_artists'
             ? 'artist'
-            : 'track';
+            : kind == 'popular_radio'
+                ? 'radio'
+                : 'track';
     final itemType = (json['item_type'] ?? inferredItemType).toString();
     final rowStyle = (json['row_style'] ?? '').toString();
     final rawItems = (json['items'] as List<dynamic>? ?? const []);
@@ -165,6 +166,12 @@ class RecommendationFeedRowState {
         final mixId = item['id']?.toString().trim() ?? '';
         final mixTitle = item['title']?.toString().trim() ?? '';
         return mixId.isNotEmpty || mixTitle.isNotEmpty;
+      }
+      if (itemType == 'radio') {
+        final radioId = item['id']?.toString().trim() ?? '';
+        final title = item['title']?.toString().trim() ?? '';
+        final artist = item['artist_name']?.toString().trim() ?? '';
+        return radioId.isNotEmpty || title.isNotEmpty || artist.isNotEmpty;
       }
       return extractTrackId(item)?.isNotEmpty ?? false;
     }).toList(growable: false);
@@ -243,6 +250,10 @@ class RecommendationFeedRowState {
 class RecommendationFeedState {
   final String requestState;
   final String sessionId;
+  final int feedVersion;
+  final String feedAction;
+  final String preparationState;
+  final List<String> qualityWarnings;
   final List<RecommendationFeedRowState> rows;
   final double? generatedAt;
   final double? expiresAt;
@@ -252,6 +263,10 @@ class RecommendationFeedState {
   const RecommendationFeedState({
     this.requestState = 'idle',
     this.sessionId = '',
+    this.feedVersion = 0,
+    this.feedAction = '',
+    this.preparationState = 'idle',
+    this.qualityWarnings = const <String>[],
     this.rows = const [],
     this.generatedAt,
     this.expiresAt,
@@ -262,13 +277,37 @@ class RecommendationFeedState {
   bool get isEmpty => rows.every((row) => row.items.isEmpty);
   bool get hasRows => rows.any((row) => row.items.isNotEmpty);
 
-  List<Map<String, dynamic>> get visibleTracks => rows
-      .where((row) => row.itemType == 'track')
-      .expand((row) => row.items)
-      .toList(growable: false);
+  List<Map<String, dynamic>> get visibleTracks {
+    final tracks = <Map<String, dynamic>>[];
+    for (final row in rows) {
+      if (row.itemType == 'track') {
+        tracks.addAll(row.items);
+        continue;
+      }
+      if (row.itemType != 'mix' && row.itemType != 'radio') {
+        continue;
+      }
+      for (final item in row.items.take(6)) {
+        final nested =
+            item['tracks'] ?? item['items'] ?? item['recommendations'];
+        if (nested is! List) continue;
+        for (final track in nested.take(4)) {
+          if (track is! Map) continue;
+          final normalized = normalizeTrack(Map<String, dynamic>.from(track));
+          if (extractTrackId(normalized)?.isNotEmpty ?? false) {
+            tracks.add(normalized);
+          }
+        }
+      }
+    }
+    return tracks;
+  }
 
   factory RecommendationFeedState.fromJson(Map<String, dynamic> json) {
     final rawRows = (json['rows'] as List<dynamic>? ?? const []);
+    final diagnostics = json['diagnostics'] is Map
+        ? Map<String, dynamic>.from(json['diagnostics'] as Map)
+        : const <String, dynamic>{};
     return RecommendationFeedState(
       requestState: (json['request_state'] ?? '').toString().trim().isNotEmpty
           ? json['request_state'].toString()
@@ -276,6 +315,20 @@ class RecommendationFeedState {
               ? 'failed'
               : 'complete'),
       sessionId: (json['session_id'] ?? '').toString(),
+      feedVersion: (json['feed_version'] as num?)?.toInt() ??
+          (diagnostics['feed_version'] as num?)?.toInt() ??
+          0,
+      feedAction: (json['feed_action'] ?? diagnostics['feed_action'] ?? '')
+          .toString(),
+      preparationState:
+          (json['preparation_state'] ?? diagnostics['preparation_state'] ?? 'idle')
+              .toString(),
+      qualityWarnings: ((json['quality_warnings'] ??
+                  diagnostics['quality_warnings']) as List<dynamic>? ??
+              const <dynamic>[])
+          .map((value) => value.toString())
+          .where((value) => value.isNotEmpty)
+          .toList(growable: false),
       rows: rawRows
           .whereType<Map>()
           .map((row) => RecommendationFeedRowState.fromJson(
@@ -287,9 +340,7 @@ class RecommendationFeedState {
           (json['error_message']?.toString().trim().isNotEmpty ?? false)
               ? json['error_message'].toString().trim()
               : null,
-      diagnostics: json['diagnostics'] is Map
-          ? Map<String, dynamic>.from(json['diagnostics'] as Map)
-          : const <String, dynamic>{},
+      diagnostics: diagnostics,
     );
   }
 
@@ -300,6 +351,10 @@ class RecommendationFeedState {
   Map<String, dynamic> toJson() => {
         'request_state': requestState,
         'session_id': sessionId,
+        'feed_version': feedVersion,
+        'feed_action': feedAction,
+        'preparation_state': preparationState,
+        if (qualityWarnings.isNotEmpty) 'quality_warnings': qualityWarnings,
         'generated_at': generatedAt,
         'expires_at': expiresAt,
         'rows': rows.map((row) => row.toJson()).toList(growable: false),
@@ -310,6 +365,10 @@ class RecommendationFeedState {
   RecommendationFeedState copyWith({
     String? requestState,
     String? sessionId,
+    int? feedVersion,
+    String? feedAction,
+    String? preparationState,
+    List<String>? qualityWarnings,
     List<RecommendationFeedRowState>? rows,
     double? generatedAt,
     double? expiresAt,
@@ -320,6 +379,10 @@ class RecommendationFeedState {
     return RecommendationFeedState(
       requestState: requestState ?? this.requestState,
       sessionId: sessionId ?? this.sessionId,
+      feedVersion: feedVersion ?? this.feedVersion,
+      feedAction: feedAction ?? this.feedAction,
+      preparationState: preparationState ?? this.preparationState,
+      qualityWarnings: qualityWarnings ?? this.qualityWarnings,
       rows: rows ?? this.rows,
       generatedAt: generatedAt ?? this.generatedAt,
       expiresAt: expiresAt ?? this.expiresAt,
@@ -351,6 +414,13 @@ String recommendationRowItemKey(
     if (mixId.isNotEmpty) return 'mix:$mixId';
     final title = item['title']?.toString().trim().toLowerCase() ?? '';
     return 'mix:$title';
+  }
+  if (itemType == 'radio') {
+    final radioId = item['id']?.toString().trim() ?? '';
+    if (radioId.isNotEmpty) return 'radio:$radioId';
+    final title = item['title']?.toString().trim().toLowerCase() ?? '';
+    final artist = item['artist_name']?.toString().trim().toLowerCase() ?? '';
+    return 'radio:$title|$artist';
   }
   final trackId = extractTrackId(item)?.trim() ?? '';
   if (trackId.isNotEmpty) return 'track:$trackId';

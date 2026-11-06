@@ -33,6 +33,31 @@ _SEARCH_TASTE_HINTS = (
     "hip hop",
 )
 
+_EXPLORATORY_PHRASES = (
+    "songs like ",
+    "similar to ",
+    "music for ",
+    "songs for ",
+    "song about ",
+    "song where ",
+    "that song ",
+    "sounds like ",
+    "reminds me of ",
+    "i remember ",
+)
+
+_TASTE_INTENT_WORDS = {
+    "mix",
+    "playlist",
+    "songs",
+    "music",
+    "mood",
+    "vibe",
+    "workout",
+    "focus",
+    "sleep",
+}
+
 
 def resolve_search_mode(
     query: str,
@@ -53,8 +78,17 @@ def resolve_search_mode(
     normalized_query = normalize_text_fn(query)
     if not normalized_query:
         return "exact"
-    if len(normalized_query) > 38 or any(
-        hint in normalized_query for hint in _SEARCH_TASTE_HINTS
+    tokens = set(normalized_query.split())
+    taste_hits = sum(
+        1
+        for hint in _SEARCH_TASTE_HINTS
+        if hint in normalized_query
+    )
+    if (
+        len(normalized_query) > 38
+        or any(normalized_query.startswith(phrase) for phrase in _EXPLORATORY_PHRASES)
+        or bool(tokens & _TASTE_INTENT_WORDS)
+        or taste_hits >= 2
     ):
         return "taste"
     return "exact"

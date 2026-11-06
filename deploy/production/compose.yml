@@ -1,0 +1,142 @@
+name: neatie
+
+x-backend-common: &backend-common
+  build:
+    context: ../../ingestion/python_proxy
+    dockerfile: Dockerfile
+  env_file:
+    - /opt/neatie/shared/backend.env
+  environment:
+    AURALIS_RUNTIME_DIR: /var/lib/neatie/runtime
+    AURALIS_PROXY_RUNTIME_DIR: /var/lib/neatie/runtime
+    PORT: "8000"
+  volumes:
+    - /var/lib/neatie/runtime:/var/lib/neatie/runtime
+    - /var/lib/neatie/downloads:/app/downloads
+    - /var/lib/neatie/secrets:/run/neatie-secrets:ro
+  restart: unless-stopped
+  stop_grace_period: 30s
+  logging:
+    driver: json-file
+    options:
+      max-size: 20m
+      max-file: "5"
+  networks:
+    - backend
+
+services:
+  pot-provider:
+    image: brainicism/bgutil-ytdlp-pot-provider:1.3.2-node
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - >-
+          fetch('http://127.0.0.1:4416/ping')
+          .then(response => { if (!response.ok) process.exit(1); })
+          .catch(() => process.exit(1))
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    restart: unless-stopped
+    stop_grace_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    networks:
+      - backend
+
+  api:
+    <<: *backend-common
+    mem_limit: 2304m
+    environment:
+      AURALIS_RUNTIME_DIR: /var/lib/neatie/runtime
+      AURALIS_PROXY_RUNTIME_DIR: /var/lib/neatie/runtime
+      PORT: "8000"
+      AURALIS_YTDLP_JS_RUNTIME: node
+      AURALIS_YTDLP_PO_PROVIDER_URL: http://pot-provider:4416
+      NEATIE_FAST_ACQUISITION: "1"
+      NEATIE_DIRECT_CLIENT: mweb
+      NEATIE_DIRECT_POOL: "1"
+      NEATIE_DIRECT_CONTEXT_TTL: "900"
+      NEATIE_RETAIN_STARTUP_READ: "1"
+      NEATIE_PLAYBACK_STARTUP: "1"
+      NEATIE_MEMORY_DIAGNOSTICS: "1"
+      NODE_OPTIONS: "--max-old-space-size=384"
+      RECOMMENDATION_ENABLE_SCHEDULER: "0"
+      RECOMMENDATION_EXTERNAL_WORKER: "1"
+      NEATIE_BACKGROUND_IDLE: "1"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import json, urllib.request;
+          payload=json.load(urllib.request.urlopen('http://127.0.0.1:8000/', timeout=5));
+          assert 'running' in str(payload.get('status', '')).lower()
+      interval: 15s
+      timeout: 6s
+      retries: 8
+      start_period: 45s
+    depends_on:
+      pot-provider:
+        condition: service_healthy
+
+  recommendation-worker:
+    <<: *backend-common
+    mem_limit: 3g
+    command: ["python", "worker_main.py"]
+    environment:
+      AURALIS_RUNTIME_DIR: /var/lib/neatie/runtime
+      AURALIS_PROXY_RUNTIME_DIR: /var/lib/neatie/runtime
+      AURALIS_YTDLP_JS_RUNTIME: node
+      AURALIS_YTDLP_PO_PROVIDER_URL: http://pot-provider:4416
+      NEATIE_FAST_ACQUISITION: "1"
+      NEATIE_DIRECT_CLIENT: mweb
+      NEATIE_DIRECT_POOL: "1"
+      NEATIE_DIRECT_CONTEXT_TTL: "900"
+      NEATIE_MEMORY_DIAGNOSTICS: "1"
+      NODE_OPTIONS: "--max-old-space-size=384"
+      RECOMMENDATION_ENABLE_SCHEDULER: "1"
+      RECOMMENDATION_EXTERNAL_WORKER: "1"
+      NEATIE_BACKGROUND_IDLE: "1"
+    depends_on:
+      pot-provider:
+        condition: service_healthy
+
+  caddy:
+    image: caddy:2-alpine
+    environment:
+      AURALIS_API_HOST: ${AURALIS_API_HOST:?AURALIS_API_HOST is required}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "5"
+    networks:
+      - backend
+
+networks:
+  backend:
+    driver: bridge
+
+volumes:
+  caddy_data:
+  caddy_config:

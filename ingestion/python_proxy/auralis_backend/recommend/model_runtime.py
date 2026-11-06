@@ -18,6 +18,45 @@ _MODEL_LOCK = Lock()
 _MODEL_REFRESH_LOCK = Lock()
 _MODEL_REFRESH_THREAD = None
 _MODEL_REFRESH_RUNNING = False
+_MODEL_TRAIN_LOCK = Lock()
+
+
+def cached_profile_model(model_id: str, source_signature: str):
+    """Borrow the exact resident model; profile hits never fetch/train a model."""
+    with _MODEL_LOCK:
+        artifact = _MODEL_CACHE.get('artifact')
+        if (isinstance(artifact, dict) and _MODEL_CACHE['expires_at'] > time.time()
+                and artifact.get('model_id') == model_id
+                and artifact.get('source_signature') == source_signature):
+            return artifact
+    return None
+
+
+def refresh_collaborative_model(server: Any, *, force: bool = False):
+    """One in-process trainer; unchanged persisted models survive restarts."""
+    with _MODEL_TRAIN_LOCK:
+        signature = server._recommendation_model_source_signature()
+        if not force:
+            connection = open_recommendation_store_connection(server)
+            try:
+                row = connection.execute(
+                    "SELECT source_signature, artifact_json FROM recommendation_models WHERE id = ?",
+                    ["global"],
+                ).fetchone()
+            finally:
+                connection.close()
+            if row is not None and row["source_signature"] == signature:
+                try:
+                    artifact = json.loads(row["artifact_json"] or "null")
+                except (ValueError, TypeError):
+                    artifact = None
+                if isinstance(artifact, dict):
+                    cache_model_artifact(server, artifact, source_signature=signature)
+                    return artifact
+        artifact = server._recommendation_train_collaborative_model(signature)
+        server._recommendation_store_collaborative_model(artifact)
+        cache_model_artifact(server, artifact, source_signature=signature)
+        return artifact
 
 
 def invalidate_model_cache() -> None:
@@ -55,6 +94,12 @@ def cache_model_artifact(
 def schedule_model_refresh(server: Any, *, force_sync: bool = False) -> bool:
     if not server.RECOMMENDATION_MODEL_STALE_REFRESH_ENABLED:
         return False
+    if (getattr(server, "RECOMMENDATION_EXTERNAL_WORKER", False)
+            and not getattr(server, "RECOMMENDATION_ENABLE_SCHEDULER", False)):
+        return False
+    from .workload import is_idle
+    if is_idle(server):
+        return False
     global _MODEL_REFRESH_THREAD
     global _MODEL_REFRESH_RUNNING
     with _MODEL_REFRESH_LOCK:
@@ -67,14 +112,7 @@ def schedule_model_refresh(server: Any, *, force_sync: bool = False) -> bool:
         try:
             if force_sync:
                 server._recommendation_sync_external_events(force=True)
-            latest_signature = server._recommendation_model_source_signature()
-            artifact = server._recommendation_train_collaborative_model(latest_signature)
-            server._recommendation_store_collaborative_model(artifact)
-            cache_model_artifact(
-                server,
-                artifact,
-                source_signature=latest_signature,
-            )
+            refresh_collaborative_model(server)
         except Exception:
             traceback.print_exc()
         finally:
@@ -162,11 +200,4 @@ def get_collaborative_model(
             "source_signature": source_signature,
         }
 
-    artifact = server._recommendation_train_collaborative_model(source_signature)
-    server._recommendation_store_collaborative_model(artifact)
-    cache_model_artifact(
-        server,
-        artifact,
-        source_signature=source_signature,
-    )
-    return artifact
+    return refresh_collaborative_model(server, force=True)

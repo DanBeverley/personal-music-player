@@ -1,32 +1,44 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, BackgroundTasks, Request, Response
 
 from .media_runtime import (
     MediaService,
 )
 from .assistant_runtime import AssistantService
+from .assistant_auth import assistant_scope, assistant_work
 from .stream_runtime import (
-    direct_stream_url as direct_stream_url_runtime,
     download_audio as download_audio_runtime,
-    proxy_stream as proxy_stream_runtime,
+    playback_resolve as playback_resolve_runtime,
     stream_audio as stream_audio_runtime,
-    warm_streams as warm_streams_runtime,
+    playback_delivery_report,
+    dispatch_playback_stream,
 )
 from ..recognition.service import RecognitionService
+from ..charts import ChartsService, get_charts_service
+from ..releases import NewReleasesService, get_new_releases_service
 from ..recommend.service import RecommendationService
+from ..search.catalog_pipeline import (
+    catalog_import_coverage_report,
+    load_catalog_acceptance_fixtures,
+)
 from ..search.service import SearchService
+from ..storage.artist_artwork import read_artist_artwork, read_entity_artwork
 from ..contracts import (
     AssistantChatRequest,
     AssistantSessionCreateRequest,
     AssistantSessionUpdateRequest,
     DownloadRequest,
     HistorySeedRequest,
+    LyricsMeaningRequest,
     RecommendationInteractionEventRequest,
     RecommendationModelTrainRequest,
+    RecommendationPreferencesRequest,
     RecommendationSearchEventRequest,
     SearchRequest,
-    WarmStreamRequest,
+    PlaybackResolveRequest,
+    PrepareSessionRequest,
+    RelatedTracksRequest,
 )
 
 router = APIRouter()
@@ -37,6 +49,8 @@ _recommendation_service = None
 _assistant_service = None
 _media_service = None
 _recognition_service = None
+_charts_service = None
+_new_releases_service = None
 
 
 def configure_router(server) -> None:
@@ -46,12 +60,16 @@ def configure_router(server) -> None:
     global _assistant_service
     global _media_service
     global _recognition_service
+    global _charts_service
+    global _new_releases_service
     _server = server
     _search_service = SearchService(server)
     _recommendation_service = RecommendationService(server)
     _assistant_service = AssistantService(server)
     _media_service = MediaService(server)
     _recognition_service = RecognitionService(server)
+    _charts_service = get_charts_service(server)
+    _new_releases_service = get_new_releases_service(server)
 
 
 def _require_server():
@@ -90,6 +108,18 @@ def _require_recognition_service() -> RecognitionService:
     return _recognition_service
 
 
+def _require_charts_service() -> ChartsService:
+    if _charts_service is None:
+        raise RuntimeError("Charts service has not been configured")
+    return _charts_service
+
+
+def _require_new_releases_service() -> NewReleasesService:
+    if _new_releases_service is None:
+        raise RuntimeError("New releases service has not been configured")
+    return _new_releases_service
+
+
 @router.get("/")
 def health_check():
     return _require_media_service().health_check()
@@ -100,8 +130,17 @@ def latency_summary():
     return _require_media_service().latency_summary()
 
 
+@router.get("/admin/catalog_coverage")
+def catalog_coverage(include_fixtures: bool = True):
+    fixtures = load_catalog_acceptance_fixtures() if include_fixtures else []
+    return catalog_import_coverage_report(
+        _require_server(),
+        fixtures=fixtures,
+    )
+
+
 @router.post("/prepare_session")
-def prepare_session(req: WarmStreamRequest):
+def prepare_session(req: PrepareSessionRequest):
     return _require_media_service().prepare_session(req)
 
 
@@ -110,9 +149,38 @@ def get_track_details(req: DownloadRequest):
     return _require_media_service().get_track_details(req)
 
 
-@router.get("/lyrics/{video_id}")
-def get_track_lyrics(video_id: str):
-    return _require_media_service().get_track_lyrics(video_id)
+@router.post("/related_tracks")
+def get_related_tracks(req: RelatedTracksRequest):
+    return _require_media_service().get_related_tracks(req)
+
+
+@router.get("/lyrics/{track_key}")
+def get_track_lyrics(
+    track_key: str,
+    title: str = "",
+    artist: str = "",
+    album: str = "",
+    duration: int | None = None,
+    source_id: str = "",
+    force_refresh: bool = False,
+):
+    return _require_media_service().get_track_lyrics(
+        track_key,
+        title=title,
+        artist=artist,
+        album=album,
+        duration=duration,
+        source_id=source_id,
+        force_refresh=force_refresh,
+    )
+
+
+@router.post("/lyrics/{video_id}/meaning")
+def get_track_lyrics_meaning(video_id: str, req: LyricsMeaningRequest, request: Request, response: Response):
+    response.headers['Cache-Control'] = 'no-store'
+    req.user_scope_id = assistant_scope(request, req.user_scope_id, stateless=True)
+    with assistant_work(req.user_scope_id):
+        return _require_media_service().get_track_lyrics_meaning(video_id, req)
 
 
 @router.post("/search")
@@ -135,6 +203,11 @@ def search_artists(req: SearchRequest):
     return _require_search_service().search_artists(req)
 
 
+@router.get("/search_playlist/{playlist_id}")
+def search_playlist(playlist_id: str):
+    return _require_search_service().playlist_details(playlist_id)
+
+
 @router.post("/resolve_artist")
 def resolve_artist(req: SearchRequest):
     return _require_search_service().resolve_artist(req)
@@ -150,9 +223,29 @@ def get_suggestions(req: SearchRequest):
     return _require_search_service().suggest(req)
 
 
+@router.get("/charts")
+def charts(
+    country: str = "GLOBAL",
+    range: str = "week",
+    source: str = "all",
+    limit: int = 60,
+):
+    return _require_charts_service().get(
+        country=country,
+        range_key=range,
+        source=source,
+        limit=limit,
+    )
+
+
+@router.get("/new_releases")
+def new_releases(limit: int = 30, refresh: bool = False):
+    return _require_new_releases_service().get(limit=limit, force=refresh, background=True)
+
+
 @router.post("/recommend")
-def recommend(req: SearchRequest):
-    return _require_recommendation_service().recommend(req)
+def recommend(req: SearchRequest, background_tasks: BackgroundTasks):
+    return _require_recommendation_service().recommend(req, background_tasks=background_tasks)
 
 
 @router.post("/interaction_event")
@@ -165,9 +258,35 @@ def recommendation_search_interaction(req: RecommendationSearchEventRequest):
     return _require_recommendation_service().search_interaction(req)
 
 
+@router.get("/recent_search_picks")
+def recent_search_picks(user_scope_id: str = "guest", limit: int = 8):
+    return _require_recommendation_service().recent_search_picks(
+        user_scope_id=user_scope_id,
+        limit=limit,
+    )
+
+
 @router.post("/history_seed")
-def recommendation_history_seed(req: HistorySeedRequest):
-    return _require_recommendation_service().history_seed(req)
+def recommendation_history_seed(req: HistorySeedRequest, request: Request):
+    import time
+    arrived = request.scope.get('neatie_history_received')
+    route_wait_ms = round((time.perf_counter()-arrived)*1000,2) if arrived is not None else None
+    result = _require_recommendation_service().history_seed(req)
+    if isinstance(result,dict):
+        result.setdefault('diagnostics',{})['history_route_wait_ms'] = route_wait_ms
+    return result
+
+
+@router.get("/recommendation/preferences")
+def recommendation_preferences(user_scope_id: str = "guest"):
+    return _require_recommendation_service().recommendation_preferences(
+        user_scope_id=user_scope_id,
+    )
+
+
+@router.put("/recommendation/preferences")
+def update_recommendation_preferences(req: RecommendationPreferencesRequest):
+    return _require_recommendation_service().update_recommendation_preferences(req)
 
 
 @router.get("/recommendation_model")
@@ -261,12 +380,60 @@ def get_album_details(album_id: str):
 
 
 @router.get("/artist/{artist_id}")
-def get_artist_details(artist_id: str):
-    return _require_media_service().get_artist_details(artist_id)
+def get_artist_details(artist_id: str, background_tasks: BackgroundTasks,
+                       view: str = "", section: str = "", collection_id: str = ""):
+    service = _require_media_service()
+    if not view and not section:
+        return service.get_artist_details(artist_id)
+    return service.get_artist_details(artist_id, overview=view == "overview",
+                                      section=section, collection_id=collection_id,
+                                      defer_persist=background_tasks.add_task)
+
+
+@router.get("/artist_artwork/{token}")
+def get_artist_artwork(token: str, size: int = 0):
+    if size not in (0, 160, 384, 768):
+        return Response(status_code=400)
+    if size:
+        from ..storage.artist_artwork import get_artist_artwork_cache
+        cache = get_artist_artwork_cache(_require_server())
+        cached = cache.read_variant(token, size) if cache is not None else None
+    else:
+        cached = read_artist_artwork(_require_server(), token)
+    if cached is None:
+        return Response(status_code=404, headers={"Cache-Control": "no-store"})
+    data, content_type = cached
+    return Response(
+        content=data,
+        media_type=content_type,
+        headers={"Cache-Control": "public, max-age=2592000, immutable"},
+    )
+
+
+@router.get("/entity_artwork/{token}")
+def get_entity_artwork(token: str, size: int = 0):
+    if size not in (0, 160, 384, 768):
+        return Response(status_code=400)
+    if size:
+        from ..storage.artist_artwork import get_entity_artwork_cache
+        cache = get_entity_artwork_cache(_require_server())
+        cached = cache.read_variant(token, size) if cache is not None else None
+    else:
+        cached = read_entity_artwork(_require_server(), token)
+    if cached is None:
+        return Response(status_code=404, headers={"Cache-Control": "no-store"})
+    data, content_type = cached
+    return Response(
+        content=data,
+        media_type=content_type,
+        headers={"Cache-Control": "public, max-age=2592000, immutable"},
+    )
 
 
 @router.get("/assistant/sessions")
-def assistant_list_sessions(user_scope_id: str, include_archived: bool = False):
+def assistant_list_sessions(request: Request, response: Response, user_scope_id: str = 'guest', include_archived: bool = False):
+    response.headers['Cache-Control'] = 'no-store'
+    user_scope_id = assistant_scope(request, user_scope_id)
     return _require_assistant_service().list_sessions(
         user_scope_id,
         include_archived=include_archived,
@@ -274,33 +441,39 @@ def assistant_list_sessions(user_scope_id: str, include_archived: bool = False):
 
 
 @router.post("/assistant/sessions")
-def assistant_create_session(req: AssistantSessionCreateRequest):
+def assistant_create_session(req: AssistantSessionCreateRequest, request: Request, response: Response):
+    response.headers['Cache-Control'] = 'no-store'
+    req.user_scope_id = assistant_scope(request, req.user_scope_id)
     return _require_assistant_service().create_session(req)
 
 
 @router.get("/assistant/sessions/{session_id}")
-def assistant_get_session(session_id: str, user_scope_id: str):
+def assistant_get_session(session_id: str, request: Request, response: Response, user_scope_id: str = 'guest'):
+    response.headers['Cache-Control'] = 'no-store'
+    user_scope_id = assistant_scope(request, user_scope_id)
     return _require_assistant_service().get_session(session_id, user_scope_id)
 
 
 @router.patch("/assistant/sessions/{session_id}")
-def assistant_update_session(session_id: str, req: AssistantSessionUpdateRequest):
+def assistant_update_session(session_id: str, req: AssistantSessionUpdateRequest, request: Request, response: Response):
+    response.headers['Cache-Control'] = 'no-store'
+    req.user_scope_id = assistant_scope(request, req.user_scope_id)
     return _require_assistant_service().update_session(session_id, req)
 
 
 @router.delete("/assistant/sessions/{session_id}")
-def assistant_delete_session(session_id: str, user_scope_id: str):
+def assistant_delete_session(session_id: str, request: Request, response: Response, user_scope_id: str = 'guest'):
+    response.headers['Cache-Control'] = 'no-store'
+    user_scope_id = assistant_scope(request, user_scope_id)
     return _require_assistant_service().delete_session(session_id, user_scope_id)
 
 
 @router.post("/assistant/chat")
-def assistant_chat(req: AssistantChatRequest):
-    return _require_assistant_service().chat(req)
-
-
-@router.post("/warm_streams")
-def warm_streams(req: WarmStreamRequest):
-    return warm_streams_runtime(_require_server(), req)
+def assistant_chat(req: AssistantChatRequest, request: Request, response: Response):
+    response.headers['Cache-Control'] = 'no-store'
+    req.user_scope_id = assistant_scope(request, req.user_scope_id, stateless=req.song is not None)
+    with assistant_work(req.user_scope_id):
+        return _require_assistant_service().chat(req)
 
 
 @router.post("/download")
@@ -308,16 +481,31 @@ def download_audio(req: DownloadRequest):
     return download_audio_runtime(_require_server(), req)
 
 
-@router.get("/stream/{video_id}")
+@router.get("/downloaded/{video_id}")
 def stream_audio(video_id: str):
     return stream_audio_runtime(_require_server(), video_id)
 
 
-@router.get("/proxy_stream/{video_id}")
-def proxy_stream(video_id: str, request: Request):
-    return proxy_stream_runtime(_require_server(), video_id, request)
+@router.post("/playback/resolve")
+def playback_resolve(req: PlaybackResolveRequest):
+    return playback_resolve_runtime(
+        _require_server(),
+        req.track_key,
+        title=req.title,
+        artist=req.artist,
+        album=req.album,
+        duration=req.duration,
+        source_id=req.source_id,
+        source_provider=req.source_provider,
+    )
 
 
-@router.get("/direct_url/{video_id}")
-def direct_stream_url(video_id: str):
-    return direct_stream_url_runtime(_require_server(), video_id)
+@router.get("/playback/stream/{track_key}")
+async def playback_stream(track_key: str, request: Request):
+    return await dispatch_playback_stream(_require_server(), track_key, request)
+
+
+@router.get('/playback/diagnostics/{trace_id}')
+def playback_diagnostics(trace_id: str, response: Response):
+    response.headers['Cache-Control'] = 'no-store'
+    return playback_delivery_report(trace_id)

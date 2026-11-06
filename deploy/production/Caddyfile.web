@@ -1,0 +1,99 @@
+:8080 {
+    log {
+        output file /var/log/neatie/access.jsonl {
+            roll_size 10MiB
+            roll_keep 5
+            roll_keep_for 48h
+        }
+        format filter {
+            wrap json
+            fields {
+                request>headers delete
+                request>uri delete
+                resp_headers delete
+            }
+        }
+    }
+    @notPlayback not path /playback/stream/* /search /recommend
+    log_skip @notPlayback
+    log_append <edge_request {http.request.uuid}
+    log_append <proxy_hop web_inner
+    log_append <request_path {http.request.uri.path}
+    @searchClientTrace {
+        path /search
+        header_regexp search_client X-Neatie-Request ^[a-z0-9]{6,20}-[0-9]{1,8}$
+    }
+    log_append @searchClientTrace <client_request {re.search_client.0}
+    log_append <trace {query.diag}
+    log_append <range {http.request.header.Range}
+    log_append <fetch_mode {http.request.header.Sec-Fetch-Mode}
+    log_append <cache_version {query.cache_version}
+    log_append <cache_variant {query.cache_variant}
+    log_append upstream_total_ms {rp.upstream.duration_ms}
+    log_append <proxy_started_ms {time.now.unix_ms}
+    header {
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "no-referrer"
+    }
+    @apiPost {
+        method POST
+        path /search /suggest /search_interaction /related_tracks /playback/resolve /prepare_session /recommend /interaction_event /history_seed
+    }
+    handle @apiPost {
+        header Cache-Control "no-store"
+        reverse_proxy api:8000
+    }
+    @assistant path /assistant/* /lyrics/*/meaning
+    handle @assistant {
+        request_body {
+            max_size 96KB
+        }
+        header Cache-Control "no-store"
+        reverse_proxy api:8000
+    }
+    @media {
+        method GET HEAD
+        path /playback/stream/*
+    }
+    handle @media {
+        reverse_proxy api:8000 {
+            header_up X-Neatie-Edge-Request {http.request.uuid}
+            flush_interval -1
+            handle_response {
+                log_append <playback_request {rp.header.X-Neatie-Playback-Request}
+                log_append <upstream_headers_ms {rp.upstream.latency_ms}
+                log_append <expected_body_bytes {rp.header.Content-Length}
+                copy_response
+            }
+        }
+    }
+    @artwork {
+        method GET HEAD
+        path /artist_artwork/* /entity_artwork/*
+    }
+    handle @artwork {
+        reverse_proxy api:8000
+    }
+    @apiGet {
+        method GET HEAD
+        path /album/* /artist/* /lyrics/* /recent_search_picks /charts /new_releases /playback/diagnostics/*
+    }
+    handle @apiGet {
+        header Cache-Control "no-store"
+        reverse_proxy api:8000 {
+            flush_interval -1
+        }
+    }
+    @static method GET HEAD
+    handle @static {
+        header Cache-Control "no-cache"
+        root * /srv
+        file_server {
+            precompressed br
+        }
+    }
+    handle {
+        header Cache-Control "no-store"
+        respond 404
+    }
+}

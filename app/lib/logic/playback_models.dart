@@ -14,15 +14,24 @@ class ResolvedStreamSource {
   final String url;
   final Map<String, String> headers;
   final DateTime fetchedAt;
+  final String sourceKind;
+  final DateTime? expiresAt;
 
   const ResolvedStreamSource({
     required this.url,
     required this.headers,
     required this.fetchedAt,
+    this.sourceKind = 'proxy',
+    this.expiresAt,
   });
 
-  bool get isFresh =>
-      DateTime.now().difference(fetchedAt) < const Duration(minutes: 25);
+  bool get isFresh {
+    final now = DateTime.now();
+    if (expiresAt != null && now.isAfter(expiresAt!)) {
+      return false;
+    }
+    return now.difference(fetchedAt) < const Duration(minutes: 25);
+  }
 }
 
 class TrackLyricsLine {
@@ -58,6 +67,7 @@ class TrackLyricsState {
   final bool hasTimestamps;
   final String? videoId;
   final String? source;
+  final String availability;
   final String? error;
   final List<TrackLyricsLine> lines;
 
@@ -67,9 +77,81 @@ class TrackLyricsState {
     this.hasTimestamps = false,
     this.videoId,
     this.source,
+    this.availability = 'unknown',
     this.error,
     this.lines = const [],
   });
+}
+
+class LyricsMeaningInsight {
+  final String summary;
+  final List<String> themes;
+  final String emotionalTone;
+  final List<String> contextNotes;
+  final List<String> notableImagery;
+  final double confidence;
+  final String sourceNotes;
+  final String assistantSeedMessage;
+  final bool cached;
+
+  const LyricsMeaningInsight({
+    required this.summary,
+    this.themes = const [],
+    this.emotionalTone = '',
+    this.contextNotes = const [],
+    this.notableImagery = const [],
+    this.confidence = 0,
+    this.sourceNotes = '',
+    this.assistantSeedMessage = '',
+    this.cached = false,
+  });
+
+  factory LyricsMeaningInsight.fromJson(Map<String, dynamic> json) {
+    List<String> stringList(dynamic value) {
+      if (value is! List) return const [];
+      return value
+          .map((item) => item.toString().trim())
+          .where((item) => item.isNotEmpty)
+          .toList(growable: false);
+    }
+
+    double parseConfidence(dynamic value) {
+      if (value is num) {
+        return value.toDouble().clamp(0.0, 1.0).toDouble();
+      }
+      final parsed = double.tryParse(value?.toString() ?? '');
+      if (parsed == null) return 0;
+      return parsed.clamp(0.0, 1.0).toDouble();
+    }
+
+    return LyricsMeaningInsight(
+      summary: json['summary']?.toString() ?? '',
+      themes: stringList(json['themes']),
+      emotionalTone: json['emotional_tone']?.toString() ?? '',
+      contextNotes: stringList(json['context_notes']),
+      notableImagery: stringList(json['notable_imagery']),
+      confidence: parseConfidence(json['confidence']),
+      sourceNotes: json['source_notes']?.toString() ?? '',
+      assistantSeedMessage: json['assistant_seed_message']?.toString() ?? '',
+      cached: json['cached'] == true,
+    );
+  }
+}
+
+class LyricsMeaningState {
+  final bool isLoading;
+  final String? videoId;
+  final String? error;
+  final LyricsMeaningInsight? insight;
+
+  const LyricsMeaningState({
+    this.isLoading = false,
+    this.videoId,
+    this.error,
+    this.insight,
+  });
+
+  bool get hasInsight => insight != null && insight!.summary.trim().isNotEmpty;
 }
 
 final audioEngineProvider = Provider<AudioEngineFFI>((ref) {
@@ -91,7 +173,9 @@ class PlayerState {
   final int currentPosition;
   final int currentPositionMs;
   final String? artist;
+  final String? album;
   final String? videoId;
+  final String? playbackSourceId;
   final int sleepTimerRemainingSeconds;
 
   PlayerState({
@@ -105,7 +189,9 @@ class PlayerState {
     this.currentPosition = 0,
     this.currentPositionMs = 0,
     this.artist,
+    this.album,
     this.videoId,
+    this.playbackSourceId,
     this.sleepTimerRemainingSeconds = 0,
   });
 
@@ -120,11 +206,15 @@ class PlayerState {
     int? currentPosition,
     int? currentPositionMs,
     String? artist,
+    String? album,
     String? videoId,
+    String? playbackSourceId,
     int? sleepTimerRemainingSeconds,
     bool clearThumbnail = false,
     bool clearArtist = false,
+    bool clearAlbum = false,
     bool clearVideoId = false,
+    bool clearPlaybackSourceId = false,
   }) {
     final nextCurrentPosition = currentPosition ?? this.currentPosition;
     return PlayerState(
@@ -141,7 +231,11 @@ class PlayerState {
               ? currentPosition * 1000
               : this.currentPositionMs),
       artist: clearArtist ? null : (artist ?? this.artist),
+      album: clearAlbum ? null : (album ?? this.album),
       videoId: clearVideoId ? null : (videoId ?? this.videoId),
+      playbackSourceId: clearPlaybackSourceId
+          ? null
+          : (playbackSourceId ?? this.playbackSourceId),
       sleepTimerRemainingSeconds:
           sleepTimerRemainingSeconds ?? this.sleepTimerRemainingSeconds,
     );

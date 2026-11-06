@@ -7,13 +7,15 @@ import uuid
 
 from fastapi import HTTPException
 
-from ..discovery.service import DiscoveryService
+from ..home_feed.api import HomeFeedApi
+from ..home_feed.scheduler import HomeJobScheduler
 from .admin_runtime import (
     evaluate_experiments as evaluate_experiments_runtime,
     experiments as experiments_runtime,
     interaction_event as interaction_event_runtime,
     model_status as model_status_runtime,
     model_versions as model_versions_runtime,
+    recent_search_picks as recent_search_picks_runtime,
     recommended_artists as recommended_artists_runtime,
     search_interaction as search_interaction_runtime,
     train_model as train_model_runtime,
@@ -61,9 +63,9 @@ class RecommendationService:
 
     def __init__(self, server: Any) -> None:
         self._server = server
-        self._discovery = DiscoveryService(server)
+        self._home = HomeFeedApi(server)
 
-    def recommend(self, req: Any) -> Dict[str, Any]:
+    def recommend(self, req: Any, *, background_tasks: Any = None) -> Dict[str, Any]:
         server = self._server
         trace = server._trace_start(
             "recommend",
@@ -81,6 +83,8 @@ class RecommendationService:
             )
             if is_row_page:
                 request_mode = "row_page"
+            elif bool(getattr(req, "feed_queue_status_only", False)):
+                request_mode = "queue_status"
             elif bool(getattr(req, "prepare_next_session", False)):
                 request_mode = "background_prepare"
             else:
@@ -106,10 +110,11 @@ class RecommendationService:
             )
 
             with request_store_runtime(allow_persistent_reads=False):
-                response = self._discovery.recommend(
+                response = self._home.recommend(
                     req,
                     request_mode=request_mode,
                     trace=trace,
+                    background_tasks=background_tasks,
                 )
 
             serialize_started_at = time.perf_counter()
@@ -181,8 +186,39 @@ class RecommendationService:
     def search_interaction(self, req: Any):
         return search_interaction_runtime(self._server, req)
 
+    def recent_search_picks(self, *, user_scope_id: str, limit: int = 8):
+        return recent_search_picks_runtime(
+            self._server,
+            user_scope_id=user_scope_id,
+            limit=limit,
+        )
+
     def history_seed(self, req: Any):
         return history_seed_runtime(self._server, req)
+
+    def recommendation_preferences(self, *, user_scope_id: str):
+        from ..discovery.preferences import load_recommendation_preferences
+
+        return load_recommendation_preferences(self._server, user_scope_id)
+
+    def update_recommendation_preferences(self, req: Any):
+        from ..discovery.preferences import save_recommendation_preferences
+
+        try:
+            payload = save_recommendation_preferences(
+                self._server,
+                user_scope_id=req.user_scope_id,
+                taste_mode=req.taste_mode,
+                listenbrainz_username=req.listenbrainz_username,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        HomeJobScheduler(self._server).candidates(
+            req,
+            reason="signal_reconcile",
+            generation_hint=f"preferences:{int(time.time() * 1000)}",
+        )
+        return payload
 
     def model_status(self):
         return model_status_runtime(self._server)

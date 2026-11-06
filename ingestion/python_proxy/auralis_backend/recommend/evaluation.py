@@ -35,6 +35,21 @@ def _supported_languages(profile: Dict[str, Any]) -> set[str]:
     return normalized
 
 
+def _supported_regions(profile: Dict[str, Any]) -> set[str]:
+    values = profile.get("supported_regions") or profile.get("regions") or []
+    if isinstance(values, str):
+        values = [values]
+    normalized = {
+        str(value or "").strip().lower()
+        for value in values
+        if str(value or "").strip()
+    }
+    dominant = str(profile.get("dominant_region") or "").strip().lower()
+    if dominant:
+        normalized.add(dominant)
+    return normalized
+
+
 def _recent_track_keys(profile: Dict[str, Any]) -> set[str]:
     keys: set[str] = set()
     for track in list(profile.get("recent_track_snapshots") or []) + list(
@@ -97,8 +112,13 @@ def evaluate_home_fixture(
     track_counts: Dict[str, int] = {}
     artist_counts: Dict[str, int] = {}
     language_mismatch_count = 0
+    region_mismatch_count = 0
+    search_only_source_count = 0
+    unknown_source_count = 0
+    unknown_album_artist_count = 0
     recent_repeat_count = 0
     supported_languages = _supported_languages(profile)
+    supported_regions = _supported_regions(profile)
     recent_track_keys = _recent_track_keys(profile)
 
     for item in visible:
@@ -116,8 +136,30 @@ def evaluate_home_fixture(
         if artist_key:
             artist_counts[artist_key] = int(artist_counts.get(artist_key) or 0) + 1
         language = str(item.get("language") or "").strip().lower()
-        if language and supported_languages and language not in supported_languages:
+        if (
+            language
+            and language != "unknown"
+            and supported_languages
+            and language not in supported_languages
+        ):
             language_mismatch_count += 1
+        region = str(item.get("region") or "").strip().lower()
+        if (
+            region
+            and region != "unknown"
+            and supported_regions
+            and region not in supported_regions
+        ):
+            region_mismatch_count += 1
+        authority = str(item.get("source_authority") or "").strip().lower()
+        if authority == "search_only":
+            search_only_source_count += 1
+        elif authority in {"", "unknown"}:
+            unknown_source_count += 1
+        if item.get("album_source") and not str(
+            item.get("artist") or item.get("artist_name") or item.get("channel") or ""
+        ).strip():
+            unknown_album_artist_count += 1
 
     emitted_rows = {
         str(row.get("kind") or "")
@@ -143,6 +185,12 @@ def evaluate_home_fixture(
         reasons.append(f"visible_artist_concentration:{max_artist_concentration}")
     if language_mismatch_count > 0:
         reasons.append(f"off_profile_language_items:{language_mismatch_count}")
+    if region_mismatch_count > 0:
+        reasons.append(f"off_profile_region_items:{region_mismatch_count}")
+    if search_only_source_count > 0:
+        reasons.append(f"search_only_source_items:{search_only_source_count}")
+    if unknown_album_artist_count > 0:
+        reasons.append(f"unknown_album_artist_items:{unknown_album_artist_count}")
     if recent_repeat_count > 0:
         reasons.append(f"recent_repeat_items:{recent_repeat_count}")
     if missing_required_rows:
@@ -155,6 +203,10 @@ def evaluate_home_fixture(
         "unique_artist_count": len(artist_counts),
         "max_artist_concentration": max_artist_concentration,
         "off_profile_language_count": language_mismatch_count,
+        "off_profile_region_count": region_mismatch_count,
+        "search_only_source_count": search_only_source_count,
+        "unknown_source_count": unknown_source_count,
+        "unknown_album_artist_count": unknown_album_artist_count,
         "recent_repeat_count": recent_repeat_count,
         "missing_required_rows": missing_required_rows,
         "reasons": reasons,

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Literal
 
 from pydantic import BaseModel, Field
 
@@ -16,35 +16,36 @@ class TrackSnapshot(BaseModel):
     duration: Optional[int] = None
 
 
-class SearchV2Request(BaseModel):
-    query: str
-    user_scope_id: str = "guest"
-    session_id: Optional[str] = None
-    limit: int = 24
-    recent_queries: List[str] = Field(default_factory=list)
-    recent_tracks: List[Dict[str, Any]] = Field(default_factory=list)
-    context_surface: str = "search"
-    force_refresh: bool = False
-    defer_side_surfaces: bool = False
-
-
-class SuggestV2Request(BaseModel):
-    query: str
-    user_scope_id: str = "guest"
-    session_id: Optional[str] = None
-    limit: int = 6
-    recent_queries: List[str] = Field(default_factory=list)
-    recent_tracks: List[Dict[str, Any]] = Field(default_factory=list)
-
-
-class RecommendationHomeV2Request(BaseModel):
+class SearchRequest(BaseModel):
     query: str = ""
+    auto_correct: bool = False
     user_scope_id: str = "guest"
     session_id: Optional[str] = None
     force_refresh: bool = False
     prepare_next_session: bool = False
     prefer_fresh_rows: bool = False
+    session_intent: bool = False
+    # Initial app launch may consume one durable ready-feed successor. This
+    # remains explicit so ordinary full-feed polls never rotate the queue.
+    promote_ready_on_launch: bool = False
+    launch_token: str = ""
+    feed_queue_status_only: bool = False
+    # Metadata-only queue long poll. The server waits on the per-scope
+    # condition until this revision changes, target depth is reached, or the
+    # bounded timeout (capped server-side) expires.
+    feed_queue_revision: int = 0
+    feed_queue_wait_ms: int = 0
+    last_seen_queue_revision: int = 0
+    queue_wait_ms: int = 0
     refresh_token: str = ""
+    # Compare-and-swap baseline for one asynchronous manual Home refresh.
+    refresh_from_version: Optional[int] = None
+    # Bounded server-side wait for a successor during pull-to-refresh. A
+    # timeout returns the unchanged active feed with explicit diagnostics.
+    feed_refresh_wait_ms: int = 0
+    # Transitional alias for older clients; the canonical wire field is
+    # feed_refresh_wait_ms.
+    refresh_wait_ms: int = 0
     recent_track_ids: List[str] = Field(default_factory=list)
     top_track_ids: List[str] = Field(default_factory=list)
     recent_tracks: List[Dict[str, Any]] = Field(default_factory=list)
@@ -58,70 +59,28 @@ class RecommendationHomeV2Request(BaseModel):
     library_track_ids: List[str] = Field(default_factory=list)
     offline_track_ids: List[str] = Field(default_factory=list)
     avoid_ids: List[str] = Field(default_factory=list)
-    limit: int = 18
-
-
-class RecommendationRowPageV2Request(BaseModel):
-    user_scope_id: str = "guest"
-    session_id: str
-    row_id: str
-    row_context: Optional[str] = None
-    offset: int = 0
-    limit: int = 8
-
-
-class SimilarArtistsV2Request(BaseModel):
-    user_scope_id: str = "guest"
-    session_id: Optional[str] = None
-    query: str = ""
-    surface: str = "search_results"
+    limit: int = 24
+    context_surface: str = "search"
+    surface: str = "home_feed"
     anchor_track_id: Optional[str] = None
     anchor_artist_id: Optional[str] = None
     anchor_track_snapshot: Optional[Dict[str, Any]] = None
-    recent_queries: List[str] = Field(default_factory=list)
-    recent_tracks: List[Dict[str, Any]] = Field(default_factory=list)
-    limit: int = 8
-
-
-class SearchV3Request(SearchV2Request):
-    recent_track_ids: List[str] = Field(default_factory=list)
-    top_track_ids: List[str] = Field(default_factory=list)
-    top_tracks: List[Dict[str, Any]] = Field(default_factory=list)
-    last_played_tracks: List[Dict[str, Any]] = Field(default_factory=list)
-    taste_queries: List[str] = Field(default_factory=list)
-    artist_hints: List[str] = Field(default_factory=list)
-    album_hints: List[str] = Field(default_factory=list)
-    playlist_names: List[str] = Field(default_factory=list)
-    library_track_ids: List[str] = Field(default_factory=list)
-    offline_track_ids: List[str] = Field(default_factory=list)
     search_mode: str = ""
-
-
-class RecommendationHomeV3Request(RecommendationHomeV2Request):
-    pass
-
-
-class RecommendationRowPageV3Request(RecommendationRowPageV2Request):
-    pass
-
-
-class SimilarArtistsV3Request(SimilarArtistsV2Request):
-    pass
-
-
-class SearchRequest(SearchV3Request):
-    surface: str = "home_feed"
     seed_id: Optional[str] = None
     seed_ids: List[str] = Field(default_factory=list)
     anchor_artist_hints: List[str] = Field(default_factory=list)
-    avoid_ids: List[str] = Field(default_factory=list)
     offset: int = 0
+    result_type: str = ""
+    cursor: str = ""
     row_id: Optional[str] = None
     row_context: Optional[str] = None
-    prepare_next_session: bool = False
-    prefer_fresh_rows: bool = False
-    refresh_token: str = ""
     defer_side_surfaces: bool = False
+    # Browser live Top response; full category/detail requests retain their contract.
+    search_preview: bool = False
+    # Optional bounded long-poll for an existing canonical search snapshot.
+    # The backend never starts retrieval for a revision wait.
+    revision: int = 0
+    revision_wait_ms: int = 0
     recent_track_snapshots: List[Dict[str, Any]] = Field(default_factory=list)
     top_track_snapshots: List[Dict[str, Any]] = Field(default_factory=list)
     anchor_track_snapshots: List[Dict[str, Any]] = Field(default_factory=list)
@@ -151,10 +110,17 @@ class RecommendationSearchEventRequest(BaseModel):
 class HistorySeedRequest(BaseModel):
     user_scope_id: str = "guest"
     limit: int = 24
+    pending_play_keys: List[str] = Field(default_factory=list, max_length=512)
 
 
 class RecommendationModelTrainRequest(BaseModel):
     force_sync: bool = False
+
+
+class RecommendationPreferencesRequest(BaseModel):
+    user_scope_id: str = "guest"
+    taste_mode: str = "neatie"
+    listenbrainz_username: str = ""
 
 
 class DownloadRequest(BaseModel):
@@ -162,16 +128,70 @@ class DownloadRequest(BaseModel):
     title: str = ""
 
 
-class WarmStreamRequest(BaseModel):
-    video_ids: List[str] = Field(default_factory=list)
-    current_video_id: Optional[str] = None
+class PrepareSessionRequest(BaseModel):
+    preferred_cached_variant: Literal['', 'opus-v1', 'aac-v1'] = ''
+    queue_cache_id: str = Field(default="", max_length=128)
+    queue_cache_revision: int = Field(default=0, ge=0)
+    cancel_queue_cache: bool = False
+    queue_cache_metadata: bool = False
+    queue_cache_status_only: bool = False
+    cache_full: bool = False
+    cached_only: bool = False
+    track_keys: List[str] = Field(default_factory=list, max_length=100)
+    current_track_key: Optional[str] = None
     active_queue: bool = False
     lookahead: int = 0
+    background: bool = False
+
+
+class PlaybackResolveRequest(BaseModel):
+    track_key: str
+    title: str = ""
+    artist: str = ""
+    album: str = ""
+    duration: int = 0
+    source_id: str = ""
+    source_provider: str = "youtube"
+
+
+class RelatedTracksRequest(BaseModel):
+    track_key: str
+    title: str = ""
+    artist: str = ""
+    album: str = ""
+    duration: int = 0
+    source_id: str = ""
+    source_provider: str = "youtube"
+    user_scope_id: str = "guest"
+    avoid_ids: List[str] = Field(default_factory=list)
+    discovery_session: str = Field(default="", max_length=128)
+    recent_ids: List[str] = Field(default_factory=list, max_length=100)
+    offset: int = 0
+    limit: int = 18
+
+
+class LyricsMeaningRequest(BaseModel):
+    video_id: str = Field(min_length=1, max_length=256)
+    title: str = Field(default='', max_length=180)
+    artist: str = Field(default='', max_length=180)
+    album: Optional[str] = Field(default=None, max_length=180)
+    year: Optional[str] = Field(default=None, max_length=24)
+    source: Optional[str] = Field(default=None, max_length=120)
+    duration: Optional[int] = Field(default=None, ge=0, le=86400)
+    source_id: str = Field(default='', max_length=256)
+    lines: List[Dict[str, Any]] = Field(default_factory=list, max_length=256)
+    user_scope_id: str = "guest"
+    question: str = Field(default='', max_length=2000)
+    conversation: List['AssistantConversationMessage'] = Field(default_factory=list, max_length=8)
+    research: bool = False
 
 
 class AssistantConversationMessage(BaseModel):
-    role: str
-    content: str
+    role: Literal['user','assistant']
+    content: str = Field(min_length=1, max_length=4000)
+
+
+LyricsMeaningRequest.model_rebuild()
 
 
 class AssistantPlaylistSummary(BaseModel):
@@ -199,12 +219,13 @@ class AssistantContextTrack(BaseModel):
 
 
 class AssistantChatRequest(BaseModel):
-    message: str
+    message: str = Field(min_length=1, max_length=2000)
     user_scope_id: str = "guest"
     session_id: Optional[str] = None
     thinking_mode: bool = True
     force_refresh: bool = False
-    conversation: List[AssistantConversationMessage] = Field(default_factory=list)
+    conversation: List[AssistantConversationMessage] = Field(default_factory=list, max_length=12)
+    song: Optional[LyricsMeaningRequest] = None
     last_assistant_tracks: List[AssistantContextTrack] = Field(default_factory=list)
     last_playlist_draft_tracks: List[AssistantContextTrack] = Field(default_factory=list)
     recent_assistant_tracks: List[AssistantContextTrack] = Field(default_factory=list)

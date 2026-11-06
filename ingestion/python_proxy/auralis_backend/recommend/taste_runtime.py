@@ -185,7 +185,9 @@ def _accumulate_feature_counters(
     subgenre_counts: Counter[str],
     era_counts: Counter[str],
     language_counts: Counter[str],
+    region_counts: Counter[str],
     script_counts: Counter[str],
+    audience_counts: Counter[str],
     scene_counts: Counter[str],
     artist_counts: Counter[str],
     album_counts: Counter[str],
@@ -209,11 +211,20 @@ def _accumulate_feature_counters(
     if era_bucket:
         era_counts[era_bucket] += weight * 1.0
     language = str(feature.get("language") or "").strip()
-    if language:
-        language_counts[language] += weight * 1.0
+    language_confidence = float(feature.get("language_confidence") or 0.0)
+    if language and language != "unknown" and language_confidence >= 0.45:
+        language_counts[language] += weight * max(language_confidence, 0.45)
+    region = str(feature.get("region") or "").strip()
+    region_confidence = float(feature.get("region_confidence") or 0.0)
+    if region and region != "unknown" and region_confidence >= 0.4:
+        region_counts[region] += weight * max(region_confidence, 0.4)
     script = str(feature.get("script") or "").strip()
     if script:
         script_counts[script] += weight * 1.0
+    audience = str(feature.get("audience_profile") or "general").strip()
+    audience_confidence = float(feature.get("audience_confidence") or 0.0)
+    if audience and audience != "unknown" and audience_confidence >= 0.5:
+        audience_counts[audience] += weight * max(audience_confidence, 0.5)
     for scene_cluster in list(feature.get("scene_cluster_ids") or [])[:8]:
         cluster_value = str(scene_cluster or "").strip()
         if cluster_value:
@@ -244,7 +255,9 @@ def _derive_taste_profile(server: Any, profile: Dict[str, Any], feedback_rows: D
     short_subgenres: Counter[str] = Counter()
     short_eras: Counter[str] = Counter()
     short_languages: Counter[str] = Counter()
+    short_regions: Counter[str] = Counter()
     short_scripts: Counter[str] = Counter()
+    short_audiences: Counter[str] = Counter()
     short_scenes: Counter[str] = Counter()
     short_artists: Counter[str] = Counter()
     short_albums: Counter[str] = Counter()
@@ -254,7 +267,9 @@ def _derive_taste_profile(server: Any, profile: Dict[str, Any], feedback_rows: D
     long_subgenres: Counter[str] = Counter()
     long_eras: Counter[str] = Counter()
     long_languages: Counter[str] = Counter()
+    long_regions: Counter[str] = Counter()
     long_scripts: Counter[str] = Counter()
+    long_audiences: Counter[str] = Counter()
     long_scenes: Counter[str] = Counter()
     long_artists: Counter[str] = Counter()
     long_albums: Counter[str] = Counter()
@@ -280,7 +295,9 @@ def _derive_taste_profile(server: Any, profile: Dict[str, Any], feedback_rows: D
                     subgenre_counts=short_subgenres,
                     era_counts=short_eras,
                     language_counts=short_languages,
+                    region_counts=short_regions,
                     script_counts=short_scripts,
+                    audience_counts=short_audiences,
                     scene_counts=short_scenes,
                     artist_counts=short_artists,
                     album_counts=short_albums,
@@ -297,7 +314,9 @@ def _derive_taste_profile(server: Any, profile: Dict[str, Any], feedback_rows: D
                 subgenre_counts=long_subgenres,
                 era_counts=long_eras,
                 language_counts=long_languages,
+                region_counts=long_regions,
                 script_counts=long_scripts,
+                audience_counts=long_audiences,
                 scene_counts=long_scenes,
                 artist_counts=long_artists,
                 album_counts=long_albums,
@@ -333,7 +352,9 @@ def _derive_taste_profile(server: Any, profile: Dict[str, Any], feedback_rows: D
                     subgenre_counts=short_subgenres,
                     era_counts=short_eras,
                     language_counts=short_languages,
+                    region_counts=short_regions,
                     script_counts=short_scripts,
+                    audience_counts=short_audiences,
                     scene_counts=short_scenes,
                     artist_counts=short_artists,
                     album_counts=short_albums,
@@ -350,7 +371,9 @@ def _derive_taste_profile(server: Any, profile: Dict[str, Any], feedback_rows: D
                 subgenre_counts=long_subgenres,
                 era_counts=long_eras,
                 language_counts=long_languages,
+                region_counts=long_regions,
                 script_counts=long_scripts,
+                audience_counts=long_audiences,
                 scene_counts=long_scenes,
                 artist_counts=long_artists,
                 album_counts=long_albums,
@@ -405,6 +428,14 @@ def _derive_taste_profile(server: Any, profile: Dict[str, Any], feedback_rows: D
 
     dominant_script = _top_keys(long_scripts, limit=1)
     dominant_language = _top_keys(long_languages, limit=1)
+    dominant_region = _top_keys(long_regions, limit=1)
+    language_scores = _normalized_counter(long_languages)
+    region_scores = _normalized_counter(long_regions)
+    audience_scores = _normalized_counter(long_audiences)
+    accepted_languages = _top_keys(long_languages, limit=6, threshold=0.45)
+    accepted_regions = _top_keys(long_regions, limit=6, threshold=0.38)
+    accepted_audiences = _top_keys(long_audiences, limit=4, threshold=0.5)
+    profile_language_confidence = min(sum(long_languages.values()) / 4.0, 1.0) if long_languages else 0.0
     dominant_era = _top_keys(long_eras, limit=1)
     album_depth_preference = min(
         len([key for key, count in long_albums.items() if count >= 0.9]) / 6.0,
@@ -437,7 +468,9 @@ def _derive_taste_profile(server: Any, profile: Dict[str, Any], feedback_rows: D
             "subgenres": _normalized_counter(long_subgenres),
             "eras": _normalized_counter(long_eras),
             "languages": _normalized_counter(long_languages),
+            "regions": _normalized_counter(long_regions),
             "scripts": _normalized_counter(long_scripts),
+            "audiences": _normalized_counter(long_audiences),
             "scenes": _normalized_counter(long_scenes),
             "artists": _normalized_counter(long_artists),
             "albums": _normalized_counter(long_albums),
@@ -448,7 +481,9 @@ def _derive_taste_profile(server: Any, profile: Dict[str, Any], feedback_rows: D
             "subgenres": _normalized_counter(short_subgenres),
             "eras": _normalized_counter(short_eras),
             "languages": _normalized_counter(short_languages),
+            "regions": _normalized_counter(short_regions),
             "scripts": _normalized_counter(short_scripts),
+            "audiences": _normalized_counter(short_audiences),
             "scenes": _normalized_counter(short_scenes),
             "artists": _normalized_counter(short_artists),
             "albums": _normalized_counter(short_albums),
@@ -458,11 +493,20 @@ def _derive_taste_profile(server: Any, profile: Dict[str, Any], feedback_rows: D
         "preferred_subgenres": _top_keys(long_subgenres, limit=6, threshold=0.35),
         "dominant_script": dominant_script[0] if dominant_script else "latin",
         "supported_scripts": _top_keys(long_scripts, limit=5, threshold=0.45),
-        "dominant_language": dominant_language[0] if dominant_language else "english",
-        "supported_languages": _top_keys(long_languages, limit=5, threshold=0.45),
+        "dominant_language": dominant_language[0] if dominant_language else "",
+        "supported_languages": accepted_languages,
+        "accepted_languages": accepted_languages,
+        "language_scores": language_scores,
+        "profile_language_confidence": round(profile_language_confidence, 4),
+        "dominant_region": dominant_region[0] if dominant_region else "",
+        "supported_regions": accepted_regions,
+        "accepted_regions": accepted_regions,
+        "region_scores": region_scores,
         "dominant_era": dominant_era[0] if dominant_era else "",
         "supported_eras": _top_keys(long_eras, limit=6, threshold=0.45),
         "supported_type_tags": _top_keys(long_types, limit=6, threshold=0.3),
+        "accepted_audience_profiles": accepted_audiences,
+        "audience_scores": audience_scores,
         "dominant_artist_keys": _top_keys(long_artists, limit=4, threshold=0.5),
         "scene_artist_scores": {
             key: round(float(value), 4)
@@ -664,6 +708,8 @@ def _feedback_action(req) -> str:
     reason = str(metadata.get("reason") or "").strip().lower()
     if reason == "history_delete":
         return "history_delete"
+    if event_type in {"remove_from_feed", "hide", "remove", "dislike"}:
+        return "history_delete"
     if event_type == "skip":
         return "negative_skip"
     if event_type in {"library", "download", "save"}:
@@ -682,6 +728,10 @@ def apply_interaction_feedback(server: Any, req) -> Dict[str, Any]:
     feature = get_track_feature(server, track_payload)
     duplicate_key = _duplicate_feedback_key(feature)
     action = _feedback_action(req)
+    event_id = str((getattr(req, "metadata", {}) or {}).get("_feedback_event_id") or "")
+    event_at = float(getattr(req, "occurred_at", 0) or time.time())
+    feedback_metadata = {"event": action, "feedback_event_at": event_at,
+                         "feedback_event_id": event_id}
     applied_keys: List[str] = []
     negative_feedback_applied = False
 
@@ -693,7 +743,7 @@ def apply_interaction_feedback(server: Any, req) -> Dict[str, Any]:
             feedback_key=track_id,
             strength=1.0,
             ttl_seconds=_HARD_HIDE_TTL_SECONDS,
-            metadata={"event": action},
+            metadata=feedback_metadata,
         )
         applied_keys.append(f"exact_track:{track_id}")
         if duplicate_key:
@@ -704,7 +754,7 @@ def apply_interaction_feedback(server: Any, req) -> Dict[str, Any]:
                 feedback_key=duplicate_key,
                 strength=0.95,
                 ttl_seconds=_DUPLICATE_HIDE_TTL_SECONDS,
-                metadata={"event": action},
+                metadata=feedback_metadata,
             )
             applied_keys.append(f"duplicate_track:{duplicate_key}")
         for feedback_type, feedback_key, strength in _scene_feedback_keys(feature):
@@ -715,7 +765,7 @@ def apply_interaction_feedback(server: Any, req) -> Dict[str, Any]:
                 feedback_key=feedback_key,
                 strength=strength,
                 ttl_seconds=_SOFT_CLUSTER_TTL_SECONDS,
-                metadata={"event": action},
+                metadata=feedback_metadata,
             )
             applied_keys.append(f"{feedback_type}:{feedback_key}")
         negative_feedback_applied = True
@@ -727,7 +777,7 @@ def apply_interaction_feedback(server: Any, req) -> Dict[str, Any]:
             feedback_key=track_id,
             strength=0.42,
             ttl_seconds=_SKIP_TTL_SECONDS,
-            metadata={"event": action},
+            metadata=feedback_metadata,
         )
         applied_keys.append(f"exact_track:{track_id}")
         if duplicate_key:
@@ -738,7 +788,7 @@ def apply_interaction_feedback(server: Any, req) -> Dict[str, Any]:
                 feedback_key=duplicate_key,
                 strength=0.28,
                 ttl_seconds=_SKIP_TTL_SECONDS,
-                metadata={"event": action},
+                metadata=feedback_metadata,
             )
             applied_keys.append(f"duplicate_track:{duplicate_key}")
         for feedback_type, feedback_key, strength in _scene_feedback_keys(feature):
@@ -749,7 +799,7 @@ def apply_interaction_feedback(server: Any, req) -> Dict[str, Any]:
                 feedback_key=feedback_key,
                 strength=max(strength * 0.35, 0.12),
                 ttl_seconds=_SKIP_TTL_SECONDS,
-                metadata={"event": action},
+                metadata=feedback_metadata,
             )
             applied_keys.append(f"{feedback_type}:{feedback_key}")
         negative_feedback_applied = True
@@ -759,6 +809,7 @@ def apply_interaction_feedback(server: Any, req) -> Dict[str, Any]:
             user_scope_id=user_scope_id,
             feedback_type="exact_track",
             feedback_key=track_id,
+            event_at=event_at,
         )
         if duplicate_key:
             if action == "positive_save":
@@ -767,6 +818,7 @@ def apply_interaction_feedback(server: Any, req) -> Dict[str, Any]:
                     user_scope_id=user_scope_id,
                     feedback_type="duplicate_track",
                     feedback_key=duplicate_key,
+                    event_at=event_at,
                 )
             else:
                 attenuate_negative_feedback(
@@ -775,6 +827,7 @@ def apply_interaction_feedback(server: Any, req) -> Dict[str, Any]:
                     feedback_type="duplicate_track",
                     feedback_key=duplicate_key,
                     factor=0.45,
+                    event_id=event_id, event_at=event_at,
                 )
         for feedback_type, feedback_key, _strength in _scene_feedback_keys(feature):
             attenuate_negative_feedback(
@@ -783,6 +836,7 @@ def apply_interaction_feedback(server: Any, req) -> Dict[str, Any]:
                 feedback_type=feedback_type,
                 feedback_key=feedback_key,
                 factor=0.55 if action == "positive_save" else 0.72,
+                event_id=event_id, event_at=event_at,
             )
         applied_keys.append(f"positive:{track_id}")
 

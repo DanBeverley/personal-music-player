@@ -71,20 +71,43 @@ bool looksLikeSemanticTasteQuery(String query) {
   final normalized = query.trim().toLowerCase();
   if (normalized.isEmpty) return false;
   if (normalized.length > 38) return true;
-  if (normalized.contains(' mix') ||
-      normalized.contains(' playlist') ||
-      normalized.contains(' songs') ||
-      normalized.contains(' music')) {
+  const exploratoryPhrases = <String>[
+    'songs like ',
+    'similar to ',
+    'music for ',
+    'songs for ',
+    'song about ',
+    'song where ',
+    'that song ',
+    'sounds like ',
+    'reminds me of ',
+    'i remember ',
+  ];
+  if (exploratoryPhrases.any(normalized.startsWith)) {
     return true;
   }
-  return sharedTasteKeywords.any((keyword) {
+  final tokens = normalized.split(RegExp(r'\s+')).toSet();
+  const intentWords = <String>{
+    'mix',
+    'playlist',
+    'songs',
+    'music',
+    'mood',
+    'vibe',
+    'workout',
+    'focus',
+    'sleep',
+  };
+  if (tokens.intersection(intentWords).isNotEmpty) return true;
+  final tasteHits = sharedTasteKeywords.where((keyword) {
     if (keyword.contains(' ')) {
       return normalized.contains(keyword);
     }
     return RegExp(
       '(^|\\s)${RegExp.escape(keyword)}(\\s|\$)',
     ).hasMatch(normalized);
-  });
+  }).length;
+  return tasteHits >= 2;
 }
 
 bool isMetadataHeavyQuery(String query) {

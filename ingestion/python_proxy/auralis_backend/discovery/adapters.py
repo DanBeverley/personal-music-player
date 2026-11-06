@@ -7,6 +7,186 @@ from .config import ENGINE_MODEL_VERSION
 from .schema import DiscoveryArtifact, DiscoveryRow
 
 
+_CLIENT_TRACK_FIELDS = {
+    "id",
+    "track_key",
+    "canonical_recording_id",
+    "musicbrainz_recording_id",
+    "isrc",
+    "videoId",
+    "video_id",
+    "playback",
+    "playback_source_id",
+    "provider",
+    "source_provider",
+    "source_authority",
+    "source_identity_authority",
+    "title",
+    "name",
+    "channel",
+    "artist",
+    "author",
+    "artists",
+    "artist_id",
+    "artist_ids",
+    "artist_entities",
+    "album",
+    "album_title",
+    "album_id",
+    "browseId",
+    "duration",
+    "duration_seconds",
+    "thumbnail",
+    "thumbnails",
+    "image",
+    "year",
+    "release_year",
+    "release_date",
+    "recommendation_reason",
+    "relation_type",
+    "relation_strength",
+    "play_count",
+    "last_played_at",
+    "isHidden",
+    "is_downloaded_locally",
+    "download_path",
+}
+
+_CLIENT_ALBUM_FIELDS = {
+    "id",
+    "title",
+    "name",
+    "album",
+    "artist",
+    "channel",
+    "artist_name",
+    "thumbnail",
+    "image",
+    "year",
+    "release_year",
+    "release_date",
+    "release_type",
+    "browseId",
+    "album_id",
+    "musicbrainz_release_group_id",
+    "musicbrainz_artist_id",
+    "musicbrainz_artist_ids",
+    "canonical_album_identity",
+    "track_count",
+    "canonical_track_count",
+    "playable_coverage",
+    "album_source",
+    "genres",
+    "genre",
+    "subgenre",
+    "language",
+    "region",
+    "relation_type",
+    "relation_strength",
+    "album_relation_reason",
+    "album_relation_score",
+    "recommendation_reason",
+}
+
+_CLIENT_ARTIST_FIELDS = {
+    "id",
+    "artist_id",
+    "musicbrainz_artist_id",
+    "name",
+    "title",
+    "artist",
+    "thumbnail",
+    "image",
+    "genres",
+    "genre",
+    "relation_type",
+    "relation_strength",
+    "recommendation_reason",
+}
+
+
+def _copy_client_fields(item: Dict[str, Any], fields: set[str]) -> Dict[str, Any]:
+    return {
+        key: value
+        for key, value in item.items()
+        if key in fields and value is not None
+    }
+
+
+def _track_to_client_payload(item: Dict[str, Any]) -> Dict[str, Any]:
+    return _copy_client_fields(item, _CLIENT_TRACK_FIELDS)
+
+
+def _album_to_client_payload(item: Dict[str, Any]) -> Dict[str, Any]:
+    payload = _copy_client_fields(item, _CLIENT_ALBUM_FIELDS)
+    raw_tracks = item.get("tracks") or item.get("canonical_tracks") or []
+    if isinstance(raw_tracks, list) and raw_tracks:
+        payload["tracks"] = [
+            _track_to_client_payload(track)
+            for track in raw_tracks
+            if isinstance(track, dict)
+        ]
+    return payload
+
+
+def _collection_to_client_payload(item: Dict[str, Any]) -> Dict[str, Any]:
+    payload = {
+        key: value
+        for key, value in item.items()
+        if key not in {"tracks", "items", "recommendations", "canonical_tracks"}
+    }
+    raw_tracks = (
+        item.get("tracks")
+        or item.get("items")
+        or item.get("recommendations")
+        or []
+    )
+    if isinstance(raw_tracks, list):
+        payload["tracks"] = [
+            _track_to_client_payload(track)
+            for track in raw_tracks
+            if isinstance(track, dict)
+        ]
+    return payload
+
+
+def _item_to_client_payload(item: Dict[str, Any], *, item_type: str) -> Dict[str, Any]:
+    normalized_type = str(item_type or "track").strip().lower()
+    if normalized_type == "album":
+        return _album_to_client_payload(item)
+    if normalized_type == "artist":
+        return _copy_client_fields(item, _CLIENT_ARTIST_FIELDS)
+    if normalized_type in {"mix", "radio"}:
+        return _collection_to_client_payload(item)
+    return _track_to_client_payload(item)
+
+
+def _home_tab_lanes_to_client_payload(raw_lanes: Any) -> Dict[str, Any]:
+    if not isinstance(raw_lanes, dict):
+        return {}
+    lanes: Dict[str, Any] = {}
+    for lane_id, raw_lane in raw_lanes.items():
+        if not isinstance(raw_lane, dict):
+            continue
+        lane: Dict[str, Any] = {}
+        for collection, item_type in (
+            ("tracks", "track"),
+            ("discoveries", "track"),
+            ("albums", "album"),
+            ("artists", "artist"),
+        ):
+            raw_items = raw_lane.get(collection)
+            if not isinstance(raw_items, list):
+                continue
+            lane[collection] = [
+                _item_to_client_payload(item, item_type=item_type)
+                for item in raw_items
+                if isinstance(item, dict)
+            ]
+        lanes[str(lane_id)] = lane
+    return lanes
+
+
 def _rotate_featured_items(items: List[Dict[str, Any]], *, window_seconds: int = 300) -> List[Dict[str, Any]]:
     if len(items) <= 1:
         return items
@@ -20,7 +200,12 @@ def row_to_payload(row: DiscoveryRow, *, offset: int = 0, limit: int | None = No
         items = _rotate_featured_items(items)
     start = max(int(offset or 0), 0)
     page_limit = max(int(limit or 0), 0) if limit is not None else len(items)
-    page = items[start : start + page_limit] if page_limit else items[start:]
+    raw_page = items[start : start + page_limit] if page_limit else items[start:]
+    page = [
+        _item_to_client_payload(item, item_type=row.item_type)
+        for item in raw_page
+        if isinstance(item, dict)
+    ]
     next_offset = start + len(page)
     has_more = bool(row.has_more and next_offset < len(items))
     payload = {
@@ -82,14 +267,10 @@ def home_response_from_artifact(
     page_size: int,
 ) -> Dict[str, Any]:
     rows = rows_to_payload(artifact.rows, page_size=page_size)
-    flattened: List[Dict[str, Any]] = []
-    for row in rows:
-        if str(row.get("item_type") or "track") != "track":
-            continue
-        flattened.extend(row.get("items") or [])
-        if len(flattened) >= 32:
-            break
     diagnostics = dict(artifact.diagnostics or {})
+    diagnostics["home_tab_lanes"] = _home_tab_lanes_to_client_payload(
+        diagnostics.get("home_tab_lanes"),
+    )
     diagnostics.setdefault("engine", "discovery_engine")
     diagnostics["artifact_source"] = artifact.artifact_source
     diagnostics.setdefault(
@@ -104,12 +285,14 @@ def home_response_from_artifact(
         "status": "success",
         "request_id": request_id,
         "session_id": artifact.session_id,
+        "feed_version": int(diagnostics.get("feed_version") or 0),
+        "feed_action": str(diagnostics.get("feed_action") or ""),
+        "preparation_state": str(diagnostics.get("preparation_state") or "idle"),
+        "quality_warnings": list(diagnostics.get("quality_warnings") or []),
         "generated_at": artifact.generated_at,
         "expires_at": artifact.expires_at,
         "model_version": ENGINE_MODEL_VERSION,
         "rows": rows,
-        "shelves": rows,
-        "recommendations": flattened[:32],
         "has_more": any(bool(row.get("has_more")) for row in rows),
         "next_offset": sum(len(row.get("items") or []) for row in rows),
         "diagnostics": diagnostics,
@@ -128,6 +311,9 @@ def row_page_response_from_artifact(
         if row.id == row_id or row.kind == row_id:
             payload = row_to_payload(row, offset=offset, limit=limit)
             diagnostics = dict(artifact.diagnostics or {})
+            diagnostics["home_tab_lanes"] = _home_tab_lanes_to_client_payload(
+                diagnostics.get("home_tab_lanes"),
+            )
             diagnostics.setdefault("engine", "discovery_engine")
             diagnostics["artifact_source"] = artifact.artifact_source
             diagnostics["cache_hit"] = artifact.artifact_source == "cache"
@@ -143,8 +329,6 @@ def row_page_response_from_artifact(
                 "model_version": ENGINE_MODEL_VERSION,
                 "row": payload,
                 "rows": [payload],
-                "shelves": [payload],
-                "recommendations": payload.get("items") or [],
                 "has_more": bool(payload.get("has_more")),
                 "next_offset": int(payload.get("next_offset") or 0),
                 "diagnostics": diagnostics,

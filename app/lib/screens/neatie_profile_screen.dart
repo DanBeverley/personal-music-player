@@ -9,6 +9,7 @@ import '../logic/audio_provider_queue.dart';
 import '../logic/auth_provider.dart';
 import '../logic/details_provider.dart';
 import '../logic/playlist_provider.dart';
+import '../logic/recommendation_preferences_provider.dart';
 import '../main_details.dart';
 import '../ui/app_theme_tokens.dart';
 import '../ui/neatie_components.dart';
@@ -152,6 +153,9 @@ class NeatieProfileScreen extends ConsumerWidget {
                 ),
               ),
             const SizedBox(height: 24),
+            const _ProfileSectionHeader(title: 'Recommendation source'),
+            const _TastePreferencesCard(),
+            const SizedBox(height: 24),
             const _ProfileSectionHeader(title: 'Public playlists'),
             if (playlists.isEmpty)
               const _ProfileEmptyCard(
@@ -225,6 +229,127 @@ class NeatieProfileScreen extends ConsumerWidget {
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+class _TastePreferencesCard extends ConsumerStatefulWidget {
+  const _TastePreferencesCard();
+
+  @override
+  ConsumerState<_TastePreferencesCard> createState() =>
+      _TastePreferencesCardState();
+}
+
+class _TastePreferencesCardState
+    extends ConsumerState<_TastePreferencesCard> {
+  final _usernameController = TextEditingController();
+  final _usernameFocus = FocusNode();
+
+  @override
+  void dispose() {
+    _usernameController.dispose();
+    _usernameFocus.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final state = ref.watch(recommendationPreferencesProvider);
+    if (!_usernameFocus.hasFocus &&
+        _usernameController.text != state.listenBrainzUsername) {
+      _usernameController.text = state.listenBrainzUsername;
+    }
+    final needsListenBrainz = state.tasteMode != 'neatie';
+    final statusText = switch (state.listenBrainzStatus) {
+      'ready' => 'ListenBrainz profile connected.',
+      'no_recommendations' =>
+        'This profile has no public recommendations; Neatie remains active.',
+      'unavailable' =>
+        'ListenBrainz could not be reached; Neatie remains active.',
+      _ => needsListenBrainz
+          ? 'Enter a public ListenBrainz username.'
+          : 'Your local listening history leads recommendations.',
+    };
+
+    return NeatieSurface(
+      radius: neatieRadiusMedium,
+      color: Colors.white.withValues(alpha: 0.025),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          DropdownButtonFormField<String>(
+            initialValue: state.tasteMode,
+            dropdownColor: const Color(0xFF171717),
+            decoration: const InputDecoration(labelText: 'Taste mode'),
+            items: const [
+              DropdownMenuItem(value: 'neatie', child: Text('Neatie')),
+              DropdownMenuItem(value: 'blended', child: Text('Blended')),
+              DropdownMenuItem(
+                value: 'listenbrainz_first',
+                child: Text('ListenBrainz-first'),
+              ),
+            ],
+            onChanged: state.isLoading || state.isSaving
+                ? null
+                : (value) {
+                    if (value != null) {
+                      ref
+                          .read(recommendationPreferencesProvider.notifier)
+                          .setTasteMode(value);
+                    }
+                  },
+          ),
+          if (needsListenBrainz) ...[
+            const SizedBox(height: 14),
+            TextField(
+              controller: _usernameController,
+              focusNode: _usernameFocus,
+              enabled: !state.isLoading && !state.isSaving,
+              autocorrect: false,
+              decoration: const InputDecoration(
+                labelText: 'ListenBrainz username',
+              ),
+              onChanged: ref
+                  .read(recommendationPreferencesProvider.notifier)
+                  .setListenBrainzUsername,
+            ),
+          ],
+          const SizedBox(height: 12),
+          Text(
+            statusText,
+            style: const TextStyle(color: neatieMutedText, fontSize: 12.5),
+          ),
+          if (state.error.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Text(
+              state.error,
+              style: const TextStyle(color: Colors.redAccent, fontSize: 12.5),
+            ),
+          ],
+          const SizedBox(height: 14),
+          Align(
+            alignment: Alignment.centerRight,
+            child: FilledButton(
+              onPressed: state.isLoading || state.isSaving
+                  ? null
+                  : () async {
+                      FocusScope.of(context).unfocus();
+                      final saved = await ref
+                          .read(recommendationPreferencesProvider.notifier)
+                          .save();
+                      if (!context.mounted || !saved) return;
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(
+                          content: Text('Recommendation settings saved.'),
+                        ),
+                      );
+                    },
+              child: Text(state.isSaving ? 'Saving…' : 'Save'),
+            ),
+          ),
+        ],
       ),
     );
   }

@@ -214,7 +214,6 @@ def _recommendation_album_embeddings(albums):
     return resolved
 
 
-@_with_server_globals
 def _recommendation_trim_text(value: Optional[str]) -> str:
     return (value or "").strip()
 
@@ -313,7 +312,15 @@ def _recommendation_track_from_song_payload(payload: Dict[str, Any]):
     )
     if track_payload is None:
         return None
+    if not _usable_track_metadata(track_payload):
+        return None
     return track_payload
+
+
+def _usable_track_metadata(track):
+    return bool(isinstance(track, dict)
+                and str(track.get("title") or "").strip().casefold() not in {"", "unknown", "unknown track"}
+                and str(track.get("artist") or track.get("channel") or "").strip().casefold() not in {"", "unknown", "unknown artist"})
 
 
 @_with_server_globals
@@ -335,9 +342,10 @@ def _recommendation_fetch_track_for_id_lightweight(track_id: str):
 
 @_with_server_globals
 def _recommendation_cached_track(track_id: str):
-    return _cache_lookup_recommendation_track_detail(
+    track = _cache_lookup_recommendation_track_detail(
         _recommendation_trim_text(track_id)
     )
+    return track if _usable_track_metadata(track) else None
 
 
 @_with_server_globals
@@ -366,9 +374,10 @@ def _recommendation_fetch_track_for_id(track_id: str):
     except Exception:
         details = {}
     track = _recommendation_track_from_details(details)
-    if track is not None:
+    if _usable_track_metadata(track):
         _recommendation_store_cached_track(track_id, track)
-    return track
+        return track
+    return None
 
 
 

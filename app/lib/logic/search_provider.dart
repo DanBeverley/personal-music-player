@@ -2,109 +2,10 @@ import 'dart:async';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import 'audio_provider.dart' show audioPlayerProvider;
 import 'interaction_events.dart';
 import 'proxy_runtime.dart';
 import 'search_payload_runtime.dart';
 import 'track_metadata.dart';
-
-class SearchNotifier extends StateNotifier<List<dynamic>> {
-  final Ref ref;
-  int _requestVersion = 0;
-  static const Duration _searchDebounce = Duration(milliseconds: 280);
-  static const Duration _searchTimeout = Duration(seconds: 15);
-
-  SearchNotifier(this.ref) : super([]);
-  bool isLoading = false;
-
-  void _primeSearchResults(List<dynamic> tracks) {
-    unawaited(
-      ref.read(audioPlayerProvider.notifier).prewarmStreams(
-            tracks.map((track) => track['id'] ?? track['videoId']),
-          ),
-    );
-  }
-
-  Future<void> search(String query) async {
-    final normalizedQuery = query.trim();
-    if (normalizedQuery.isEmpty) {
-      clear();
-      return;
-    }
-    final requestVersion = ++_requestVersion;
-    isLoading = true;
-    state = [...state];
-    try {
-      await Future<void>.delayed(_searchDebounce);
-      if (requestVersion != _requestVersion) return;
-      if (requestVersion != _requestVersion) return;
-      final fetchResult = await fetchSearchPayload(
-        ref.read,
-        normalizedQuery,
-        limit: 16,
-        timeout: _searchTimeout,
-        deferSideSurfaces: true,
-      );
-      if (requestVersion != _requestVersion) return;
-      if (fetchResult.hasPayload) {
-        final payload = fetchResult.payload!;
-        final rawResults = (payload['results'] as List<dynamic>? ?? const []);
-        state = rawResults
-            .whereType<Map>()
-            .map((entry) => normalizeTrack(Map<String, dynamic>.from(entry)))
-            .where((track) => (extractTrackId(track)?.isNotEmpty ?? false))
-            .toList(growable: false);
-        debugProxyLog(
-          'search',
-          'track query="$normalizedQuery" status=200 results=${state.length} similar=${((payload['similar_artists'] as List?) ?? const []).length} diagnostics=${compactDiagnosticValue(payload['diagnostics'])}',
-        );
-        _primeSearchResults(state);
-        unawaited(
-          recordCloudSearchEvent(
-            normalizedQuery,
-            resultCount: state.length,
-          ),
-        );
-        unawaited(
-          recordProxySearchEvent(
-            normalizedQuery,
-            resultCount: state.length,
-            searchScope: 'track',
-          ),
-        );
-        notifyRecommendationSignal(normalizedQuery);
-      } else {
-        debugProxyLog(
-          'search',
-          'track query="$normalizedQuery" status=${fetchResult.status}',
-        );
-        state = [];
-      }
-    } on TimeoutException catch (error) {
-      debugProxyLog('search', 'track query="$normalizedQuery" timeout=$error');
-      state = [];
-    } catch (error) {
-      debugProxyLog('search', 'track query="$normalizedQuery" error=$error');
-    } finally {
-      final isLatestRequest = requestVersion == _requestVersion;
-      if (isLatestRequest) {
-        isLoading = false;
-        state = [...state];
-      }
-    }
-  }
-
-  void clear() {
-    _requestVersion++;
-    isLoading = false;
-    state = [];
-  }
-}
-
-final searchProvider =
-    StateNotifierProvider<SearchNotifier, List<dynamic>>((ref) {
-  return SearchNotifier(ref);
-});
 
 class SearchPageState {
   final String requestState;
@@ -112,13 +13,20 @@ class SearchPageState {
   final String modelVersion;
   final String queryIntent;
   final Map<String, dynamic>? topResult;
+  final Map<String, dynamic>? leadArtist;
+  final Map<String, dynamic>? containingAlbum;
   final List<Map<String, dynamic>> tracks;
   final List<Map<String, dynamic>> artists;
   final List<Map<String, dynamic>> albums;
   final List<Map<String, dynamic>> similarArtists;
   final List<Map<String, dynamic>> similarTracks;
   final List<Map<String, dynamic>> artistTracks;
+  final List<Map<String, dynamic>> artistAlbums;
   final List<Map<String, dynamic>> relatedAlbums;
+  final List<Map<String, dynamic>> playlists;
+  final Map<String, dynamic> pagination;
+  final Set<String> loadingSurfaces;
+  final Set<String> appendedItemKeys;
   final Map<String, dynamic> diagnostics;
   final String? errorMessage;
 
@@ -128,13 +36,20 @@ class SearchPageState {
     this.modelVersion = '',
     this.queryIntent = 'mixed',
     this.topResult,
+    this.leadArtist,
+    this.containingAlbum,
     this.tracks = const [],
     this.artists = const [],
     this.albums = const [],
     this.similarArtists = const [],
     this.similarTracks = const [],
     this.artistTracks = const [],
+    this.artistAlbums = const [],
     this.relatedAlbums = const [],
+    this.playlists = const [],
+    this.pagination = const {},
+    this.loadingSurfaces = const {},
+    this.appendedItemKeys = const {},
     this.diagnostics = const {},
     this.errorMessage,
   });
@@ -147,7 +62,9 @@ class SearchPageState {
       similarArtists.isNotEmpty ||
       similarTracks.isNotEmpty ||
       artistTracks.isNotEmpty ||
-      relatedAlbums.isNotEmpty;
+      artistAlbums.isNotEmpty ||
+      relatedAlbums.isNotEmpty ||
+      playlists.isNotEmpty;
 
   factory SearchPageState.fromJson(Map<String, dynamic> json) {
     final rawTopResult = json['top_result'];
@@ -174,19 +91,16 @@ class SearchPageState {
         (json['similar_tracks'] as List<dynamic>? ?? const []);
     final rawArtistTracks =
         (json['artist_tracks'] as List<dynamic>? ?? const []);
+    final rawArtistAlbums =
+        (json['artist_albums'] as List<dynamic>? ?? const []);
     final rawRelatedAlbums =
         (json['related_albums'] as List<dynamic>? ?? const []);
+    final rawPlaylists = (json['playlists'] as List<dynamic>? ?? const []);
     final normalizedTracks = rawTracks
         .whereType<Map>()
         .map((entry) => normalizeTrack(Map<String, dynamic>.from(entry)))
         .where((track) => extractTrackId(track)?.isNotEmpty ?? false)
         .toList(growable: false);
-    if (normalizedTopResult == null && normalizedTracks.isNotEmpty) {
-      normalizedTopResult = <String, dynamic>{
-        'entity_type': 'track',
-        'item': normalizedTracks.first,
-      };
-    }
     return SearchPageState(
       requestState: (json['request_state'] ?? '').toString().trim().isNotEmpty
           ? json['request_state'].toString()
@@ -199,6 +113,12 @@ class SearchPageState {
               (normalizedTracks.isNotEmpty ? 'track' : 'mixed'))
           .toString(),
       topResult: normalizedTopResult,
+      leadArtist: json['lead_artist'] is Map
+          ? Map<String, dynamic>.from(json['lead_artist'] as Map)
+          : null,
+      containingAlbum: json['containing_album'] is Map
+          ? Map<String, dynamic>.from(json['containing_album'] as Map)
+          : null,
       tracks: normalizedTracks,
       artists: rawArtists
           .whereType<Map>()
@@ -229,11 +149,23 @@ class SearchPageState {
           .map((entry) => normalizeTrack(Map<String, dynamic>.from(entry)))
           .where((track) => extractTrackId(track)?.isNotEmpty ?? false)
           .toList(growable: false),
+      artistAlbums: rawArtistAlbums
+          .whereType<Map>()
+          .map((entry) => Map<String, dynamic>.from(entry))
+          .where(_hasResolvedSearchAlbumArtist)
+          .toList(growable: false),
       relatedAlbums: rawRelatedAlbums
           .whereType<Map>()
           .map((entry) => Map<String, dynamic>.from(entry))
           .where(_hasResolvedSearchAlbumArtist)
           .toList(growable: false),
+      playlists: rawPlaylists
+          .whereType<Map>()
+          .map((entry) => Map<String, dynamic>.from(entry))
+          .toList(growable: false),
+      pagination: json['pagination'] is Map
+          ? Map<String, dynamic>.from(json['pagination'] as Map)
+          : const {},
       diagnostics: json['diagnostics'] is Map
           ? Map<String, dynamic>.from(json['diagnostics'] as Map)
           : const {},
@@ -250,14 +182,23 @@ class SearchPageState {
     String? modelVersion,
     String? queryIntent,
     Map<String, dynamic>? topResult,
+    Map<String, dynamic>? leadArtist,
+    Map<String, dynamic>? containingAlbum,
     bool clearTopResult = false,
+    bool clearLeadArtist = false,
+    bool clearContainingAlbum = false,
     List<Map<String, dynamic>>? tracks,
     List<Map<String, dynamic>>? artists,
     List<Map<String, dynamic>>? albums,
     List<Map<String, dynamic>>? similarArtists,
     List<Map<String, dynamic>>? similarTracks,
     List<Map<String, dynamic>>? artistTracks,
+    List<Map<String, dynamic>>? artistAlbums,
     List<Map<String, dynamic>>? relatedAlbums,
+    List<Map<String, dynamic>>? playlists,
+    Map<String, dynamic>? pagination,
+    Set<String>? loadingSurfaces,
+    Set<String>? appendedItemKeys,
     Map<String, dynamic>? diagnostics,
     String? errorMessage,
     bool clearError = false,
@@ -268,58 +209,25 @@ class SearchPageState {
       modelVersion: modelVersion ?? this.modelVersion,
       queryIntent: queryIntent ?? this.queryIntent,
       topResult: clearTopResult ? null : topResult ?? this.topResult,
+      leadArtist: clearLeadArtist ? null : leadArtist ?? this.leadArtist,
+      containingAlbum:
+          clearContainingAlbum ? null : containingAlbum ?? this.containingAlbum,
       tracks: tracks ?? this.tracks,
       artists: artists ?? this.artists,
       albums: albums ?? this.albums,
       similarArtists: similarArtists ?? this.similarArtists,
       similarTracks: similarTracks ?? this.similarTracks,
       artistTracks: artistTracks ?? this.artistTracks,
+      artistAlbums: artistAlbums ?? this.artistAlbums,
       relatedAlbums: relatedAlbums ?? this.relatedAlbums,
+      playlists: playlists ?? this.playlists,
+      pagination: pagination ?? this.pagination,
+      loadingSurfaces: loadingSurfaces ?? this.loadingSurfaces,
+      appendedItemKeys: appendedItemKeys ?? this.appendedItemKeys,
       diagnostics: diagnostics ?? this.diagnostics,
       errorMessage: clearError ? null : errorMessage ?? this.errorMessage,
     );
   }
-}
-
-List<Map<String, dynamic>> _mergeSearchEntities(
-  List<Map<String, dynamic>> current,
-  List<Map<String, dynamic>> incoming, {
-  required String Function(Map<String, dynamic>) identity,
-}) {
-  final merged = <Map<String, dynamic>>[];
-  final indexes = <String, int>{};
-  for (final item in [...current, ...incoming]) {
-    final key = identity(item);
-    if (key.isEmpty) continue;
-    final existingIndex = indexes[key];
-    if (existingIndex == null) {
-      indexes[key] = merged.length;
-      merged.add(item);
-      continue;
-    }
-    merged[existingIndex] = <String, dynamic>{
-      ...merged[existingIndex],
-      ...item,
-    };
-  }
-  return merged;
-}
-
-String _trackSearchIdentity(Map<String, dynamic> track) =>
-    extractTrackId(track)?.trim() ?? '';
-
-String _artistSearchIdentity(Map<String, dynamic> artist) {
-  final id = artist['id']?.toString().trim() ?? '';
-  if (id.isNotEmpty) return id;
-  return artist['name']?.toString().trim().toLowerCase() ?? '';
-}
-
-String _albumSearchIdentity(Map<String, dynamic> album) {
-  final id = album['id']?.toString().trim() ?? '';
-  if (id.isNotEmpty) return id;
-  final title = album['title']?.toString().trim().toLowerCase() ?? '';
-  final artist = album['artist']?.toString().trim().toLowerCase() ?? '';
-  return title.isEmpty ? '' : '$title|$artist';
 }
 
 bool _hasResolvedSearchAlbumArtist(Map<String, dynamic> album) {
@@ -331,98 +239,155 @@ bool _hasResolvedSearchAlbumArtist(Map<String, dynamic> album) {
       artist != 'unknown artist';
 }
 
+String _searchArtistKey(Map<String, dynamic> artist) {
+  final canonicalId =
+      (artist['canonical_artist_id'] ?? artist['canonical_artist_key'] ?? '')
+          .toString()
+          .trim()
+          .toLowerCase();
+  final musicBrainzId = (artist['musicbrainz_artist_id'] ??
+          artist['artist_mbid'] ??
+          artist['mb_artist_id'] ??
+          '')
+      .toString()
+      .trim()
+      .toLowerCase();
+  if (musicBrainzId.isNotEmpty) return 'mbid:$musicBrainzId';
+  if (canonicalId.startsWith('musicbrainz:artist:')) {
+    return 'mbid:${canonicalId.substring('musicbrainz:artist:'.length)}';
+  }
+  final providerId = (artist['provider_artist_id'] ??
+          artist['browseId'] ??
+          artist['artist_id'] ??
+          artist['id'] ??
+          '')
+      .toString()
+      .trim()
+      .toLowerCase();
+  if (providerId.isNotEmpty &&
+      !providerId.startsWith('musicbrainz:artist:') &&
+      !providerId.startsWith('artist-name:') &&
+      !providerId.startsWith('derived:')) {
+    return 'provider:$providerId';
+  }
+  final name = (artist['normalized_name'] ??
+          artist['name'] ??
+          artist['artist'] ??
+          artist['channel'] ??
+          '')
+      .toString()
+      .trim()
+      .toLowerCase();
+  return name.isNotEmpty ? 'name:$name' : canonicalId;
+}
+
+bool _sameSearchArtist(
+  Map<String, dynamic> left,
+  Map<String, dynamic> right,
+) {
+  Set<String> stableTokens(Map<String, dynamic> artist) {
+    final key = _searchArtistKey(artist);
+    final tokens = <String>{};
+    if (key.startsWith('mbid:') || key.startsWith('provider:')) {
+      tokens.add(key);
+    }
+    final providerId = (artist['provider_artist_id'] ??
+            artist['browseId'] ??
+            artist['artist_id'] ??
+            artist['id'] ??
+            '')
+        .toString()
+        .trim()
+        .toLowerCase();
+    if (providerId.isNotEmpty &&
+        !providerId.startsWith('musicbrainz:artist:') &&
+        !providerId.startsWith('artist-name:') &&
+        !providerId.startsWith('derived:')) {
+      tokens.add('provider:$providerId');
+    }
+    return tokens;
+  }
+
+  final leftTokens = stableTokens(left);
+  final rightTokens = stableTokens(right);
+  if (leftTokens.isNotEmpty && rightTokens.isNotEmpty) {
+    return leftTokens.intersection(rightTokens).isNotEmpty;
+  }
+  final leftName = (left['normalized_name'] ?? left['name'] ?? '')
+      .toString()
+      .trim()
+      .toLowerCase();
+  final rightName = (right['normalized_name'] ?? right['name'] ?? '')
+      .toString()
+      .trim()
+      .toLowerCase();
+  return leftName.isNotEmpty &&
+      leftName == rightName &&
+      (leftTokens.isEmpty || rightTokens.isEmpty);
+}
+
+String _searchVisibleItemFingerprint(Map<String, dynamic>? item) {
+  if (item == null) return '';
+  const fields = <String>[
+    'entity_type',
+    'canonical_recording_id',
+    'canonical_album_identity',
+    'canonical_artist_id',
+    'musicbrainz_recording_id',
+    'musicbrainz_release_id',
+    'musicbrainz_artist_id',
+    'provider_artist_id',
+    'provider_album_id',
+    'track_key',
+    'videoId',
+    'browseId',
+    'id',
+    'title',
+    'name',
+    'artist',
+    'channel',
+    'thumbnail',
+    'year',
+    'release_year',
+  ];
+  return fields.map((field) => '$field:${item[field] ?? ''}').join('|');
+}
+
+String _searchVisibleStateFingerprint(SearchPageState value) {
+  String listFingerprint(Iterable<Map<String, dynamic>> items) =>
+      items.map((item) => _searchVisibleItemFingerprint(item)).join('||');
+  final topItem = value.topResult?['item'];
+  return <String>[
+    value.queryIntent,
+    'top_type:${value.topResult?['entity_type'] ?? ''}',
+    _searchVisibleItemFingerprint(
+      topItem is Map ? Map<String, dynamic>.from(topItem) : null,
+    ),
+    _searchVisibleItemFingerprint(value.leadArtist),
+    _searchVisibleItemFingerprint(value.containingAlbum),
+    listFingerprint(value.tracks),
+    listFingerprint(value.artists),
+    listFingerprint(value.albums),
+    listFingerprint(value.similarArtists),
+    listFingerprint(value.artistTracks),
+    listFingerprint(value.artistAlbums),
+    listFingerprint(value.relatedAlbums),
+    listFingerprint(value.playlists),
+  ].join('###');
+}
+
 class SearchPageNotifier extends StateNotifier<SearchPageState> {
   final Ref ref;
   int _requestVersion = 0;
   bool isLoading = false;
+  bool _revisionWaitInFlight = false;
+  int _revisionWaitSerial = 0;
+  String _currentQuery = '';
   static const Duration _searchDebounce = Duration.zero;
   static const Duration _searchTimeout = Duration(seconds: 15);
-  static const Duration _searchEnrichmentTimeout = Duration(seconds: 8);
+  static const Duration _revisionWaitCadence = Duration(milliseconds: 180);
 
   SearchPageNotifier(this.ref) : super(const SearchPageState());
-
-  Future<void> _enrichSearchPageResults(
-    String normalizedQuery, {
-    required int requestVersion,
-  }) async {
-    try {
-      final fetchResult = await fetchSearchPayload(
-        ref.read,
-        normalizedQuery,
-        limit: 16,
-        timeout: _searchEnrichmentTimeout,
-        preferCache: true,
-        deferSideSurfaces: false,
-      );
-      if (requestVersion != _requestVersion || !fetchResult.hasPayload) return;
-      final nextState = SearchPageState.fromJson(fetchResult.payload!);
-      final currentTracks = state.tracks;
-      final nextTracks = nextState.tracks;
-      if (currentTracks.isNotEmpty &&
-          nextTracks.isNotEmpty &&
-          _trackSearchIdentity(currentTracks.first) !=
-              _trackSearchIdentity(nextTracks.first)) {
-        return;
-      }
-      state = state.copyWith(
-        requestId: nextState.requestId,
-        modelVersion: nextState.modelVersion,
-        queryIntent: nextState.queryIntent,
-        topResult: nextState.topResult,
-        tracks: _mergeSearchEntities(
-          state.tracks,
-          nextState.tracks,
-          identity: _trackSearchIdentity,
-        ),
-        artists: _mergeSearchEntities(
-          state.artists,
-          nextState.artists,
-          identity: _artistSearchIdentity,
-        ),
-        albums: _mergeSearchEntities(
-          state.albums,
-          nextState.albums,
-          identity: _albumSearchIdentity,
-        ),
-        similarArtists: _mergeSearchEntities(
-          state.similarArtists,
-          nextState.similarArtists,
-          identity: _artistSearchIdentity,
-        ),
-        similarTracks: _mergeSearchEntities(
-          state.similarTracks,
-          nextState.similarTracks,
-          identity: _trackSearchIdentity,
-        ),
-        artistTracks: _mergeSearchEntities(
-          state.artistTracks,
-          nextState.artistTracks,
-          identity: _trackSearchIdentity,
-        ),
-        relatedAlbums: _mergeSearchEntities(
-          state.relatedAlbums,
-          nextState.relatedAlbums,
-          identity: _albumSearchIdentity,
-        ),
-        diagnostics: <String, dynamic>{
-          ...state.diagnostics,
-          ...nextState.diagnostics,
-          'side_surfaces_enriched': true,
-        },
-        clearError: true,
-      );
-    } catch (_) {
-      return;
-    }
-  }
-
-  void _primeSearchResults(List<Map<String, dynamic>> tracks) {
-    unawaited(
-      ref.read(audioPlayerProvider.notifier).prewarmStreams(
-            tracks.map((track) => track['id'] ?? track['videoId']),
-          ),
-    );
-  }
 
   Future<void> search(String query) async {
     final normalizedQuery = query.trim();
@@ -431,6 +396,9 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
       return;
     }
     final requestVersion = ++_requestVersion;
+    _currentQuery = normalizedQuery;
+    _revisionWaitSerial++;
+    _revisionWaitInFlight = false;
     isLoading = true;
     state = state.copyWith(requestState: 'loading', clearError: true);
     try {
@@ -444,7 +412,7 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
         normalizedQuery,
         limit: 16,
         timeout: _searchTimeout,
-        deferSideSurfaces: true,
+        deferSideSurfaces: false,
       );
       if (requestVersion != _requestVersion) return;
       if (fetchResult.hasPayload) {
@@ -453,16 +421,12 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
         state = nextState.copyWith(
           requestState: 'complete',
           clearError: true,
-          diagnostics: <String, dynamic>{
-            ...nextState.diagnostics,
-            'tracks_first_response': true,
-          },
+          diagnostics: nextState.diagnostics,
         );
         debugProxyLog(
           'search',
           'page query="$normalizedQuery" status=200 tracks=${nextState.tracks.length} artists=${nextState.artists.length} albums=${nextState.albums.length} similar=${nextState.similarArtists.length} diagnostics=${compactDiagnosticValue(nextState.diagnostics)}',
         );
-        _primeSearchResults(nextState.tracks);
         unawaited(
           recordCloudSearchEvent(
             normalizedQuery,
@@ -476,18 +440,10 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
             searchScope: 'search_page',
           ),
         );
-        notifyRecommendationSignal(normalizedQuery);
-        final needsEnrichment = nextState.tracks.isNotEmpty &&
-            (nextState.artists.isEmpty ||
-                nextState.albums.isEmpty ||
-                nextState.similarArtists.length < 4 ||
-                nextState.similarTracks.length < 6 ||
-                nextState.artistTracks.length < 4 ||
-                nextState.relatedAlbums.length < 4);
-        if (needsEnrichment) {
+        if (_artistSurfaceNeedsRefresh()) {
           unawaited(
-            _enrichSearchPageResults(
-              normalizedQuery,
+            _refreshPendingArtistSurface(
+              query: normalizedQuery,
               requestVersion: requestVersion,
             ),
           );
@@ -532,9 +488,388 @@ class SearchPageNotifier extends StateNotifier<SearchPageState> {
     }
   }
 
+  bool _artistSurfaceNeedsRefresh() {
+    final exhaustedSurfaces = state.diagnostics['search_exhausted_surfaces'];
+    if (exhaustedSurfaces is List &&
+        exhaustedSurfaces.any((surface) => surface.toString() == 'artists')) {
+      return false;
+    }
+    if (state.diagnostics['target_revalidation_pending'] == true) return true;
+    final pendingSurfaces = state.diagnostics['search_pending_surfaces'];
+    if (pendingSurfaces is List &&
+        pendingSurfaces.any((surface) => surface.toString() == 'artists')) {
+      return true;
+    }
+    final artworkPending =
+        (state.diagnostics['artist_artwork_pending'] as num?)?.toInt() ?? 0;
+    if (artworkPending > 0) return true;
+    final artistsPage = state.pagination['artists'];
+    return artistsPage is Map && artistsPage['deferred_expansion'] == true;
+  }
+
+  Future<void> _refreshPendingArtistSurface({
+    required String query,
+    required int requestVersion,
+  }) async {
+    while (true) {
+      if (requestVersion != _requestVersion ||
+          query != _currentQuery ||
+          !_artistSurfaceNeedsRefresh()) {
+        return;
+      }
+      await Future<void>.delayed(_revisionWaitCadence);
+      if (requestVersion != _requestVersion || query != _currentQuery) return;
+      await loadMore(
+        'artists',
+        expectedQuery: query,
+        expectedRequestVersion: requestVersion,
+        refreshVisiblePage: true,
+        revisionWait: true,
+      );
+    }
+  }
+
+  Future<void> loadMore(
+    String surface, {
+    String? expectedQuery,
+    int? expectedRequestVersion,
+    bool refreshVisiblePage = false,
+    bool revisionWait = false,
+  }) async {
+    final normalizedSurface = surface.trim().toLowerCase();
+    if ((expectedQuery != null && expectedQuery != _currentQuery) ||
+        (expectedRequestVersion != null &&
+            expectedRequestVersion != _requestVersion)) {
+      return;
+    }
+    final submittedQuery = _currentQuery;
+    final submittedRequestVersion = _requestVersion;
+    if (_currentQuery.isEmpty ||
+        !const {'tracks', 'artists', 'albums', 'playlists'}
+            .contains(normalizedSurface) ||
+        state.loadingSurfaces.contains(normalizedSurface)) {
+      return;
+    }
+    final page = state.pagination[normalizedSurface];
+    final pageMap = page is Map ? Map<String, dynamic>.from(page) : const {};
+    final surfaceIsEmpty = switch (normalizedSurface) {
+      'tracks' => state.tracks.isEmpty,
+      'artists' => state.artists.isEmpty,
+      'albums' => state.albums.isEmpty,
+      'playlists' => state.playlists.isEmpty,
+      _ => false,
+    };
+    final hasMore =
+        surfaceIsEmpty || pageMap.isEmpty || pageMap['has_more'] == true;
+    if (!hasMore && !refreshVisiblePage) return;
+    if (normalizedSurface == 'artists') {
+      if (revisionWait) {
+        if (_revisionWaitInFlight) return;
+        _revisionWaitInFlight = true;
+      } else if (_revisionWaitInFlight) {
+        // Let the passive long-poll finish before a manual refresh to avoid
+        // duplicate requests against the same snapshot revision.
+        return;
+      }
+    }
+    final revisionWaitSerial = _revisionWaitSerial;
+    final offset = refreshVisiblePage || surfaceIsEmpty
+        ? 0
+        : (pageMap['next_offset'] as num?)?.toInt() ?? 0;
+    if (!revisionWait) {
+      state = state.copyWith(
+        loadingSurfaces: {...state.loadingSurfaces, normalizedSurface},
+        appendedItemKeys: const {},
+      );
+    }
+    try {
+      final result = await fetchSearchPayload(
+        ref.read,
+        submittedQuery,
+        limit: 16,
+        timeout: _searchTimeout,
+        deferSideSurfaces: false,
+        resultType: normalizedSurface,
+        offset: offset,
+        revision: revisionWait
+            ? ((state.diagnostics['search_snapshot_revision'] as num?)
+                    ?.toInt() ??
+                0)
+            : null,
+        revisionWaitMs: revisionWait ? 3000 : null,
+      );
+      if (!result.hasPayload ||
+          submittedQuery != _currentQuery ||
+          submittedRequestVersion != _requestVersion) {
+        return;
+      }
+      final next = SearchPageState.fromJson(result.payload!);
+      if (next.diagnostics['revision_wait_timed_out'] == true) {
+        return;
+      }
+      // A polling revision that carries no visible improvement must not
+      // trigger a rebuild or animation. The loading flag is cleared in the
+      // finally block below, while the established snapshot remains intact.
+      if (_searchVisibleStateFingerprint(next) ==
+          _searchVisibleStateFingerprint(state)) {
+        return;
+      }
+      final appendedKeys = <String>{};
+      bool hasUsefulValue(dynamic value) {
+        if (value == null) return false;
+        if (value is String) return value.trim().isNotEmpty;
+        if (value is Iterable) return value.isNotEmpty;
+        if (value is Map) return value.isNotEmpty;
+        return true;
+      }
+
+      List<Map<String, dynamic>> appendUnique(
+        List<Map<String, dynamic>> current,
+        List<Map<String, dynamic>> incoming,
+        String Function(Map<String, dynamic>) keyOf, {
+        String? animationSurface,
+      }) {
+        final output = <Map<String, dynamic>>[...current];
+        final positions = <String, int>{};
+        for (final entry in current.indexed) {
+          final key = keyOf(entry.$2);
+          if (key.isNotEmpty) positions[key] = entry.$1;
+        }
+        for (final item in incoming) {
+          final key = keyOf(item);
+          if (key.isEmpty) continue;
+          final existingIndex = positions[key];
+          if (existingIndex != null) {
+            output[existingIndex] = <String, dynamic>{
+              ...output[existingIndex],
+              ...Map<String, dynamic>.fromEntries(
+                item.entries.where(
+                  (entry) => hasUsefulValue(entry.value),
+                ),
+              ),
+            };
+            continue;
+          }
+          positions[key] = output.length;
+          output.add(item);
+          appendedKeys.add('${animationSurface ?? normalizedSurface}:$key');
+        }
+        return output;
+      }
+
+      List<Map<String, dynamic>> appendArtists(
+        List<Map<String, dynamic>> current,
+        List<Map<String, dynamic>> incoming,
+      ) {
+        final output = <Map<String, dynamic>>[...current];
+        for (final item in incoming) {
+          final existingIndex = output
+              .indexWhere((existing) => _sameSearchArtist(existing, item));
+          if (existingIndex >= 0) {
+            output[existingIndex] = <String, dynamic>{
+              ...output[existingIndex],
+              ...Map<String, dynamic>.fromEntries(
+                item.entries.where((entry) => hasUsefulValue(entry.value)),
+              ),
+            };
+            continue;
+          }
+          output.add(item);
+          appendedKeys.add(
+            '$normalizedSurface:${_searchArtistKey(item)}',
+          );
+        }
+        return output;
+      }
+
+      final previousSnapshotRevision =
+          (state.diagnostics['search_snapshot_revision'] as num?)?.toInt() ?? 0;
+      final incomingSnapshotRevision =
+          (next.diagnostics['search_snapshot_revision'] as num?)?.toInt() ?? 0;
+      final currentTargetIdentity =
+          state.diagnostics['target_identity']?.toString().trim() ?? '';
+      final incomingTargetIdentity =
+          next.diagnostics['target_identity']?.toString().trim() ?? '';
+      final targetWasCorrected = normalizedSurface == 'artists' &&
+          incomingSnapshotRevision > previousSnapshotRevision &&
+          incomingTargetIdentity.isNotEmpty &&
+          currentTargetIdentity.isNotEmpty &&
+          incomingTargetIdentity != currentTargetIdentity;
+      final mergedArtists = normalizedSurface == 'artists'
+          ? targetWasCorrected
+              ? next.artists
+              : appendArtists(state.artists, next.artists)
+          : state.artists;
+      Map<String, dynamic>? refreshedTopResult = state.topResult;
+      final incomingTopResult = next.topResult;
+      final currentTopItem = state.topResult?['item'];
+      if (targetWasCorrected) {
+        refreshedTopResult = incomingTopResult;
+      } else if (normalizedSurface == 'artists' &&
+          incomingTopResult?['entity_type']?.toString() == 'artist') {
+        refreshedTopResult = incomingTopResult;
+      } else if (normalizedSurface == 'artists' &&
+          state.topResult?['entity_type']?.toString() == 'artist' &&
+          currentTopItem is Map) {
+        final currentTop = Map<String, dynamic>.from(currentTopItem);
+        final richerTop =
+            mergedArtists.cast<Map<String, dynamic>?>().firstWhere(
+                  (item) => item != null && _sameSearchArtist(item, currentTop),
+                  orElse: () => null,
+                );
+        if (richerTop != null) {
+          refreshedTopResult = <String, dynamic>{
+            ...state.topResult!,
+            'item': <String, dynamic>{...currentTop, ...richerTop},
+          };
+        }
+      }
+      Map<String, dynamic>? refreshedLeadArtist = state.leadArtist;
+      if (normalizedSurface == 'artists') {
+        final currentLead = state.leadArtist;
+        final incomingLead = next.leadArtist;
+        if (targetWasCorrected) {
+          refreshedLeadArtist = incomingLead;
+        } else if (currentLead == null) {
+          refreshedLeadArtist = incomingLead;
+        } else if (incomingLead != null &&
+            _sameSearchArtist(currentLead, incomingLead)) {
+          refreshedLeadArtist = <String, dynamic>{
+            ...currentLead,
+            ...incomingLead,
+          };
+        }
+      }
+      final nextPagination = <String, dynamic>{
+        ...state.pagination,
+        if (next.pagination[normalizedSurface] != null)
+          normalizedSurface: next.pagination[normalizedSurface],
+      };
+      final visibleBefore = _searchVisibleStateFingerprint(state);
+      state = state.copyWith(
+        tracks: normalizedSurface == 'tracks'
+            ? appendUnique(
+                state.tracks, next.tracks, (item) => extractTrackId(item) ?? '')
+            : state.tracks,
+        artists: mergedArtists,
+        albums: normalizedSurface == 'albums'
+            ? appendUnique(
+                state.albums,
+                next.albums,
+                (item) => (item['id'] ?? '${item['title']}|${item['artist']}')
+                    .toString())
+            : state.albums,
+        playlists: normalizedSurface == 'playlists'
+            ? appendUnique(state.playlists, next.playlists,
+                (item) => (item['id'] ?? item['name'] ?? '').toString())
+            : state.playlists,
+        similarArtists: normalizedSurface == 'artists'
+            ? targetWasCorrected
+                ? next.similarArtists
+                : appendArtists(state.similarArtists, next.similarArtists)
+            : state.similarArtists,
+        artistTracks: normalizedSurface == 'artists'
+            ? targetWasCorrected
+                ? next.artistTracks
+                : appendUnique(
+                    state.artistTracks,
+                    next.artistTracks,
+                    (item) => extractTrackId(item) ?? '',
+                    animationSurface: 'tracks',
+                  )
+            : state.artistTracks,
+        artistAlbums: normalizedSurface == 'artists'
+            ? targetWasCorrected
+                ? next.artistAlbums
+                : appendUnique(
+                    state.artistAlbums,
+                    next.artistAlbums,
+                    (item) => (item['canonical_album_identity'] ??
+                            item['id'] ??
+                            '${item['title']}|${item['artist']}')
+                        .toString()
+                        .toLowerCase(),
+                    animationSurface: 'albums',
+                  )
+            : state.artistAlbums,
+        relatedAlbums:
+            normalizedSurface == 'artists' || normalizedSurface == 'albums'
+                ? targetWasCorrected
+                    ? next.relatedAlbums
+                    : appendUnique(
+                        state.relatedAlbums,
+                        next.relatedAlbums,
+                        (item) => (item['canonical_album_identity'] ??
+                                item['id'] ??
+                                '${item['title']}|${item['artist']}')
+                            .toString()
+                            .toLowerCase(),
+                        animationSurface: 'albums',
+                      )
+                : state.relatedAlbums,
+        topResult: refreshedTopResult,
+        leadArtist: refreshedLeadArtist,
+        containingAlbum: targetWasCorrected
+            ? next.containingAlbum
+            : state.containingAlbum ?? next.containingAlbum,
+        clearTopResult: targetWasCorrected && refreshedTopResult == null,
+        clearLeadArtist: targetWasCorrected && refreshedLeadArtist == null,
+        clearContainingAlbum:
+            targetWasCorrected && next.containingAlbum == null,
+        pagination: nextPagination,
+        appendedItemKeys: appendedKeys,
+        diagnostics: <String, dynamic>{
+          ...state.diagnostics,
+          ...next.diagnostics,
+        },
+      );
+      if (normalizedSurface == 'artists') {
+        final visibleChanged =
+            _searchVisibleStateFingerprint(state) != visibleBefore;
+        final snapshotRevision =
+            (state.diagnostics['search_snapshot_revision'] as num?)?.toInt() ??
+                0;
+        if (visibleChanged) {
+          final primaryTrackIds = state.tracks
+              .map(extractTrackId)
+              .whereType<String>()
+              .where((id) => id.isNotEmpty)
+              .toSet();
+          final visibleMoreCount = state.artistTracks
+              .where(
+                (track) => !primaryTrackIds.contains(extractTrackId(track)),
+              )
+              .length;
+          debugProxyLog(
+            'search',
+            'progressive refresh query="$submittedQuery" snapshot_revision=$snapshotRevision visible_related=${state.similarArtists.length} artist_tracks=${state.artistTracks.length} visible_more=$visibleMoreCount artist_albums=${state.artistAlbums.length} query_albums=${state.albums.length} playlists=${state.playlists.length}',
+          );
+        }
+      }
+    } finally {
+      if (revisionWait && revisionWaitSerial == _revisionWaitSerial) {
+        _revisionWaitInFlight = false;
+      }
+      if (state.loadingSurfaces.contains(normalizedSurface)) {
+        state = state.copyWith(
+          loadingSurfaces:
+              state.loadingSurfaces.difference({normalizedSurface}),
+        );
+      }
+    }
+  }
+
+  Future<void> refreshVisibleArtistMetadata() async {
+    if (_currentQuery.isEmpty) return;
+    await loadMore('artists', refreshVisiblePage: true);
+  }
+
   void clear() {
     _requestVersion++;
+    _revisionWaitSerial++;
+    _revisionWaitInFlight = false;
     isLoading = false;
+    _currentQuery = '';
     state = const SearchPageState(requestState: 'idle');
   }
 }

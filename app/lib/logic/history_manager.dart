@@ -25,9 +25,22 @@ Map<String, dynamic>? _lastTrackSnapshotFromRawTrack(
   final normalized = normalizeTrack(rawTrack);
   final trackId = extractTrackId(normalized);
   if (trackId == null || trackId.isEmpty) return null;
+  final playbackSourceId = extractPlaybackSourceId(normalized);
+  final playbackProvider = extractPlaybackProvider(normalized);
   return {
     'id': trackId,
-    'videoId': trackId,
+    'track_key': trackId,
+    if (playbackProvider == 'youtube' && playbackSourceId != null)
+      'videoId': playbackSourceId,
+    if (playbackSourceId != null) 'playback_source_id': playbackSourceId,
+    if (playbackSourceId != null)
+      'playback': {
+        ...?(normalized['playback'] is Map
+            ? Map<String, dynamic>.from(normalized['playback'] as Map)
+            : null),
+        'provider': playbackProvider,
+        'source_id': playbackSourceId,
+      },
     'title': normalized['title'],
     'thumbnail': normalized['thumbnail'],
     'channel': normalized['channel'],
@@ -83,6 +96,28 @@ class HistoryManager {
       return decoded is List ? decoded : const [];
     } catch (_) {
       return const [];
+    }
+  }
+
+  static Future<void> _preserveUnreadableHistoryFile(
+    File file,
+    String label,
+    Object error,
+  ) async {
+    try {
+      if (!file.existsSync()) return;
+      final backup = File(
+        '${file.path}.corrupt.${DateTime.now().millisecondsSinceEpoch}',
+      );
+      try {
+        await file.rename(backup.path);
+      } catch (_) {
+        await file.copy(backup.path);
+        await file.delete();
+      }
+      debugPrint('$label parse failed; quarantined backup=${backup.path}: $error');
+    } catch (backupError) {
+      debugPrint('$label backup failed after parse error=$error backup=$backupError');
     }
   }
 
@@ -172,10 +207,7 @@ class HistoryManager {
           .where((entry) => entry.isNotEmpty)
           .toList();
     } catch (error) {
-      debugPrint('History cache parse failed, resetting local history: $error');
-      try {
-        await f.writeAsString('[]');
-      } catch (_) {}
+      await _preserveUnreadableHistoryFile(f, 'History cache', error);
       return const [];
     }
   }
@@ -223,12 +255,32 @@ class HistoryManager {
           .whereType<Map<String, dynamic>>()
           .toList();
     } catch (error) {
-      debugPrint('History entry cache parse failed, resetting entries: $error');
-      try {
-        await file.writeAsString('[]');
-      } catch (_) {}
+      await _preserveUnreadableHistoryFile(file, 'History entry cache', error);
       return const [];
     }
+  }
+
+  static List<Map<String, dynamic>> _mergeHistoryEntryLists(
+    Iterable<Map<String, dynamic>> primary,
+    Iterable<Map<String, dynamic>> secondary,
+  ) {
+    final merged = <Map<String, dynamic>>[];
+    final seen = <String>{};
+    void add(Map<String, dynamic> entry) {
+      final trackId = extractTrackId(entry);
+      if (trackId == null || trackId.isEmpty || !seen.add(trackId)) return;
+      merged.add(Map<String, dynamic>.from(entry));
+    }
+
+    for (final entry in primary) {
+      add(entry);
+      if (merged.length >= _historyEntryLimit) return merged;
+    }
+    for (final entry in secondary) {
+      add(entry);
+      if (merged.length >= _historyEntryLimit) return merged;
+    }
+    return merged;
   }
 
   static Future<void> _writeLocalHistoryEntries(
@@ -373,12 +425,11 @@ class HistoryManager {
         addTracks(decoded['top_track_snapshots'], source: 'persisted_top');
         if (entries.isEmpty) return false;
 
-        await _writeLocalHistoryEntries(
-          entries.take(_historyEntryLimit).toList(),
-        );
+        final mergedEntries = _mergeHistoryEntryLists(entries, existingEntries);
+        await _writeLocalHistoryEntries(mergedEntries);
         final legacySeeds = <String>[];
         final seen = <String>{};
-        for (final entry in entries) {
+        for (final entry in mergedEntries) {
           final trackId = extractTrackId(entry);
           if (trackId == null || trackId.isEmpty || !seen.add(trackId)) {
             continue;

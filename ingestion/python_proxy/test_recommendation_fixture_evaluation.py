@@ -112,6 +112,48 @@ class RecommendationFixtureEvaluationTests(unittest.TestCase):
         self.assertIn("visible_duplicate_tracks:1", reasons)
         self.assertIn("visible_artist_concentration:4", reasons)
 
+    def test_fixture_evaluation_rejects_search_only_sources_and_unknown_album_artists(self) -> None:
+        metrics = evaluate_home_fixture(
+            profile={
+                "supported_languages": ["english"],
+                "supported_regions": ["us", "global"],
+            },
+            rows=[
+                {
+                    "kind": "made_for_you",
+                    "items": [
+                        {
+                            "id": "tribute",
+                            "title": "Rock Tribute",
+                            "artist": "Tribute Band",
+                            "language": "english",
+                            "region": "us",
+                            "source_authority": "search_only",
+                        }
+                    ],
+                },
+                {
+                    "kind": "recommended_albums",
+                    "items": [
+                        {
+                            "id": "album-without-artist",
+                            "title": "Unknown Collection",
+                            "album_source": "album_search",
+                            "language": "spanish",
+                            "region": "latin_america",
+                            "source_authority": "unknown",
+                        }
+                    ],
+                },
+            ],
+        )
+        self.assertEqual(metrics["search_only_source_count"], 1)
+        self.assertEqual(metrics["unknown_album_artist_count"], 1)
+        self.assertEqual(metrics["off_profile_language_count"], 1)
+        self.assertEqual(metrics["off_profile_region_count"], 1)
+        self.assertIn("search_only_source_items:1", metrics["reasons"])
+        self.assertIn("unknown_album_artist_items:1", metrics["reasons"])
+
 
 if __name__ == "__main__":
     unittest.main()

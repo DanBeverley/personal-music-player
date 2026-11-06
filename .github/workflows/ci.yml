@@ -23,8 +23,6 @@ jobs:
         working-directory: ingestion/python_proxy
     env:
       AWS_EC2_METADATA_DISABLED: "true"
-      AURALIS_RUNTIME_DIR: ${{ runner.temp }}/neatie-ci
-      AURALIS_PROXY_RUNTIME_DIR: ${{ runner.temp }}/neatie-ci
       RECOMMENDATION_ENABLE_SCHEDULER: "0"
     steps:
       - uses: actions/checkout@v4
@@ -44,6 +42,9 @@ jobs:
           python -m ruff check --select E9,F63,F7 server.py api_app.py auralis_backend
           python -m ruff check --select F82 api_app.py auralis_backend/api/routes.py auralis_backend/contracts.py
       - name: Test API, catalogue, Search, playback and Home contracts
+        env:
+          AURALIS_RUNTIME_DIR: ${{ runner.temp }}/neatie-ci
+          AURALIS_PROXY_RUNTIME_DIR: ${{ runner.temp }}/neatie-ci
         run: >-
           python -m pytest -q --strict-markers --disable-socket --allow-unix-socket
           test_api_contracts.py test_catalog_normalization.py test_details_reliability.py

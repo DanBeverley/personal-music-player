@@ -2,6 +2,8 @@
 
 **[Open the live web app](https://neatie.duckdns.org)** · [Architecture](docs/handoff/ARCHITECTURE.md) · [Release status](docs/handoff/CURRENT_STATUS.md)
 
+[![CI status](https://github.com/DanBeverley/personal-music-player/actions/workflows/ci.yml/badge.svg)](https://github.com/DanBeverley/personal-music-player/actions/workflows/ci.yml)
+
 Neatie is a music discovery and listening app for **Android** and **desktop and mobile browsers**. Find a recording, explore an artist’s work, build a queue and keep a personal library. Both clients share the same catalogue, recommendation and playback backend. Android also supports downloads and device-local audio.
 
 The web preview currently serves build `2026-11-06-artist-home`. Guests can search and listen. Sign in to use personalized Home, cloud likes and playlists. Background playback and cross-device playlist edits are still being validated on real devices. [Known issues](docs/handoff/KNOWN_ISSUES.md) · [Roadmap](docs/handoff/NEXT_STEPS.md)

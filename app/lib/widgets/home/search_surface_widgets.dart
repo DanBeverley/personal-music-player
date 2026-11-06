@@ -1,13 +1,71 @@
-import 'package:flutter/material.dart';
+import 'dart:async';
 
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import '../../logic/audio_provider_queue.dart';
+import '../../logic/suggest_provider.dart';
+import '../../logic/track_metadata.dart';
+import '../../navigation/player_navigation.dart';
 import '../../ui/app_theme_tokens.dart';
 import '../../ui/neatie_components.dart';
 import '../app_artwork.dart';
+import '../playlist/add_to_playlist_dialog.dart';
+import 'neatie_home_sections.dart';
+import 'track_menu_button.dart';
+
+String _searchArtistIdentityKey(Map<String, dynamic> artist) {
+  final canonical =
+      (artist['canonical_artist_id'] ?? artist['canonical_artist_key'] ?? '')
+          .toString()
+          .trim()
+          .toLowerCase();
+  final musicBrainz = (artist['musicbrainz_artist_id'] ??
+          artist['artist_mbid'] ??
+          artist['mb_artist_id'] ??
+          '')
+      .toString()
+      .trim()
+      .toLowerCase();
+  if (musicBrainz.isNotEmpty) return 'mbid:$musicBrainz';
+  if (canonical.startsWith('musicbrainz:artist:')) {
+    return 'mbid:${canonical.substring('musicbrainz:artist:'.length)}';
+  }
+  final provider = (artist['provider_artist_id'] ??
+          artist['browseId'] ??
+          artist['artist_id'] ??
+          artist['id'] ??
+          '')
+      .toString()
+      .trim()
+      .toLowerCase();
+  if (provider.isNotEmpty &&
+      !provider.startsWith('musicbrainz:artist:') &&
+      !provider.startsWith('artist-name:') &&
+      !provider.startsWith('derived:')) {
+    return 'provider:$provider';
+  }
+  final name = (artist['normalized_name'] ?? artist['name'] ?? '')
+      .toString()
+      .trim()
+      .toLowerCase();
+  return 'name:$name';
+}
+
+String _searchAlbumIdentityKey(Map<String, dynamic> album) {
+  return (album['canonical_album_identity'] ??
+          album['id'] ??
+          '${album['title'] ?? album['name'] ?? ''}|'
+              '${album['artist'] ?? album['artist_name'] ?? ''}')
+      .toString()
+      .trim()
+      .toLowerCase();
+}
 
 class NeatieSearchMasthead extends StatelessWidget {
   const NeatieSearchMasthead({
     super.key,
-    this.logoAsset = 'assets/branding/neatie_intro_mark.png',
+    this.logoAsset = 'assets/branding/neatie_3rd.png',
   });
 
   final String logoAsset;
@@ -143,10 +201,14 @@ class SearchSuggestionPanel extends StatelessWidget {
     super.key,
     required this.suggestions,
     required this.onSelectSuggestion,
+    this.onPlaySuggestion,
+    this.onPrimeSuggestion,
   });
 
-  final List<String> suggestions;
+  final List<SearchSuggestion> suggestions;
   final ValueChanged<String> onSelectSuggestion;
+  final ValueChanged<SearchSuggestion>? onPlaySuggestion;
+  final ValueChanged<SearchSuggestion>? onPrimeSuggestion;
 
   @override
   Widget build(BuildContext context) {
@@ -158,8 +220,72 @@ class SearchSuggestionPanel extends StatelessWidget {
         itemCount: suggestions.length,
         itemBuilder: (context, index) {
           final suggestion = suggestions[index];
+          if (suggestion.isDirectPlayTrack) {
+            final track = suggestion.track!;
+            final title = (track['title'] ?? suggestion.text).toString();
+            final artist = (track['artist'] ??
+                    track['channel'] ??
+                    track['author'] ??
+                    'Recently played')
+                .toString();
+            final videoId = extractTrackId(track);
+            return InkWell(
+              onTap: () => onPlaySuggestion?.call(suggestion),
+              onTapDown: onPrimeSuggestion == null
+                  ? null
+                  : (_) => onPrimeSuggestion!(suggestion),
+              child: Padding(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                child: Row(
+                  children: [
+                    AppArtwork(
+                      thumbnail: track['thumbnail']?.toString(),
+                      videoId: videoId,
+                      width: 46,
+                      height: 46,
+                      radius: 10,
+                    ),
+                    const SizedBox(width: 14),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            title,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontWeight: FontWeight.w800,
+                            ),
+                          ),
+                          const SizedBox(height: 3),
+                          Text(
+                            artist,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              color: Colors.white60,
+                              fontSize: 13,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    const Icon(
+                      Icons.play_arrow_rounded,
+                      color: Colors.white,
+                      size: 28,
+                    ),
+                  ],
+                ),
+              ),
+            );
+          }
           return InkWell(
-            onTap: () => onSelectSuggestion(suggestion),
+            onTap: () => onSelectSuggestion(suggestion.text),
             child: Padding(
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 13),
               child: Row(
@@ -168,7 +294,7 @@ class SearchSuggestionPanel extends StatelessWidget {
                   const SizedBox(width: 16),
                   Expanded(
                     child: Text(
-                      suggestion,
+                      suggestion.text,
                       style: const TextStyle(color: Colors.white),
                     ),
                   ),
@@ -192,7 +318,13 @@ class NeatieSearchTabBar extends StatelessWidget {
   final String selected;
   final ValueChanged<String> onSelected;
 
-  static const tabs = <String>['Top', 'Songs', 'Albums', 'Artists', 'Playlists'];
+  static const tabs = <String>[
+    'Top',
+    'Songs',
+    'Albums',
+    'Artists',
+    'Playlists'
+  ];
 
   @override
   Widget build(BuildContext context) {
@@ -254,38 +386,19 @@ class NeatieSearchLanding extends StatelessWidget {
         icon: Icons.trending_up_rounded,
         colors: [Color(0xFF6140A0), Color(0xFFB04D70)]
       ),
-      (
-        title: 'Mood',
-        icon: Icons.favorite_border_rounded,
-        colors: [Color(0xFF527E7D), Color(0xFF273F43)]
-      ),
-      (
-        title: 'Genres',
-        icon: Icons.grid_view_rounded,
-        colors: [Color(0xFF493C86), Color(0xFF7B4FB5)]
-      ),
     ];
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         songMatchLauncher,
         const SizedBox(height: 22),
-        const Text(
-          'Browse all',
-          style: TextStyle(
-            color: Colors.white,
-            fontSize: 16,
-            fontWeight: FontWeight.w800,
-          ),
-        ),
-        const SizedBox(height: 12),
         GridView.builder(
           shrinkWrap: true,
           physics: const NeverScrollableScrollPhysics(),
           itemCount: browse.length,
           gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
             crossAxisCount: 2,
-              childAspectRatio: 2.8,
+            childAspectRatio: 2.8,
             crossAxisSpacing: 10,
             mainAxisSpacing: 10,
           ),
@@ -330,21 +443,55 @@ class NeatieSearchLanding extends StatelessWidget {
   }
 }
 
-class NeatieSearchResultsSection extends StatelessWidget {
+List<Map<String, dynamic>> _matchingRecentTracks(
+  String query,
+  List<Map<String, dynamic>> tracks,
+) {
+  final normalizedQuery = query.trim().toLowerCase();
+  if (normalizedQuery.isEmpty || tracks.isEmpty) return const [];
+  final seen = <String>{};
+  final matches = <Map<String, dynamic>>[];
+  for (final track in tracks) {
+    final title = track['title']?.toString().toLowerCase() ?? '';
+    final artist = (track['artist'] ?? track['channel'] ?? track['author'])
+            ?.toString()
+            .toLowerCase() ??
+        '';
+    if (!title.contains(normalizedQuery) && !artist.contains(normalizedQuery)) {
+      continue;
+    }
+    final key = extractTrackId(track) ??
+        '$title|$artist|${track['thumbnail']?.toString() ?? ''}';
+    if (!seen.add(key)) continue;
+    matches.add(track);
+  }
+  return matches;
+}
+
+class NeatieSearchResultsSection extends StatefulWidget {
   const NeatieSearchResultsSection({
     super.key,
     required this.query,
+    required this.queryIntent,
+    required this.topResult,
+    required this.leadArtist,
+    required this.containingAlbum,
     required this.selectedTab,
     required this.isLoading,
+    required this.loadingSurfaces,
+    required this.appendedItemKeys,
     required this.tracks,
     required this.artists,
     required this.albums,
+    required this.recentlyPlayedTracks,
     required this.similarArtists,
-    required this.artistWorks,
+    required this.artistTracks,
+    required this.artistAlbums,
     required this.similarTracks,
     required this.playlists,
     required this.errorMessage,
     required this.onPlayTrack,
+    required this.onPrimeTrack,
     required this.onOpenTrack,
     required this.onOpenArtist,
     required this.onOpenAlbum,
@@ -352,84 +499,407 @@ class NeatieSearchResultsSection extends StatelessWidget {
   });
 
   final String query;
+  final String queryIntent;
+  final Map<String, dynamic>? topResult;
+  final Map<String, dynamic>? leadArtist;
+  final Map<String, dynamic>? containingAlbum;
   final String selectedTab;
   final bool isLoading;
+  final Set<String> loadingSurfaces;
+  final Set<String> appendedItemKeys;
   final List<Map<String, dynamic>> tracks;
   final List<Map<String, dynamic>> artists;
   final List<Map<String, dynamic>> albums;
+  final List<Map<String, dynamic>> recentlyPlayedTracks;
   final List<Map<String, dynamic>> similarArtists;
-  final List<Map<String, dynamic>> artistWorks;
+  final List<Map<String, dynamic>> artistTracks;
+  final List<Map<String, dynamic>> artistAlbums;
   final List<Map<String, dynamic>> similarTracks;
   final List<Map<String, dynamic>> playlists;
   final String? errorMessage;
   final ValueChanged<Map<String, dynamic>> onPlayTrack;
+  final ValueChanged<Map<String, dynamic>> onPrimeTrack;
   final ValueChanged<Map<String, dynamic>> onOpenTrack;
   final ValueChanged<Map<String, dynamic>> onOpenArtist;
   final ValueChanged<Map<String, dynamic>> onOpenAlbum;
   final ValueChanged<Map<String, dynamic>> onOpenPlaylist;
 
+
+  @override
+  State<NeatieSearchResultsSection> createState() => _NeatieSearchResultsSectionState();
+}
+
+class _NeatieSearchResultsSectionState extends State<NeatieSearchResultsSection> {
+  NeatieSearchResultsSection? _initial;
+  final Set<String> _seen = {};
+  final List<({String kind, List<String> keys})> _continuations = [];
+
+  String get query => widget.query;
+  String get queryIntent => widget.queryIntent;
+  String get selectedTab => widget.selectedTab;
+  bool get isLoading => widget.isLoading;
+  Set<String> get loadingSurfaces => widget.loadingSurfaces;
+  Set<String> get appendedItemKeys => widget.appendedItemKeys;
+  String? get errorMessage => widget.errorMessage;
+  ValueChanged<Map<String, dynamic>> get onPlayTrack => widget.onPlayTrack;
+  ValueChanged<Map<String, dynamic>> get onPrimeTrack => widget.onPrimeTrack;
+  ValueChanged<Map<String, dynamic>> get onOpenTrack => widget.onOpenTrack;
+  ValueChanged<Map<String, dynamic>> get onOpenArtist => widget.onOpenArtist;
+  ValueChanged<Map<String, dynamic>> get onOpenAlbum => widget.onOpenAlbum;
+  ValueChanged<Map<String, dynamic>> get onOpenPlaylist => widget.onOpenPlaylist;
+  List<Map<String, dynamic>> get tracks => _initialItems('track', widget.tracks, _initial?.tracks);
+  List<Map<String, dynamic>> get artists => _initialItems('artist', widget.artists, _initial?.artists);
+  List<Map<String, dynamic>> get albums => _initialItems('album', widget.albums, _initial?.albums);
+  List<Map<String, dynamic>> get recentlyPlayedTracks => _initialItems('track', widget.recentlyPlayedTracks, _initial?.recentlyPlayedTracks);
+  List<Map<String, dynamic>> get similarArtists => _initialItems('artist', widget.similarArtists, _initial?.similarArtists);
+  List<Map<String, dynamic>> get artistTracks => _initialItems('track', widget.artistTracks, _initial?.artistTracks);
+  List<Map<String, dynamic>> get artistAlbums => _initialItems('album', widget.artistAlbums, _initial?.artistAlbums);
+  List<Map<String, dynamic>> get similarTracks => _initialItems('track', widget.similarTracks, _initial?.similarTracks);
+  List<Map<String, dynamic>> get playlists => _initialItems('playlist', widget.playlists, _initial?.playlists);
+  Map<String, dynamic>? get topResult =>
+      _initial?.topResult == null && _initial != null ? null : widget.topResult;
+  Map<String, dynamic>? get leadArtist =>
+      _initial?.leadArtist == null && _initial != null ? null : widget.leadArtist;
+  Map<String, dynamic>? get containingAlbum =>
+      _initial?.containingAlbum == null && _initial != null ? null : widget.containingAlbum;
+
+  String _key(String kind, Map<String, dynamic> item) {
+    final identity = switch (kind) {
+      'track' => extractTrackId(item) ?? '',
+      'artist' => _searchArtistIdentityKey(item),
+      'album' => _searchAlbumIdentityKey(item),
+      _ => (item['id'] ?? item['name'] ?? '').toString(),
+    };
+    return '$kind:$identity';
+  }
+
+  bool _displayable(String kind, Map<String, dynamic> item) =>
+      !const {'album', 'playlist'}.contains(kind) ||
+      preferredArtworkUrl(item['thumbnail']?.toString()).isNotEmpty;
+
+  List<Map<String, dynamic>> _initialItems(String kind,
+      List<Map<String, dynamic>> current, List<Map<String, dynamic>>? initial) {
+    if (selectedTab.toLowerCase() != 'top' || initial == null) return current;
+    final latest = {for (final item in current) _key(kind, item): item};
+    return [for (final item in initial)
+      if (_displayable(kind, item) && latest.containsKey(_key(kind, item))) latest[_key(kind, item)]!];
+  }
+
+  Map<String, List<Map<String, dynamic>>> _items(NeatieSearchResultsSection value) => {
+    'track': [...value.tracks, ...value.artistTracks, ...value.similarTracks,
+      if (value.topResult?['entity_type'] == 'track' && value.topResult?['item'] is Map)
+        Map<String, dynamic>.from(value.topResult!['item'] as Map)],
+    'artist': [...value.artists, ...value.similarArtists,
+      if (value.leadArtist != null) value.leadArtist!,
+      if (value.topResult?['entity_type'] == 'artist' && value.topResult?['item'] is Map)
+        Map<String, dynamic>.from(value.topResult!['item'] as Map)],
+    'album': [...value.albums, ...value.artistAlbums,
+      if (value.containingAlbum != null) value.containingAlbum!,
+      if (value.topResult?['entity_type'] == 'album' && value.topResult?['item'] is Map)
+        Map<String, dynamic>.from(value.topResult!['item'] as Map)],
+    'playlist': value.playlists,
+  }.map((kind, items) => MapEntry(kind,
+      items.where((item) => _displayable(kind, item)).toList(growable: false)));
+
+  @override
+  void didUpdateWidget(covariant NeatieSearchResultsSection oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.query != widget.query || oldWidget.selectedTab != widget.selectedTab ||
+        (widget.isLoading && !oldWidget.isLoading)) {
+      _initial = null;
+      _seen.clear();
+      _continuations.clear();
+    }
+  }
+
+  void _captureArrivalOrder() {
+    if (selectedTab.toLowerCase() != 'top' || widget.isLoading) return;
+    final current = _items(widget);
+    if (_initial == null) {
+      if (current.values.every((items) => items.isEmpty) && widget.topResult == null) return;
+      _initial = widget;
+      for (final group in current.entries) {
+        _seen.addAll(group.value.map((item) => _key(group.key, item)));
+      }
+      if (widget.containingAlbum != null) _seen.add(_key('album', widget.containingAlbum!));
+      if (widget.leadArtist != null) _seen.add(_key('artist', widget.leadArtist!));
+      final top = widget.topResult;
+      if (top?['item'] is Map) {
+        _seen.add(_key(top!['entity_type'].toString(),
+            Map<String, dynamic>.from(top['item'] as Map)));
+      }
+      return;
+    }
+    for (final group in current.entries) {
+      final keys = <String>[];
+      for (final item in group.value) {
+        final key = _key(group.key, item);
+        if (_seen.add(key)) keys.add(key);
+      }
+      if (keys.isNotEmpty) _continuations.add((kind: group.key, keys: keys));
+    }
+  }
+
+  List<Widget> _continuationSections() {
+    final current = _items(widget);
+    final sections = <Widget>[];
+    for (final batch in _continuations) {
+      final latest = {for (final item in current[batch.kind]!) _key(batch.kind, item): item};
+      final items = [for (final key in batch.keys) if (latest[key] != null) latest[key]!];
+      if (items.isEmpty) continue;
+      sections.add(switch (batch.kind) {
+        'track' => _SearchTrackSection(title: 'More songs', tracks: items,
+            onPlay: onPlayTrack, onPrime: onPrimeTrack, onOpen: onOpenTrack),
+        'artist' => _SearchArtistSection(title: 'More related artists', artists: items,
+            horizontalShelf: true, onOpen: onOpenArtist),
+        'album' => _SearchAlbumSection(title: 'More albums', albums: items,
+            horizontalShelf: true, onOpen: onOpenAlbum),
+        _ => _SearchPlaylistSection(playlists: items, horizontalShelf: true,
+            onOpen: onOpenPlaylist),
+      });
+    }
+    return sections;
+  }
+
   @override
   Widget build(BuildContext context) {
+    _captureArrivalOrder();
     final normalizedTab = selectedTab.toLowerCase();
+    final leadArtistName =
+        (leadArtist?['name'] ?? leadArtist?['artist'] ?? '').toString().trim();
+    final artistAlbumTitle = leadArtistName.isEmpty
+        ? 'Albums by this artist'
+        : 'Albums by $leadArtistName';
+    // Query albums and artist-discography albums have different contracts.
+    // Do not erase the query row merely because the same release also appears
+    // in the richer artist catalog.
+    final regularAlbums = albums;
+    final primaryTrackIds = tracks
+        .map(extractTrackId)
+        .whereType<String>()
+        .where((id) => id.isNotEmpty)
+        .toSet();
+    final additionalArtistTracks = artistTracks
+        .where((track) => !primaryTrackIds.contains(extractTrackId(track)))
+        .toList(growable: false);
     final sections = <Widget>[];
     if (normalizedTab == 'top') {
-      final top = artists.isNotEmpty
-          ? _TopArtistResult(artist: artists.first, onTap: () => onOpenArtist(artists.first))
-          : tracks.isNotEmpty
-              ? _TopTrackResult(
-                  track: tracks.first,
-                  onPlay: () => onPlayTrack(tracks.first),
-                  onOpen: () => onOpenTrack(tracks.first),
-                )
-              : null;
+      final backendTopType =
+          topResult?['entity_type']?.toString().toLowerCase() ?? '';
+      final backendTopItem = topResult?['item'];
+      final backendTop = backendTopItem is Map
+          ? Map<String, dynamic>.from(backendTopItem)
+          : null;
+      Widget? top;
+      if (backendTopType == 'artist' && backendTop != null) {
+        top = _TopArtistResult(
+          artist: backendTop,
+          onTap: () => onOpenArtist(backendTop),
+        );
+      } else if (backendTopType == 'track' && backendTop != null) {
+        top = _TopTrackResult(
+          track: backendTop,
+          onPlay: () => onPlayTrack(backendTop),
+          onPrime: () => onPrimeTrack(backendTop),
+          onOpen: () => onOpenTrack(backendTop),
+        );
+      } else if (backendTopType == 'album' && backendTop != null) {
+        top = _TaggedEntityResult(
+          item: backendTop,
+          tag: 'Album',
+          onTap: () => onOpenAlbum(backendTop),
+        );
+      }
       if (top != null) sections.add(top);
+      if (leadArtist != null &&
+          !(backendTopType == 'artist' &&
+              backendTop?['id']?.toString() == leadArtist?['id']?.toString())) {
+        sections.add(
+          _TaggedEntityResult(
+            item: leadArtist!,
+            tag: 'Artist',
+            circular: true,
+            onTap: () => onOpenArtist(leadArtist!),
+          ),
+        );
+      }
+      if (containingAlbum != null &&
+          !(backendTopType == 'album' &&
+              backendTop != null &&
+              _searchAlbumIdentityKey(backendTop) ==
+                  _searchAlbumIdentityKey(containingAlbum!))) {
+        sections.add(
+          _TaggedEntityResult(
+            item: containingAlbum!,
+            tag: 'Album',
+            onTap: () => onOpenAlbum(containingAlbum!),
+          ),
+        );
+      }
       if (tracks.isNotEmpty) {
-        sections.add(_SearchTrackSection(title: 'Songs', tracks: tracks.take(5).toList(growable: false), onPlay: onPlayTrack, onOpen: onOpenTrack));
+        final topId = backendTopType == 'track'
+            ? extractTrackId(backendTop ?? const {})
+            : null;
+        sections.add(_SearchTrackSection(
+          title: 'Songs',
+          tracks: tracks
+              .where((track) => extractTrackId(track) != topId)
+              .toList(growable: false),
+          appendedItemKeys: appendedItemKeys,
+          onPlay: onPlayTrack,
+          onPrime: onPrimeTrack,
+          onOpen: onOpenTrack,
+        ));
       }
       if (artists.isNotEmpty) {
-        sections.add(_SearchArtistSection(title: 'Artists', artists: artists.take(5).toList(growable: false), onOpen: onOpenArtist));
+        sections.add(_SearchArtistSection(
+            title: 'Artists',
+            artists: artists,
+            appendedItemKeys: appendedItemKeys,
+            horizontalShelf: true,
+            onOpen: onOpenArtist));
       }
-      if (similarArtists.isNotEmpty) {
-        sections.add(_SearchArtistSection(title: 'Similar artists', artists: similarArtists.take(5).toList(growable: false), onOpen: onOpenArtist));
+      if (additionalArtistTracks.isNotEmpty) {
+        sections.add(_SearchTrackSection(
+          title: leadArtistName.isEmpty
+              ? 'More from this artist'
+              : 'More from $leadArtistName',
+          tracks: additionalArtistTracks,
+          onPlay: onPlayTrack,
+          onPrime: onPrimeTrack,
+          onOpen: onOpenTrack,
+        ));
       }
-      if (albums.isNotEmpty) {
-        sections.add(_SearchAlbumSection(albums: albums.take(8).toList(growable: false), onOpen: onOpenAlbum));
+      if (artistAlbums.isNotEmpty) {
+        sections.add(_SearchAlbumSection(
+            title: artistAlbumTitle,
+            albums: artistAlbums,
+            appendedItemKeys: appendedItemKeys,
+            horizontalShelf: true,
+            onOpen: onOpenAlbum));
       }
-      if (artistWorks.isNotEmpty) {
-        sections.add(_ArtistWorksSection(works: artistWorks.take(6).toList(growable: false), onPlayTrack: onPlayTrack, onOpenTrack: onOpenTrack, onOpenAlbum: onOpenAlbum));
-      }
-      if (similarTracks.isNotEmpty) {
-        sections.add(_SearchTrackSection(title: 'Similar tracks', tracks: similarTracks.take(5).toList(growable: false), onPlay: onPlayTrack, onOpen: onOpenTrack));
+      if (regularAlbums.isNotEmpty) {
+        sections.add(_SearchAlbumSection(
+            albums: regularAlbums,
+            appendedItemKeys: appendedItemKeys,
+            horizontalShelf: true,
+            onOpen: onOpenAlbum));
       }
       if (playlists.isNotEmpty) {
-        sections.add(_SearchPlaylistSection(playlists: playlists.take(4).toList(growable: false), onOpen: onOpenPlaylist));
+        sections.add(_SearchPlaylistSection(
+            playlists: playlists,
+            appendedItemKeys: appendedItemKeys,
+            horizontalShelf: true,
+            onOpen: onOpenPlaylist));
+      }
+      if (similarArtists.isNotEmpty) {
+        sections.add(_SearchArtistSection(
+            title: 'Related artists',
+            artists: similarArtists,
+            appendedItemKeys: appendedItemKeys,
+            horizontalShelf: true,
+            animateSection: true,
+            onOpen: onOpenArtist));
+      }
+      final recentMatches = _matchingRecentTracks(
+        query,
+        recentlyPlayedTracks,
+      );
+      if (recentMatches.isNotEmpty) {
+        sections.add(
+          _SearchTrackSection(
+            title: 'Recently played',
+            tracks: recentMatches,
+            onPlay: onPlayTrack,
+            onPrime: onPrimeTrack,
+            onOpen: onOpenTrack,
+          ),
+        );
+      }
+      if (similarTracks.isNotEmpty) {
+        sections.add(_SearchTrackSection(
+            title: 'Similar tracks',
+            tracks: similarTracks,
+            onPlay: onPlayTrack,
+            onPrime: onPrimeTrack,
+            onOpen: onOpenTrack));
       }
     } else if (normalizedTab == 'songs') {
       if (tracks.isNotEmpty) {
-        sections.add(_SearchTrackSection(title: 'Songs', tracks: tracks, onPlay: onPlayTrack, onOpen: onOpenTrack));
+        sections.add(_SearchTrackSection(
+            title: 'Songs',
+            tracks: tracks,
+            appendedItemKeys: appendedItemKeys,
+            onPlay: onPlayTrack,
+            onPrime: onPrimeTrack,
+            onOpen: onOpenTrack));
       }
       if (similarTracks.isNotEmpty) {
-        sections.add(_SearchTrackSection(title: 'Similar tracks', tracks: similarTracks, onPlay: onPlayTrack, onOpen: onOpenTrack));
+        sections.add(_SearchTrackSection(
+            title: 'Similar tracks',
+            tracks: similarTracks,
+            onPlay: onPlayTrack,
+            onPrime: onPrimeTrack,
+            onOpen: onOpenTrack));
       }
     } else if (normalizedTab == 'albums') {
-      if (albums.isNotEmpty) {
-        sections.add(_SearchAlbumSection(albums: albums, onOpen: onOpenAlbum));
+      if (artistAlbums.isNotEmpty) {
+        sections.add(_SearchAlbumSection(
+            title: artistAlbumTitle,
+            albums: artistAlbums,
+            appendedItemKeys: appendedItemKeys,
+            onOpen: onOpenAlbum));
+      }
+      if (regularAlbums.isNotEmpty) {
+        sections.add(_SearchAlbumSection(
+            albums: regularAlbums,
+            appendedItemKeys: appendedItemKeys,
+            onOpen: onOpenAlbum));
       }
     } else if (normalizedTab == 'artists') {
       if (artists.isNotEmpty) {
-        sections.add(_SearchArtistSection(title: 'Artists', artists: artists, onOpen: onOpenArtist));
+        sections.add(_SearchArtistSection(
+            title: 'Artists',
+            artists: artists,
+            appendedItemKeys: appendedItemKeys,
+            onOpen: onOpenArtist));
+      }
+      if (artistAlbums.isNotEmpty) {
+        sections.add(_SearchAlbumSection(
+            title: artistAlbumTitle,
+            albums: artistAlbums,
+            appendedItemKeys: appendedItemKeys,
+            onOpen: onOpenAlbum));
+      }
+      if (artistTracks.isNotEmpty) {
+        sections.add(_SearchTrackSection(
+          title: leadArtistName.isEmpty
+              ? 'Artist works'
+              : 'Works by $leadArtistName',
+          tracks: artistTracks,
+          onPlay: onPlayTrack,
+          onPrime: onPrimeTrack,
+          onOpen: onOpenTrack,
+        ));
       }
       if (similarArtists.isNotEmpty) {
-        sections.add(_SearchArtistSection(title: 'Similar artists', artists: similarArtists, onOpen: onOpenArtist));
-      }
-      if (artistWorks.isNotEmpty) {
-        sections.add(_ArtistWorksSection(works: artistWorks, onPlayTrack: onPlayTrack, onOpenTrack: onOpenTrack, onOpenAlbum: onOpenAlbum));
+        sections.add(_SearchArtistSection(
+            title: 'Related artists',
+            artists: similarArtists,
+            appendedItemKeys: appendedItemKeys,
+            animateSection: true,
+            onOpen: onOpenArtist));
       }
     } else {
       if (playlists.isNotEmpty) {
-        sections.add(_SearchPlaylistSection(playlists: playlists, onOpen: onOpenPlaylist));
+        sections.add(_SearchPlaylistSection(
+            playlists: playlists,
+            appendedItemKeys: appendedItemKeys,
+            onOpen: onOpenPlaylist));
       }
     }
+
+    if (normalizedTab == 'top') sections.addAll(_continuationSections());
 
     if (isLoading && sections.isEmpty) {
       return const Padding(
@@ -446,9 +916,68 @@ class NeatieSearchResultsSection extends StatelessWidget {
                 : 'No results found.',
       );
     }
+    final loadingSurface = switch (normalizedTab) {
+      'artists' => 'artists',
+      'albums' => 'albums',
+      'playlists' => 'playlists',
+      _ => 'tracks',
+    };
+    final showProgressiveLoading = normalizedTab == 'top'
+        ? loadingSurfaces.isNotEmpty
+        : loadingSurfaces.contains(loadingSurface);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
-      children: sections,
+      children: [
+        ...sections,
+        if (showProgressiveLoading)
+          const Padding(
+            padding: EdgeInsets.only(top: 18, bottom: 8),
+            child: Center(child: NeatieQuietPicksLoadingIndicator()),
+          ),
+      ],
+    );
+  }
+}
+
+class _SearchAppendAnimation extends StatelessWidget {
+  const _SearchAppendAnimation({
+    super.key,
+    required this.animate,
+    required this.order,
+    required this.child,
+  });
+
+  final bool animate;
+  final int order;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    final mediaQuery = MediaQuery.maybeOf(context);
+    final reduceMotion = mediaQuery?.disableAnimations == true ||
+        mediaQuery?.accessibleNavigation == true;
+    if (!animate || reduceMotion) return child;
+    final delayMs = (order % 6) * 28;
+    final totalMs = 260 + delayMs;
+    return TweenAnimationBuilder<double>(
+      tween: Tween<double>(begin: 0, end: 1),
+      duration: Duration(milliseconds: totalMs),
+      curve: Interval(
+        delayMs / totalMs,
+        1,
+        curve: Curves.easeOutCubic,
+      ),
+      builder: (context, value, animatedChild) => Opacity(
+        opacity: value,
+        child: Transform.translate(
+          offset: Offset(18 * (1 - value), 0),
+          child: Transform.scale(
+            scale: 0.97 + (0.03 * value),
+            child: animatedChild,
+          ),
+        ),
+      ),
+      child: child,
     );
   }
 }
@@ -457,65 +986,190 @@ class _SearchPlaylistSection extends StatelessWidget {
   const _SearchPlaylistSection({
     required this.playlists,
     required this.onOpen,
+    this.appendedItemKeys = const {},
+    this.horizontalShelf = false,
   });
 
   final List<Map<String, dynamic>> playlists;
   final ValueChanged<Map<String, dynamic>> onOpen;
+  final Set<String> appendedItemKeys;
+  final bool horizontalShelf;
 
   @override
   Widget build(BuildContext context) {
-    if (playlists.isEmpty) return const SizedBox.shrink();
+    final visiblePlaylists = playlists
+        .where((playlist) => preferredArtworkUrl(
+              playlist['thumbnail']?.toString(),
+            ).isNotEmpty)
+        .toList(growable: false);
+    if (visiblePlaylists.isEmpty) return const SizedBox.shrink();
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         const _SearchSectionTitle('Playlists'),
-        ...playlists.map((playlist) {
-          final count = playlist['track_count'] as int? ?? 0;
-          return InkWell(
-            borderRadius: BorderRadius.circular(10),
-            onTap: () => onOpen(playlist),
-            child: Padding(
-              padding: const EdgeInsets.symmetric(vertical: 7),
-              child: Row(
-                children: [
-                  AppArtwork(
-                    thumbnail: playlist['thumbnail'],
-                    width: 54,
-                    height: 54,
-                    radius: 8,
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          playlist['name']?.toString() ?? 'Playlist',
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontWeight: FontWeight.w700,
+        SizedBox(
+          height: horizontalShelf ? 210 : null,
+          child: GridView.builder(
+              scrollDirection:
+                  horizontalShelf ? Axis.horizontal : Axis.vertical,
+              shrinkWrap: true,
+              physics: horizontalShelf
+                  ? const BouncingScrollPhysics()
+                  : const NeverScrollableScrollPhysics(),
+              gridDelegate: horizontalShelf
+                  ? const SliverGridDelegateWithFixedCrossAxisCount(
+                      crossAxisCount: 1,
+                      mainAxisExtent: 150,
+                      mainAxisSpacing: 14,
+                    )
+                  : const SliverGridDelegateWithFixedCrossAxisCount(
+                      crossAxisCount: 2,
+                      mainAxisSpacing: 18,
+                      crossAxisSpacing: 14,
+                      childAspectRatio: 0.78,
+                    ),
+              itemCount: visiblePlaylists.length,
+              itemBuilder: (context, index) {
+                final playlist = visiblePlaylists[index];
+                final count = (playlist['track_count'] as num?)?.toInt() ?? 0;
+                final key =
+                    (playlist['id'] ?? playlist['name'] ?? '').toString();
+                return _SearchAppendAnimation(
+                  key: ValueKey('playlist:$key'),
+                  animate: appendedItemKeys.contains('playlists:$key'),
+                  order: index,
+                  child: InkWell(
+                    borderRadius: BorderRadius.circular(10),
+                    onTap: () => onOpen(playlist),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 7),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          AppArtwork(
+                            thumbnail: playlist['thumbnail'],
+                            width: double.infinity,
+                            height: 138,
+                            radius: 10,
                           ),
-                        ),
-                        const SizedBox(height: 3),
-                        Text(
-                          '$count ${count == 1 ? 'track' : 'tracks'}',
-                          style: const TextStyle(color: neatieMutedText),
-                        ),
-                      ],
+                          const SizedBox(height: 9),
+                          Text(
+                            playlist['name']?.toString() ?? 'Playlist',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                          const SizedBox(height: 3),
+                          Text(
+                            [
+                              playlist['author']?.toString().trim(),
+                              if (count > 0)
+                                '$count ${count == 1 ? 'track' : 'tracks'}',
+                            ]
+                                .where((value) => value?.isNotEmpty == true)
+                                .join(' • '),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(color: neatieMutedText),
+                          ),
+                        ],
+                      ),
                     ),
                   ),
-                  const Icon(
-                    Icons.chevron_right_rounded,
-                    color: neatieMutedText,
+                );
+              }),
+        ),
+      ],
+    );
+  }
+}
+
+class _TaggedEntityResult extends StatelessWidget {
+  const _TaggedEntityResult({
+    required this.item,
+    required this.tag,
+    required this.onTap,
+    this.circular = false,
+  });
+
+  final Map<String, dynamic> item;
+  final String tag;
+  final VoidCallback onTap;
+  final bool circular;
+
+  @override
+  Widget build(BuildContext context) {
+    final title = (item['name'] ?? item['title'] ?? tag).toString();
+    final subtitle = (item['artist'] ?? item['description'] ?? '').toString();
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(10),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 7),
+        child: Row(
+          children: [
+            if (circular)
+              ArtistArtwork(
+                thumbnail: item['thumbnail'],
+                width: 58,
+                height: 58,
+              )
+            else
+              AppArtwork(
+                thumbnail: item['thumbnail'],
+                width: 58,
+                height: 58,
+                radius: 8,
+              ),
+            const SizedBox(width: 13),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.w800,
+                    ),
                   ),
+                  if (subtitle.trim().isNotEmpty) ...[
+                    const SizedBox(height: 3),
+                    Text(
+                      subtitle,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(color: neatieMutedText),
+                    ),
+                  ],
                 ],
               ),
             ),
-          );
-        }),
-      ],
+            DecoratedBox(
+              decoration: BoxDecoration(
+                color: Colors.white.withValues(alpha: 0.12),
+                borderRadius: BorderRadius.circular(5),
+              ),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+                child: Text(
+                  tag,
+                  style: const TextStyle(
+                    color: Colors.white70,
+                    fontSize: 11,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }
@@ -559,11 +1213,10 @@ class _TopArtistResult extends StatelessWidget {
             padding: const EdgeInsets.symmetric(vertical: 6),
             child: Row(
               children: [
-                AppArtwork(
+                ArtistArtwork(
                   thumbnail: artist['thumbnail'],
                   width: 58,
                   height: 58,
-                  radius: 999,
                 ),
                 const SizedBox(width: 14),
                 Expanded(
@@ -602,11 +1255,13 @@ class _TopTrackResult extends StatelessWidget {
   const _TopTrackResult({
     required this.track,
     required this.onPlay,
+    required this.onPrime,
     required this.onOpen,
   });
 
   final Map<String, dynamic> track;
   final VoidCallback onPlay;
+  final VoidCallback onPrime;
   final VoidCallback onOpen;
 
   @override
@@ -615,7 +1270,12 @@ class _TopTrackResult extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         const _SearchSectionTitle('Top result'),
-        _SearchTrackTile(track: track, onPlay: onPlay, onOpen: onOpen),
+        _SearchTrackTile(
+          track: track,
+          onPlay: onPlay,
+          onPrime: onPrime,
+          onOpen: onOpen,
+        ),
       ],
     );
   }
@@ -626,13 +1286,17 @@ class _SearchTrackSection extends StatelessWidget {
     required this.title,
     required this.tracks,
     required this.onPlay,
+    required this.onPrime,
     required this.onOpen,
+    this.appendedItemKeys = const {},
   });
 
   final String title;
   final List<Map<String, dynamic>> tracks;
   final ValueChanged<Map<String, dynamic>> onPlay;
+  final ValueChanged<Map<String, dynamic>> onPrime;
   final ValueChanged<Map<String, dynamic>> onOpen;
+  final Set<String> appendedItemKeys;
 
   @override
   Widget build(BuildContext context) {
@@ -641,33 +1305,46 @@ class _SearchTrackSection extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         _SearchSectionTitle(title),
-        for (final track in tracks)
-          _SearchTrackTile(
-            track: track,
-            onPlay: () => onPlay(track),
-            onOpen: () => onOpen(track),
+        for (final entry in tracks.indexed)
+          _SearchAppendAnimation(
+            key: ValueKey(
+              'track:${extractTrackId(entry.$2) ?? entry.$2['title'] ?? entry.$1}',
+            ),
+            animate: appendedItemKeys.contains(
+              'tracks:${extractTrackId(entry.$2) ?? ''}',
+            ),
+            order: entry.$1,
+            child: _SearchTrackTile(
+              track: entry.$2,
+              onPlay: () => onPlay(entry.$2),
+              onPrime: () => onPrime(entry.$2),
+              onOpen: () => onOpen(entry.$2),
+            ),
           ),
       ],
     );
   }
 }
 
-class _SearchTrackTile extends StatelessWidget {
+class _SearchTrackTile extends ConsumerWidget {
   const _SearchTrackTile({
     required this.track,
     required this.onPlay,
+    required this.onPrime,
     required this.onOpen,
   });
 
   final Map<String, dynamic> track;
   final VoidCallback onPlay;
+  final VoidCallback onPrime;
   final VoidCallback onOpen;
 
   @override
-  Widget build(BuildContext context) {
-    final artist = (track['channel'] ?? track['artist'] ?? track['author'] ?? '').toString();
+  Widget build(BuildContext context, WidgetRef ref) {
+    final subtitle = formatTrackSubtitle(track, includeDuration: true);
     return InkWell(
       onTap: onPlay,
+      onTapDown: (_) => onPrime(),
       borderRadius: BorderRadius.circular(10),
       child: Padding(
         padding: const EdgeInsets.only(bottom: 10),
@@ -675,43 +1352,58 @@ class _SearchTrackTile extends StatelessWidget {
           children: [
             AppArtwork(
               thumbnail: track['thumbnail'],
-              videoId: (track['id'] ?? track['videoId'])?.toString(),
+              videoId: extractPlaybackSourceId(track),
               width: 52,
               height: 52,
               radius: 7,
             ),
             const SizedBox(width: 12),
             Expanded(
-              child: InkWell(
-                onTap: onOpen,
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      track['title']?.toString() ?? 'Unknown',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 15,
-                        fontWeight: FontWeight.w700,
-                      ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    track['title']?.toString() ?? 'Unknown',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 15,
+                      fontWeight: FontWeight.w700,
                     ),
-                    const SizedBox(height: 3),
-                    Text(
-                      artist,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(color: neatieMutedText, fontSize: 12),
-                    ),
-                  ],
-                ),
+                  ),
+                  const SizedBox(height: 3),
+                  Text(
+                    subtitle,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style:
+                        const TextStyle(color: neatieMutedText, fontSize: 12),
+                  ),
+                ],
               ),
             ),
-            IconButton(
-              onPressed: onOpen,
-              icon: const Icon(Icons.more_vert_rounded),
-              color: neatieMutedText,
+            TrackMenuButton(
+              track: track,
+              onOpenDetails: onOpen,
+              onAddToPlaylist: (selectedTrack) async {
+                if (!context.mounted) return;
+                showAddToPlaylistDialog(
+                  context: context,
+                  track: Map<String, dynamic>.from(selectedTrack),
+                );
+              },
+              onStartStation: (selectedTrack) async {
+                final trackId = extractTrackId(selectedTrack);
+                if (trackId == null || trackId.isEmpty) return;
+                await ref
+                    .read(playbackQueueProvider.notifier)
+                    .startRadioSession(selectedTrack);
+                if (!context.mounted) return;
+                unawaited(openFullPlayer(context));
+              },
+              buttonSize: 36,
+              iconSize: 18,
             ),
           ],
         ),
@@ -725,49 +1417,80 @@ class _SearchArtistSection extends StatelessWidget {
     required this.title,
     required this.artists,
     required this.onOpen,
+    this.appendedItemKeys = const {},
+    this.animateSection = false,
+    this.horizontalShelf = false,
   });
 
   final String title;
   final List<Map<String, dynamic>> artists;
   final ValueChanged<Map<String, dynamic>> onOpen;
+  final Set<String> appendedItemKeys;
+  final bool animateSection;
+  final bool horizontalShelf;
 
   @override
   Widget build(BuildContext context) {
     if (artists.isEmpty) return const SizedBox.shrink();
-    return Column(
+    final allItemsWereAppended = artists.every(
+      (artist) => appendedItemKeys.contains(
+        'artists:${_searchArtistIdentityKey(artist)}',
+      ),
+    );
+    final section = Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         _SearchSectionTitle(title),
         SizedBox(
-          height: 86,
-          child: ListView.separated(
-            scrollDirection: Axis.horizontal,
-            physics: const BouncingScrollPhysics(),
+          height: horizontalShelf ? 210 : null,
+          child: GridView.builder(
+            scrollDirection: horizontalShelf ? Axis.horizontal : Axis.vertical,
+            shrinkWrap: true,
+            physics: horizontalShelf
+                ? const BouncingScrollPhysics()
+                : const NeverScrollableScrollPhysics(),
+            gridDelegate: horizontalShelf
+                ? const SliverGridDelegateWithFixedCrossAxisCount(
+                    crossAxisCount: 1,
+                    mainAxisExtent: 150,
+                    mainAxisSpacing: 16,
+                  )
+                : const SliverGridDelegateWithFixedCrossAxisCount(
+                    crossAxisCount: 2,
+                    mainAxisSpacing: 18,
+                    crossAxisSpacing: 16,
+                    childAspectRatio: 0.88,
+                  ),
             itemCount: artists.length,
-            separatorBuilder: (_, __) => const SizedBox(width: 18),
             itemBuilder: (context, index) {
               final artist = artists[index];
-              return SizedBox(
-                width: 120,
+              final key = _searchArtistIdentityKey(artist);
+              return _SearchAppendAnimation(
+                key: ValueKey('artist:$key'),
+                animate: appendedItemKeys.contains('artists:$key'),
+                order: index,
                 child: InkWell(
                   onTap: () => onOpen(artist),
-                  child: Row(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      AppArtwork(
+                      ArtistArtwork(
                         thumbnail: artist['thumbnail'],
-                        width: 58,
-                        height: 58,
-                        radius: 999,
+                        width: 138,
+                        height: 138,
                       ),
-                      const SizedBox(width: 10),
-                      Expanded(
-                        child: Text(
-                          artist['name']?.toString() ?? 'Artist',
-                          maxLines: 2,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w700),
-                        ),
+                      const SizedBox(height: 8),
+                      Text(
+                        artist['name']?.toString() ?? 'Artist',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                            color: Colors.white, fontWeight: FontWeight.w700),
                       ),
+                      const SizedBox(height: 2),
+                      const Text('Artist',
+                          style:
+                              TextStyle(color: neatieMutedText, fontSize: 12)),
                     ],
                   ),
                 ),
@@ -777,59 +1500,11 @@ class _SearchArtistSection extends StatelessWidget {
         ),
       ],
     );
-  }
-}
-
-class _ArtistWorksSection extends StatelessWidget {
-  const _ArtistWorksSection({
-    required this.works,
-    required this.onPlayTrack,
-    required this.onOpenTrack,
-    required this.onOpenAlbum,
-  });
-
-  final List<Map<String, dynamic>> works;
-  final ValueChanged<Map<String, dynamic>> onPlayTrack;
-  final ValueChanged<Map<String, dynamic>> onOpenTrack;
-  final ValueChanged<Map<String, dynamic>> onOpenAlbum;
-
-  bool _isAlbum(Map<String, dynamic> work) {
-    final type = (work['entity_type'] ?? work['type'] ?? work['kind'])
-        ?.toString()
-        .toLowerCase();
-    final hasTrackShape = work['videoId'] != null ||
-        work['video_id'] != null ||
-        work['channel'] != null ||
-        work['author'] != null ||
-        work['duration'] != null;
-    return type == 'album' ||
-        work['browseId'] != null ||
-        work['album_id'] != null ||
-        (!hasTrackShape && work['artist'] != null && work['title'] != null);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    if (works.isEmpty) return const SizedBox.shrink();
-    final albums = works.where(_isAlbum).toList(growable: false);
-    final tracks = works.where((work) => !_isAlbum(work)).toList(growable: false);
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        if (tracks.isNotEmpty)
-          _SearchTrackSection(
-            title: 'Artist works',
-            tracks: tracks,
-            onPlay: onPlayTrack,
-            onOpen: onOpenTrack,
-          ),
-        if (albums.isNotEmpty)
-          _SearchAlbumSection(
-            title: tracks.isEmpty ? 'Artist works' : 'Albums by these artists',
-            albums: albums,
-            onOpen: onOpenAlbum,
-          ),
-      ],
+    return _SearchAppendAnimation(
+      key: ValueKey('artist-section:$title'),
+      animate: animateSection && allItemsWereAppended,
+      order: 0,
+      child: section,
     );
   }
 }
@@ -839,84 +1514,100 @@ class _SearchAlbumSection extends StatelessWidget {
     this.title = 'Albums',
     required this.albums,
     required this.onOpen,
+    this.appendedItemKeys = const {},
+    this.horizontalShelf = false,
   });
 
   final String title;
   final List<Map<String, dynamic>> albums;
   final ValueChanged<Map<String, dynamic>> onOpen;
+  final Set<String> appendedItemKeys;
+  final bool horizontalShelf;
 
   @override
   Widget build(BuildContext context) {
-    if (albums.isEmpty) return const SizedBox.shrink();
+    final visibleAlbums = albums
+        .where((album) => preferredArtworkUrl(
+              album['thumbnail']?.toString(),
+            ).isNotEmpty)
+        .toList(growable: false);
+    if (visibleAlbums.isEmpty) return const SizedBox.shrink();
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         _SearchSectionTitle(title),
-        for (final album in albums)
-          InkWell(
-            onTap: () => onOpen(album),
-            borderRadius: BorderRadius.circular(12),
-            child: Padding(
-              padding: const EdgeInsets.symmetric(vertical: 7),
-              child: Row(
-                children: [
-                  AppArtwork(
-                    thumbnail: album['thumbnail'],
-                    width: 64,
-                    height: 64,
-                    radius: 9,
-                  ),
-                  const SizedBox(width: 13),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          album['title']?.toString() ?? 'Album',
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontWeight: FontWeight.w700,
+        SizedBox(
+          // Android's font metrics need a little more room beneath the 150px
+          // cover for both album text lines.
+          height: horizontalShelf ? 218 : null,
+          child: GridView.builder(
+              scrollDirection:
+                  horizontalShelf ? Axis.horizontal : Axis.vertical,
+              shrinkWrap: true,
+              physics: horizontalShelf
+                  ? const BouncingScrollPhysics()
+                  : const NeverScrollableScrollPhysics(),
+              gridDelegate: horizontalShelf
+                  ? const SliverGridDelegateWithFixedCrossAxisCount(
+                      crossAxisCount: 1,
+                      mainAxisExtent: 170,
+                      mainAxisSpacing: 14,
+                    )
+                  : const SliverGridDelegateWithFixedCrossAxisCount(
+                      crossAxisCount: 2,
+                      mainAxisSpacing: 18,
+                      crossAxisSpacing: 14,
+                      childAspectRatio: 0.72,
+                    ),
+              itemCount: visibleAlbums.length,
+              itemBuilder: (context, index) {
+                final album = visibleAlbums[index];
+                final key = _searchAlbumIdentityKey(album);
+                return _SearchAppendAnimation(
+                  key: ValueKey('album:$key'),
+                  animate: appendedItemKeys.contains('albums:$key'),
+                  order: index,
+                  child: InkWell(
+                    onTap: () => onOpen(album),
+                    borderRadius: BorderRadius.circular(12),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 7),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          AppArtwork(
+                            thumbnail: album['thumbnail'],
+                            width: double.infinity,
+                            height: 150,
+                            radius: 9,
                           ),
-                        ),
-                        const SizedBox(height: 4),
-                        Text(
-                          album['artist']?.toString() ?? '',
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            color: neatieMutedText,
-                            fontSize: 12,
-                          ),
-                        ),
-                        if ((album['year'] ?? album['release_date'])
-                                ?.toString()
-                                .trim()
-                                .isNotEmpty ==
-                            true) ...[
-                          const SizedBox(height: 3),
+                          const SizedBox(height: 8),
                           Text(
-                            (album['year'] ?? album['release_date']).toString(),
+                            album['title']?.toString() ?? 'Album',
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
                             style: const TextStyle(
-                              color: Colors.white38,
-                              fontSize: 11,
+                              color: Colors.white,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            album['artist']?.toString() ?? '',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              color: neatieMutedText,
+                              fontSize: 12,
                             ),
                           ),
                         ],
-                      ],
+                      ),
                     ),
                   ),
-                  const Icon(
-                    Icons.chevron_right_rounded,
-                    color: neatieMutedText,
-                  ),
-                ],
-              ),
-            ),
-          ),
+                );
+              }),
+        ),
       ],
     );
   }

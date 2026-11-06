@@ -1,7 +1,12 @@
 ﻿from __future__ import annotations
 
 from functools import wraps
+import os
+import sqlite3
+import time
 from auralis_backend.runtime_context import resolve_server
+
+_HEARTBEAT_BUSY_COUNT = 0
 
 
 def _with_server_globals(fn):
@@ -786,9 +791,6 @@ def _recommendation_runtime_snapshot(version_limit: int = 5):
         ),
         "active_promotion": active_promotion,
         "export_dir": RECOMMENDATION_MODEL_EXPORT_DIR,
-        "nearline_precompute": _nearline_runtime_snapshot(),
-        "nearline_last_cycle_at": _recommendation_sync_state_float("nearline_last_cycle_at", 0.0),
-        "nearline_last_cycle_status": _recommendation_sync_state_get("nearline_last_cycle_status", ""),
     }
 
 
@@ -801,6 +803,24 @@ def _recommendation_store_search_event(req: RecommendationSearchEventRequest):
     user_scope_id = _assistant_safe_scope_id(req.user_scope_id or "guest")
     occurred_at = float(req.occurred_at or time.time())
     payload = dict(req.metadata or {})
+    if _recommendation_trim_text(req.source) == "web_search_selection":
+        selected_item = payload.get("selected_item")
+        selected_type = _recommendation_trim_text(
+            payload.get("selected_entity_type") or payload.get("entity_type") or "track"
+        ).lower()
+        if isinstance(selected_item, dict) and selected_type in {"", "track", "tracks"}:
+            try:
+                from ..search.preferences import remember_selected_query
+
+                remember_selected_query(
+                    resolve_server(), user_scope_id=user_scope_id,
+                    query=query, item=selected_item,
+                )
+            except Exception:
+                pass
+        # This event is preference input only; keep it out of shared search,
+        # inventory and recommendation signal stores.
+        return True
     event_id = hashlib.sha1(
         json.dumps(
             {
@@ -835,9 +855,53 @@ def _recommendation_store_search_event(req: RecommendationSearchEventRequest):
         connection.commit()
     finally:
         connection.close()
+    selected_item = {}
+    selected_type = ""
+    for key in (
+        "selected_item",
+        "clicked_item",
+        "track",
+        "item",
+        "entity",
+    ):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            selected_item = dict(value)
+            break
+    selected_type = _recommendation_trim_text(
+        payload.get("selected_entity_type")
+        or payload.get("clicked_entity_type")
+        or payload.get("entity_type")
+        or ("track" if selected_item else "")
+    )
+    if selected_item:
+        try:
+            from ..search.intelligence import remember_search_resolution
+
+            remember_search_resolution(
+                resolve_server(),
+                user_scope_id=user_scope_id,
+                query=query,
+                entity_type=selected_type or "track",
+                item=selected_item,
+                confidence=float(payload.get("confidence") or 0.8),
+                event_weight=max(_recommendation_event_weight(payload.get("event_type") or req.source), 1.0),
+                event_type=_recommendation_trim_text(payload.get("event_type") or req.source),
+                source="search_interaction",
+            )
+        except Exception:
+            pass
     _recommendation_invalidate_collaborative_cache()
-    _nearline_invalidate_user(user_scope_id)
-    _nearline_invalidate_user_query(user_scope_id, query)
+    try:
+        from ..home_feed.scheduler import HomeJobScheduler
+
+        HomeJobScheduler(resolve_server()).candidates(
+            req,
+            reason="signal_reconcile",
+            generation_hint=f"search:{event_id}",
+        )
+    except Exception:
+        pass
     return True
 
 
@@ -1055,9 +1119,18 @@ def _recommendation_store_interaction_event(req: RecommendationInteractionEventR
         ).encode("utf-8")
     ).hexdigest()
 
+    # The event and its leased follow-up are committed together. A restart
+    # cannot lose feedback after returning stored=true to the client.
+    from ..home_feed.repositories import HomeRepositorySet
+    from ..home_feed.contracts import HomeJobType
+    repositories = HomeRepositorySet.from_server(resolve_server())
+    deferred = (os.environ.get("NEATIE_ASYNC_LISTENING_FEEDBACK", "true").lower() == "true"
+                and event_type in {"play", "complete", "replay"}
+                and payload.get("reason") != "history_delete")
     connection = _recommendation_store_connection()
     try:
-        connection.execute(
+        connection.execute("BEGIN IMMEDIATE")
+        inserted = connection.execute(
             """
             INSERT OR IGNORE INTO recommendation_events(
                 id, user_scope_id, track_id, artist_name, event_type, source, weight, metadata_json, occurred_at
@@ -1076,9 +1149,43 @@ def _recommendation_store_interaction_event(req: RecommendationInteractionEventR
                 occurred_at,
             ],
         )
+        if deferred and inserted.rowcount == 1:
+            request = req.model_dump(mode="json")
+            request.update(user_scope_id=user_scope_id, occurred_at=occurred_at)
+            repositories.jobs.enqueue(
+                user_scope_id, HomeJobType.RECONCILE_INTERACTION,
+                f"interaction:{event_id}",
+                payload={"request": request, "event_id": event_id,
+                         "reason": "interaction_followup"},
+                priority=100, max_attempts=8, connection=connection,
+            )
         connection.commit()
     finally:
         connection.close()
+    try:
+        from ..domain.user_state import schedule_history_seed_snapshot_refresh
+
+        schedule_history_seed_snapshot_refresh(resolve_server(), user_scope_id)
+    except Exception:
+        pass
+    if deferred or inserted.rowcount == 0:
+        # In-memory invalidation is cheap; cloud feedback and scheduling are
+        # owned by the durable worker. Explicit hide/save remains synchronous.
+        from .profile_runtime import invalidate_profile_cache
+        invalidate_profile_cache()
+        _recommendation_invalidate_collaborative_cache()
+        return True
+    _apply_interaction_followup(req, event_id)
+    return True
+
+
+@_with_server_globals
+def _apply_interaction_followup(req, event_id, *, retry_errors=False):
+    user_scope_id = _assistant_safe_scope_id(req.user_scope_id or "guest")
+    track_id = _recommendation_trim_text(req.track_id)
+    event_type = (req.event_type or "play").strip().lower()
+    occurred_at = float(req.occurred_at or time.time())
+    payload = dict(req.metadata or {})
     _recommendation_attribute_interaction_event(
         event_id,
         user_scope_id=user_scope_id,
@@ -1092,12 +1199,29 @@ def _recommendation_store_interaction_event(req: RecommendationInteractionEventR
         from auralis_backend.recommend.profile_runtime import invalidate_profile_cache
         from auralis_backend.recommend.taste_runtime import apply_interaction_feedback
 
-        apply_interaction_feedback(sys.modules[__name__], req)
+        # Internal idempotency token is derived from the durable event, never
+        # accepted from a caller's metadata.
+        feedback_req = req.model_copy(update={"metadata": {
+            **payload, "_feedback_event_id": event_id}})
+        apply_interaction_feedback(resolve_server(), feedback_req)
         invalidate_profile_cache()
     except Exception:
+        if retry_errors:
+            raise
         pass
     _recommendation_invalidate_collaborative_cache()
-    _nearline_invalidate_user(user_scope_id)
+    try:
+        from ..home_feed.scheduler import HomeJobScheduler
+
+        HomeJobScheduler(resolve_server()).candidates(
+            req,
+            reason="signal_reconcile",
+            generation_hint=f"interaction:{event_id}",
+        )
+    except Exception:
+        if retry_errors:
+            raise
+        pass
     return True
 
 
@@ -1333,6 +1457,11 @@ def _recommendation_model_source_signature():
             """
         ).fetchone()
         payload = {
+            "training_contract": "implicit-bpr-v2",
+            "recency_epoch": int(time.time() // max(60, RECOMMENDATION_MODEL_MAX_AGE_SECONDS)),
+            "training_config": [RECOMMENDATION_MODEL_MIN_EVENTS, RECOMMENDATION_MODEL_MAX_EVENTS,
+                                RECOMMENDATION_MODEL_FACTOR_DIM, RECOMMENDATION_MODEL_EPOCHS,
+                                RECOMMENDATION_MODEL_NEIGHBOR_LIMIT],
             "event_count": int(row["event_count"] or 0),
             "max_occurred_at": round(float(row["max_occurred_at"] or 0), 3),
             "user_count": int(row["user_count"] or 0),
@@ -1977,7 +2106,6 @@ def _recommendation_run_maintenance_cycle(
         "model_id": "",
         "source_signature": "",
         "experiment_evaluation": None,
-        "nearline_precompute": None,
     }
     try:
         if force_sync or bool(RECOMMENDATION_SYNC_DATABASE_DSN):
@@ -1996,14 +2124,13 @@ def _recommendation_run_maintenance_cycle(
         train_due = (
             force_train
             or signature_changed
-            or (cycle_started_at - last_train_at) >= RECOMMENDATION_TRAIN_INTERVAL_SECONDS
+            or (cycle_started_at - last_train_at) >= RECOMMENDATION_MODEL_MAX_AGE_SECONDS
         )
         if train_due:
-            model = _recommendation_get_collaborative_model(
-                force_refresh=True,
-                force_sync=False,
-            )
-            result["trained"] = True
+            from .model_runtime import refresh_collaborative_model
+            previous_id = _recommendation_sync_state_get("scheduler_last_model_id", "")
+            model = refresh_collaborative_model(resolve_server(), force=force_train)
+            result["trained"] = (model or {}).get("model_id", "") != previous_id
             result["model_ready"] = bool((model or {}).get("ready"))
             result["model_id"] = _recommendation_trim_text((model or {}).get("model_id"))
             _recommendation_sync_state_set("scheduler_last_train_at", str(time.time()))
@@ -2032,21 +2159,6 @@ def _recommendation_run_maintenance_cycle(
                         "experiment_last_promoted_at",
                         str(time.time()),
                     )
-        nearline_result = _nearline_run_precompute_cycle(
-            force=bool(force_train),
-        )
-        result["nearline_precompute"] = nearline_result
-        try:
-            _recommendation_sync_state_set(
-                "nearline_last_cycle_at",
-                str(time.time()),
-            )
-            _recommendation_sync_state_set(
-                "nearline_last_cycle_status",
-                _recommendation_trim_text((nearline_result or {}).get("error")) or "success",
-            )
-        except Exception:
-            pass
         _recommendation_sync_state_set("scheduler_last_error", "")
         _recommendation_sync_state_set(
             "scheduler_last_cycle_at",
@@ -2062,75 +2174,199 @@ def _recommendation_run_maintenance_cycle(
 def _recommendation_bootstrap_once():
     _recommendation_run_maintenance_cycle(
         force_sync=bool(RECOMMENDATION_SYNC_DATABASE_DSN),
-        force_train=True,
+        force_train=False,
         run_experiment_evaluation=True,
     )
 
 
 @_with_server_globals
 def _recommendation_worker_heartbeat(worker_mode: str, status: str):
-    _recommendation_sync_state_set("worker_mode", worker_mode)
-    _recommendation_sync_state_set("worker_status", status)
-    _recommendation_sync_state_set("worker_process_id", str(os.getpid()))
-    _recommendation_sync_state_set("worker_last_heartbeat_at", str(time.time()))
+    global _HEARTBEAT_BUSY_COUNT
+    connection = None
+    try:
+        _recommendation_init_store_db()
+        connection = _recommendation_store_connection()
+        connection.execute("PRAGMA busy_timeout=1000")
+        now = time.time()
+        connection.executemany(
+            """INSERT INTO recommendation_sync_state(name, value, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(name) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
+            [(name, value, now) for name, value in (
+                ("worker_mode", worker_mode), ("worker_status", status),
+                ("worker_process_id", str(os.getpid())),
+                ("worker_last_heartbeat_at", str(now)),
+            )],
+        )
+        connection.commit()
+    except sqlite3.OperationalError as exc:
+        # Only SQLite busy contention is transient; surface disk/schema faults.
+        if (getattr(exc, "sqlite_errorcode", -1) & 0xff) != sqlite3.SQLITE_BUSY:
+            raise
+        _HEARTBEAT_BUSY_COUNT += 1
+        if _HEARTBEAT_BUSY_COUNT & (_HEARTBEAT_BUSY_COUNT - 1) == 0:
+            print(f"[recommendation_worker] heartbeat=busy count={_HEARTBEAT_BUSY_COUNT}", flush=True)
+        return False
+    finally:
+        if connection is not None:
+            connection.close()
+    if _HEARTBEAT_BUSY_COUNT:
+        print(f"[recommendation_worker] heartbeat=recovered busy_count={_HEARTBEAT_BUSY_COUNT}", flush=True)
+        _HEARTBEAT_BUSY_COUNT = 0
+    return True
+
+
+@_with_server_globals
+def _run_home_feed_jobs(max_jobs: int = 8) -> int:
+    """Drain a bounded batch through the four independently owned Home lanes."""
+
+    from auralis_backend.home_feed.worker import run_home_feed_lanes
+
+    results = run_home_feed_lanes(resolve_server(), max_jobs=max_jobs)
+    _recommendation_sync_state_set("home_worker_last_run_at", str(time.time()))
+    _recommendation_sync_state_set("home_worker_last_batch_count", str(len(results)))
+    return len(results)
+
+
+def _home_feed_lane_loop(server, stop_event, lane_name, job_types, worker_mode):
+    """Continuously drain one owned lane without waiting for provider lanes."""
+
+    from auralis_backend.home_feed.worker import HomeFeedWorker
+
+    worker = HomeFeedWorker(
+        server,
+        worker_id=f"{worker_mode}:{os.getpid()}:home-feed:{lane_name}",
+        job_types=tuple(job_types),
+    )
+    from .workload import is_idle
+    while not stop_event.is_set():
+        if lane_name in {"candidates", "radio", "artwork"} and is_idle(server):
+            stop_event.wait(5.0)
+            continue
+        try:
+            result = worker.run_once()
+        except Exception as exc:
+            _recommendation_sync_state_set(
+                f"home_worker_{lane_name}_last_error",
+                f"{type(exc).__name__}:{str(exc)[:500]}",
+            )
+            stop_event.wait(1.0)
+            continue
+        if result.claimed:
+            _recommendation_sync_state_set(
+                f"home_worker_{lane_name}_last_run_at",
+                str(time.time()),
+            )
+            continue
+        stop_event.wait(0.25 if lane_name == "compose" else 1.0)
 
 
 @_with_server_globals
 def _recommendation_scheduler_loop(worker_mode: str = "embedded"):
+    from threading import Thread
+    from auralis_backend.home_feed.worker import HOME_WORKER_LANES
+    from .workload import is_idle
+    from .feature_store import prune_hot_runtime_caches
+    from ..storage.cache_runtime import prune_expired_runtime_caches
+
     next_sync_at = 0.0
     next_train_at = 0.0
     next_eval_at = 0.0
+    next_charts_at = 0.0
+    next_heartbeat_at = 0.0
+    next_cache_prune_at = 0.0
     minimum_sync_interval = max(30, RECOMMENDATION_SYNC_INTERVAL_SECONDS)
     minimum_train_interval = max(60, RECOMMENDATION_TRAIN_INTERVAL_SECONDS)
     minimum_eval_interval = max(60, RECOMMENDATION_EXPERIMENT_EVAL_INTERVAL_SECONDS)
     _recommendation_sync_state_set("worker_started_at", str(time.time()))
     _recommendation_worker_heartbeat(worker_mode, "running")
-    while not recommendation_scheduler_stop.is_set():
-        now = time.time()
-        _recommendation_worker_heartbeat(worker_mode, "running")
-        should_sync = now >= next_sync_at
-        should_train = now >= next_train_at
-        should_evaluate = RECOMMENDATION_PROMOTE_WINNER and now >= next_eval_at
-        if should_sync or should_train:
-            _recommendation_run_maintenance_cycle(
-                force_sync=should_sync,
-                force_train=should_train,
-                run_experiment_evaluation=should_evaluate,
-            )
-            completed_at = time.time()
-            if should_sync:
-                next_sync_at = completed_at + minimum_sync_interval
-            if should_train:
-                next_train_at = completed_at + minimum_train_interval
-            if should_evaluate:
+    server = resolve_server()
+    lane_threads = [
+        Thread(
+            target=_home_feed_lane_loop,
+            args=(
+                server,
+                recommendation_scheduler_stop,
+                lane_name,
+                job_types,
+                worker_mode,
+            ),
+            name=f"home-feed-{lane_name}",
+            daemon=True,
+        )
+        for lane_name, job_types in HOME_WORKER_LANES
+    ]
+    for thread in lane_threads:
+        thread.start()
+    try:
+        while not recommendation_scheduler_stop.is_set():
+            now = time.time()
+            if now >= next_cache_prune_at:
+                prune_hot_runtime_caches()
+                prune_expired_runtime_caches()
+                next_cache_prune_at = now + 60
+            idle = is_idle(server)
+            if now >= next_heartbeat_at:
+                _recommendation_worker_heartbeat(worker_mode, "idle" if idle else "running")
+                next_heartbeat_at = now + 30
+            if idle:
+                recommendation_scheduler_stop.wait(5.0)
+                continue
+            should_sync = now >= next_sync_at
+            should_train = now >= next_train_at
+            should_evaluate = RECOMMENDATION_PROMOTE_WINNER and now >= next_eval_at
+            if now >= next_charts_at:
+                try:
+                    from ..charts import get_charts_service
+
+                    get_charts_service(server).ensure_demand_refreshes()
+                except Exception:
+                    traceback.print_exc()
+                next_charts_at = now + 30 * 60
+            if should_sync or should_train:
+                _recommendation_run_maintenance_cycle(
+                    force_sync=should_sync,
+                    force_train=False,
+                    run_experiment_evaluation=should_evaluate,
+                )
+                completed_at = time.time()
+                if should_sync:
+                    next_sync_at = completed_at + minimum_sync_interval
+                if should_train:
+                    next_train_at = completed_at + minimum_train_interval
+                if should_evaluate:
+                    next_eval_at = completed_at + minimum_eval_interval
+            elif should_evaluate:
+                evaluation = _recommendation_evaluate_experiment()
+                completed_at = time.time()
                 next_eval_at = completed_at + minimum_eval_interval
-        elif should_evaluate:
-            evaluation = _recommendation_evaluate_experiment()
-            completed_at = time.time()
-            next_eval_at = completed_at + minimum_eval_interval
-            _recommendation_sync_state_set(
-                "experiment_last_evaluated_at",
-                str(completed_at),
-            )
-            _recommendation_sync_state_set(
-                "experiment_last_evaluation_reason",
-                _recommendation_trim_text(evaluation.get("reason", "")),
-            )
-            if evaluation.get("promoted"):
                 _recommendation_sync_state_set(
-                    "experiment_last_promoted_at",
+                    "experiment_last_evaluated_at",
                     str(completed_at),
                 )
-        sleep_for = max(
-            5.0,
-            min(
-                next_sync_at - time.time(),
-                next_train_at - time.time(),
-                next_eval_at - time.time() if RECOMMENDATION_PROMOTE_WINNER else 30.0,
-                30.0,
-            ),
-        )
-        recommendation_scheduler_stop.wait(sleep_for)
+                _recommendation_sync_state_set(
+                    "experiment_last_evaluation_reason",
+                    _recommendation_trim_text(evaluation.get("reason", "")),
+                )
+                if evaluation.get("promoted"):
+                    _recommendation_sync_state_set(
+                        "experiment_last_promoted_at",
+                        str(completed_at),
+                    )
+            sleep_for = max(
+                1.0,
+                min(
+                    next_sync_at - time.time(),
+                    next_train_at - time.time(),
+                    next_eval_at - time.time() if RECOMMENDATION_PROMOTE_WINNER else 30.0,
+                    next_charts_at - time.time(),
+                    5.0,
+                ),
+            )
+            recommendation_scheduler_stop.wait(sleep_for)
+    finally:
+        for thread in lane_threads:
+            thread.join(timeout=2.0)
     _recommendation_worker_heartbeat(worker_mode, "stopped")
 
 

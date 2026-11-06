@@ -1,10 +1,40 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from contextlib import contextmanager
+from contextvars import ContextVar
+from functools import wraps
 from typing import Any, Dict, List
 
 
 JsonDict = Dict[str, Any]
+
+
+_composition_facts = ContextVar('home_composition_facts', default=None)
+
+
+@contextmanager
+def composition_facts():
+    """Reuse immutable profile facts only for this composition, never globally."""
+    token = _composition_facts.set({})
+    try:
+        yield
+    finally:
+        _composition_facts.reset(token)
+
+
+def composition_fact(function):
+    @wraps(function)
+    def read(taste, *keys):
+        facts = _composition_facts.get()
+        if facts is None:
+            return function(taste, *keys)
+        key = (function, id(taste), keys)
+        if key not in facts:
+            # Keep the profile alive to prevent id reuse inside this scope.
+            facts[key] = (taste, function(taste, *keys))
+        return facts[key][1]
+    return read
 
 
 @dataclass(frozen=True)
@@ -33,7 +63,6 @@ class LaneRecipe:
     positive_hints: tuple[str, ...] = ()
     negative_hints: tuple[str, ...] = ()
     allow_acoustic: bool = True
-    retrieval_queries: tuple[str, ...] = ()
     candidate_sources: tuple[str, ...] = ()
 
 
@@ -46,6 +75,8 @@ class TasteProfile:
     top_tracks: List[JsonDict] = field(default_factory=list)
     last_played_tracks: List[JsonDict] = field(default_factory=list)
     anchor_tracks: List[JsonDict] = field(default_factory=list)
+    full_history_tracks: List[JsonDict] = field(default_factory=list)
+    frequent_tracks: List[JsonDict] = field(default_factory=list)
     artist_hints: List[str] = field(default_factory=list)
     album_hints: List[str] = field(default_factory=list)
     top_artists: List[str] = field(default_factory=list)
@@ -54,7 +85,17 @@ class TasteProfile:
     recent_queries: List[str] = field(default_factory=list)
     taste_queries: List[str] = field(default_factory=list)
     collaborative_track_ids: List[str] = field(default_factory=list)
+    avoid_ids: List[str] = field(default_factory=list)
+    # Identities visible in active/prepared feeds. Track selection now treats
+    # these as exposure preferences, balancing useful familiar and unseen
+    # supply. Explicit row/queue exclusions and promotion novelty stay separate.
+    hard_avoid_ids: List[str] = field(default_factory=list)
+    force_refresh: bool = False
+    refresh_token: str = ""
+    rotation_epoch: int = 0
     source_profile: JsonDict = field(default_factory=dict)
+    taste_mode: str = "neatie"
+    listenbrainz_username: str = ""
 
     @property
     def is_cold_start(self) -> bool:

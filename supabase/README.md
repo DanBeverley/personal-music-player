@@ -1,4 +1,6 @@
-# EBB Phase 1 Auth Setup
+# Supabase auth and Android Phase 1 setup
+
+Current web/auth origins, private configuration boundaries and acceptance gates are in [OPERATIONS.md](../docs/handoff/OPERATIONS.md) and [NEXT_STEPS.md](../docs/handoff/NEXT_STEPS.md). The Phase 1 local-migration notes below describe Android; web guest history is not imported into an account.
 
 ## 1. Create the Schema
 
@@ -45,7 +47,7 @@ flutter run `
 
 ```powershell
 flutter build apk --release --split-per-abi `
-  --dart-define=AURALIS_PROXY_URL=http://34.172.70.149 `
+  --dart-define=AURALIS_PROXY_URL=https://YOUR_VERIFIED_PRODUCTION_API `
   --dart-define=SUPABASE_URL=https://YOUR_PROJECT.supabase.co `
   --dart-define=SUPABASE_ANON_KEY=YOUR_SUPABASE_ANON_KEY `
   --dart-define=SUPABASE_REDIRECT_SCHEME=ebb `

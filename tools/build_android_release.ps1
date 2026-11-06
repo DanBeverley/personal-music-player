@@ -9,17 +9,25 @@ param(
     [ValidateSet("none", "build", "patch", "minor", "major")]
     [string]$Bump = "none",
 
-    [string]$AuralisProxyUrl = "http://34.172.70.149",
+    [string]$AuralisProxyUrl = $env:AURALIS_PROXY_URL,
 
-    [string]$SupabaseUrl = "https://ywfhlxfkfonxyrltgidv.supabase.co",
+    [string]$SupabaseUrl = $env:SUPABASE_URL,
 
-    [string]$SupabaseAnonKey = "sb_publishable_zyHAjfe-3NNaFqCI6LGd_Q_lw0Ke4zU",
+    [string]$SupabaseAnonKey = $env:SUPABASE_ANON_KEY,
 
-    [string]$SupabaseRedirectScheme = "ebb",
+    [string]$SupabaseRedirectScheme = $(
+        if ($env:SUPABASE_REDIRECT_SCHEME) { $env:SUPABASE_REDIRECT_SCHEME } else { "ebb" }
+    ),
 
-    [string]$SupabaseRedirectHost = "login-callback",
+    [string]$SupabaseRedirectHost = $(
+        if ($env:SUPABASE_REDIRECT_HOST) { $env:SUPABASE_REDIRECT_HOST } else { "login-callback" }
+    ),
+
+    [string]$ExpectedSigningSha256 = "4968ebd1503e3b25d49641827fa2d1c63861b17698cf7f83410dd574e678646b",
 
     [string[]]$ExtraDartDefine = @(),
+
+    [switch]$Mandatory,
 
     [switch]$SkipBuild
 )
@@ -49,6 +57,35 @@ if ($versionParts.Count -gt 1) {
 }
 if ($versionCode -le 0) {
     throw "Version code must be greater than 0. Current version: $version"
+}
+
+$requiredConfig = [ordered]@{
+    AURALIS_PROXY_URL = $AuralisProxyUrl
+    SUPABASE_URL = $SupabaseUrl
+    SUPABASE_ANON_KEY = $SupabaseAnonKey
+    SUPABASE_REDIRECT_SCHEME = $SupabaseRedirectScheme
+    SUPABASE_REDIRECT_HOST = $SupabaseRedirectHost
+}
+foreach ($entry in $requiredConfig.GetEnumerator()) {
+    if ([string]::IsNullOrWhiteSpace([string]$entry.Value)) {
+        throw "Missing release configuration: $($entry.Key)"
+    }
+}
+
+$requiredSigning = @(
+    "ANDROID_KEYSTORE_PATH",
+    "ANDROID_KEY_ALIAS",
+    "ANDROID_STORE_PASSWORD",
+    "ANDROID_KEY_PASSWORD"
+)
+foreach ($name in $requiredSigning) {
+    $value = [Environment]::GetEnvironmentVariable($name)
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        throw "Missing Android release signing environment variable: $name"
+    }
+}
+if (-not (Test-Path -LiteralPath $env:ANDROID_KEYSTORE_PATH)) {
+    throw "Android release keystore was not found at ANDROID_KEYSTORE_PATH."
 }
 
 if ($Bump -ne "none") {
@@ -91,6 +128,11 @@ if ($Bump -ne "none") {
     Write-Host "Bumped app version to $version"
 }
 
+$expectedTag = "v$versionName"
+if ($Tag -ne $expectedTag) {
+    throw "Release tag must match pubspec versionName. Expected '$expectedTag', got '$Tag'."
+}
+
 if (-not $SkipBuild) {
     Push-Location $appRoot
     try {
@@ -105,8 +147,11 @@ if (-not $SkipBuild) {
         foreach ($define in $dartDefines) {
             $buildArgs += "--dart-define=$define"
         }
-        Write-Host "Running: flutter $($buildArgs -join ' ')"
+        Write-Host "Building signed split-per-ABI Android release."
         & flutter @buildArgs
+        if ($LASTEXITCODE -ne 0) {
+            throw "Flutter Android release build failed with exit code $LASTEXITCODE."
+        }
     } finally {
         Pop-Location
     }
@@ -122,8 +167,7 @@ $assets = @()
 foreach ($apkName in $apkFiles) {
     $apkPath = Join-Path $outputDir $apkName
     if (-not (Test-Path $apkPath)) {
-        Write-Warning "Skipping missing APK: $apkPath"
-        continue
+        throw "Expected split APK is missing: $apkPath"
     }
     $abi = $apkName -replace '^app-', ''
     $abi = $abi -replace '-release\.apk$', ''
@@ -142,11 +186,53 @@ if ($assets.Count -eq 0) {
     throw "No APK files were found in $outputDir"
 }
 
+$androidSdkRoot = if ($env:ANDROID_HOME) { $env:ANDROID_HOME } else { $env:ANDROID_SDK_ROOT }
+if ([string]::IsNullOrWhiteSpace($androidSdkRoot)) {
+    throw "ANDROID_HOME or ANDROID_SDK_ROOT must be set to verify APK signing."
+}
+$buildToolsRoot = Join-Path $androidSdkRoot "build-tools"
+$buildTools = Get-ChildItem -LiteralPath $buildToolsRoot -Directory |
+    Sort-Object Name -Descending |
+    Select-Object -First 1
+if (-not $buildTools) {
+    throw "No Android build-tools installation was found under $buildToolsRoot."
+}
+$apksignerName = if ($IsWindows -or $env:OS -eq "Windows_NT") { "apksigner.bat" } else { "apksigner" }
+$apksigner = Join-Path $buildTools.FullName $apksignerName
+if (-not (Test-Path -LiteralPath $apksigner)) {
+    throw "apksigner was not found at $apksigner."
+}
+$normalizedExpectedSigningSha256 = ($ExpectedSigningSha256 -replace ":", "").ToLowerInvariant()
+foreach ($apkName in $apkFiles) {
+    $apkPath = Join-Path $outputDir $apkName
+    $verificationOutput = & $apksigner verify --print-certs $apkPath 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "APK signature verification failed for ${apkName}: $verificationOutput"
+    }
+    $digestLine = $verificationOutput | Where-Object {
+        $_ -match "Signer #1 certificate SHA-256 digest:\s*([a-fA-F0-9]+)"
+    } | Select-Object -First 1
+    if (-not $digestLine) {
+        throw "Could not read the APK signing certificate fingerprint for $apkName."
+    }
+    $actualSigningSha256 = ([regex]::Match(
+        [string]$digestLine,
+        "Signer #1 certificate SHA-256 digest:\s*([a-fA-F0-9]+)"
+    ).Groups[1].Value).ToLowerInvariant()
+    if ($actualSigningSha256 -ne $normalizedExpectedSigningSha256) {
+        throw "APK signing fingerprint mismatch for ${apkName}. Expected $normalizedExpectedSigningSha256, got $actualSigningSha256."
+    }
+}
+Write-Host "Verified Android signing certificate on all APKs: $normalizedExpectedSigningSha256"
+
 $manifest = [ordered]@{
+    schemaVersion = 1
+    packageName = "com.danbeverley.ebb"
     versionName = $versionName
     versionCode = $versionCode
     releaseNotes = $ReleaseNotes
-    mandatory = $false
+    mandatory = [bool]$Mandatory
+    publishedAt = [DateTime]::UtcNow.ToString("o")
     assets = $assets
 }
 

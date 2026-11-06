@@ -19,5 +19,16 @@ elseif(APPLE)
     # Provide framework settings or .dylib
 elseif(ANDROID)
     find_library(log-lib log)
-    target_link_libraries(auralis ${log-lib})
+    find_library(android-lib android)
+    find_library(opensles-lib OpenSLES)
+    find_library(dl-lib dl)
+    find_library(math-lib m)
+    target_link_libraries(
+        auralis
+        ${log-lib}
+        ${android-lib}
+        ${opensles-lib}
+        ${dl-lib}
+        ${math-lib}
+    )
 endif()

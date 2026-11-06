@@ -1,17 +1,7 @@
-# app
+# Neatie Flutter clients
 
-A new Flutter project.
+Main worktree owns Android. The separate web worktree conditionally imports main_android.dart or web/web_app.dart and owns the deployed browser implementation. Shared backend contracts do not imply identical UI, audio or worktree contents.
 
-## Getting Started
+Read the [project map](../docs/handoff/PROJECT_OVERVIEW.md), [current status](../docs/handoff/CURRENT_STATUS.md), [full queue](../docs/handoff/NEXT_STEPS.md) and [architecture](../docs/handoff/ARCHITECTURE.md) before changing code. [AGENTS.md](../AGENTS.md) defines working rules.
 
-This project is a starting point for a Flutter application.
-
-A few resources to get you started if this is your first Flutter project:
-
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
-
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+Android release native libraries are built through CMake/managedJniLibs. Local .env, runtime/cookies and legacy native archives are outside Git; preserve needed private files separately. User runs flutter analyze; focused test/build commands are in NEXT_STEPS. See [release and self-update](../docs/ANDROID_RELEASE.md) and [authentication](../supabase/README.md).

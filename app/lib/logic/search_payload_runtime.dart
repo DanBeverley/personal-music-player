@@ -20,29 +20,39 @@ Future<Map<String, dynamic>> buildSemanticSearchRequestBody(
   required int limit,
   bool deferSideSurfaces = false,
   String searchMode = '',
+  String resultType = '',
+  int offset = 0,
+  int? revision,
+  int? revisionWaitMs,
 }) async {
   final normalizedQuery = query.trim();
   final normalizedSearchMode = searchMode.isNotEmpty
       ? searchMode
       : classifySearchQueryMode(normalizedQuery);
+  final storageScopeId = read(authProvider).storageScopeId;
+  if (normalizedSearchMode != 'taste') {
+    return <String, dynamic>{
+      'query': normalizedQuery,
+      'limit': limit,
+      'user_scope_id': storageScopeId,
+      'search_mode': normalizedSearchMode,
+      'context_surface': 'interactive_search',
+      'defer_side_surfaces': deferSideSurfaces,
+      'result_type': resultType,
+      'offset': offset,
+      if (revision != null) 'revision': revision,
+      if (revisionWaitMs != null) 'revision_wait_ms': revisionWaitMs,
+    };
+  }
   final playlists = read(playlistProvider);
   final libraryTracks = read(libraryProvider).valueOrNull ?? const [];
-  final storageScopeId = read(authProvider).storageScopeId;
-  final useLightweightContext = normalizedSearchMode == 'exact';
-  final useLocalRecentQueriesOnly = normalizedSearchMode != 'taste';
   final searchSignals = await Future.wait<Object?>([
-    HistoryManager.getRecentTrackSnapshots(
-        limit: useLightweightContext ? 4 : 12),
-    HistoryManager.getLastPlayedTrackSnapshots(
-        limit: useLightweightContext ? 4 : 8),
-    HistoryManager.getFrequentlyPlayedTrackSnapshots(
-        limit: useLightweightContext ? 4 : 10),
-    HistoryManager.getRecentSeeds(limit: useLightweightContext ? 4 : 12),
-    HistoryManager.getFrequentlyPlayedTrackIds(
-        limit: useLightweightContext ? 4 : 10),
-    useLocalRecentQueriesOnly
-        ? Future<List<String>>.value(peekRecentCloudSearchQueries(limit: 6))
-        : getRecentCloudSearchQueries(limit: 8),
+    HistoryManager.getRecentTrackSnapshots(limit: 12),
+    HistoryManager.getLastPlayedTrackSnapshots(limit: 8),
+    HistoryManager.getFrequentlyPlayedTrackSnapshots(limit: 10),
+    HistoryManager.getRecentSeeds(limit: 12),
+    HistoryManager.getFrequentlyPlayedTrackIds(limit: 10),
+    getRecentCloudSearchQueries(limit: 8),
   ]);
 
   final recentTrackSnapshots =
@@ -107,42 +117,38 @@ Future<Map<String, dynamic>> buildSemanticSearchRequestBody(
 
   addTrackHints(
     lastPlayedSnapshots,
-    artistWeight: useLightweightContext ? 0.65 : 1.45,
-    albumWeight: useLightweightContext ? 0.35 : 1.0,
+    artistWeight: 1.45,
+    albumWeight: 1.0,
   );
   addTrackHints(
     recentTrackSnapshots,
-    artistWeight: useLightweightContext ? 0.55 : 1.1,
-    albumWeight: useLightweightContext ? 0.28 : 0.82,
+    artistWeight: 1.1,
+    albumWeight: 0.82,
   );
-  if (!useLightweightContext) {
-    addTrackHints(
-      topTrackSnapshots,
-      artistWeight: 1.7,
-      albumWeight: 1.18,
-    );
-  }
+  addTrackHints(
+    topTrackSnapshots,
+    artistWeight: 1.7,
+    albumWeight: 1.18,
+  );
 
-  if (!useLightweightContext) {
-    for (final playlist in playlists) {
-      bumpSearchSignalWeight(queryWeights, playlist.name, 1.25);
-      for (final track in playlist.tracks.take(16)) {
-        bumpSearchSignalWeight(
-          artistWeights,
-          extractSearchArtistHint(track),
-          1.28,
-        );
-        bumpSearchSignalWeight(
-          queryWeights,
-          extractSearchAlbumHint(track),
-          0.84,
-        );
-        addAlbumWeight(extractSearchAlbumHint(track), 1.0);
-      }
+  for (final playlist in playlists) {
+    bumpSearchSignalWeight(queryWeights, playlist.name, 1.25);
+    for (final track in playlist.tracks.take(16)) {
+      bumpSearchSignalWeight(
+        artistWeights,
+        extractSearchArtistHint(track),
+        1.28,
+      );
+      bumpSearchSignalWeight(
+        queryWeights,
+        extractSearchAlbumHint(track),
+        0.84,
+      );
+      addAlbumWeight(extractSearchAlbumHint(track), 1.0);
     }
   }
 
-  for (final track in libraryTracks.take(useLightweightContext ? 8 : 24)) {
+  for (final track in libraryTracks.take(24)) {
     final normalizedTrack = normalizeTrack(track);
     final trackId = extractTrackId(normalizedTrack);
     if (trackId != null && trackId.isNotEmpty) {
@@ -151,31 +157,24 @@ Future<Map<String, dynamic>> buildSemanticSearchRequestBody(
         offlineTrackIds.add(trackId);
       }
     }
-    if (!useLightweightContext) {
-      bumpSearchSignalWeight(
-        artistWeights,
-        extractSearchArtistHint(track),
-        1.12,
-      );
-      bumpSearchSignalWeight(
-        queryWeights,
-        extractSearchAlbumHint(track),
-        0.7,
-      );
-      addAlbumWeight(extractSearchAlbumHint(track), 0.88);
-    }
+    bumpSearchSignalWeight(
+      artistWeights,
+      extractSearchArtistHint(track),
+      1.12,
+    );
+    bumpSearchSignalWeight(
+      queryWeights,
+      extractSearchAlbumHint(track),
+      0.7,
+    );
+    addAlbumWeight(extractSearchAlbumHint(track), 0.88);
   }
 
-  bumpSearchSignalWeight(queryWeights, normalizedQuery, 2.45);
-  if (normalizedSearchMode == 'taste') {
-    bumpSearchSignalWeight(queryWeights, normalizedQuery, 1.25);
-  }
+  bumpSearchSignalWeight(queryWeights, normalizedQuery, 3.7);
 
-  if (!useLightweightContext) {
-    for (final queryValue in blendedRecentQueries) {
-      if (looksLikeSemanticTasteQuery(queryValue)) {
-        bumpSearchSignalWeight(queryWeights, queryValue, 1.18);
-      }
+  for (final queryValue in blendedRecentQueries) {
+    if (looksLikeSemanticTasteQuery(queryValue)) {
+      bumpSearchSignalWeight(queryWeights, queryValue, 1.18);
     }
   }
 
@@ -193,6 +192,8 @@ Future<Map<String, dynamic>> buildSemanticSearchRequestBody(
     'search_mode': normalizedSearchMode,
     'context_surface': 'interactive_search',
     'defer_side_surfaces': deferSideSurfaces,
+    'result_type': resultType,
+    'offset': offset,
     'recent_track_ids': recentTrackIds,
     'top_track_ids': topTrackIds,
     'recent_track_snapshots': recentTrackSnapshots,
@@ -214,16 +215,6 @@ Future<Map<String, dynamic>> buildSemanticSearchRequestBody(
   };
 }
 
-class _CachedSearchPayload {
-  final Map<String, dynamic> payload;
-  final DateTime storedAt;
-
-  const _CachedSearchPayload({
-    required this.payload,
-    required this.storedAt,
-  });
-}
-
 class SearchFetchResult {
   final Map<String, dynamic>? payload;
   final String status;
@@ -238,65 +229,29 @@ class SearchFetchResult {
   bool get hasPayload => payload != null;
 }
 
-final Map<String, _CachedSearchPayload> _searchPayloadCache =
-    <String, _CachedSearchPayload>{};
-final Map<String, Future<SearchFetchResult>> _searchPayloadForegroundInflight =
+final Map<String, Future<SearchFetchResult>> _searchPayloadInflight =
     <String, Future<SearchFetchResult>>{};
-final Map<String, Future<SearchFetchResult>> _searchPayloadBackgroundInflight =
-    <String, Future<SearchFetchResult>>{};
-const Duration _searchCacheFreshTtl = Duration(minutes: 4);
-const Duration _searchCacheMaxTtl = Duration(minutes: 12);
 
 Future<T> _runSearchRequest<T>(Future<T> future, Duration timeout) {
   return runSearchRequest(future, timeout);
 }
 
-String _searchPayloadCacheKey(
+String _searchRequestKey(
   ProviderReader read,
   String query, {
   required int limit,
   bool deferSideSurfaces = false,
   String searchMode = '',
+  String resultType = '',
+  int offset = 0,
+  int? revision,
+  int? revisionWaitMs,
 }) {
   final normalizedQuery = query.trim().toLowerCase();
   final storageScopeId = read(authProvider).storageScopeId;
   final normalizedSearchMode =
       searchMode.isNotEmpty ? searchMode : classifySearchQueryMode(query);
-  return '$storageScopeId|$limit|$normalizedQuery|${deferSideSurfaces ? 'tracks_first' : 'full'}|$normalizedSearchMode';
-}
-
-void _storeSearchPayloadCache(
-  String cacheKey,
-  Map<String, dynamic> payload,
-) {
-  _searchPayloadCache[cacheKey] = _CachedSearchPayload(
-    payload: Map<String, dynamic>.from(payload),
-    storedAt: DateTime.now(),
-  );
-  if (_searchPayloadCache.length > 36) {
-    final oldestEntries = _searchPayloadCache.entries.toList()
-      ..sort((a, b) => a.value.storedAt.compareTo(b.value.storedAt));
-    for (final entry in oldestEntries.take(_searchPayloadCache.length - 24)) {
-      _searchPayloadCache.remove(entry.key);
-    }
-  }
-}
-
-_CachedSearchPayload? _lookupSearchPayloadCache(
-  String cacheKey, {
-  bool allowStale = false,
-}) {
-  final cached = _searchPayloadCache[cacheKey];
-  if (cached == null) return null;
-  final age = DateTime.now().difference(cached.storedAt);
-  final ttl = allowStale ? _searchCacheMaxTtl : _searchCacheFreshTtl;
-  if (age > ttl) {
-    if (allowStale) {
-      _searchPayloadCache.remove(cacheKey);
-    }
-    return null;
-  }
-  return cached;
+  return '$storageScopeId|$limit|$normalizedQuery|${deferSideSurfaces ? 'tracks_first' : 'full'}|$normalizedSearchMode|$resultType|$offset|${revision ?? 0}|${revisionWaitMs ?? 0}';
 }
 
 Future<SearchFetchResult> fetchSearchPayload(
@@ -304,10 +259,12 @@ Future<SearchFetchResult> fetchSearchPayload(
   String query, {
   required int limit,
   required Duration timeout,
-  bool preferCache = true,
-  bool backgroundRefresh = false,
   bool deferSideSurfaces = false,
   String searchMode = '',
+  String resultType = '',
+  int offset = 0,
+  int? revision,
+  int? revisionWaitMs,
 }) async {
   final normalizedQuery = query.trim();
   if (normalizedQuery.isEmpty) {
@@ -316,45 +273,18 @@ Future<SearchFetchResult> fetchSearchPayload(
   final normalizedSearchMode = searchMode.isNotEmpty
       ? searchMode
       : classifySearchQueryMode(normalizedQuery);
-  final cacheKey = _searchPayloadCacheKey(
+  final requestKey = _searchRequestKey(
     read,
     normalizedQuery,
     limit: limit,
     deferSideSurfaces: deferSideSurfaces,
     searchMode: normalizedSearchMode,
+    resultType: resultType,
+    offset: offset,
+    revision: revision,
+    revisionWaitMs: revisionWaitMs,
   );
-  final freshCached = _lookupSearchPayloadCache(cacheKey);
-  if (preferCache && freshCached != null && !backgroundRefresh) {
-    return SearchFetchResult(
-      status: 'cache_hit',
-      payload: Map<String, dynamic>.from(freshCached.payload),
-    );
-  }
-  if (!backgroundRefresh) {
-    final staleCached = _lookupSearchPayloadCache(cacheKey, allowStale: true);
-    if (staleCached != null) {
-      unawaited(
-        fetchSearchPayload(
-          read,
-          normalizedQuery,
-          limit: limit,
-          timeout: timeout,
-          preferCache: false,
-          backgroundRefresh: true,
-          deferSideSurfaces: deferSideSurfaces,
-          searchMode: normalizedSearchMode,
-        ),
-      );
-      return SearchFetchResult(
-        status: 'stale_cache',
-        payload: Map<String, dynamic>.from(staleCached.payload),
-      );
-    }
-  }
-  final inflightMap = backgroundRefresh
-      ? _searchPayloadBackgroundInflight
-      : _searchPayloadForegroundInflight;
-  final inflight = inflightMap[cacheKey];
+  final inflight = _searchPayloadInflight[requestKey];
   if (inflight != null) {
     return inflight;
   }
@@ -367,6 +297,10 @@ Future<SearchFetchResult> fetchSearchPayload(
         limit: limit,
         deferSideSurfaces: deferSideSurfaces,
         searchMode: normalizedSearchMode,
+        resultType: resultType,
+        offset: offset,
+        revision: revision,
+        revisionWaitMs: revisionWaitMs,
       );
       final timedResponse = await _runSearchRequest(
         proxyControlHttpClient.post(
@@ -377,53 +311,24 @@ Future<SearchFetchResult> fetchSearchPayload(
         timeout,
       );
       if (timedResponse.statusCode != 200) {
-        if (!backgroundRefresh) {
-          final staleCached =
-              _lookupSearchPayloadCache(cacheKey, allowStale: true);
-          if (staleCached != null) {
-            return SearchFetchResult(
-              status: 'stale_cache',
-              payload: Map<String, dynamic>.from(staleCached.payload),
-              statusCode: timedResponse.statusCode,
-            );
-          }
-        }
         return SearchFetchResult(
           status: 'http_error',
           statusCode: timedResponse.statusCode,
         );
       }
       final payload = jsonDecode(timedResponse.body) as Map<String, dynamic>;
-      _storeSearchPayloadCache(cacheKey, payload);
-      return SearchFetchResult(status: 'network_success', payload: payload);
+      return SearchFetchResult(
+        status: 'network_success',
+        payload: payload,
+      );
     } on TimeoutException {
-      if (!backgroundRefresh) {
-        final staleCached =
-            _lookupSearchPayloadCache(cacheKey, allowStale: true);
-        if (staleCached != null) {
-          return SearchFetchResult(
-            status: 'stale_cache',
-            payload: Map<String, dynamic>.from(staleCached.payload),
-          );
-        }
-      }
       return const SearchFetchResult(status: 'timeout');
     } catch (_) {
-      if (!backgroundRefresh) {
-        final staleCached =
-            _lookupSearchPayloadCache(cacheKey, allowStale: true);
-        if (staleCached != null) {
-          return SearchFetchResult(
-            status: 'stale_cache',
-            payload: Map<String, dynamic>.from(staleCached.payload),
-          );
-        }
-      }
       return const SearchFetchResult(status: 'exception');
     } finally {
-      inflightMap.remove(cacheKey);
+      _searchPayloadInflight.remove(requestKey);
     }
   }();
-  inflightMap[cacheKey] = requestFuture;
+  _searchPayloadInflight[requestKey] = requestFuture;
   return requestFuture;
 }

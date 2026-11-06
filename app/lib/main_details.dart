@@ -1,13 +1,16 @@
-﻿import 'dart:async';
+import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'logic/audio_provider_queue.dart';
+import 'logic/audio_provider.dart';
+import 'logic/collection_likes_provider.dart';
 import 'logic/details_provider.dart';
 import 'logic/download_provider.dart';
+import 'logic/followed_artists_provider.dart';
 import 'logic/playlist_provider.dart';
-import 'main_player.dart';
+import 'navigation/player_navigation.dart';
 import 'ui/app_theme_tokens.dart';
 import 'ui/neatie_components.dart';
 import 'widgets/details/details_sections.dart';
@@ -16,6 +19,14 @@ const _accentGrey = neatieActive;
 const _surfaceGreyAlt = neatieRaised;
 const _voidBlack = neatieInk;
 const double _radiusLarge = neatieRadiusLarge;
+
+void _primeDetailsTrack(WidgetRef ref, dynamic rawTrack) {
+  final trackId = extractTrackId(rawTrack);
+  if (trackId == null || trackId.isEmpty) return;
+  unawaited(
+    ref.read(audioPlayerProvider.notifier).prepareImmediatePlayback(trackId),
+  );
+}
 
 class ArtistDetailsScreen extends ConsumerStatefulWidget {
   final String artistId;
@@ -50,7 +61,6 @@ class _ArtistDetailsScreenState extends ConsumerState<ArtistDetailsScreen> {
     bool shuffle = false,
   }) async {
     if (tracks.isEmpty) return;
-    final navigator = Navigator.of(context);
     final currentTrack = shuffle
         ? tracks[DateTime.now().microsecondsSinceEpoch % tracks.length]
         : tracks.first;
@@ -63,13 +73,11 @@ class _ArtistDetailsScreenState extends ConsumerState<ArtistDetailsScreen> {
           shuffle: shuffle,
         );
     if (!mounted) return;
-    navigator.push(
-      MaterialPageRoute(builder: (_) => const FullPlayerScreen()),
-    );
+    unawaited(openFullPlayer(context));
   }
 
   Future<void> _openAlbum(Map<String, dynamic> album) async {
-    final albumId = album['id']?.toString();
+    final albumId = resolveAlbumDetailId(album);
     if (albumId == null || albumId.isEmpty) return;
     unawaited(ref.read(albumDetailsProvider.notifier).fetchAlbum(albumId));
     await Navigator.of(context).push(
@@ -117,6 +125,22 @@ class _ArtistDetailsScreenState extends ConsumerState<ArtistDetailsScreen> {
             .map((entry) => Map<String, dynamic>.from(entry))
             .toList(growable: false);
     final description = (artist['description'] ?? '').toString().trim();
+    final isFollowing = ref.watch(followedArtistsProvider.select((artists) {
+      final id = (artist['id'] ?? artist['browseId'] ?? artist['artist_id'])
+              ?.toString()
+              .trim() ??
+          '';
+      final name = artist['name']?.toString().trim().toLowerCase() ?? '';
+      return artists.any((entry) {
+        final entryId = (entry['id'] ?? entry['browseId'] ?? entry['artist_id'])
+                ?.toString()
+                .trim() ??
+            '';
+        final entryName = entry['name']?.toString().trim().toLowerCase() ?? '';
+        return (id.isNotEmpty && entryId == id) ||
+            (name.isNotEmpty && entryName == name);
+      });
+    }));
 
     return Scaffold(
       backgroundColor: _voidBlack,
@@ -140,6 +164,9 @@ class _ArtistDetailsScreenState extends ConsumerState<ArtistDetailsScreen> {
                 DetailsPlayShuffleActionsRow(
                   playLabel: 'Play top songs',
                   surfaceColor: _surfaceGreyAlt,
+                  onPrime: topSongs.isEmpty
+                      ? null
+                      : () => _primeDetailsTrack(ref, topSongs.first),
                   onPlay: topSongs.isEmpty
                       ? null
                       : () => _playArtistTracks(artist, topSongs),
@@ -150,6 +177,34 @@ class _ArtistDetailsScreenState extends ConsumerState<ArtistDetailsScreen> {
                             topSongs,
                             shuffle: true,
                           ),
+                ),
+                const SizedBox(height: 12),
+                SizedBox(
+                  width: double.infinity,
+                  child: OutlinedButton.icon(
+                    onPressed: () {
+                      unawaited(
+                        ref
+                            .read(followedArtistsProvider.notifier)
+                            .toggle(artist),
+                      );
+                    },
+                    icon: Icon(
+                      isFollowing
+                          ? Icons.check_circle_rounded
+                          : Icons.person_add_alt_1_rounded,
+                    ),
+                    label: Text(isFollowing ? 'Following' : 'Follow artist'),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: Colors.white,
+                      side: BorderSide(
+                        color: Colors.white.withValues(alpha: 0.2),
+                      ),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(18),
+                      ),
+                    ),
+                  ),
                 ),
                 if (albums.isNotEmpty) ...[
                   const SizedBox(height: 28),
@@ -164,13 +219,13 @@ class _ArtistDetailsScreenState extends ConsumerState<ArtistDetailsScreen> {
                   title: 'Top songs',
                   tracks: topSongs,
                   isLoading: artistState.isLoading,
-                  emptyMessage:
-                      artistState.error ??
+                  emptyMessage: artistState.error ??
                       'No top-song data available for this artist.',
                   fallbackSubtitle:
                       artist['name']?.toString() ?? 'Unknown Artist',
+                  onPrimeTrack: (track) => _primeDetailsTrack(ref, track),
                   onPlayTrack: (track) async {
-                    final navigator = Navigator.of(context);
+                    final playerContext = context;
                     await ref
                         .read(playbackQueueProvider.notifier)
                         .startPlaylistSession(
@@ -180,12 +235,8 @@ class _ArtistDetailsScreenState extends ConsumerState<ArtistDetailsScreen> {
                           tracks: topSongs,
                           currentTrack: track,
                         );
-                    if (!mounted) return;
-                    navigator.push(
-                      MaterialPageRoute(
-                        builder: (_) => const FullPlayerScreen(),
-                      ),
-                    );
+                    if (!playerContext.mounted) return;
+                    unawaited(openFullPlayer(playerContext));
                   },
                 ),
                 if (relatedArtists.isNotEmpty) ...[
@@ -203,6 +254,7 @@ class _ArtistDetailsScreenState extends ConsumerState<ArtistDetailsScreen> {
     );
   }
 }
+
 class AlbumDetailsScreen extends ConsumerStatefulWidget {
   final String albumId;
   final Map<String, dynamic> fallbackAlbum;
@@ -234,7 +286,6 @@ class _AlbumDetailsScreenState extends ConsumerState<AlbumDetailsScreen> {
     bool shuffle = false,
   }) async {
     if (tracks.isEmpty) return;
-    final navigator = Navigator.of(context);
     final currentTrack = shuffle
         ? tracks[DateTime.now().microsecondsSinceEpoch % tracks.length]
         : tracks.first;
@@ -247,9 +298,7 @@ class _AlbumDetailsScreenState extends ConsumerState<AlbumDetailsScreen> {
           shuffle: shuffle,
         );
     if (!mounted) return;
-    navigator.push(
-      MaterialPageRoute(builder: (_) => const FullPlayerScreen()),
-    );
+    unawaited(openFullPlayer(context));
   }
 
   void _saveAlbumAsPlaylist(Map<String, dynamic> album, List<dynamic> tracks) {
@@ -277,7 +326,13 @@ class _AlbumDetailsScreenState extends ConsumerState<AlbumDetailsScreen> {
         loadedAlbum != null && loadedAlbum['id']?.toString() == widget.albumId
             ? loadedAlbum
             : widget.fallbackAlbum;
-    final tracks = (loadedAlbum?['tracks'] as List<dynamic>?) ?? const [];
+    final loadedTracks = (loadedAlbum?['tracks'] as List<dynamic>?) ?? const [];
+    final fallbackTracks = (widget.fallbackAlbum['tracks'] as List<dynamic>?) ??
+        (widget.fallbackAlbum['canonical_tracks'] as List<dynamic>?) ??
+        const [];
+    final tracks = loadedTracks.isNotEmpty ? loadedTracks : fallbackTracks;
+    final likeKey = 'album:${widget.albumId}';
+    final isLiked = ref.watch(collectionLikesProvider).contains(likeKey);
 
     return Scaffold(
       backgroundColor: _voidBlack,
@@ -294,46 +349,37 @@ class _AlbumDetailsScreenState extends ConsumerState<AlbumDetailsScreen> {
                 AlbumHeroSection(
                   album: album,
                   tracks: tracks,
-                  radiusLarge: _radiusLarge,
                 ),
                 const SizedBox(height: 22),
-                DetailsPlayShuffleActionsRow(
-                  playLabel: 'Play Album',
-                  surfaceColor: _surfaceGreyAlt,
+                CollectionIconActionsRow(
                   onPlay: tracks.isEmpty ? null : () => _playAlbum(tracks),
+                  onPrime: tracks.isEmpty
+                      ? null
+                      : () => _primeDetailsTrack(ref, tracks.first),
                   onShuffle: tracks.isEmpty
                       ? null
                       : () => _playAlbum(tracks, shuffle: true),
-                ),
-                const SizedBox(height: 12),
-                OutlinedButton.icon(
-                  style: OutlinedButton.styleFrom(
-                    foregroundColor: Colors.white,
-                    side: BorderSide(
-                      color: Colors.white.withValues(alpha: 0.14),
-                    ),
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 16,
-                      vertical: 14,
-                    ),
+                  isLiked: isLiked,
+                  onLike: () => unawaited(
+                    ref.read(collectionLikesProvider.notifier).toggle(likeKey),
                   ),
-                  onPressed: tracks.isEmpty
+                  secondaryIcon: Icons.library_add_rounded,
+                  onSecondary: tracks.isEmpty
                       ? null
                       : () => _saveAlbumAsPlaylist(album, tracks),
-                  icon: const Icon(Icons.library_add_rounded),
-                  label: const Text('Save Album As Playlist'),
                 ),
                 const SizedBox(height: 24),
                 DetailsTrackListSection(
                   title: 'Tracks',
                   tracks: tracks,
                   isLoading: albumState.isLoading,
-                  emptyMessage:
-                      albumState.error ?? 'No track data available for this album.',
+                  emptyMessage: albumState.error ??
+                      'No track data available for this album.',
                   fallbackSubtitle: album['artist']?.toString() ?? '',
                   fallbackThumbnail: album['thumbnail']?.toString(),
+                  onPrimeTrack: (track) => _primeDetailsTrack(ref, track),
                   onPlayTrack: (track) async {
-                    final navigator = Navigator.of(context);
+                    final playerContext = context;
                     await ref
                         .read(playbackQueueProvider.notifier)
                         .startPlaylistSession(
@@ -343,12 +389,8 @@ class _AlbumDetailsScreenState extends ConsumerState<AlbumDetailsScreen> {
                           tracks: tracks,
                           currentTrack: track,
                         );
-                    if (!mounted) return;
-                    navigator.push(
-                      MaterialPageRoute(
-                        builder: (_) => const FullPlayerScreen(),
-                      ),
-                    );
+                    if (!playerContext.mounted) return;
+                    unawaited(openFullPlayer(playerContext));
                   },
                 ),
               ],
@@ -434,15 +476,14 @@ class TrackDetailsScreen extends ConsumerWidget {
                 track: track,
                 downloadTask: downloadTask,
                 accentColor: _accentGrey,
+                onPrime: () => _primeDetailsTrack(ref, track),
                 onPlay: () {
                   unawaited(
                     ref.read(playbackQueueProvider.notifier).startRadioSession(
                           track,
                         ),
                   );
-                  Navigator.of(context).push(
-                    MaterialPageRoute(builder: (_) => const FullPlayerScreen()),
-                  );
+                  unawaited(openFullPlayer(context));
                 },
                 onDownload: videoId == null
                     ? null

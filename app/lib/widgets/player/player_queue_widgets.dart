@@ -130,7 +130,6 @@ class PlayerQueueTile extends StatelessWidget {
             ? Colors.white.withValues(alpha: 0.08)
             : Colors.white.withValues(alpha: 0.03),
         borderRadius: BorderRadius.circular(radiusLarge),
-        border: Border.all(color: Colors.white.withValues(alpha: 0.06)),
       ),
       child: AnimatedOpacity(
         duration: const Duration(milliseconds: 220),

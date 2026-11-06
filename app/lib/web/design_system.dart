@@ -1,0 +1,541 @@
+import 'dart:math' as math;
+import 'package:flutter/material.dart';
+
+class NeatieNavigation extends StatelessWidget {
+  const NeatieNavigation(
+      {super.key,
+      required this.labels,
+      required this.icons,
+      required this.selected,
+      required this.onSelect,
+      this.vertical = false});
+  final List<String> labels;
+  final List<IconData> icons;
+  final int selected;
+  final ValueChanged<int> onSelect;
+  final bool vertical;
+
+  @override
+  Widget build(BuildContext context) => SizedBox(
+      height: vertical ? labels.length * 58.0 : 68,
+      child: LayoutBuilder(builder: (context, constraints) {
+        final slot = constraints.maxWidth / labels.length;
+        final duration = MediaQuery.disableAnimationsOf(context)
+            ? Duration.zero
+            : const Duration(milliseconds: 300);
+        return Stack(children: [
+          AnimatedPositioned(
+              key: const ValueKey('navigation-highlight'),
+              duration: duration,
+              curve: Curves.easeInOutCubic,
+              left: vertical ? 0 : selected * slot + 4,
+              top: vertical ? selected * 58.0 : 6,
+              width: vertical ? constraints.maxWidth : slot - 8,
+              height: vertical ? 52 : 56,
+              child: IgnorePointer(
+                  child: DecoratedBox(
+                      decoration: BoxDecoration(
+                          color: NeatieDesign.accent.withValues(alpha: .12),
+                          borderRadius:
+                              BorderRadius.circular(vertical ? 14 : 24))))),
+          for (var i = 0; i < labels.length; i++)
+            Positioned(
+                left: vertical ? 0 : i * slot,
+                top: vertical ? i * 58.0 : 0,
+                width: vertical ? constraints.maxWidth : slot,
+                height: vertical ? 52 : 68,
+                child: Semantics(
+                    selected: selected == i,
+                    button: true,
+                    child: Material(
+                        color: Colors.transparent,
+                        child: InkWell(
+                            borderRadius: BorderRadius.circular(14),
+                            onTap: () => onSelect(i),
+                            child: Padding(
+                                padding: vertical
+                                    ? const EdgeInsets.symmetric(horizontal: 14)
+                                    : EdgeInsets.zero,
+                                child: AnimatedDefaultTextStyle(
+                                    duration: duration,
+                                    style: TextStyle(
+                                        fontFamily: 'NeatieSans',
+                                        fontSize: 12,
+                                        fontWeight: FontWeight.w600,
+                                        color: selected == i
+                                            ? NeatieDesign.accent
+                                            : NeatieDesign.ink),
+                                    child: vertical
+                                        ? Row(children: [
+                                            Icon(icons[i],
+                                                size: 21,
+                                                color: selected == i
+                                                    ? NeatieDesign.accent
+                                                    : NeatieDesign.muted),
+                                            const SizedBox(width: 14),
+                                            Text(labels[i])
+                                          ])
+                                        : Column(
+                                            mainAxisAlignment:
+                                                MainAxisAlignment.center,
+                                            children: [
+                                                Icon(icons[i],
+                                                    size: 21,
+                                                    color: selected == i
+                                                        ? NeatieDesign.accent
+                                                        : NeatieDesign.muted),
+                                                const SizedBox(height: 5),
+                                                Text(labels[i])
+                                              ]))))))),
+        ]);
+      }));
+}
+
+abstract final class NeatieDesign {
+  static const background = Color(0xff0d1010);
+  static const surface = Color(0xff171c1b);
+  static const raised = Color(0xff202725);
+  static const ink = Color(0xfff3f0e8);
+  static const muted = Color(0xffa6b2aa);
+  static const accent = Color(0xffceddbb);
+  static const line = Color(0xff2b3430);
+
+  static TextStyle display(double size) => TextStyle(
+      fontFamily: 'NeatieDisplay',
+      fontSize: size,
+      height: 1.08,
+      letterSpacing: -.8,
+      color: ink,
+      fontWeight: FontWeight.w400);
+  static const eyebrow = TextStyle(
+      fontSize: 10,
+      fontWeight: FontWeight.w700,
+      letterSpacing: 2.2,
+      color: muted);
+
+  static ThemeData get theme {
+    final base = ThemeData(
+        brightness: Brightness.dark,
+        useMaterial3: true,
+        fontFamily: 'NeatieSans',
+        scaffoldBackgroundColor: background,
+        colorScheme: const ColorScheme.dark(
+            primary: accent,
+            onPrimary: background,
+            secondary: accent,
+            surface: surface,
+            onSurface: ink,
+            onSurfaceVariant: muted,
+            outline: line));
+    return base.copyWith(
+      textTheme: base.textTheme.copyWith(
+          headlineLarge: display(48),
+          headlineMedium: display(38),
+          headlineSmall: display(30),
+          titleLarge: const TextStyle(
+              fontFamily: 'NeatieSans',
+              fontSize: 23,
+              color: ink,
+              fontWeight: FontWeight.w700,
+              letterSpacing: -.6),
+          titleMedium: const TextStyle(
+              fontFamily: 'NeatieSans',
+              fontSize: 16,
+              color: ink,
+              fontWeight: FontWeight.w600),
+          titleSmall: const TextStyle(
+              fontFamily: 'NeatieSans',
+              fontSize: 13,
+              color: ink,
+              fontWeight: FontWeight.w600),
+          bodyMedium: const TextStyle(
+              fontFamily: 'NeatieSans',
+              fontSize: 13,
+              color: muted,
+              height: 1.5),
+          bodySmall: const TextStyle(
+              fontFamily: 'NeatieSans',
+              fontSize: 11,
+              color: muted,
+              height: 1.5)),
+      appBarTheme: const AppBarTheme(
+          backgroundColor: background,
+          surfaceTintColor: Colors.transparent,
+          elevation: 0,
+          centerTitle: false),
+      cardTheme: CardThemeData(
+          color: surface,
+          elevation: 0,
+          margin: const EdgeInsets.all(4),
+          shape:
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(18))),
+      dividerTheme: const DividerThemeData(color: line, thickness: 1),
+      listTileTheme: const ListTileThemeData(
+          contentPadding: EdgeInsets.symmetric(horizontal: 14, vertical: 4),
+          iconColor: muted,
+          selectedColor: accent,
+          selectedTileColor: raised),
+      inputDecorationTheme: InputDecorationTheme(
+          filled: true,
+          fillColor: surface,
+          contentPadding:
+              const EdgeInsets.symmetric(horizontal: 20, vertical: 20),
+          border: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(16),
+              borderSide: const BorderSide(color: line)),
+          enabledBorder: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(16),
+              borderSide: const BorderSide(color: line)),
+          focusedBorder: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(16),
+              borderSide: const BorderSide(color: accent))),
+      filledButtonTheme: FilledButtonThemeData(
+          style: FilledButton.styleFrom(
+              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 20),
+              textStyle: const TextStyle(
+                  fontFamily: 'NeatieSans', fontWeight: FontWeight.w700),
+              shape: const StadiumBorder())),
+      outlinedButtonTheme: OutlinedButtonThemeData(
+          style: OutlinedButton.styleFrom(
+              foregroundColor: ink,
+              side: const BorderSide(color: line),
+              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 18),
+              shape: const StadiumBorder())),
+      chipTheme: base.chipTheme.copyWith(
+          backgroundColor: surface,
+          selectedColor: raised,
+          side: const BorderSide(color: line),
+          shape: const StadiumBorder(),
+          showCheckmark: false,
+          labelStyle: const TextStyle(
+              fontFamily: 'NeatieSans', fontSize: 12, color: ink)),
+      sliderTheme: base.sliderTheme.copyWith(
+          trackHeight: 3,
+          thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 5),
+          overlayShape: const RoundSliderOverlayShape(overlayRadius: 12),
+          activeTrackColor: accent,
+          inactiveTrackColor: line),
+      navigationBarTheme: const NavigationBarThemeData(
+          backgroundColor: background,
+          indicatorColor: raised,
+          height: 70,
+          labelTextStyle: WidgetStatePropertyAll(TextStyle(
+              fontFamily: 'NeatieSans',
+              fontSize: 10,
+              fontWeight: FontWeight.w600))),
+    );
+  }
+}
+
+class NeatieBrand extends StatelessWidget {
+  const NeatieBrand({super.key, this.size = 30});
+  final double size;
+  @override
+  Widget build(BuildContext context) =>
+      Row(mainAxisSize: MainAxisSize.min, children: [
+        Container(
+            width: 30,
+            height: 30,
+            decoration: const BoxDecoration(
+                shape: BoxShape.circle, color: NeatieDesign.accent),
+            child: const Icon(Icons.graphic_eq_rounded,
+                size: 19, color: NeatieDesign.background)),
+        const SizedBox(width: 10),
+        Text('neatie', style: NeatieDesign.display(size)),
+      ]);
+}
+
+class EditorialHeading extends StatelessWidget {
+  const EditorialHeading(
+      {super.key,
+      required this.title,
+      required this.subtitle,
+      required this.eyebrow,
+      this.action});
+  final String title, subtitle, eyebrow;
+  final Widget? action;
+  @override
+  Widget build(BuildContext context) =>
+      LayoutBuilder(builder: (context, bounds) {
+        final compact = bounds.maxWidth < 600;
+        return Padding(
+            padding: EdgeInsets.only(top: compact ? 12 : 24, bottom: 24),
+            child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Expanded(
+                  child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                    if (eyebrow.isNotEmpty) ...[
+                      Text(eyebrow, style: NeatieDesign.eyebrow),
+                      const SizedBox(height: 12)
+                    ],
+                    Text(title, style: NeatieDesign.display(compact ? 34 : 46)),
+                    const SizedBox(height: 12),
+                    Text(subtitle,
+                        style: Theme.of(context).textTheme.bodyMedium),
+                  ])),
+              if (action != null) ...[const SizedBox(width: 12), action!],
+            ]));
+      });
+}
+
+class EditorialSurface extends StatefulWidget {
+  const EditorialSurface(
+      {super.key,
+      required this.child,
+      this.radius = 20,
+      this.outlined = true,
+      this.color = NeatieDesign.surface});
+  final Widget child;
+  final double radius;
+  final bool outlined;
+  final Color color;
+  @override
+  State<EditorialSurface> createState() => _EditorialSurfaceState();
+}
+
+class _EditorialSurfaceState extends State<EditorialSurface> {
+  bool hovered = false;
+  @override
+  Widget build(BuildContext context) => MouseRegion(
+      onEnter: (_) => setState(() => hovered = true),
+      onExit: (_) => setState(() => hovered = false),
+      child: AnimatedContainer(
+          duration: MediaQuery.disableAnimationsOf(context)
+              ? Duration.zero
+              : const Duration(milliseconds: 180),
+          curve: Curves.easeOutCubic,
+          transform: Matrix4.translationValues(0,
+              hovered && !MediaQuery.disableAnimationsOf(context) ? -2 : 0, 0),
+          decoration: BoxDecoration(
+              color: hovered ? NeatieDesign.raised : widget.color,
+              borderRadius: BorderRadius.circular(widget.radius),
+              border: !widget.outlined
+                  ? null
+                  : Border.all(
+                      color: hovered
+                          ? const Color(0xff465548)
+                          : NeatieDesign.line)),
+          clipBehavior: Clip.antiAlias,
+          child: widget.child));
+}
+
+/// A quiet equalizer shared by loading surfaces and the playback button.
+class NeatieLoading extends StatefulWidget {
+  const NeatieLoading(
+      {super.key,
+      this.label = 'Loading',
+      this.size = 28,
+      this.showLabel = false,
+      this.color = NeatieDesign.accent});
+  final String label;
+  final double size;
+  final bool showLabel;
+  final Color color;
+  @override
+  State<NeatieLoading> createState() => _NeatieLoadingState();
+}
+
+class _NeatieLoadingState extends State<NeatieLoading>
+    with SingleTickerProviderStateMixin {
+  late final animation = AnimationController(
+      vsync: this, duration: const Duration(milliseconds: 1400));
+  bool animate = false;
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final enabled =
+        !MediaQuery.disableAnimationsOf(context) && TickerMode.of(context);
+    if (enabled != animate) {
+      animate = enabled;
+      if (enabled) {
+        animation.repeat();
+      } else {
+        animation.stop();
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => Semantics(
+      label: widget.label,
+      liveRegion: true,
+      child: ExcludeSemantics(
+          child: Row(mainAxisSize: MainAxisSize.min, children: [
+        AnimatedBuilder(
+            animation: animation,
+            builder: (_, __) => CustomPaint(
+                size: Size.square(widget.size),
+                painter: _EqualizerPainter(
+                    animate ? animation.value : 0, widget.color))),
+        if (widget.showLabel) ...[
+          const SizedBox(width: 10),
+          Flexible(
+              child: Text(widget.label,
+                  style:
+                      const TextStyle(fontSize: 12, color: NeatieDesign.muted)))
+        ],
+      ])));
+  @override
+  void dispose() {
+    animation.dispose();
+    super.dispose();
+  }
+}
+
+class _EqualizerPainter extends CustomPainter {
+  _EqualizerPainter(this.phase, this.color);
+  final double phase;
+  final Color color;
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..color = color
+      ..strokeWidth = size.width / 12
+      ..strokeCap = StrokeCap.round;
+    for (var i = 0; i < 5; i++) {
+      final wave = (math.sin(phase * math.pi * 2 - i * .9) + 1) / 2;
+      final height = size.height * (.22 + .46 * wave);
+      final x = size.width * (.18 + i * .16);
+      canvas.drawLine(Offset(x, (size.height - height) / 2),
+          Offset(x, (size.height + height) / 2), paint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(_EqualizerPainter old) =>
+      phase != old.phase || color != old.color;
+}
+
+class SectionHeading extends StatelessWidget {
+  const SectionHeading({super.key, required this.title, this.action});
+  final String title;
+  final Widget? action;
+  @override
+  Widget build(BuildContext context) => Padding(
+      padding: const EdgeInsets.only(top: 28, bottom: 14),
+      child: Row(children: [
+        Expanded(
+            child: Text(title, style: Theme.of(context).textTheme.titleLarge)),
+        if (action != null) ...[const SizedBox(width: 12), action!],
+      ]));
+}
+
+class BrowseMoreButton extends StatelessWidget {
+  const BrowseMoreButton(
+      {super.key, required this.label, required this.onPressed});
+  final String label;
+  final VoidCallback? onPressed;
+  @override
+  Widget build(BuildContext context) => IconButton(
+      tooltip: label,
+      onPressed: onPressed,
+      style: IconButton.styleFrom(minimumSize: const Size(42, 42)),
+      icon: const Icon(Icons.arrow_forward_rounded, size: 19));
+}
+
+/// Morph the submit arrow into a clear cross without swapping hit targets.
+class SearchFieldActionIcon extends StatelessWidget {
+  const SearchFieldActionIcon({super.key, required this.clear});
+  final bool clear;
+  @override
+  Widget build(BuildContext context) => ExcludeSemantics(
+          child: TweenAnimationBuilder<double>(
+        tween: Tween(begin: 0, end: clear ? 1 : 0),
+        duration: MediaQuery.disableAnimationsOf(context)
+            ? Duration.zero
+            : const Duration(milliseconds: 220),
+        curve: Curves.easeInOutCubic,
+        builder: (_, value, __) => CustomPaint(
+            size: const Size.square(24),
+            painter: _SearchActionPainter(
+                value, IconTheme.of(context).color ?? NeatieDesign.muted)),
+      ));
+}
+
+class _SearchActionPainter extends CustomPainter {
+  const _SearchActionPainter(this.progress, this.color);
+  final double progress;
+  final Color color;
+  @override
+  void paint(Canvas canvas, Size size) {
+    canvas.scale(size.width / 24, size.height / 24);
+    final pen = Paint()
+      ..color = color
+      ..strokeWidth = 1.8
+      ..strokeCap = StrokeCap.round;
+    canvas.drawLine(
+        Offset.lerp(const Offset(10, 5), const Offset(6, 6), progress)!,
+        Offset.lerp(const Offset(17, 12), const Offset(18, 18), progress)!,
+        pen);
+    canvas.drawLine(
+        Offset.lerp(const Offset(17, 12), const Offset(18, 6), progress)!,
+        Offset.lerp(const Offset(10, 19), const Offset(6, 18), progress)!,
+        pen);
+    pen.color = color.withValues(alpha: color.a * (1 - progress));
+    canvas.drawLine(const Offset(4, 12), const Offset(17, 12), pen);
+  }
+
+  @override
+  bool shouldRepaint(covariant _SearchActionPainter old) =>
+      old.progress != progress || old.color != color;
+}
+
+/// Animate tab entry while keeping the page subtree, scroll and requests alive.
+class PageEntrance extends StatefulWidget {
+  const PageEntrance(
+      {super.key,
+      required this.active,
+      required this.child,
+      this.duration = const Duration(milliseconds: 420)});
+  final bool active;
+  final Widget child;
+  final Duration duration;
+  @override
+  State<PageEntrance> createState() => _PageEntranceState();
+}
+
+class _PageEntranceState extends State<PageEntrance>
+    with SingleTickerProviderStateMixin {
+  late final animation =
+      AnimationController(vsync: this, duration: widget.duration);
+  bool reduced = false;
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    reduced = MediaQuery.disableAnimationsOf(context);
+    if (reduced)
+      animation.value = 1;
+    else if (widget.active && animation.value == 0) animation.forward();
+  }
+
+  @override
+  void didUpdateWidget(covariant PageEntrance old) {
+    super.didUpdateWidget(old);
+    if (widget.active && !old.active) {
+      if (reduced)
+        animation.value = 1;
+      else
+        animation.forward(from: 0);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final curved = animation.drive(CurveTween(curve: Curves.easeOutCubic));
+    return TickerMode(
+        enabled: widget.active,
+        child: FadeTransition(
+            opacity: curved,
+            child: SlideTransition(
+                position: Tween(begin: const Offset(0, .012), end: Offset.zero)
+                    .animate(curved),
+                child: widget.child)));
+  }
+
+  @override
+  void dispose() {
+    animation.dispose();
+    super.dispose();
+  }
+}

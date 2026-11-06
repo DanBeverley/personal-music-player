@@ -21,6 +21,7 @@ class RecommendationRowDetailScreen extends ConsumerStatefulWidget {
   final ValueChanged<Map<String, dynamic>>? onOpenAlbum;
   final ValueChanged<Map<String, dynamic>>? onOpenArtist;
   final ValueChanged<Map<String, dynamic>>? onOpenMix;
+  final ValueChanged<Map<String, dynamic>>? onOpenRadio;
 
   const RecommendationRowDetailScreen({
     super.key,
@@ -31,6 +32,7 @@ class RecommendationRowDetailScreen extends ConsumerStatefulWidget {
     this.onOpenAlbum,
     this.onOpenArtist,
     this.onOpenMix,
+    this.onOpenRadio,
   });
 
   @override
@@ -42,7 +44,6 @@ class _RecommendationRowDetailScreenState
     extends ConsumerState<RecommendationRowDetailScreen> {
   final ScrollController _scrollController = ScrollController();
   bool _loggedInitialPagingState = false;
-  bool _isPrefetchingLongRow = false;
 
   @override
   void initState() {
@@ -51,7 +52,6 @@ class _RecommendationRowDetailScreenState
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       _handleScroll();
-      unawaited(_prefetchPreparedLongRow());
     });
   }
 
@@ -81,22 +81,6 @@ class _RecommendationRowDetailScreenState
       return;
     }
     unawaited(ref.read(recommendationProvider.notifier).loadMoreRow(row.id));
-  }
-
-  Future<void> _prefetchPreparedLongRow() async {
-    if (_isPrefetchingLongRow || widget.initialRow.kind != 'quiet_picks') {
-      return;
-    }
-    _isPrefetchingLongRow = true;
-    try {
-      for (var page = 0; page < 5 && mounted; page++) {
-        final row = _resolvedRow(ref.read(recommendationProvider));
-        if (!row.hasMore) break;
-        await ref.read(recommendationProvider.notifier).loadMoreRow(row.id);
-      }
-    } finally {
-      _isPrefetchingLongRow = false;
-    }
   }
 
   Future<void> _openPlayer() async {
@@ -134,6 +118,10 @@ class _RecommendationRowDetailScreenState
     }
     if (row.itemType == 'mix') {
       widget.onOpenMix?.call(item);
+      return;
+    }
+    if (row.itemType == 'radio') {
+      widget.onOpenRadio?.call(item);
       return;
     }
     unawaited(_playTrack(row, item));
@@ -270,7 +258,7 @@ class _RecommendationRowDetailScreenState
                           ),
                           child: AppArtwork(
                             thumbnail: heroTrack['thumbnail'],
-                            videoId: extractTrackId(heroTrack),
+                            videoId: extractPlaybackSourceId(heroTrack),
                             width: 112,
                             height: 112,
                             radius: 18,
@@ -313,6 +301,13 @@ class _RecommendationRowDetailScreenState
                           onTap: row.items.isEmpty || row.itemType != 'track'
                               ? null
                               : () => _playTrack(row, row.items.first),
+                          onTapDown: row.items.isEmpty ||
+                                  row.itemType != 'track' ||
+                                  extractTrackId(row.items.first) == null
+                              ? null
+                              : (_) => widget.onPrimeTrack?.call(
+                                    extractTrackId(row.items.first)!,
+                                  ),
                           borderRadius: BorderRadius.circular(999),
                           child: Container(
                             width: 54,
@@ -363,10 +358,13 @@ class _RecommendationRowDetailScreenState
                                     color: Colors.white70,
                                   ),
                                 )
-                              : Icon(
-                                  Icons.keyboard_arrow_down_rounded,
-                                  color: Colors.white.withValues(alpha: 0.58),
-                                  size: 28,
+                              : Text(
+                                  'Keep scrolling for more',
+                                  style: TextStyle(
+                                    color: Colors.white.withValues(alpha: 0.58),
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w600,
+                                  ),
                                 ),
                         ),
                       );
@@ -377,26 +375,30 @@ class _RecommendationRowDetailScreenState
                     final itemTitle =
                         (track['title'] ?? track['name'])?.toString() ??
                             'Unknown ${row.itemType}';
-                    final itemSubtitle = (track['channel'] ??
-                                track['author'] ??
-                                track['artist'] ??
-                                track['subtitle'])
-                            ?.toString() ??
-                        (row.itemType == 'artist' ? 'Artist' : '');
+                    final itemSubtitle = row.itemType == 'track'
+                        ? formatTrackSubtitle(track)
+                        : (track['channel'] ??
+                                    track['author'] ??
+                                    track['artist'] ??
+                                    track['subtitle'])
+                                ?.toString() ??
+                            (row.itemType == 'artist' ? 'Artist' : '');
                     return Container(
                       margin: const EdgeInsets.only(bottom: 12),
                       decoration: BoxDecoration(
                         color: Colors.white.withValues(alpha: 0.03),
                         borderRadius: BorderRadius.circular(22),
-                        border: Border.all(
-                          color: Colors.white.withValues(alpha: 0.06),
-                        ),
                       ),
                       child: Material(
                         color: Colors.transparent,
                         child: InkWell(
                           borderRadius: BorderRadius.circular(22),
                           onTap: () => _openItem(row, track),
+                          onTapDown: row.itemType != 'track' ||
+                                  videoId == null ||
+                                  videoId.isEmpty
+                              ? null
+                              : (_) => widget.onPrimeTrack?.call(videoId),
                           child: Padding(
                             padding: const EdgeInsets.all(12),
                             child: Row(

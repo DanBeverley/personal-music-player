@@ -6,7 +6,10 @@ import 'package:path_provider/path_provider.dart';
 import 'proxy_runtime.dart';
 import 'recommendation_feed_models.dart';
 
-const int homeFeedCacheVersion = 5;
+const int homeFeedCacheVersion = 12;
+// Version 11 may contain a four-row progressive artifact and is intentionally
+// excluded after restoring complete-feed publication.
+const Set<int> readableHomeFeedCacheVersions = <int>{10, 12};
 const Duration homeFeedCacheTtl = Duration(hours: 18);
 
 String _safeCacheSegment(String value) =>
@@ -14,48 +17,36 @@ String _safeCacheSegment(String value) =>
 
 Future<File> _homeFeedCacheFile(String scopeId) async {
   final dir = await getApplicationDocumentsDirectory();
-  final scope = _safeCacheSegment(scopeId.trim().isNotEmpty ? scopeId : 'guest');
+  final scope =
+      _safeCacheSegment(scopeId.trim().isNotEmpty ? scopeId : 'guest');
   return File('${dir.path}/users/$scope/home_feed_cache.json');
 }
 
 bool shouldCacheHomeFeed(RecommendationFeedState feedState) {
-  if (!feedState.hasRows || feedState.rows.length < 4) return false;
-  final tabDiagnostics = feedState.diagnostics['home_tab_diagnostics'];
-  var hasUsableTabs = false;
-  if (tabDiagnostics is Map) {
-    if (tabDiagnostics['accepted'] == true) {
-      hasUsableTabs = true;
-    } else {
-      final laneCounts = tabDiagnostics['lane_item_counts'];
-      if (laneCounts is Map) {
-        var usableNonAllLanes = 0;
-        for (final entry in laneCounts.entries) {
-          if (entry.key.toString() == 'all') continue;
-          final count = entry.value is num
-              ? (entry.value as num).toInt()
-              : int.tryParse(entry.value.toString()) ?? 0;
-          if (count >= 6) usableNonAllLanes++;
-        }
-        hasUsableTabs = usableNonAllLanes >= 2;
-      }
-    }
-  }
-  if (!hasUsableTabs) {
-    return false;
-  }
+  const activeActions = <String>{
+    'served_active',
+    'promoted_prepared',
+    'built_and_promoted',
+  };
+  final failedContracts = feedState.diagnostics['artifact_failed_contracts'];
   final rowKinds = feedState.rows.map((row) => row.kind).toSet();
-  final hasPersonalizedCore =
-      rowKinds.contains('made_for_you') ||
-          rowKinds.contains('because_you_played') ||
-          rowKinds.contains('frequently_listened') ||
-          rowKinds.contains('todays_pick');
-  final hasFlavor =
-      rowKinds.contains('recommended_albums') ||
-          rowKinds.contains('recommended_artists') ||
-          rowKinds.contains('trending_by_genre') ||
-          rowKinds.contains('quiet_picks') ||
-          rowKinds.contains('hidden_gems');
-  return hasPersonalizedCore && hasFlavor;
+  const requiredRows = <String>{
+    'todays_pick',
+    'featured_new_albums',
+    'made_for_you',
+    'popular_radio',
+    'recommended_albums',
+    'recommended_artists',
+    'quiet_picks',
+  };
+  return feedState.hasRows &&
+      rowKinds.containsAll(requiredRows) &&
+      feedState.feedVersion > 0 &&
+      activeActions.contains(feedState.feedAction) &&
+      const <String>{'feed-state-v2', 'home-repository-v2'}
+          .contains(feedState.diagnostics['feed_state_version']) &&
+      feedState.diagnostics['artifact_status'] == 'servable' &&
+      (failedContracts is! List || failedContracts.isEmpty);
 }
 
 Future<RecommendationFeedState?> loadCachedHomeFeed(String scopeId) async {
@@ -67,7 +58,8 @@ Future<RecommendationFeedState?> loadCachedHomeFeed(String scopeId) async {
     final decoded = jsonDecode(raw);
     if (decoded is! Map) return null;
     final envelope = Map<String, dynamic>.from(decoded);
-    if ((envelope['version'] as num?)?.toInt() != homeFeedCacheVersion) {
+    if (!readableHomeFeedCacheVersions
+        .contains((envelope['version'] as num?)?.toInt())) {
       return null;
     }
     if ((envelope['scope_id'] ?? '').toString() != scopeId) return null;
@@ -80,7 +72,7 @@ Future<RecommendationFeedState?> loadCachedHomeFeed(String scopeId) async {
     final cachedState = RecommendationFeedState.fromHomeJson(
       Map<String, dynamic>.from(payload),
     );
-    return cachedState.hasRows ? cachedState : null;
+    return shouldCacheHomeFeed(cachedState) ? cachedState : null;
   } catch (error) {
     debugProxyLog('recommend', 'home feed cache read failed=$error');
     return null;

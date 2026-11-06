@@ -48,10 +48,12 @@ class DomainServerAdapter:
         artist_id: str,
         *,
         enrich_related: bool = True,
+        lightweight: bool = False,
     ):
         return self.raw._build_artist_details_payload(
             artist_id,
             enrich_related=enrich_related,
+            lightweight=lightweight,
         )
 
     def assistant_tool_search_albums(self, query: str, limit: int):

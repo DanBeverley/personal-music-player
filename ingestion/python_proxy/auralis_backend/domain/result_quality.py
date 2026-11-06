@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, Iterable
 
 from .server_adapter import adapt_domain_server
@@ -40,7 +41,7 @@ def _combined_text(server, values: Iterable[Any]) -> str:
 
 
 def _contains_any(text: str, terms: Iterable[str]) -> bool:
-    return any(term in text for term in terms)
+    return any(re.search(r"(?<!\w)" + (r"cover(?:s|ed|ing)?" if term == "cover" else re.escape(term)) + r"(?!\w)", text) for term in terms)
 
 
 def track_result_penalty(
@@ -49,6 +50,7 @@ def track_result_penalty(
     *,
     query: str = "",
     normalized_anchor_artists: Iterable[str] = (),
+    allow_remaster: bool = False,
 ) -> float:
     normalized_title = _normalize(server, track.get("title"))
     normalized_artist = _normalize(
@@ -73,10 +75,10 @@ def track_result_penalty(
         penalty += 1.9
     if not query_allows_derivative and _contains_any(normalized_artist, ("tribute", "karaoke", "cover")):
         penalty += 1.4
-    if _contains_any(normalized_title, _SOFT_PENALTY_TERMS) and not _contains_any(
-        normalized_query,
-        _SOFT_PENALTY_TERMS,
-    ):
+    if any(_contains_any(normalized_title, (term,))
+           and not _contains_any(normalized_query, (term,))
+           and not (allow_remaster and term in {"remaster", "remastered"})
+           for term in _SOFT_PENALTY_TERMS):
         penalty += 0.55
 
     normalized_anchor_artist_set = {

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../../logic/download_provider.dart';
+import '../../logic/track_metadata.dart';
 import '../../ui/app_theme_tokens.dart';
 import '../../ui/neatie_components.dart';
 import '../app_artwork.dart';
@@ -26,19 +27,10 @@ class ArtistHeroSection extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Center(
-          child: Container(
-            padding: const EdgeInsets.all(14),
-            decoration: BoxDecoration(
-              color: Colors.white.withValues(alpha: 0.03),
-              shape: BoxShape.circle,
-              border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
-            ),
-            child: AppArtwork(
-              thumbnail: artist['thumbnail'],
-              width: 220,
-              height: 220,
-              radius: 999,
-            ),
+          child: ArtistArtwork(
+            thumbnail: artist['thumbnail'],
+            width: 220,
+            height: 220,
           ),
         ),
         const SizedBox(height: 24),
@@ -73,34 +65,24 @@ class ArtistHeroSection extends StatelessWidget {
 class AlbumHeroSection extends StatelessWidget {
   final Map<String, dynamic> album;
   final List<dynamic> tracks;
-  final double radiusLarge;
 
   const AlbumHeroSection({
     super.key,
     required this.album,
     required this.tracks,
-    required this.radiusLarge,
   });
 
   @override
   Widget build(BuildContext context) {
+    final duration = formatCollectionDuration(tracks);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Center(
-          child: Container(
-            padding: const EdgeInsets.all(14),
-            decoration: BoxDecoration(
-              color: Colors.white.withValues(alpha: 0.03),
-              borderRadius: BorderRadius.circular(radiusLarge),
-              border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
-            ),
-            child: AppArtwork(
-              thumbnail: album['thumbnail'],
-              width: 240,
-              height: 240,
-              radius: 28,
-            ),
+          child: CollectionVinylArtwork(
+            thumbnail: album['thumbnail'],
+            videoId: tracks.isNotEmpty ? extractTrackId(tracks.first) : null,
+            size: 244,
           ),
         ),
         const SizedBox(height: 24),
@@ -116,8 +98,11 @@ class AlbumHeroSection extends StatelessWidget {
         Text(
           [
             album['artist']?.toString() ?? 'Unknown Artist',
-            if ((album['year'] ?? '').toString().isNotEmpty)
-              album['year'].toString(),
+            if ((album['release_year'] ?? album['year'] ?? '')
+                .toString()
+                .isNotEmpty)
+              (album['release_year'] ?? album['year']).toString(),
+            if (duration.isNotEmpty) duration,
             if (tracks.isNotEmpty) '${tracks.length} tracks',
           ].join(' / '),
           style: TextStyle(
@@ -130,10 +115,181 @@ class AlbumHeroSection extends StatelessWidget {
   }
 }
 
+class CollectionVinylArtwork extends StatelessWidget {
+  const CollectionVinylArtwork({
+    super.key,
+    required this.thumbnail,
+    this.videoId,
+    this.size = 220,
+    this.cover,
+  });
+
+  final dynamic thumbnail;
+  final String? videoId;
+  final double size;
+  final Widget? cover;
+
+  @override
+  Widget build(BuildContext context) {
+    final coverSize = size * 0.74;
+    final discSize = size * 0.68;
+    return SizedBox(
+      width: size,
+      height: size * 0.82,
+      child: Stack(
+        alignment: Alignment.center,
+        children: [
+          Positioned(
+            right: size * 0.03,
+            child: Container(
+              width: discSize,
+              height: discSize,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: const Color(0xFF171717),
+                border: Border.all(color: const Color(0xFF303030), width: 2),
+                boxShadow: const [
+                  BoxShadow(
+                    color: Colors.black54,
+                    blurRadius: 20,
+                    offset: Offset(8, 10),
+                  ),
+                ],
+              ),
+              child: Stack(
+                alignment: Alignment.center,
+                children: [
+                  for (final factor in const [0.86, 0.68, 0.50])
+                    Container(
+                      width: discSize * factor,
+                      height: discSize * factor,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        border: Border.all(
+                          color: Colors.white.withValues(alpha: 0.055),
+                        ),
+                      ),
+                    ),
+                  Container(
+                    width: discSize * 0.25,
+                    height: discSize * 0.25,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: neatieActive.withValues(alpha: 0.72),
+                    ),
+                  ),
+                  Container(
+                    width: 6,
+                    height: 6,
+                    decoration: const BoxDecoration(
+                      color: Colors.black,
+                      shape: BoxShape.circle,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          Positioned(
+            left: size * 0.03,
+            child: DecoratedBox(
+              decoration: const BoxDecoration(
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black87,
+                    blurRadius: 22,
+                    offset: Offset(0, 12),
+                  ),
+                ],
+              ),
+              child: SizedBox(
+                width: coverSize,
+                height: coverSize,
+                child: cover ??
+                    AppArtwork(
+                      thumbnail: thumbnail,
+                      videoId: videoId,
+                      width: coverSize,
+                      height: coverSize,
+                      radius: 0,
+                    ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class CollectionIconActionsRow extends StatelessWidget {
+  const CollectionIconActionsRow({
+    super.key,
+    required this.onPlay,
+    required this.onShuffle,
+    required this.onLike,
+    required this.isLiked,
+    this.onPrime,
+    this.onSecondary,
+    this.secondaryIcon = Icons.more_horiz_rounded,
+  });
+
+  final VoidCallback? onPlay;
+  final VoidCallback? onShuffle;
+  final VoidCallback? onLike;
+  final bool isLiked;
+  final VoidCallback? onPrime;
+  final VoidCallback? onSecondary;
+  final IconData secondaryIcon;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        IconButton(
+          tooltip: isLiked ? 'Unlike' : 'Like',
+          onPressed: onLike,
+          icon: Icon(
+            isLiked ? Icons.favorite_rounded : Icons.favorite_border_rounded,
+            color: isLiked ? const Color(0xFFE48B94) : Colors.white,
+          ),
+        ),
+        if (onSecondary != null)
+          IconButton(
+            tooltip: 'More',
+            onPressed: onSecondary,
+            icon: Icon(secondaryIcon, color: Colors.white70),
+          ),
+        const Spacer(),
+        IconButton(
+          tooltip: 'Shuffle',
+          onPressed: onShuffle,
+          icon: const Icon(Icons.shuffle_rounded, color: Colors.white),
+        ),
+        const SizedBox(width: 10),
+        Listener(
+          onPointerDown: onPrime == null ? null : (_) => onPrime!(),
+          child: IconButton.filled(
+            tooltip: 'Play',
+            style: IconButton.styleFrom(
+              backgroundColor: Colors.white,
+              foregroundColor: Colors.black,
+              minimumSize: const Size(58, 58),
+            ),
+            onPressed: onPlay,
+            icon: const Icon(Icons.play_arrow_rounded, size: 34),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
 class DetailsPlayShuffleActionsRow extends StatelessWidget {
   final String playLabel;
   final VoidCallback? onPlay;
   final VoidCallback? onShuffle;
+  final VoidCallback? onPrime;
   final Color surfaceColor;
 
   const DetailsPlayShuffleActionsRow({
@@ -142,6 +298,7 @@ class DetailsPlayShuffleActionsRow extends StatelessWidget {
     required this.onPlay,
     required this.onShuffle,
     required this.surfaceColor,
+    this.onPrime,
   });
 
   @override
@@ -149,14 +306,17 @@ class DetailsPlayShuffleActionsRow extends StatelessWidget {
     return Row(
       children: [
         Expanded(
-          child: FilledButton(
-            style: FilledButton.styleFrom(
-              backgroundColor: surfaceColor,
-              foregroundColor: Colors.white,
-              padding: const EdgeInsets.symmetric(vertical: 14),
+          child: Listener(
+            onPointerDown: onPrime == null ? null : (_) => onPrime!(),
+            child: FilledButton(
+              style: FilledButton.styleFrom(
+                backgroundColor: surfaceColor,
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(vertical: 14),
+              ),
+              onPressed: onPlay,
+              child: Text(playLabel),
             ),
-            onPressed: onPlay,
-            child: Text(playLabel),
           ),
         ),
         const SizedBox(width: 12),
@@ -333,11 +493,10 @@ class RelatedArtistsSection extends StatelessWidget {
                     onTap: () => onOpenArtist(related),
                     child: Column(
                       children: [
-                        AppArtwork(
+                        ArtistArtwork(
                           thumbnail: related['thumbnail'],
                           width: 68,
                           height: 68,
-                          radius: 999,
                         ),
                         const SizedBox(height: 10),
                         Text(
@@ -373,6 +532,7 @@ class DetailsTrackListSection extends StatelessWidget {
   final String fallbackSubtitle;
   final String? fallbackThumbnail;
   final Future<void> Function(Map<String, dynamic> track) onPlayTrack;
+  final ValueChanged<Map<String, dynamic>>? onPrimeTrack;
 
   const DetailsTrackListSection({
     super.key,
@@ -382,6 +542,7 @@ class DetailsTrackListSection extends StatelessWidget {
     required this.emptyMessage,
     required this.fallbackSubtitle,
     required this.onPlayTrack,
+    this.onPrimeTrack,
     this.fallbackThumbnail,
   });
 
@@ -425,11 +586,16 @@ class DetailsTrackListSection extends StatelessWidget {
                 radius: neatieRadiusMedium,
                 color: Colors.white.withValues(alpha: 0.035),
                 blur: false,
+                bordered: false,
+                elevated: false,
                 child: Material(
                   color: Colors.transparent,
                   child: InkWell(
                     borderRadius: BorderRadius.circular(neatieRadiusMedium),
                     onTap: () => onPlayTrack(track),
+                    onTapDown: onPrimeTrack == null
+                        ? null
+                        : (_) => onPrimeTrack!(track),
                     child: Row(
                       children: [
                         AppArtwork(
@@ -674,6 +840,7 @@ class TrackDetailsActionsRow extends StatelessWidget {
   final Map<String, dynamic> track;
   final DownloadTask? downloadTask;
   final VoidCallback onPlay;
+  final VoidCallback? onPrime;
   final VoidCallback? onDownload;
   final Color accentColor;
 
@@ -682,6 +849,7 @@ class TrackDetailsActionsRow extends StatelessWidget {
     required this.track,
     required this.downloadTask,
     required this.onPlay,
+    this.onPrime,
     required this.onDownload,
     required this.accentColor,
   });
@@ -692,10 +860,13 @@ class TrackDetailsActionsRow extends StatelessWidget {
       padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
       child: Row(
         children: [
-          IconButton(
-            iconSize: 56,
-            icon: const Icon(Icons.play_circle_fill, color: Colors.white),
-            onPressed: onPlay,
+          Listener(
+            onPointerDown: onPrime == null ? null : (_) => onPrime!(),
+            child: IconButton(
+              iconSize: 56,
+              icon: const Icon(Icons.play_circle_fill, color: Colors.white),
+              onPressed: onPlay,
+            ),
           ),
           const SizedBox(width: 16),
           IconButton(
@@ -786,6 +957,8 @@ class SimilarTracksSection extends StatelessWidget {
               radius: neatieRadiusMedium,
               color: Colors.white.withValues(alpha: 0.035),
               blur: false,
+              bordered: false,
+              elevated: false,
               child: Material(
                 color: Colors.transparent,
                 child: InkWell(

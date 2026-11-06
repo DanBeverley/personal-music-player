@@ -50,18 +50,18 @@ def assistant_tool_search_tracks(server: Any, query: str, limit: int):
     query = (query or "").strip()
     if not query:
         return []
-    from auralis_backend.search.runtime import search_tracks_blended
+    from auralis_backend.search.runtime import search_tracks_direct
 
-    return search_tracks_blended(query, limit, server=server)
+    return search_tracks_direct(query, limit, server=server)
 
 
 def assistant_tool_search_albums(server: Any, query: str, limit: int):
     query = (query or "").strip()
     if not query:
         return []
-    from auralis_backend.search.runtime import search_albums_blended
+    from auralis_backend.search.runtime import search_albums_direct
 
-    return search_albums_blended(query, limit, server=server)
+    return search_albums_direct(query, limit, server=server)
 
 
 def assistant_tool_search_artists_direct(server: Any, query: str, limit: int):
@@ -455,8 +455,10 @@ def assistant_fallback_chat_reply(server: Any, req: Any, model_override=None):
         messages,
         temperature=0.6,
         model_override=model_override,
+        timeout_seconds=25,
+        max_output_tokens=700,
     )
     reply = (reply or "").strip()
     if reply:
         return reply
-    return "I'm here with you. Tell me a little more and I'll stay with you."
+    raise ValueError('empty_assistant_answer')

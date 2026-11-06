@@ -120,7 +120,8 @@ class DownloadCenterNotifier extends StateNotifier<DownloadCenterState> {
   }
 
   Future<bool> downloadTrack(Map<String, dynamic> track) async {
-    final videoId = (track['id'] ?? track['videoId'])?.toString();
+    if (extractPlaybackProvider(track) != 'youtube') return false;
+    final videoId = extractPlaybackSourceId(track);
     if (videoId == null || videoId.isEmpty) return false;
 
     final existing = state.taskFor(videoId);
@@ -163,7 +164,7 @@ class DownloadCenterNotifier extends StateNotifier<DownloadCenterState> {
       final client = http.Client();
       try {
         final streamResponse = await client.send(
-          http.Request('GET', buildProxyUri('/stream/$videoId')),
+          http.Request('GET', buildProxyUri('/downloaded/$videoId')),
         );
 
         if (streamResponse.statusCode != 200) {
@@ -198,15 +199,18 @@ class DownloadCenterNotifier extends StateNotifier<DownloadCenterState> {
 
       final jsonPath = outPath.replaceAll('.mp3', '.json');
       await File(jsonPath).writeAsString(jsonEncode(meta));
-      await upsertCloudLibraryTrack({
-        ...meta,
-        'id': videoId,
-        'videoId': videoId,
-        if (meta['title'] == null) 'title': title,
-        if (meta['author'] == null && subtitle != null) 'author': subtitle,
-        if (meta['thumbnail'] == null && thumbnail != null)
-          'thumbnail': thumbnail,
-      });
+      await upsertCloudLibraryTrack(
+        {
+          ...meta,
+          'id': videoId,
+          'videoId': videoId,
+          if (meta['title'] == null) 'title': title,
+          if (meta['author'] == null && subtitle != null) 'author': subtitle,
+          if (meta['thumbnail'] == null && thumbnail != null)
+            'thumbnail': thumbnail,
+        },
+        persistLocalLike: false,
+      );
       ref.invalidate(libraryProvider);
 
       _upsert(task.copyWith(

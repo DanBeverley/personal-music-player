@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Iterable, Optional
+import time
 
 from ..runtime_context import resolve_server
 
@@ -33,18 +34,23 @@ class SearchServerAdapter:
         artist_id: str,
         *,
         enrich_related: bool = True,
+        lightweight: bool = False,
     ) -> dict[str, Any]:
         return self.raw._build_artist_details_payload(
             artist_id,
             enrich_related=enrich_related,
+            lightweight=lightweight,
         )
 
-    def search_upstream_call_with_retry(self, fn, *, default):
+    def search_upstream_call_with_retry(self, fn, *, default, timeout_seconds=None):
         return self.raw._search_upstream_call_with_retry(
             fn,
-            attempts=self.raw.UPSTREAM_RETRY_ATTEMPTS,
+            attempts=1,
             backoff_seconds=self.raw.UPSTREAM_RETRY_BACKOFF_SECONDS,
             default=default,
+            **({"timeout_seconds": timeout_seconds} if timeout_seconds is not None else {}),
+            **({'admission_wait_seconds': self.raw.search_admission_wait_seconds}
+               if getattr(self.raw, 'search_admission_wait_seconds', 0) else {}),
         )
 
     def upstream_call_with_retry(self, fn, *, default):
@@ -54,6 +60,27 @@ class SearchServerAdapter:
             backoff_seconds=self.raw.UPSTREAM_RETRY_BACKOFF_SECONDS,
             default=default,
         )
+
+    def submit_search_upstream(self, fn, *, deadline):
+        """Share existing admission/worker limits without nested blocking jobs."""
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        admission = self.raw.search_upstream_admission
+        wait_seconds = min(remaining, max(0.0, float(
+            getattr(self.raw, "search_admission_wait_seconds", 0) or 0)))
+        if not admission.acquire(timeout=wait_seconds):
+            return None
+        try:
+            if time.monotonic() >= deadline:
+                admission.release()
+                return None
+            future = self.raw.search_upstream_executor.submit(fn)
+        except Exception:
+            admission.release()
+            raise
+        future.add_done_callback(lambda _future: admission.release())
+        return future
 
     def normalize_track(self, track: Any) -> dict[str, Any] | None:
         return self.raw.normalize_recommendation_track(track)

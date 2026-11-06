@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'auth_provider.dart' show authProvider;
@@ -22,10 +24,12 @@ enum RecommendationRequestMode {
 
 class _RecommendationRequestBehavior {
   final bool prepareNextSession;
+  final bool forceRefresh;
   final bool preferFreshRows;
 
   const _RecommendationRequestBehavior({
     this.prepareNextSession = false,
+    this.forceRefresh = false,
     this.preferFreshRows = false,
   });
 }
@@ -37,7 +41,7 @@ _RecommendationRequestBehavior _recommendationRequestBehavior(
   switch (requestMode) {
     case RecommendationRequestMode.pullToRefresh:
       return const _RecommendationRequestBehavior(
-        prepareNextSession: true,
+        forceRefresh: true,
         preferFreshRows: true,
       );
     case RecommendationRequestMode.backgroundPrepare:
@@ -115,6 +119,10 @@ Future<Map<String, dynamic>> buildRecommendationRequestBody(
   Set<String> avoidIds = const <String>{},
   RecommendationRequestMode requestMode = RecommendationRequestMode.launch,
   bool preferFreshRows = false,
+  String refreshToken = '',
+  bool promoteReadyOnLaunch = false,
+  int feedRefreshWaitMs = 0,
+  String launchToken = '',
   List<String> extraArtistHints = const <String>[],
   List<String> extraTasteQueries = const <String>[],
   List<String> extraSessionQueries = const <String>[],
@@ -138,7 +146,7 @@ Future<Map<String, dynamic>> buildRecommendationRequestBody(
     HistoryManager.getFrequentlyPlayedTrackSnapshots(limit: 10),
     HistoryManager.getRecentSeeds(limit: 10),
     HistoryManager.getFrequentlyPlayedTrackIds(limit: 10),
-      allowNetworkCloudQueries
+    allowNetworkCloudQueries
         ? getRecentCloudSearchQueries(limit: 8)
         : Future<List<String>>.value(peekRecentCloudSearchQueries(limit: 8)),
   ]);
@@ -235,10 +243,21 @@ Future<Map<String, dynamic>> buildRecommendationRequestBody(
     'user_scope_id': storageScopeId,
     'client_signal_tier': hasUserSignals ? 'personalized' : 'cold_start',
     'fresh_account_empty_home': !hasUserSignals,
-    'force_refresh': false,
+    'force_refresh': behavior.forceRefresh,
     'prepare_next_session': behavior.prepareNextSession,
+    // Launch promotion is an explicit one-shot server contract. Ordinary
+    // later full-feed requests must not rotate the ready queue.
+    'promote_ready_on_launch': promoteReadyOnLaunch,
+    if (feedRefreshWaitMs > 0)
+      'feed_refresh_wait_ms': feedRefreshWaitMs.clamp(0, 3000),
+    if (launchToken.trim().isNotEmpty) 'launch_token': launchToken.trim(),
     'prefer_fresh_rows': behavior.preferFreshRows,
-    if (behavior.preferFreshRows)
+    'session_intent': extraArtistHints.isNotEmpty ||
+        extraTasteQueries.isNotEmpty ||
+        extraSessionQueries.isNotEmpty,
+    if (refreshToken.trim().isNotEmpty)
+      'refresh_token': refreshToken.trim()
+    else if (behavior.preferFreshRows)
       'refresh_token': DateTime.now().millisecondsSinceEpoch.toString(),
     if (seedIds.isNotEmpty) 'seed_id': seedIds.first,
     'seed_ids': seedIds.take(5).toList(growable: false),

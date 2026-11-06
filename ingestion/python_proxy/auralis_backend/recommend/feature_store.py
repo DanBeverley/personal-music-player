@@ -6,6 +6,7 @@ from contextvars import ContextVar
 import json
 import os
 import re
+import sys
 from threading import Lock
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -14,22 +15,30 @@ from ..domain.catalog import (
     canonical_album_identity,
     canonical_artist_identity,
     canonical_title_artist_identity,
+    normalize_catalog_language,
+    normalize_catalog_region,
+    normalized_audience_metadata,
+    normalized_audio_traits,
 )
 from ..storage.postgres import db_available, get_connection
 from .store_runtime import open_recommendation_store_connection
 
 
-CATALOG_FEATURE_VERSION = "catalog-feature-v1"
-TASTE_PROFILE_VERSION = "taste-profile-v1"
+CATALOG_FEATURE_VERSION = "catalog-feature-v2"
+TASTE_PROFILE_VERSION = "taste-profile-v2"
 SCENE_GRAPH_VERSION = "scene-graph-v1"
 _HOT_CACHE_TTL_SECONDS = max(
     30,
     int(os.environ.get("AURALIS_FEATURE_HOT_CACHE_TTL_SECONDS", "600")),
 )
+_HOT_CACHE_MAX_ENTRIES = max(1, int(os.environ.get("AURALIS_FEATURE_HOT_CACHE_ENTRIES", "512")))
+_HOT_CACHE_MAX_BYTES = max(1024, int(os.environ.get("AURALIS_FEATURE_HOT_CACHE_BYTES", str(16 * 1024 * 1024))))
+_HOT_CACHE_MAX_VALUE_BYTES = min(_HOT_CACHE_MAX_BYTES, 1024 * 1024)
+_HOT_CACHE_BYTES: Dict[str, int] = {}
 
 
 _SCHEMA_LOCK = Lock()
-_SQLITE_SCHEMA_READY = False
+_SQLITE_SCHEMA_READY_PATHS: set[str] = set()
 _POSTGRES_SCHEMA_READY = False
 _HOT_CACHE_LOCK = Lock()
 _REQUEST_STORE_RUNTIME: ContextVar[Dict[str, Any] | None] = ContextVar(
@@ -37,7 +46,7 @@ _REQUEST_STORE_RUNTIME: ContextVar[Dict[str, Any] | None] = ContextVar(
     default=None,
 )
 _CACHE_MISS = object()
-_HOT_CACHES: Dict[str, Dict[str, Tuple[float, Any]]] = {
+_HOT_CACHES: Dict[str, Dict[str, Tuple[float, Any, int]]] = {
     "catalog": {},
     "taste": {},
     "negative": {},
@@ -173,20 +182,20 @@ _TYPE_PATTERNS = {
 }
 
 _GENRE_RULES: Sequence[Tuple[str, str, re.Pattern[str]]] = (
-    ("rock", "hard_rock", re.compile(r"\b(guns n roses|guns n' roses|acdc|ac/dc|aerosmith|hard rock|arena rock|appetite for destruction)\b", re.IGNORECASE)),
-    ("rock", "classic_rock", re.compile(r"\b(classic rock|led zeppelin|eagles|queen|bon jovi|scorpions|poison|journey|fleetwood mac|foreigner)\b", re.IGNORECASE)),
-    ("rock", "alternative_rock", re.compile(r"\b(alternative rock|alt rock|radiohead|coldplay|the killers|foo fighters)\b", re.IGNORECASE)),
-    ("rock", "grunge", re.compile(r"\b(grunge|nirvana|soundgarden|pearl jam|alice in chains)\b", re.IGNORECASE)),
-    ("metal", "heavy_metal", re.compile(r"\b(metal|heavy metal|black sabbath|iron maiden|metallica|megadeth|slayer)\b", re.IGNORECASE)),
-    ("pop", "synth_pop", re.compile(r"\b(pop|synth pop|synth-pop|taylor swift|katy perry|dua lipa|madonna)\b", re.IGNORECASE)),
-    ("hip_hop", "rap", re.compile(r"\b(hip hop|hip-hop|rap|kanye west|kendrick lamar|drake|eminem|jay z|jay-z)\b", re.IGNORECASE)),
-    ("rnb", "soul", re.compile(r"\b(rnb|r&b|soul|neo soul|neo-soul|marvin gaye|sza|the weeknd)\b", re.IGNORECASE)),
-    ("electronic", "edm", re.compile(r"\b(edm|electronic|house|techno|trance|club mix|dance mix|daft punk|calvin harris)\b", re.IGNORECASE)),
+    ("rock", "hard_rock", re.compile(r"\b(hard rock|arena rock|glam rock|blues rock|southern rock)\b", re.IGNORECASE)),
+    ("rock", "classic_rock", re.compile(r"\b(classic rock|rock and roll|rock n roll|progressive rock|psychedelic rock)\b", re.IGNORECASE)),
+    ("rock", "alternative_rock", re.compile(r"\b(alternative rock|alt rock|indie rock|post rock)\b", re.IGNORECASE)),
+    ("rock", "grunge", re.compile(r"\b(grunge)\b", re.IGNORECASE)),
+    ("metal", "heavy_metal", re.compile(r"\b(metal|heavy metal|thrash metal|doom metal|power metal)\b", re.IGNORECASE)),
+    ("pop", "synth_pop", re.compile(r"\b(pop|synth pop|synth-pop|dance pop|electropop)\b", re.IGNORECASE)),
+    ("hip_hop", "rap", re.compile(r"\b(hip hop|hip-hop|rap|trap|drill)\b", re.IGNORECASE)),
+    ("rnb", "soul", re.compile(r"\b(rnb|r&b|soul|neo soul|neo-soul|funk)\b", re.IGNORECASE)),
+    ("electronic", "edm", re.compile(r"\b(edm|electronic|house|techno|trance|club mix|dance mix|dubstep|drum and bass)\b", re.IGNORECASE)),
     ("electronic", "ambient", re.compile(r"\b(ambient|sleep|focus|chillout|downtempo|meditation)\b", re.IGNORECASE)),
-    ("country", "country", re.compile(r"\b(country|nashville|americana|morgan wallen|johnny cash)\b", re.IGNORECASE)),
-    ("jazz", "jazz", re.compile(r"\b(jazz|bebop|swing|miles davis|coltrane|ella fitzgerald)\b", re.IGNORECASE)),
-    ("blues", "blues", re.compile(r"\b(blues|bb king|b\\.b\\. king|muddy waters|eric clapton)\b", re.IGNORECASE)),
-    ("folk", "folk", re.compile(r"\b(folk|singer songwriter|singer-songwriter|bob dylan|joan baez|acoustic)\b", re.IGNORECASE)),
+    ("country", "country", re.compile(r"\b(country|nashville|americana|bluegrass|honky tonk)\b", re.IGNORECASE)),
+    ("jazz", "jazz", re.compile(r"\b(jazz|bebop|swing|modal jazz|cool jazz|vocal jazz)\b", re.IGNORECASE)),
+    ("blues", "blues", re.compile(r"\b(blues|delta blues|electric blues|chicago blues)\b", re.IGNORECASE)),
+    ("folk", "folk", re.compile(r"\b(folk|singer songwriter|singer-songwriter|acoustic)\b", re.IGNORECASE)),
     ("latin", "latin_pop", re.compile(r"\b(latin|reggaeton|bachata|salsa|corridos|spanish|en espa[ñn]ol|gipsy kings)\b", re.IGNORECASE)),
     ("devotional", "devotional", re.compile(r"\b(bhajan|devotional|qawwali|worship|gospel|nasheed)\b", re.IGNORECASE)),
     ("soundtrack", "soundtrack", re.compile(r"\b(soundtrack|original score|motion picture|ost)\b", re.IGNORECASE)),
@@ -196,6 +205,10 @@ _LANGUAGE_HINTS: Sequence[Tuple[str, str, re.Pattern[str]]] = (
     ("spanish", "latin_america", re.compile(r"\b(hola|amor|corazon|corazón|vida|canci[oó]n|en espa[ñn]ol|latino|gipsy kings)\b", re.IGNORECASE)),
     ("portuguese", "brazil", re.compile(r"\b(saudade|brasil|sertanejo|mpb)\b", re.IGNORECASE)),
     ("french", "francophone", re.compile(r"\b(amour|bonjour|chanson|paris)\b", re.IGNORECASE)),
+    ("vietnamese", "vietnam", re.compile(r"\b(viet|v-pop|vpop|saigon|hanoi)\b|[\u0102\u0103\u00C2\u00E2\u00CA\u00EA\u00D4\u00F4\u01A0\u01A1\u01AF\u01B0\u0110\u0111]", re.IGNORECASE)),
+    ("korean", "korea", re.compile(r"\b(k-pop|kpop|korean)\b|[\uAC00-\uD7AF]", re.IGNORECASE)),
+    ("japanese", "japan", re.compile(r"\b(j-pop|jpop|japanese)\b|[\u3040-\u30FF]", re.IGNORECASE)),
+    ("hindi", "india", re.compile(r"\b(hindi|bollywood|hindustani|punjabi|bhojpuri|tamil|telugu|malayalam|kannada)\b", re.IGNORECASE)),
     ("hindi", "india", re.compile(r"[\u0900-\u097F]")),
     ("arabic", "mena", re.compile(r"[\u0600-\u06FF]")),
     ("cyrillic", "cis", re.compile(r"[\u0400-\u04FF]")),
@@ -240,6 +253,13 @@ def _copy_cached_value(value: Any) -> Any:
     if isinstance(value, list):
         return list(value)
     return value
+
+
+def _number(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 @contextmanager
@@ -301,36 +321,101 @@ def hot_runtime_cache_get(bucket: str, key: str) -> Tuple[bool, Any]:
         row = cache.get(key)
         if row is None:
             return False, None
-        expires_at, value = row
+        expires_at, value, _ = row
         if expires_at <= time.time():
-            cache.pop(key, None)
+            _hot_cache_remove(bucket, key)
             return False, None
+        # Dict insertion order is the LRU order; no second payload cache.
+        cache.pop(key)
+        cache[key] = row
         if value is _CACHE_MISS:
             return True, None
         return True, _copy_cached_value(value)
 
 
 def hot_runtime_cache_put(bucket: str, key: str, value: Any) -> Any:
+    stored = _CACHE_MISS if value is None else _copy_cached_value(value)
+    weight = _hot_cache_weight(stored) + sys.getsizeof(key)
     with _HOT_CACHE_LOCK:
-        _HOT_CACHES.setdefault(bucket, {})[key] = (
-            time.time() + float(_HOT_CACHE_TTL_SECONDS),
-            _CACHE_MISS if value is None else _copy_cached_value(value),
-        )
+        _prune_hot_cache(bucket, time.time())
+        _hot_cache_remove(bucket, key)
+        if weight <= _HOT_CACHE_MAX_VALUE_BYTES:
+            cache = _HOT_CACHES.setdefault(bucket, {})
+            while cache and (len(cache) >= _HOT_CACHE_MAX_ENTRIES or
+                    _HOT_CACHE_BYTES.get(bucket, 0) + weight > _HOT_CACHE_MAX_BYTES):
+                _hot_cache_remove(bucket, next(iter(cache)))
+            cache[key] = (time.time() + float(_HOT_CACHE_TTL_SECONDS), stored, weight)
+            _HOT_CACHE_BYTES[bucket] = _HOT_CACHE_BYTES.get(bucket, 0) + weight
     return value
+
+
+def _hot_cache_weight(value: Any) -> int:
+    """Bound traversal too: oversized/deep values stay in persisted storage."""
+    pending, seen, total = [value], set(), 0
+    while pending:
+        item = pending.pop()
+        if id(item) in seen:
+            continue
+        seen.add(id(item))
+        total += sys.getsizeof(item)
+        if total > _HOT_CACHE_MAX_VALUE_BYTES or len(seen) > 8192:
+            return _HOT_CACHE_MAX_VALUE_BYTES + 1
+        if isinstance(item, dict):
+            if len(item) > 8192:
+                return _HOT_CACHE_MAX_VALUE_BYTES + 1
+            pending.extend(item.keys())
+            pending.extend(item.values())
+        elif isinstance(item, (list, tuple, set)):
+            if len(item) > 8192:
+                return _HOT_CACHE_MAX_VALUE_BYTES + 1
+            pending.extend(item)
+    return total
+
+
+def _hot_cache_remove(bucket: str, key: str) -> None:
+    row = _HOT_CACHES.setdefault(bucket, {}).pop(key, None)
+    if row is not None:
+        _HOT_CACHE_BYTES[bucket] = max(0, _HOT_CACHE_BYTES.get(bucket, 0) - row[2])
+
+
+def _prune_hot_cache(bucket: str, now: float) -> None:
+    cache = _HOT_CACHES.setdefault(bucket, {})
+    for key in list(cache):
+        if cache[key][0] <= now:
+            _hot_cache_remove(bucket, key)
+
+
+def prune_hot_runtime_caches() -> dict[str, int]:
+    with _HOT_CACHE_LOCK:
+        for bucket in _HOT_CACHES:
+            _prune_hot_cache(bucket, time.time())
+        return {"entries": sum(map(len, _HOT_CACHES.values())),
+                "estimated_bytes": sum(_HOT_CACHE_BYTES.values())}
 
 
 def hot_runtime_cache_invalidate(bucket: str, key: str) -> None:
     with _HOT_CACHE_LOCK:
-        _HOT_CACHES.setdefault(bucket, {}).pop(key, None)
+        _hot_cache_remove(bucket, key)
 
 
 def hot_runtime_cache_clear(bucket: str) -> None:
     with _HOT_CACHE_LOCK:
         _HOT_CACHES.setdefault(bucket, {}).clear()
+        _HOT_CACHE_BYTES[bucket] = 0
 
 
 def ensure_feature_schema(server: Any) -> None:
-    global _SQLITE_SCHEMA_READY, _POSTGRES_SCHEMA_READY
+    global _POSTGRES_SCHEMA_READY
+    sqlite_path = str(
+        getattr(server, "RECOMMENDATION_STORE_DB_PATH", "") or ""
+    ).strip()
+    sqlite_schema_key = (
+        sqlite_path
+        if sqlite_path == ":memory:"
+        else os.path.abspath(sqlite_path)
+        if sqlite_path
+        else f"runtime:{id(server)}"
+    )
     with _SCHEMA_LOCK:
         if (
             persistent_store_reads_enabled()
@@ -345,13 +430,17 @@ def ensure_feature_schema(server: Any) -> None:
                 _POSTGRES_SCHEMA_READY = True
             except Exception:
                 pass
-        if not _SQLITE_SCHEMA_READY:
+        if (
+            sqlite_path == ":memory:"
+            or sqlite_schema_key not in _SQLITE_SCHEMA_READY_PATHS
+        ):
             connection = open_recommendation_store_connection(server)
             try:
                 for statement in _SQLITE_SCHEMA_SQL:
                     connection.execute(statement)
                 connection.commit()
-                _SQLITE_SCHEMA_READY = True
+                if sqlite_path != ":memory:":
+                    _SQLITE_SCHEMA_READY_PATHS.add(sqlite_schema_key)
             finally:
                 connection.close()
 
@@ -467,21 +556,121 @@ def _infer_genre_bundle(text: str) -> Tuple[str, List[str], str]:
     return primary_genre, secondary, subgenre
 
 
-def _infer_language_region(text: str, script: str) -> Tuple[str, str]:
+def _infer_language_region_evidence(text: str, script: str) -> Dict[str, Any]:
     for language, region, pattern in _LANGUAGE_HINTS:
         if pattern.search(text or ""):
-            return language, region
+            return {
+                "language": language,
+                "region": region,
+                "language_confidence": 0.82,
+                "region_confidence": 0.78,
+                "language_source": "text_hint",
+                "region_source": "text_hint",
+            }
     if script == "devanagari":
-        return "hindi", "india"
+        return {
+            "language": "hindi",
+            "region": "india",
+            "language_confidence": 0.9,
+            "region_confidence": 0.82,
+            "language_source": "script",
+            "region_source": "script",
+        }
     if script == "arabic":
-        return "arabic", "mena"
+        return {
+            "language": "arabic",
+            "region": "mena",
+            "language_confidence": 0.9,
+            "region_confidence": 0.72,
+            "language_source": "script",
+            "region_source": "script",
+        }
     if script == "cyrillic":
-        return "cyrillic", "cis"
+        return {
+            "language": "cyrillic",
+            "region": "cis",
+            "language_confidence": 0.86,
+            "region_confidence": 0.65,
+            "language_source": "script",
+            "region_source": "script",
+        }
     if script in {"han", "kana", "hangul"}:
-        return "cjk", "east_asia"
-    if script == "latin":
-        return "english", "global"
-    return "unknown", "unknown"
+        return {
+            "language": "cjk",
+            "region": "east_asia",
+            "language_confidence": 0.82,
+            "region_confidence": 0.72,
+            "language_source": "script",
+            "region_source": "script",
+        }
+    return {
+        "language": "unknown",
+        "region": "unknown",
+        "language_confidence": 0.0,
+        "region_confidence": 0.0,
+        "language_source": "unknown",
+        "region_source": "unknown",
+    }
+
+
+def _infer_language_region(text: str, script: str) -> Tuple[str, str]:
+    evidence = _infer_language_region_evidence(text, script)
+    return str(evidence.get("language") or "unknown"), str(evidence.get("region") or "unknown")
+
+
+def _metadata_language_region(
+    item: Dict[str, Any],
+    *,
+    text: str,
+    script: str,
+) -> Dict[str, Any]:
+    inferred = _infer_language_region_evidence(text, script)
+    raw_language = str(item.get("language") or "").strip()
+    raw_region = str(item.get("region") or "").strip()
+    language = normalize_catalog_language(raw_language or inferred["language"])
+    region = normalize_catalog_region(raw_region or inferred["region"])
+    language_source = str(item.get("language_source") or "").strip()
+    region_source = str(item.get("region_source") or "").strip()
+    language_confidence = _number(item.get("language_confidence"), 0.0)
+    region_confidence = _number(item.get("region_confidence"), 0.0)
+    if raw_language and language != "unknown":
+        language_source = language_source or "source_metadata"
+        language_confidence = language_confidence or 0.92
+    elif language != "unknown":
+        language_source = str(inferred.get("language_source") or "derived_metadata")
+        language_confidence = float(inferred.get("language_confidence") or 0.0)
+    else:
+        language_source = language_source or "unknown"
+        language_confidence = 0.0
+    if raw_region and region != "unknown":
+        region_source = region_source or "source_metadata"
+        region_confidence = region_confidence or 0.88
+    elif region != "unknown":
+        region_source = str(inferred.get("region_source") or "derived_metadata")
+        region_confidence = float(inferred.get("region_confidence") or 0.0)
+    else:
+        region_source = region_source or "unknown"
+        region_confidence = 0.0
+    return {
+        "language": language,
+        "region": region,
+        "language_confidence": round(max(0.0, min(language_confidence, 1.0)), 4),
+        "region_confidence": round(max(0.0, min(region_confidence, 1.0)), 4),
+        "language_source": language_source,
+        "region_source": region_source,
+    }
+
+
+def _metadata_audience(item: Dict[str, Any]) -> Dict[str, Any]:
+    audience = normalized_audience_metadata(item)
+    return {
+        "audience_profile": str(audience.get("audience_profile") or "general"),
+        "audience_confidence": round(
+            max(0.0, min(_number(audience.get("audience_confidence"), 0.0), 1.0)),
+            4,
+        ),
+        "audience_source": str(audience.get("audience_source") or "unknown"),
+    }
 
 
 def _infer_mood_axes(primary_genre: str, subgenre: str, type_tags: Sequence[str]) -> Dict[str, float]:
@@ -571,7 +760,21 @@ def derive_track_feature(server: Any, track: Dict[str, Any]) -> Dict[str, Any]:
     era = era_bucket(year)
     type_tags = _infer_type_tags(text)
     primary_genre, secondary_genres, subgenre = _infer_genre_bundle(text)
-    language, region = _infer_language_region(text, script)
+    language_region = _metadata_language_region(normalized_track, text=text, script=script)
+    audience = _metadata_audience(normalized_track)
+    language = str(language_region["language"])
+    region = str(language_region["region"])
+    inferred_mood_axes = _infer_mood_axes(primary_genre, subgenre, type_tags)
+    mood_axes = {**inferred_mood_axes, **normalized_audio_traits(normalized_track)}
+    popularity = float(normalized_track.get("popularity") or 0.0)
+    if popularity <= 0:
+        popularity = 0.45
+    peer_artist_ids = _normalize_sequence(
+        [
+            *(normalized_track.get("peer_artist_ids") or []),
+            normalized_track.get("related_to_artist") or "",
+        ]
+    )
     confidence = 0.25 + (0.25 if primary_genre else 0.0) + (0.15 if year else 0.0) + (0.12 if script != "unknown" else 0.0) + (0.08 if type_tags else 0.0)
     return {
         "entity_type": "track",
@@ -587,13 +790,20 @@ def derive_track_feature(server: Any, track: Dict[str, Any]) -> Dict[str, Any]:
         "release_year": year,
         "era_bucket": era,
         "language": language,
+        "language_confidence": language_region["language_confidence"],
+        "language_source": language_region["language_source"],
         "script": script,
         "region": region,
+        "region_confidence": language_region["region_confidence"],
+        "region_source": language_region["region_source"],
         "scene_cluster_ids": _scene_clusters(primary_genre, subgenre, era, region),
-        "peer_artist_ids": [],
+        "audience_profile": audience["audience_profile"],
+        "audience_confidence": audience["audience_confidence"],
+        "audience_source": audience["audience_source"],
+        "peer_artist_ids": peer_artist_ids,
         "track_type_tags": type_tags,
-        "mood_axes": _infer_mood_axes(primary_genre, subgenre, type_tags),
-        "popularity": 0.45,
+        "mood_axes": mood_axes,
+        "popularity": max(0.0, min(popularity, 1.0)),
         "freshness": _freshness_from_year(year),
         "confidence": round(max(0.0, min(confidence, 0.95)), 4),
         "source_metadata": {
@@ -609,7 +819,10 @@ def derive_artist_feature(server: Any, artist: Dict[str, Any] | str) -> Dict[str
     text = _artist_text(server, payload)
     script = script_bucket(text)
     primary_genre, secondary_genres, subgenre = _infer_genre_bundle(text)
-    language, region = _infer_language_region(text, script)
+    language_region = _metadata_language_region(payload, text=text, script=script)
+    audience = _metadata_audience(payload)
+    language = str(language_region["language"])
+    region = str(language_region["region"])
     peer_artist_ids = _normalize_sequence(
         [
             server._recommendation_trim_text((item or {}).get("id"))
@@ -630,9 +843,16 @@ def derive_artist_feature(server: Any, artist: Dict[str, Any] | str) -> Dict[str
         "subgenre": subgenre,
         "active_era": "",
         "language": language,
+        "language_confidence": language_region["language_confidence"],
+        "language_source": language_region["language_source"],
         "script": script,
         "region": region,
+        "region_confidence": language_region["region_confidence"],
+        "region_source": language_region["region_source"],
         "scene_cluster_ids": _scene_clusters(primary_genre, subgenre, "", region),
+        "audience_profile": audience["audience_profile"],
+        "audience_confidence": audience["audience_confidence"],
+        "audience_source": audience["audience_source"],
         "peer_artist_ids": peer_artist_ids,
         "popularity": 0.5,
         "confidence": round(0.3 + (0.2 if primary_genre else 0.0) + (0.12 if peer_artist_ids else 0.0), 4),
@@ -651,7 +871,13 @@ def derive_album_feature(server: Any, album: Dict[str, Any]) -> Dict[str, Any]:
         if year is not None:
             break
     era = era_bucket(year)
-    language, region = _infer_language_region(text, script)
+    language_region = _metadata_language_region(payload, text=text, script=script)
+    audience = _metadata_audience(payload)
+    language = str(language_region["language"])
+    region = str(language_region["region"])
+    popularity = float(payload.get("popularity") or 0.0)
+    if popularity <= 0:
+        popularity = 0.46
     return {
         "entity_type": "album",
         "feature_version": CATALOG_FEATURE_VERSION,
@@ -666,10 +892,17 @@ def derive_album_feature(server: Any, album: Dict[str, Any]) -> Dict[str, Any]:
         "release_year": year,
         "era_bucket": era,
         "language": language,
+        "language_confidence": language_region["language_confidence"],
+        "language_source": language_region["language_source"],
         "script": script,
         "region": region,
+        "region_confidence": language_region["region_confidence"],
+        "region_source": language_region["region_source"],
         "scene_cluster_ids": _scene_clusters(primary_genre, subgenre, era, region),
-        "popularity": 0.46,
+        "audience_profile": audience["audience_profile"],
+        "audience_confidence": audience["audience_confidence"],
+        "audience_source": audience["audience_source"],
+        "popularity": max(0.0, min(popularity, 1.0)),
         "freshness": _freshness_from_year(year),
         "confidence": round(0.28 + (0.2 if primary_genre else 0.0) + (0.14 if year else 0.0), 4),
         "source_metadata": {
@@ -958,6 +1191,7 @@ def _feature_richer(stored: Dict[str, Any], derived: Dict[str, Any]) -> bool:
         "language",
         "script",
         "region",
+        "audience_profile",
     ):
         if not stored.get(key) and derived.get(key):
             return True
@@ -1479,6 +1713,10 @@ def _store_pg_feedback(
                         expires_at = EXCLUDED.expires_at,
                         metadata = EXCLUDED.metadata,
                         updated_at = now()
+                    WHERE COALESCE((recommendation_negative_feedback.metadata->>'feedback_event_at')::double precision,
+                                   EXTRACT(EPOCH FROM recommendation_negative_feedback.updated_at))
+                       <= COALESCE((EXCLUDED.metadata->>'feedback_event_at')::double precision,
+                                   EXTRACT(EPOCH FROM EXCLUDED.updated_at))
                     """,
                     [
                         user_scope_id,
@@ -1518,6 +1756,9 @@ def _store_sqlite_feedback(
                 expires_at = excluded.expires_at,
                 metadata_json = excluded.metadata_json,
                 updated_at = excluded.updated_at
+            WHERE COALESCE(json_extract(recommendation_negative_feedback.metadata_json, '$.feedback_event_at'),
+                           recommendation_negative_feedback.updated_at)
+               <= COALESCE(json_extract(excluded.metadata_json, '$.feedback_event_at'), excluded.updated_at)
             """,
             [
                 user_scope_id,
@@ -1589,6 +1830,7 @@ def clear_negative_feedback(
     user_scope_id: str,
     feedback_type: str,
     feedback_key: str,
+    event_at: float | None = None,
 ) -> None:
     normalized_scope = str(user_scope_id or "").strip()
     normalized_type = str(feedback_type or "").strip()
@@ -1605,8 +1847,11 @@ def clear_negative_feedback(
                             """
                             DELETE FROM recommendation_negative_feedback
                             WHERE user_scope_id = %s AND feedback_type = %s AND feedback_key = %s
+                              AND (%s::double precision IS NULL OR
+                                   COALESCE((metadata->>'feedback_event_at')::double precision,
+                                            EXTRACT(EPOCH FROM updated_at)) <= %s)
                             """,
-                            [normalized_scope, normalized_type, normalized_key],
+                            [normalized_scope, normalized_type, normalized_key, event_at, event_at],
                         )
         except Exception:
             pass
@@ -1616,8 +1861,9 @@ def clear_negative_feedback(
             """
             DELETE FROM recommendation_negative_feedback
             WHERE user_scope_id = ? AND feedback_type = ? AND feedback_key = ?
+              AND (? IS NULL OR COALESCE(json_extract(metadata_json, '$.feedback_event_at'), updated_at) <= ?)
             """,
-            [normalized_scope, normalized_type, normalized_key],
+            [normalized_scope, normalized_type, normalized_key, event_at, event_at],
         )
         connection.commit()
     finally:
@@ -1634,11 +1880,20 @@ def attenuate_negative_feedback(
     feedback_key: str,
     factor: float,
     floor: float = 0.12,
+    event_id: str = "",
+    event_at: float | None = None,
 ) -> None:
     rows = load_negative_feedback(server, user_scope_id=user_scope_id)
     entry = dict((rows.get(feedback_type) or {}).get(feedback_key) or {})
     if not entry:
         return
+    metadata = dict(entry.get("metadata") or {})
+    if event_id and metadata.get("feedback_event_id") == event_id:
+        return
+    if event_at is not None and float(metadata.get("feedback_event_at") or 0) > event_at:
+        return
+    if event_id:
+        metadata.update(feedback_event_id=event_id, feedback_event_at=event_at)
     updated_strength = float(entry.get("strength") or 0.0) * max(min(float(factor or 1.0), 1.0), 0.0)
     if updated_strength <= float(floor or 0.0):
         clear_negative_feedback(
@@ -1646,6 +1901,7 @@ def attenuate_negative_feedback(
             user_scope_id=user_scope_id,
             feedback_type=feedback_type,
             feedback_key=feedback_key,
+            event_at=event_at,
         )
         return
     remaining_ttl = max(float(entry.get("expires_at") or 0.0) - float(time.time()), 60.0)
@@ -1656,7 +1912,7 @@ def attenuate_negative_feedback(
         feedback_key=feedback_key,
         strength=updated_strength,
         ttl_seconds=remaining_ttl,
-        metadata=dict(entry.get("metadata") or {}),
+        metadata=metadata,
     )
 
 

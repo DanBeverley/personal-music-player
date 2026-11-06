@@ -4,7 +4,7 @@ publish_to: 'none'
 version: 1.0.0+1
 
 environment:
-  sdk: '>=3.2.0 <4.0.0'
+  sdk: '>=3.4.0 <4.0.0'
 
 dependencies:
   flutter:
@@ -16,6 +16,7 @@ dependencies:
   audio_service: ^0.18.18
   google_fonts: ^8.0.2
   cached_network_image: ^3.4.1
+  flutter_cache_manager: ^3.4.1
   just_audio: ^0.10.5
   image_picker: ^1.1.2
   file_picker: ^8.1.2
@@ -24,6 +25,8 @@ dependencies:
   record: ^6.0.0
   url_launcher: ^6.3.1
   crypto: ^3.0.6
+  shared_preferences: ^2.5.3
+  web: ^1.1.1
 
 dev_dependencies:
   flutter_test:
@@ -33,11 +36,22 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  fonts:
+    - family: NeatieSans
+      fonts:
+        - asset: assets/fonts/Manrope.ttf
+    - family: NeatieDisplay
+      fonts:
+        - asset: assets/fonts/DMSerifDisplay.ttf
   assets:
-    - assets/branding/neatie_app_icon.png
-    - assets/branding/neatie_intro_mark.png
-    - assets/branding/neatie_intro_icon.png
+    - path: assets/branding/neatie_3rd.png
+      platforms: [android, ios, linux, macos, windows]
+    - path: assets/branding/neatie_login_wave_bg.png
+      platforms: [android, ios, linux, macos, windows]
 
 flutter_launcher_icons:
   android: true
-  image_path: assets/branding/neatie_app_icon.png
+  image_path: assets/branding/neatie_3rd.png
+  adaptive_icon_background: "#000000"
+  adaptive_icon_foreground: assets/branding/neatie_3rd.png
+  adaptive_icon_foreground_inset: 25

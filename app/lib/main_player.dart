@@ -3,9 +3,11 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'logic/assistant_provider.dart';
 import 'logic/audio_provider.dart';
 import 'logic/audio_provider_queue.dart';
 import 'logic/details_provider.dart';
+import 'screens/assistant_screen.dart';
 import 'ui/app_theme_tokens.dart';
 import 'ui/neatie_components.dart';
 import 'widgets/player/player_lyrics_panel.dart';
@@ -40,8 +42,10 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
   List<Map<String, dynamic>> _queueSearchResults = const [];
   bool _isQueueSearchLoading = false;
   bool _isQueueSheetOpen = false;
+  bool _isLyricsMeaningOpen = false;
   int _queueSearchRequestVersion = 0;
-  String? _lastLyricsVideoId;
+  String _queueSearchQuery = '';
+  String? _lastLyricsRequestSignature;
   StateSetter? _queueSheetStateSetter;
   int _activePage = 0;
   int _lastSyncedLyricIndex = -1;
@@ -146,6 +150,9 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
 
   void _onQueueSearchChanged() {
     final query = _queueSearchController.text.trim();
+    if (query == _queueSearchQuery) return;
+    _queueSearchQuery = query;
+    final requestVersion = ++_queueSearchRequestVersion;
     _queueSearchDebounce?.cancel();
     if (query.isEmpty) {
       if (_queueSearchResults.isNotEmpty || _isQueueSearchLoading) {
@@ -158,13 +165,22 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
       return;
     }
 
+    setState(() {
+      _queueSearchResults = _localQueueMatches(query);
+      _isQueueSearchLoading = true;
+    });
+    _refreshQueueSheet();
     _queueSearchDebounce = Timer(const Duration(milliseconds: 260), () {
-      unawaited(_searchQueueTracks(query));
+      unawaited(_searchQueueTracks(query, requestVersion));
     });
   }
 
-  Future<void> _searchQueueTracks(String query) async {
-    final requestVersion = ++_queueSearchRequestVersion;
+  List<Map<String, dynamic>> _localQueueMatches(String query) {
+    return matchQueueTracks(ref.read(playbackQueueProvider).queue, query);
+  }
+
+  Future<void> _searchQueueTracks(String query, int requestVersion) async {
+    if (!mounted || requestVersion != _queueSearchRequestVersion) return;
     if (mounted) {
       setState(() => _isQueueSearchLoading = true);
       _refreshQueueSheet();
@@ -183,18 +199,22 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
         final payload = fetchResult.payload!;
         final results = (payload['results'] as List<dynamic>? ?? const []);
         setState(() {
-          _queueSearchResults = results
+          final seen = <String>{};
+          _queueSearchResults = [..._localQueueMatches(query), ...results
               .map((entry) => Map<String, dynamic>.from(entry as Map))
-              .toList(growable: false);
+              ].where((track) {
+                final id = extractTrackId(track);
+                return id != null && seen.add(id);
+              }).toList(growable: false);
         });
         _refreshQueueSheet();
       } else {
-        setState(() => _queueSearchResults = const []);
+        setState(() => _queueSearchResults = _localQueueMatches(query));
         _refreshQueueSheet();
       }
     } catch (_) {
       if (!mounted || requestVersion != _queueSearchRequestVersion) return;
-      setState(() => _queueSearchResults = const []);
+      setState(() => _queueSearchResults = _localQueueMatches(query));
       _refreshQueueSheet();
     } finally {
       if (mounted && requestVersion == _queueSearchRequestVersion) {
@@ -243,19 +263,59 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
     _refreshQueueSheet();
   }
 
-  void _ensureLyricsLoaded(String? videoId) {
-    if (_lastLyricsVideoId == videoId) return;
-    _lastLyricsVideoId = videoId;
+  void _ensureLyricsLoaded(PlayerState playerState) {
+    final trackKey = playerState.videoId?.trim() ?? '';
+    final existingLyrics = ref.read(lyricsProvider);
+    final matchDuration = existingLyrics.hasLyrics || existingLyrics.isLoading
+        ? 0
+        : playerState.duration;
+    final signature = [
+      trackKey,
+      playerState.playbackSourceId ?? '',
+      playerState.currentTrackName,
+      playerState.artist ?? '',
+      playerState.album ?? '',
+      '$matchDuration',
+    ].join('|');
+    if (_lastLyricsRequestSignature == signature) return;
+    _lastLyricsRequestSignature = signature;
+    _isLyricsMeaningOpen = false;
     _lyricsLineKeys.clear();
     _lastSyncedLyricIndex = -1;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      if (videoId == null || videoId.isEmpty) {
+      ref.read(lyricsMeaningProvider.notifier).clear();
+      if (trackKey.isEmpty) {
         ref.read(lyricsProvider.notifier).clear();
         return;
       }
-      unawaited(ref.read(lyricsProvider.notifier).fetchLyrics(videoId));
+      unawaited(
+        ref.read(lyricsProvider.notifier).fetchLyrics(
+              trackKey,
+              title: playerState.currentTrackName,
+              artist: playerState.artist,
+              album: playerState.album,
+              duration: playerState.duration,
+              sourceId: playerState.playbackSourceId,
+            ),
+      );
     });
+  }
+
+  void _retryLyrics(PlayerState playerState) {
+    final trackKey = playerState.videoId?.trim() ?? '';
+    if (trackKey.isEmpty) return;
+    unawaited(
+      ref.read(lyricsProvider.notifier).fetchLyrics(
+            trackKey,
+            title: playerState.currentTrackName,
+            artist: playerState.artist,
+            album: playerState.album,
+            duration: playerState.duration,
+            sourceId: playerState.playbackSourceId,
+            forceRefresh: true,
+          ),
+    );
   }
 
   int _activeLyricsIndex(
@@ -344,14 +404,51 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
     TrackLyricsState lyricsState,
   ) {
     final activeIndex = _activeLyricsIndex(lyricsState, playerState);
+    final meaningState = ref.watch(lyricsMeaningProvider);
     _syncLyricsScroll(activeIndex);
     return PlayerLyricsPanel(
       playerState: playerState,
       lyricsState: lyricsState,
+      meaningState: meaningState,
+      isMeaningPanelOpen: _isLyricsMeaningOpen,
       activeIndex: activeIndex,
       lyricKeyFor: _lyricKeyFor,
       radiusLarge: _radiusLarge,
       accentColor: _accentGrey,
+      onOpenMeaning: () => _openLyricsMeaning(playerState, lyricsState),
+      onCloseMeaning: () => setState(() => _isLyricsMeaningOpen = false),
+      onRetryLyrics: () => _retryLyrics(playerState),
+      onAskNeatie: _openAssistantFromLyricsMeaning,
+    );
+  }
+
+  void _openLyricsMeaning(
+    PlayerState playerState,
+    TrackLyricsState lyricsState,
+  ) {
+    setState(() => _isLyricsMeaningOpen = true);
+    unawaited(
+      ref.read(lyricsMeaningProvider.notifier).fetchMeaning(
+            videoId: playerState.videoId,
+            title: playerState.currentTrackName,
+            artist: playerState.artist,
+            album: playerState.album,
+            source: lyricsState.source,
+            lines: lyricsState.lines,
+          ),
+    );
+  }
+
+  Future<void> _openAssistantFromLyricsMeaning() async {
+    final insight = ref.read(lyricsMeaningProvider).insight;
+    final seed = insight?.assistantSeedMessage.trim() ?? '';
+    if (seed.isEmpty) return;
+    final assistant = ref.read(assistantProvider.notifier);
+    assistant.clearConversation();
+    unawaited(assistant.sendMessage(seed));
+    if (!mounted) return;
+    await Navigator.of(context).push(
+      MaterialPageRoute(builder: (_) => const AssistantScreen()),
     );
   }
 
@@ -391,7 +488,7 @@ class _FullPlayerScreenState extends ConsumerState<FullPlayerScreen> {
     final audioNotifier = ref.read(audioPlayerProvider.notifier);
     final lyricsState = ref.watch(lyricsProvider);
     final queueState = ref.watch(playbackQueueProvider);
-    _ensureLyricsLoaded(playerState.videoId);
+    _ensureLyricsLoaded(playerState);
 
     return Scaffold(
       extendBodyBehindAppBar: true,

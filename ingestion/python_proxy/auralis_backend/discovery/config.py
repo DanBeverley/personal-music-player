@@ -1,42 +1,54 @@
 from __future__ import annotations
 
 from typing import Dict, List
+import os
 
 from .schema import LaneRecipe, RowRecipe
 
 
+def home_discovery_trial_enabled() -> bool:
+    """One reversible controlled pass; admission/playability remain enforced."""
+    return os.environ.get('NEATIE_HOME_DISCOVERY_TRIAL', '').strip().lower() in {'1', 'true', 'yes'}
+
+
 ENGINE_NAME = "discovery_engine"
-ENGINE_MODEL_VERSION = "discovery-engine:home_orchestrator_v4"
+ENGINE_MODEL_VERSION = "discovery-engine:home_orchestrator"
 
-ARTIFACT_VERSION = "discovery_home_artifact_v4"
-ARTIFACT_NAMESPACE = "discovery_home_artifact"
+# Keep the current persisted identifier during the cutover.  There is one
+# artifact implementation; changing this value would make the accepted feed
+# from the previous build unreadable before its replacement is prepared.
+ARTIFACT_VERSION = "discovery_home_artifact_v7"
+# Contract for promotion, independent from the storage serialization version.
+# A persisted artifact can deserialize successfully while still being unsafe
+# to promote after a row-contract change.
+FEED_PROMOTION_CONTRACT_VERSION = "feed-promotion-v2-radio-verified"
 ARTIFACT_TTL_SECONDS = 60 * 60 * 24
-
-PROVIDER_BUDGETS_MS: Dict[str, int] = {
-    "history": 200,
-    "similarity": 1500,
-    "artist_graph": 3500,
-    "genre_mood": 2500,
-    "album": 2500,
-    "freshness": 400,
-    "popularity": 1200,
-    "collaborative": 800,
-}
 
 TRACK_POOL_QUOTAS: Dict[str, int] = {
     "history": 64,
-    "similarity": 120,
-    "artist_graph": 96,
-    "genre_mood": 120,
-    "lane_chill": 40,
-    "lane_workout": 40,
-    "lane_focus": 40,
-    "lane_mood": 40,
-    "popularity": 96,
-    "collaborative": 48,
+    "profile_spine": 240,
+    "similarity": 220,
+    "artist_graph": 180,
+    "genre_mood": 200,
+    "lane_chill": 64,
+    "lane_workout": 64,
+    "lane_focus": 64,
+    "lane_mood": 64,
+    "ytmusic_home": 128,
+    "popularity": 128,
+    "collaborative": 80,
 }
 
-DISCOVERY_UNIVERSE_TARGET = 420
+# Retained, canonical supply for several rotations and long row-detail pages.
+# It is not a raw provider-result count or a visible-row publication gate.
+DISCOVERY_UNIVERSE_TARGET = 640
+
+# Radio cards can be published once they have a useful visible queue.  The
+# worker keeps enriching accepted cards toward the deeper target in later
+# cycles, but a 24-track minimum made otherwise healthy artist catalogs
+# impossible to publish.
+POPULAR_RADIO_CARD_MIN_TRACKS = 8
+POPULAR_RADIO_CARD_TARGET_TRACKS = 12
 
 ROW_RECIPES: Dict[str, RowRecipe] = {
     "todays_pick": RowRecipe(
@@ -44,20 +56,20 @@ ROW_RECIPES: Dict[str, RowRecipe] = {
         title="Today's pick",
         item_type="track",
         launch_required=True,
-        min_items=1,
+        min_items=6,
         target_items=6,
         max_items=8,
         page_size=6,
         can_page=False,
-        candidate_sources=("similarity", "artist_graph", "genre_mood", "popularity", "history"),
+        candidate_sources=("similarity", "artist_graph", "genre_mood", "profile_spine", "popularity"),
         ranking_intent="daily_pick",
     ),
     "featured_new_albums": RowRecipe(
         kind="featured_new_albums",
         title="Featured albums for you",
         item_type="album",
-        launch_required=True,
-        min_items=1,
+        launch_required=False,
+        min_items=4,
         target_items=8,
         max_items=10,
         page_size=10,
@@ -78,8 +90,8 @@ ROW_RECIPES: Dict[str, RowRecipe] = {
         title="Last played",
         item_type="track",
         launch_required=False,
-        min_items=1,
-        target_items=12,
+        min_items=8,
+        target_items=8,
         max_items=16,
         page_size=8,
         can_page=False,
@@ -91,8 +103,8 @@ ROW_RECIPES: Dict[str, RowRecipe] = {
         title="Frequently listened",
         item_type="track",
         launch_required=False,
-        min_items=2,
-        target_items=12,
+        min_items=8,
+        target_items=8,
         max_items=16,
         page_size=8,
         can_page=False,
@@ -104,12 +116,12 @@ ROW_RECIPES: Dict[str, RowRecipe] = {
         title="Made for you",
         item_type="mix",
         launch_required=True,
-        min_items=3,
-        target_items=5,
-        max_items=5,
-        page_size=5,
+        min_items=5,
+        target_items=8,
+        max_items=12,
+        page_size=12,
         can_page=False,
-        candidate_sources=("discovery_universe", "similarity", "artist_graph", "genre_mood", "collaborative", "popularity"),
+        candidate_sources=("profile_spine", "similarity", "artist_graph", "collaborative", "popularity"),
         ranking_intent="personal_mix",
         row_style="mix_cards",
     ),
@@ -118,35 +130,35 @@ ROW_RECIPES: Dict[str, RowRecipe] = {
         title="Because you played",
         item_type="track",
         launch_required=True,
-        min_items=4,
-        target_items=24,
+        min_items=12,
+        target_items=12,
         max_items=48,
         page_size=12,
         can_page=True,
-        candidate_sources=("similarity", "artist_graph", "history", "popularity", "discovery_universe"),
+        candidate_sources=("similarity", "artist_graph", "profile_spine"),
         ranking_intent="anchor_recommendation",
     ),
-    "trending_by_genre": RowRecipe(
-        kind="trending_by_genre",
-        title="Trending by genre",
-        item_type="track",
-        launch_required=True,
-        min_items=6,
-        target_items=32,
-        max_items=64,
-        page_size=12,
+    "popular_radio": RowRecipe(
+        kind="popular_radio",
+        title="Popular Radio",
+        item_type="radio",
+        launch_required=False,
+        min_items=10,
+        target_items=12,
+        max_items=15,
+        page_size=15,
         can_page=True,
-        candidate_sources=("genre_mood", "popularity", "similarity", "discovery_universe"),
-        ranking_intent="genre_discovery",
-        row_style="genre_tabs",
+        candidate_sources=("profile_spine", "artist_graph", "similarity", "collaborative", "popularity"),
+        ranking_intent="artist_radio",
+        row_style="radio_cards",
     ),
     "recommended_albums": RowRecipe(
         kind="recommended_albums",
         title="Recommended albums",
         item_type="album",
-        launch_required=True,
-        min_items=1,
-        target_items=24,
+        launch_required=False,
+        min_items=4,
+        target_items=12,
         max_items=48,
         page_size=12,
         can_page=True,
@@ -165,12 +177,12 @@ ROW_RECIPES: Dict[str, RowRecipe] = {
         title="Recommended artists",
         item_type="artist",
         launch_required=False,
-        min_items=1,
-        target_items=16,
-        max_items=30,
+        min_items=10,
+        target_items=10,
+        max_items=48,
         page_size=10,
         can_page=True,
-        candidate_sources=("artist_graph", "similarity", "popularity", "discovery_universe"),
+        candidate_sources=("profile_spine", "artist_graph", "similarity", "collaborative"),
         ranking_intent="artist_discovery",
     ),
     "quiet_picks": RowRecipe(
@@ -178,26 +190,24 @@ ROW_RECIPES: Dict[str, RowRecipe] = {
         title="Quiet Picks",
         item_type="track",
         launch_required=False,
-        min_items=8,
-        target_items=64,
-        max_items=96,
+        min_items=20,
+        target_items=20,
+        max_items=200,
         page_size=20,
         can_page=True,
-        candidate_sources=("similarity", "artist_graph", "genre_mood", "collaborative", "popularity", "discovery_universe"),
+        candidate_sources=(
+            "genre_mood",
+            "lane_chill",
+            "lane_workout",
+            "lane_focus",
+            "lane_mood",
+            "similarity",
+            "artist_graph",
+            "collaborative",
+            "profile_spine",
+            "popularity",
+        ),
         ranking_intent="taste_discovery",
-    ),
-    "hidden_gems": RowRecipe(
-        kind="hidden_gems",
-        title="Hidden gems",
-        item_type="track",
-        launch_required=False,
-        min_items=4,
-        target_items=24,
-        max_items=48,
-        page_size=12,
-        can_page=True,
-        candidate_sources=("similarity", "artist_graph", "genre_mood", "popularity", "discovery_universe"),
-        ranking_intent="novelty_discovery",
     ),
 }
 
@@ -209,7 +219,7 @@ LANE_RECIPES: Dict[str, LaneRecipe] = {
         title="All",
         min_items=12,
         target_items=24,
-        candidate_sources=("similarity", "artist_graph", "genre_mood", "collaborative", "popularity"),
+        candidate_sources=("similarity", "artist_graph", "collaborative"),
     ),
     "chill": LaneRecipe(
         lane_id="chill",
@@ -218,7 +228,6 @@ LANE_RECIPES: Dict[str, LaneRecipe] = {
         target_items=24,
         positive_hints=("acoustic", "soul", "rnb", "mellow", "soft", "jazz", "downtempo", "chill"),
         negative_hints=("metal", "thrash", "hardcore", "speed", "aggressive"),
-        retrieval_queries=("chill mellow acoustic soul songs", "downtempo jazz rnb songs"),
         candidate_sources=("lane_chill",),
     ),
     "workout": LaneRecipe(
@@ -229,7 +238,6 @@ LANE_RECIPES: Dict[str, LaneRecipe] = {
         positive_hints=("rock", "dance", "edm", "pop", "metal", "punk", "upbeat", "live", "energy"),
         negative_hints=("acoustic", "lullaby", "sleep", "piano ballad", "ambient", "slow", "quiet", "soft"),
         allow_acoustic=False,
-        retrieval_queries=("workout upbeat rock dance songs", "high energy edm pop songs"),
         candidate_sources=("lane_workout",),
     ),
     "focus": LaneRecipe(
@@ -239,7 +247,6 @@ LANE_RECIPES: Dict[str, LaneRecipe] = {
         target_items=24,
         positive_hints=("instrumental", "ambient", "piano", "lo-fi", "study", "soundtrack", "focus"),
         negative_hints=("live", "party", "metal", "punk", "hardcore"),
-        retrieval_queries=("focus instrumental ambient study songs", "lo-fi piano soundtrack songs"),
         candidate_sources=("lane_focus",),
     ),
     "mood": LaneRecipe(
@@ -249,7 +256,6 @@ LANE_RECIPES: Dict[str, LaneRecipe] = {
         target_items=24,
         positive_hints=("emotional", "atmospheric", "dream", "melancholy", "soul", "cinematic", "mood"),
         negative_hints=(),
-        retrieval_queries=("emotional atmospheric cinematic songs", "dreamy melancholy soul songs"),
         candidate_sources=("lane_mood",),
     ),
 }

@@ -22,6 +22,16 @@ The web preview currently serves build `2026-11-06-artist-home`. Guests can sear
 
 **Android** adds downloads, device-local playback, a sleep timer and song recognition from a recording or imported media when ACRCloud is configured. Signed APK releases and in-app update support are documented in the [Android release guide](docs/ANDROID_RELEASE.md).
 
+## Preview
+
+### Home
+
+![Neatie Home on desktop with a featured album, liked songs, recommendations and the bottom player](docs/images/neatie-home.png)
+
+### Vinyl player
+
+![Neatie’s vinyl player on desktop with playback controls and the Up Next cover queue](docs/images/neatie-vinyl.png)
+
 ## How it works
 
 - **Clients** live in [`app/`](app/). Flutter shares models and contracts across clients. Android uses Riverpod, `just_audio` and `audio_service`. Web uses HTML audio and Media Session controls.

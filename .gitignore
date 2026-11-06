@@ -32,6 +32,7 @@ deploy/production/*.tar.gz
 
 # Local Codex worker/checkpoint artifacts
 .codex/
+/AGENTS.md
 
 # Native C++
 core_native/build/
